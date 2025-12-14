@@ -113,7 +113,7 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru') {
         Authorization: `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'gpt-5-mini',
         messages: prompt,
         response_format: { type: 'json_object' }
       }),
