@@ -1,5 +1,6 @@
 const DEFAULT_STATE = {
-  apiKey: ''
+  apiKey: '',
+  model: 'gpt-4.1-nano'
 };
 
 async function getState() {
@@ -49,7 +50,8 @@ async function handleGetSettings(message, sendResponse) {
   const state = await getState();
   sendResponse({
     allowed: !!state.apiKey,
-    apiKey: state.apiKey
+    apiKey: state.apiKey,
+    model: state.model
   });
 }
 
@@ -61,7 +63,7 @@ async function handleTranslateText(message, sendResponse) {
       return;
     }
 
-    const translations = await translateTexts(message.texts, state.apiKey, message.targetLanguage);
+    const translations = await translateTexts(message.texts, state.apiKey, message.targetLanguage, state.model);
     sendResponse({ success: true, translations });
   } catch (error) {
     console.error('Translation failed', error);
@@ -69,7 +71,7 @@ async function handleTranslateText(message, sendResponse) {
   }
 }
 
-async function translateTexts(texts, apiKey, targetLanguage = 'ru') {
+async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.model) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
   const prompt = [
@@ -104,7 +106,7 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru') {
           Authorization: `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-          model: 'gpt-5-mini',
+          model,
           messages: prompt,
           response_format: { type: 'json_object' }
         }),
