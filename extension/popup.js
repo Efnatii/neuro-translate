@@ -12,7 +12,11 @@ const models = [
   { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', price: 0.15 },
   { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.2 },
   { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', price: 0.6 },
-  { id: 'gpt-5-mini', name: 'GPT-5 Mini', price: 0.9 }
+  { id: 'gpt-5-mini', name: 'GPT-5 Mini', price: 0.9 },
+  { id: 'gpt-4.1', name: 'GPT-4.1', price: 5 },
+  { id: 'gpt-4.1-pro', name: 'GPT-4.1 Pro', price: 15 },
+  { id: 'gpt-5.1', name: 'GPT-5.1', price: 20 },
+  { id: 'gpt-5.1-pro', name: 'GPT-5.1 Pro', price: 30 }
 ].sort((a, b) => a.price - b.price);
 
 init();

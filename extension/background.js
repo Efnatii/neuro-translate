@@ -1,6 +1,6 @@
 const DEFAULT_STATE = {
   apiKey: '',
-  model: 'gpt-4.1-nano'
+  model: 'gpt-4.1-mini'
 };
 
 async function getState() {
@@ -74,20 +74,19 @@ async function handleTranslateText(message, sendResponse) {
 async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.model) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
-  const delimiter = '|||';
   const prompt = [
     {
       role: 'system',
       content: [
-        'You are a translation engine.',
-        `Translate each user provided string into ${targetLanguage}.`,
-        `Return the translations joined by the delimiter "${delimiter}" in the same order.`,
-        'Do not add numbering, explanations, or any extra text.'
+        'You are a precise translation engine.',
+        `Translate every element of the provided JSON array into ${targetLanguage}.`,
+        'Return only a valid JSON array of translated strings that matches the length and order of the input.',
+        'Do not merge, split, or skip any items. Do not add explanations or formatting such as code fences.'
       ].join(' ')
     },
     {
       role: 'user',
-      content: texts.join(`\n${delimiter}\n`)
+      content: JSON.stringify(texts)
     }
   ];
 
@@ -123,12 +122,12 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
         throw new Error('No translation returned');
       }
 
-      const translations = content.split(delimiter).map((text) => text.trim());
-      if (!translations.length) {
+      const parsed = safeParseArray(content);
+      if (!Array.isArray(parsed) || parsed.length !== texts.length) {
         throw new Error('Unexpected translation format');
       }
 
-      return texts.map((text, index) => translations[index] || text);
+      return texts.map((text, index) => (typeof parsed[index] === 'string' ? parsed[index] : text));
     } catch (error) {
       if (error?.name === 'AbortError') {
         lastError = new Error('Translation request timed out');
@@ -149,6 +148,20 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
   }
 
   throw lastError || new Error('Translation failed');
+}
+
+function safeParseArray(content) {
+  try {
+    const normalized = content
+      .replace(/^```json\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
+    const parsed = JSON.parse(normalized);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (error) {
+    console.warn('Failed to parse translation response as JSON, received:', content);
+    return null;
+  }
 }
 
 async function handleTranslationProgress(message, sender) {
