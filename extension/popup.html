@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neuro Translate</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 12px; min-width: 320px; }
+    label { display: block; margin-top: 8px; }
+    input[type="text"] { width: 100%; box-sizing: border-box; padding: 6px; }
+    button { margin-top: 8px; padding: 6px 10px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .row button { flex: 1; }
+    .status { margin-top: 8px; color: #555; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h3>Neuro Translate</h3>
+  <label>
+    API Key
+    <input type="text" id="apiKey" placeholder="Enter GPT-5-Nano API key" />
+  </label>
+  <label>
+    <input type="checkbox" id="enabled" /> Enable automatic translation
+  </label>
+  <div class="row">
+    <button id="save">Save settings</button>
+    <button id="cancel">Cancel translation</button>
+  </div>
+  <div class="row">
+    <button id="blockDomain">Do not translate this domain</button>
+    <button id="unblockDomain">Allow this domain</button>
+  </div>
+  <p class="status" id="status"></p>
+  <script src="popup.js"></script>
+</body>
+</html>
