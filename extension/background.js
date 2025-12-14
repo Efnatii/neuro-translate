@@ -103,8 +103,7 @@ async function translateSingle(text, apiKey, targetLanguage) {
         role: 'user',
         content: text
       }
-    ],
-    temperature: 0.3
+    ]
   };
 
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
