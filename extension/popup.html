@@ -9,8 +9,16 @@
     label { display: block; margin-top: 8px; }
     input[type="text"] { width: 100%; box-sizing: border-box; padding: 6px; }
     button { margin-top: 8px; padding: 6px 10px; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; }
-    .row button { flex: 1; }
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: stretch;
+    }
+    .row button {
+      flex: 1;
+      min-width: 0;
+    }
     .status { margin-top: 8px; color: #555; font-size: 12px; }
   </style>
 </head>
@@ -22,8 +30,8 @@
   </label>
   <div class="row">
     <button id="translate">Перевести страницу</button>
+    <button id="cancel">Отменить перевод</button>
   </div>
-  <button id="cancel">Отменить перевод</button>
   <p class="status" id="status"></p>
   <script src="popup.js"></script>
 </body>

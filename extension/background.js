@@ -89,49 +89,65 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru') {
     }
   ];
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const maxAttempts = 2;
+  let lastError = null;
 
-  try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-5-mini',
-        messages: prompt,
-        response_format: { type: 'json_object' }
-      }),
-      signal: controller.signal
-    });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45000);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Translation request failed: ${response.status} ${errorText}`);
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-5-mini',
+          messages: prompt,
+          response_format: { type: 'json_object' }
+        }),
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Translation request failed: ${response.status} ${errorText}`);
+      }
+
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error('No translation returned');
+      }
+
+      const parsed = JSON.parse(content);
+      if (!Array.isArray(parsed?.translations)) {
+        throw new Error('Unexpected translation format');
+      }
+
+      return texts.map((text, index) => parsed.translations[index] || text);
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        lastError = new Error('Translation request timed out');
+      } else {
+        lastError = error;
+      }
+
+      const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
+      if (attempt < maxAttempts && isTimeout) {
+        console.warn(`Translation attempt ${attempt} timed out, retrying...`);
+        continue;
+      }
+
+      throw lastError;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error('No translation returned');
-    }
-
-    const parsed = JSON.parse(content);
-    if (!Array.isArray(parsed?.translations)) {
-      throw new Error('Unexpected translation format');
-    }
-
-    return texts.map((text, index) => parsed.translations[index] || text);
-  } catch (error) {
-    if (error?.name === 'AbortError') {
-      throw new Error('Translation request timed out');
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw lastError || new Error('Translation failed');
 }
 
 async function handleTranslationProgress(message) {
