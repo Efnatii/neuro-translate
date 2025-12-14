@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Neuro Translate",
   "version": "0.1.0",
-  "description": "Automatically translates pages using GPT-5-Nano with controllable options.",
+  "description": "Translate pages on demand using GPT-5-Nano.",
   "permissions": ["storage", "scripting", "tabs"],
   "host_permissions": ["<all_urls>"],
   "background": {
