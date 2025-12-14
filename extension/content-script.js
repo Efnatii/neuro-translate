@@ -1,22 +1,38 @@
 let cancelRequested = false;
 let translationError = null;
 let translationProgress = { completedChunks: 0, totalChunks: 0 };
+let translationInProgress = false;
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'CANCEL_TRANSLATION') {
     cancelRequested = true;
     reportProgress('Перевод отменён', translationProgress.completedChunks, translationProgress.totalChunks);
   }
+
+  if (message?.type === 'START_TRANSLATION') {
+    startTranslation();
+  }
 });
 
-(async function init() {
-  const settings = await requestSettings();
-  if (!settings?.allowed) {
+async function startTranslation() {
+  if (translationInProgress) {
+    reportProgress('Перевод уже выполняется', translationProgress.completedChunks, translationProgress.totalChunks);
     return;
   }
 
-  translatePage(settings);
-})();
+  const settings = await requestSettings();
+  if (!settings?.allowed) {
+    reportProgress('Перевод недоступен для этой страницы', translationProgress.completedChunks, translationProgress.totalChunks);
+    return;
+  }
+
+  translationInProgress = true;
+  try {
+    await translatePage(settings);
+  } finally {
+    translationInProgress = false;
+  }
+}
 
 async function requestSettings() {
   return new Promise((resolve) => {
