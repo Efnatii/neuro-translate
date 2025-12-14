@@ -1,4 +1,5 @@
 const apiKeyInput = document.getElementById('apiKey');
+const modelSelect = document.getElementById('model');
 const statusLabel = document.getElementById('status');
 
 const cancelButton = document.getElementById('cancel');
@@ -6,16 +7,25 @@ const translateButton = document.getElementById('translate');
 
 let keySaveTimeout = null;
 
+const models = [
+  { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', price: 0.15 },
+  { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.2 },
+  { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', price: 0.6 },
+  { id: 'gpt-5-mini', name: 'GPT-5 Mini', price: 0.9 }
+].sort((a, b) => a.price - b.price);
+
 init();
 
 async function init() {
   const state = await getState();
   apiKeyInput.value = state.apiKey || '';
+  renderModelOptions(state.model);
   renderTranslationStatus(state.translationStatus);
 
   chrome.storage.onChanged.addListener(handleStorageChange);
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
+  modelSelect.addEventListener('change', handleModelChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
 }
@@ -29,14 +39,36 @@ function handleApiKeyChange() {
   }, 300);
 }
 
+async function handleModelChange() {
+  const model = modelSelect.value;
+  await chrome.storage.local.set({ model });
+  statusLabel.textContent = 'Модель сохранена.';
+}
+
 async function getState() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['apiKey', 'translationStatus'], (data) => {
+    chrome.storage.local.get(['apiKey', 'model', 'translationStatus'], (data) => {
       resolve({
         apiKey: data.apiKey || '',
+        model: data.model,
         translationStatus: data.translationStatus
       });
     });
+  });
+}
+
+function renderModelOptions(selected) {
+  const defaultModel = models[0]?.id;
+  const currentModel = selected || defaultModel;
+
+  modelSelect.innerHTML = '';
+
+  models.forEach((model) => {
+    const option = document.createElement('option');
+    option.value = model.id;
+    option.textContent = `${model.name} ($${model.price}/1M токенов)`;
+    option.selected = model.id === currentModel;
+    modelSelect.appendChild(option);
   });
 }
 
