@@ -4,10 +4,12 @@ const statusLabel = document.getElementById('status');
 
 const saveButton = document.getElementById('save');
 const cancelButton = document.getElementById('cancel');
+const translateButton = document.getElementById('translate');
 const blockButton = document.getElementById('blockDomain');
 const unblockButton = document.getElementById('unblockDomain');
 
 let currentDomain = null;
+let keySaveTimeout = null;
 
 init();
 
@@ -21,10 +23,21 @@ async function init() {
 
   chrome.storage.onChanged.addListener(handleStorageChange);
 
+  apiKeyInput.addEventListener('input', handleApiKeyChange);
   saveButton.addEventListener('click', handleSave);
   cancelButton.addEventListener('click', sendCancel);
+  translateButton.addEventListener('click', sendTranslateRequest);
   blockButton.addEventListener('click', () => updateDomainBlock(true));
   unblockButton.addEventListener('click', () => updateDomainBlock(false));
+}
+
+function handleApiKeyChange() {
+  clearTimeout(keySaveTimeout);
+  const apiKey = apiKeyInput.value.trim();
+  keySaveTimeout = setTimeout(async () => {
+    await chrome.storage.local.set({ apiKey });
+    statusLabel.textContent = 'API ключ сохранён.';
+  }, 300);
 }
 
 async function getState() {
@@ -80,6 +93,13 @@ async function sendCancel() {
   if (!tab?.id) return;
   chrome.tabs.sendMessage(tab.id, { type: 'CANCEL_TRANSLATION' });
   statusLabel.textContent = 'Перевод для этой страницы отменён.';
+}
+
+async function sendTranslateRequest() {
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  chrome.tabs.sendMessage(tab.id, { type: 'START_TRANSLATION' });
+  statusLabel.textContent = 'Запускаем перевод страницы...';
 }
 
 async function updateDomainBlock(block) {
