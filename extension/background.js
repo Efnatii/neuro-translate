@@ -35,6 +35,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.tabs.sendMessage(sender.tab.id, { type: 'CANCEL_TRANSLATION' });
   }
 
+  if (message?.type === 'TRANSLATION_PROGRESS') {
+    handleTranslationProgress(message);
+  }
+
+  if (message?.type === 'GET_TRANSLATION_STATUS') {
+    handleGetTranslationStatus(sendResponse);
+    return true;
+  }
+
   return false;
 });
 
@@ -128,4 +137,19 @@ function safeGetDomain(urlString) {
   } catch (error) {
     return null;
   }
+}
+
+async function handleTranslationProgress(message) {
+  const status = {
+    completedChunks: message.completedChunks || 0,
+    totalChunks: message.totalChunks || 0,
+    message: message.message || '',
+    timestamp: Date.now()
+  };
+  await chrome.storage.local.set({ translationStatus: status });
+}
+
+async function handleGetTranslationStatus(sendResponse) {
+  const { translationStatus } = await chrome.storage.local.get({ translationStatus: null });
+  sendResponse(translationStatus);
 }

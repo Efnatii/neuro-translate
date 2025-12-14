@@ -17,6 +17,9 @@ async function init() {
   enabledCheckbox.checked = !!state.enabled;
   currentDomain = await getActiveDomain();
   renderDomainStatus(state.blockedDomains || []);
+  renderTranslationStatus(state.translationStatus);
+
+  chrome.storage.onChanged.addListener(handleStorageChange);
 
   saveButton.addEventListener('click', handleSave);
   cancelButton.addEventListener('click', sendCancel);
@@ -26,11 +29,12 @@ async function init() {
 
 async function getState() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['apiKey', 'enabled', 'blockedDomains'], (data) => {
+    chrome.storage.local.get(['apiKey', 'enabled', 'blockedDomains', 'translationStatus'], (data) => {
       resolve({
         apiKey: data.apiKey || '',
         enabled: data.enabled !== false,
-        blockedDomains: data.blockedDomains || []
+        blockedDomains: data.blockedDomains || [],
+        translationStatus: data.translationStatus
       });
     });
   });
@@ -52,14 +56,14 @@ async function getActiveDomain() {
 
 function renderDomainStatus(blockedDomains) {
   if (!currentDomain) {
-    statusLabel.textContent = 'Unable to detect current domain.';
+    statusLabel.textContent = 'Не удалось определить домен.';
     return;
   }
 
   if (blockedDomains.includes(currentDomain)) {
-    statusLabel.textContent = `${currentDomain} is excluded from translation.`;
+    statusLabel.textContent = `${currentDomain} исключён из перевода.`;
   } else {
-    statusLabel.textContent = `${currentDomain} is eligible for translation.`;
+    statusLabel.textContent = `${currentDomain} доступен для перевода.`;
   }
 }
 
@@ -68,14 +72,14 @@ async function handleSave() {
   const enabled = enabledCheckbox.checked;
 
   await chrome.storage.local.set({ apiKey, enabled });
-  statusLabel.textContent = 'Settings saved.';
+  statusLabel.textContent = 'Настройки сохранены.';
 }
 
 async function sendCancel() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
   chrome.tabs.sendMessage(tab.id, { type: 'CANCEL_TRANSLATION' });
-  statusLabel.textContent = 'Translation canceled for this page.';
+  statusLabel.textContent = 'Перевод для этой страницы отменён.';
 }
 
 async function updateDomainBlock(block) {
@@ -93,4 +97,22 @@ async function updateDomainBlock(block) {
   const blockedDomains = Array.from(blocked);
   await chrome.storage.local.set({ blockedDomains });
   renderDomainStatus(blockedDomains);
+}
+
+function handleStorageChange(changes) {
+  if (changes.translationStatus) {
+    renderTranslationStatus(changes.translationStatus.newValue);
+  }
+}
+
+function renderTranslationStatus(status) {
+  const defaultText = 'Статус: перевод не выполняется.';
+  if (!status) {
+    statusLabel.textContent = defaultText;
+    return;
+  }
+
+  const { completedChunks = 0, totalChunks = 0, message } = status;
+  const progress = totalChunks ? ` (${completedChunks}/${totalChunks})` : '';
+  statusLabel.textContent = message ? `${message}${progress}` : defaultText;
 }
