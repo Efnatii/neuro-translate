@@ -1,4 +1,5 @@
 let cancelRequested = false;
+let translationError = null;
 let translationProgress = { completedChunks: 0, totalChunks: 0 };
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -36,6 +37,7 @@ async function translatePage(settings) {
   }
 
   cancelRequested = false;
+  translationError = null;
   reportProgress('Перевод запущен', 0, chunks.length);
 
   const maxConcurrency = Math.min(4, chunks.length);
@@ -51,14 +53,15 @@ async function translatePage(settings) {
 
       try {
         const result = await translate(texts, settings.targetLanguage || 'ru');
-        if (result?.success) {
-          chunk.forEach(({ node }, index) => {
-            node.nodeValue = result.translations[index] || node.nodeValue;
-          });
-        }
+        chunk.forEach(({ node }, index) => {
+          node.nodeValue = result.translations[index] || node.nodeValue;
+        });
       } catch (error) {
         console.error('Chunk translation failed', error);
+        translationError = error;
+        cancelRequested = true;
         reportProgress('Ошибка перевода', translationProgress.completedChunks, chunks.length);
+        return;
       }
 
       translationProgress.completedChunks += 1;
@@ -69,6 +72,11 @@ async function translatePage(settings) {
   const workers = Array.from({ length: maxConcurrency }, () => worker());
   await Promise.all(workers);
 
+  if (translationError) {
+    reportProgress('Ошибка перевода', translationProgress.completedChunks, chunks.length);
+    return;
+  }
+
   if (cancelRequested) {
     reportProgress('Перевод отменён', translationProgress.completedChunks, chunks.length);
     return;
@@ -78,14 +86,20 @@ async function translatePage(settings) {
 }
 
 async function translate(texts, targetLanguage) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
         type: 'TRANSLATE_TEXT',
         texts,
         targetLanguage
       },
-      (response) => resolve(response)
+      (response) => {
+        if (response?.success) {
+          resolve(response);
+        } else {
+          reject(new Error(response?.error || 'Не удалось выполнить перевод.'));
+        }
+      }
     );
   });
 }
