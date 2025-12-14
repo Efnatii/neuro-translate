@@ -1,7 +1,5 @@
 const DEFAULT_STATE = {
-  apiKey: '',
-  enabled: true,
-  blockedDomains: []
+  apiKey: ''
 };
 
 async function getState() {
@@ -49,26 +47,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleGetSettings(message, sendResponse) {
   const state = await getState();
-  const domain = safeGetDomain(message.url);
-  const blocked = domain && state.blockedDomains?.includes(domain);
   sendResponse({
-    allowed: state.enabled && !blocked && !!state.apiKey,
-    enabled: state.enabled,
-    blocked,
-    apiKey: state.apiKey,
-    blockedDomains: state.blockedDomains,
-    domain
+    allowed: !!state.apiKey,
+    apiKey: state.apiKey
   });
 }
 
 async function handleTranslateText(message, sendResponse) {
   try {
     const state = await getState();
-    if (!state.enabled) {
-      sendResponse({ success: false, error: 'Translator is disabled.' });
-      return;
-    }
-
     if (!state.apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
@@ -144,15 +131,6 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru') {
     throw error;
   } finally {
     clearTimeout(timeout);
-  }
-}
-
-function safeGetDomain(urlString) {
-  try {
-    const url = new URL(urlString);
-    return url.hostname;
-  } catch (error) {
-    return null;
   }
 }
 
