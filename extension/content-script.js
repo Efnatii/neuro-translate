@@ -1,8 +1,10 @@
 let cancelRequested = false;
+let translationProgress = { completedChunks: 0, totalChunks: 0 };
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'CANCEL_TRANSLATION') {
     cancelRequested = true;
+    reportProgress('Перевод отменён', translationProgress.completedChunks, translationProgress.totalChunks);
   }
 });
 
@@ -26,21 +28,53 @@ async function requestSettings() {
 async function translatePage(settings) {
   const textNodes = collectTextNodes(document.body);
   const chunks = chunkNodes(textNodes, 800);
+  translationProgress = { completedChunks: 0, totalChunks: chunks.length };
 
-  for (const chunk of chunks) {
-    if (cancelRequested) {
-      console.debug('Translation canceled by user');
-      break;
-    }
-
-    const texts = chunk.map(({ node }) => node.nodeValue);
-    const result = await translate(texts, settings.targetLanguage || 'ru');
-    if (result?.success) {
-      chunk.forEach(({ node }, index) => {
-        node.nodeValue = result.translations[index] || node.nodeValue;
-      });
-    }
+  if (!chunks.length) {
+    reportProgress('Перевод не требуется', 0, 0);
+    return;
   }
+
+  cancelRequested = false;
+  reportProgress('Перевод запущен', 0, chunks.length);
+
+  const maxConcurrency = Math.min(4, chunks.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (true) {
+      if (cancelRequested) return;
+      const currentIndex = nextIndex++;
+      if (currentIndex >= chunks.length) return;
+      const chunk = chunks[currentIndex];
+      const texts = chunk.map(({ node }) => node.nodeValue);
+
+      try {
+        const result = await translate(texts, settings.targetLanguage || 'ru');
+        if (result?.success) {
+          chunk.forEach(({ node }, index) => {
+            node.nodeValue = result.translations[index] || node.nodeValue;
+          });
+        }
+      } catch (error) {
+        console.error('Chunk translation failed', error);
+        reportProgress('Ошибка перевода', translationProgress.completedChunks, chunks.length);
+      }
+
+      translationProgress.completedChunks += 1;
+      reportProgress('Перевод выполняется', translationProgress.completedChunks, chunks.length);
+    }
+  };
+
+  const workers = Array.from({ length: maxConcurrency }, () => worker());
+  await Promise.all(workers);
+
+  if (cancelRequested) {
+    reportProgress('Перевод отменён', translationProgress.completedChunks, chunks.length);
+    return;
+  }
+
+  reportProgress('Перевод завершён', translationProgress.completedChunks, chunks.length);
 }
 
 async function translate(texts, targetLanguage) {
@@ -99,4 +133,13 @@ function chunkNodes(nodes, maxLength) {
   }
 
   return chunks;
+}
+
+function reportProgress(message, completedChunks, totalChunks) {
+  chrome.runtime.sendMessage({
+    type: 'TRANSLATION_PROGRESS',
+    message,
+    completedChunks,
+    totalChunks
+  });
 }

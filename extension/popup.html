@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -17,19 +17,19 @@
 <body>
   <h3>Neuro Translate</h3>
   <label>
-    API Key
-    <input type="text" id="apiKey" placeholder="Enter GPT-5-Nano API key" />
+    API ключ
+    <input type="text" id="apiKey" placeholder="Введите API-ключ GPT-5-Nano" />
   </label>
   <label>
-    <input type="checkbox" id="enabled" /> Enable automatic translation
+    <input type="checkbox" id="enabled" /> Включить автоперевод
   </label>
   <div class="row">
-    <button id="save">Save settings</button>
-    <button id="cancel">Cancel translation</button>
+    <button id="save">Сохранить настройки</button>
+    <button id="cancel">Отменить перевод</button>
   </div>
   <div class="row">
-    <button id="blockDomain">Do not translate this domain</button>
-    <button id="unblockDomain">Allow this domain</button>
+    <button id="blockDomain">Не переводить этот домен</button>
+    <button id="unblockDomain">Разрешить этот домен</button>
   </div>
   <p class="status" id="status"></p>
   <script src="popup.js"></script>
