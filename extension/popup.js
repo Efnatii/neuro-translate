@@ -6,6 +6,7 @@ const cancelButton = document.getElementById('cancel');
 const translateButton = document.getElementById('translate');
 
 let keySaveTimeout = null;
+let activeTabId = null;
 
 const models = [
   { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', price: 0.15 },
@@ -17,10 +18,13 @@ const models = [
 init();
 
 async function init() {
+  const tab = await getActiveTab();
+  activeTabId = tab?.id || null;
+
   const state = await getState();
   apiKeyInput.value = state.apiKey || '';
   renderModelOptions(state.model);
-  renderTranslationStatus(state.translationStatus);
+  renderTranslationStatus(state.translationStatusByTab?.[activeTabId]);
 
   chrome.storage.onChanged.addListener(handleStorageChange);
 
@@ -47,11 +51,11 @@ async function handleModelChange() {
 
 async function getState() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['apiKey', 'model', 'translationStatus'], (data) => {
+    chrome.storage.local.get(['apiKey', 'model', 'translationStatusByTab'], (data) => {
       resolve({
         apiKey: data.apiKey || '',
         model: data.model,
-        translationStatus: data.translationStatus
+        translationStatusByTab: data.translationStatusByTab || {}
       });
     });
   });
@@ -92,8 +96,9 @@ async function sendTranslateRequest() {
 }
 
 function handleStorageChange(changes) {
-  if (changes.translationStatus) {
-    renderTranslationStatus(changes.translationStatus.newValue);
+  if (changes.translationStatusByTab) {
+    const nextStatuses = changes.translationStatusByTab.newValue || {};
+    renderTranslationStatus(activeTabId ? nextStatuses[activeTabId] : null);
   }
 }
 
