@@ -35,11 +35,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === 'TRANSLATION_PROGRESS') {
-    handleTranslationProgress(message);
+    handleTranslationProgress(message, sender);
   }
 
   if (message?.type === 'GET_TRANSLATION_STATUS') {
-    handleGetTranslationStatus(sendResponse);
+    handleGetTranslationStatus(sendResponse, sender?.tab?.id);
     return true;
   }
 
@@ -74,20 +74,20 @@ async function handleTranslateText(message, sendResponse) {
 async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.model) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
+  const delimiter = '|||';
   const prompt = [
     {
       role: 'system',
       content: [
         'You are a translation engine.',
         `Translate each user provided string into ${targetLanguage}.`,
-        'Return a JSON object with a "translations" array where each item',
-        'is the translation for the corresponding input string.',
-        'Only return valid JSON and nothing else.'
+        `Return the translations joined by the delimiter "${delimiter}" in the same order.`,
+        'Do not add numbering, explanations, or any extra text.'
       ].join(' ')
     },
     {
       role: 'user',
-      content: JSON.stringify({ texts })
+      content: texts.join(`\n${delimiter}\n`)
     }
   ];
 
@@ -107,8 +107,7 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
         },
         body: JSON.stringify({
           model,
-          messages: prompt,
-          response_format: { type: 'json_object' }
+          messages: prompt
         }),
         signal: controller.signal
       });
@@ -124,12 +123,12 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
         throw new Error('No translation returned');
       }
 
-      const parsed = JSON.parse(content);
-      if (!Array.isArray(parsed?.translations)) {
+      const translations = content.split(delimiter).map((text) => text.trim());
+      if (!translations.length) {
         throw new Error('Unexpected translation format');
       }
 
-      return texts.map((text, index) => parsed.translations[index] || text);
+      return texts.map((text, index) => translations[index] || text);
     } catch (error) {
       if (error?.name === 'AbortError') {
         lastError = new Error('Translation request timed out');
@@ -152,17 +151,22 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
   throw lastError || new Error('Translation failed');
 }
 
-async function handleTranslationProgress(message) {
+async function handleTranslationProgress(message, sender) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) return;
+
   const status = {
     completedChunks: message.completedChunks || 0,
     totalChunks: message.totalChunks || 0,
     message: message.message || '',
     timestamp: Date.now()
   };
-  await chrome.storage.local.set({ translationStatus: status });
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
+  translationStatusByTab[tabId] = status;
+  await chrome.storage.local.set({ translationStatusByTab });
 }
 
-async function handleGetTranslationStatus(sendResponse) {
-  const { translationStatus } = await chrome.storage.local.get({ translationStatus: null });
-  sendResponse(translationStatus);
+async function handleGetTranslationStatus(sendResponse, tabId) {
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
+  sendResponse(translationStatusByTab[tabId] || null);
 }
