@@ -83,28 +83,24 @@ async function handleTranslateText(message, sendResponse) {
 }
 
 async function translateTexts(texts, apiKey, targetLanguage = 'ru') {
-  const translations = [];
-  for (const text of texts) {
-    const translated = await translateSingle(text, apiKey, targetLanguage);
-    translations.push(translated || text);
-  }
-  return translations;
-}
+  if (!Array.isArray(texts) || !texts.length) return [];
 
-async function translateSingle(text, apiKey, targetLanguage) {
-  const body = {
-    model: 'gpt-5-nano',
-    messages: [
-      {
-        role: 'system',
-        content: `You are a translation engine. Translate the user text into ${targetLanguage}. Only return the translated text.`
-      },
-      {
-        role: 'user',
-        content: text
-      }
-    ]
-  };
+  const prompt = [
+    {
+      role: 'system',
+      content: [
+        'You are a translation engine.',
+        `Translate each user provided string into ${targetLanguage}.`,
+        'Return a JSON object with a "translations" array where each item',
+        'is the translation for the corresponding input string.',
+        'Only return valid JSON and nothing else.'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({ texts })
+    }
+  ];
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
@@ -116,7 +112,11 @@ async function translateSingle(text, apiKey, targetLanguage) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: prompt,
+        response_format: { type: 'json_object' }
+      }),
       signal: controller.signal
     });
 
@@ -131,7 +131,12 @@ async function translateSingle(text, apiKey, targetLanguage) {
       throw new Error('No translation returned');
     }
 
-    return content.trim();
+    const parsed = JSON.parse(content);
+    if (!Array.isArray(parsed?.translations)) {
+      throw new Error('Unexpected translation format');
+    }
+
+    return texts.map((text, index) => parsed.translations[index] || text);
   } catch (error) {
     if (error?.name === 'AbortError') {
       throw new Error('Translation request timed out');
