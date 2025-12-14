@@ -2,11 +2,16 @@ let cancelRequested = false;
 let translationError = null;
 let translationProgress = { completedChunks: 0, totalChunks: 0 };
 let translationInProgress = false;
+let activeTranslationEntries = [];
+let originalSnapshot = [];
+
+const STORAGE_KEY = 'pageTranslations';
+
+restoreFromMemory();
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'CANCEL_TRANSLATION') {
-    cancelRequested = true;
-    reportProgress('Перевод отменён', translationProgress.completedChunks, translationProgress.totalChunks);
+    cancelTranslation();
   }
 
   if (message?.type === 'START_TRANSLATION') {
@@ -44,7 +49,15 @@ async function requestSettings() {
 
 async function translatePage(settings) {
   const textNodes = collectTextNodes(document.body);
-  const chunks = chunkNodes(textNodes, 800);
+  const nodesWithPath = textNodes.map((node) => ({
+    node,
+    path: getNodePath(node),
+    original: node.nodeValue
+  }));
+  originalSnapshot = nodesWithPath.map(({ path, original }) => ({ path, original }));
+  activeTranslationEntries = [];
+
+  const chunks = chunkNodes(nodesWithPath, 800);
   translationProgress = { completedChunks: 0, totalChunks: chunks.length };
 
   if (!chunks.length) {
@@ -69,8 +82,10 @@ async function translatePage(settings) {
 
       try {
         const result = await translate(texts, settings.targetLanguage || 'ru');
-        chunk.forEach(({ node }, index) => {
-          node.nodeValue = result.translations[index] || node.nodeValue;
+        chunk.forEach(({ node, path, original }, index) => {
+          const translated = result.translations[index] || node.nodeValue;
+          node.nodeValue = translated;
+          updateActiveEntry(path, original, translated);
         });
       } catch (error) {
         console.error('Chunk translation failed', error);
@@ -99,6 +114,7 @@ async function translatePage(settings) {
   }
 
   reportProgress('Перевод завершён', translationProgress.completedChunks, chunks.length);
+  await saveTranslationsToMemory(activeTranslationEntries);
 }
 
 async function translate(texts, targetLanguage) {
@@ -147,14 +163,14 @@ function chunkNodes(nodes, maxLength) {
   let currentChunk = [];
   let currentLength = 0;
 
-  nodes.forEach((node) => {
-    const text = node.nodeValue;
+  nodes.forEach((entry) => {
+    const text = entry.node.nodeValue;
     if (currentLength + text.length > maxLength && currentChunk.length) {
       chunks.push(currentChunk);
       currentChunk = [];
       currentLength = 0;
     }
-    currentChunk.push({ node });
+    currentChunk.push(entry);
     currentLength += text.length;
   });
 
@@ -172,4 +188,105 @@ function reportProgress(message, completedChunks, totalChunks) {
     completedChunks,
     totalChunks
   });
+}
+
+async function restoreFromMemory() {
+  const stored = await getStoredTranslations(location.href);
+  if (!stored?.length) return;
+
+  const restoredSnapshot = [];
+  stored.forEach(({ path, translated, original }) => {
+    const node = findNodeByPath(path);
+    if (node) {
+      const originalValue = typeof original === 'string' ? original : node.nodeValue;
+      activeTranslationEntries.push({ path, original: originalValue, translated });
+      restoredSnapshot.push({ path, original: originalValue });
+      node.nodeValue = translated;
+    }
+  });
+  if (restoredSnapshot.length) {
+    originalSnapshot = restoredSnapshot;
+  }
+}
+
+function getNodePath(node) {
+  const path = [];
+  let current = node;
+  while (current && current !== document.body) {
+    const parent = current.parentNode;
+    if (!parent) break;
+    const index = Array.prototype.indexOf.call(parent.childNodes, current);
+    path.unshift(index);
+    current = parent;
+  }
+  return path;
+}
+
+function findNodeByPath(path) {
+  let current = document.body;
+  for (const index of path) {
+    if (!current?.childNodes?.[index]) return null;
+    current = current.childNodes[index];
+  }
+  return current && current.nodeType === Node.TEXT_NODE ? current : null;
+}
+
+function updateActiveEntry(path, original, translated) {
+  const existingIndex = activeTranslationEntries.findIndex((entry) => isSamePath(entry.path, path));
+  if (existingIndex >= 0) {
+    activeTranslationEntries[existingIndex] = { path, original, translated };
+  } else {
+    activeTranslationEntries.push({ path, original, translated });
+  }
+}
+
+function isSamePath(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
+async function saveTranslationsToMemory(entries) {
+  const filtered = entries.filter(({ translated }) => translated && translated.trim());
+  const existing = await getTranslationsObject();
+  existing[location.href] = filtered;
+  await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+}
+
+async function getStoredTranslations(url) {
+  const existing = await getTranslationsObject();
+  return existing[url] || [];
+}
+
+async function clearStoredTranslations(url) {
+  const existing = await getTranslationsObject();
+  delete existing[url];
+  await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+}
+
+async function getTranslationsObject() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([STORAGE_KEY], (data) => {
+      resolve(data?.[STORAGE_KEY] || {});
+    });
+  });
+}
+
+function restoreOriginal(entries) {
+  entries.forEach(({ path, original }) => {
+    const node = findNodeByPath(path);
+    if (node && typeof original === 'string') {
+      node.nodeValue = original;
+    }
+  });
+}
+
+async function cancelTranslation() {
+  cancelRequested = true;
+  const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+  if (entriesToRestore.length) {
+    restoreOriginal(entriesToRestore);
+  }
+  await clearStoredTranslations(location.href);
+  activeTranslationEntries = [];
+  reportProgress('Перевод отменён', translationProgress.completedChunks, translationProgress.totalChunks);
 }
