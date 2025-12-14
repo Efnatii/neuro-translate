@@ -88,15 +88,25 @@ async function getActiveTab() {
 async function sendCancel() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  chrome.tabs.sendMessage(tab.id, { type: 'CANCEL_TRANSLATION' });
-  statusLabel.textContent = 'Перевод для этой страницы отменён.';
+  chrome.tabs.sendMessage(tab.id, { type: 'CANCEL_TRANSLATION' }, () => {
+    if (chrome.runtime.lastError) {
+      statusLabel.textContent = 'Не удалось связаться со страницей. Обновите её и попробуйте снова.';
+      return;
+    }
+    statusLabel.textContent = 'Перевод для этой страницы отменён.';
+  });
 }
 
 async function sendTranslateRequest() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  chrome.tabs.sendMessage(tab.id, { type: 'START_TRANSLATION' });
-  statusLabel.textContent = 'Запускаем перевод страницы...';
+  chrome.tabs.sendMessage(tab.id, { type: 'START_TRANSLATION' }, () => {
+    if (chrome.runtime.lastError) {
+      statusLabel.textContent = 'Не удалось подключиться к странице. Обновите её и попробуйте снова.';
+      return;
+    }
+    statusLabel.textContent = 'Запускаем перевод страницы...';
+  });
 }
 
 function handleStorageChange(changes) {

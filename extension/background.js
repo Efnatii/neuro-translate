@@ -122,12 +122,15 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
         throw new Error('No translation returned');
       }
 
-      const parsed = safeParseArray(content);
-      if (!Array.isArray(parsed) || parsed.length !== texts.length) {
+      const parsed = safeParseArray(content, texts.length);
+      if (!Array.isArray(parsed)) {
         throw new Error('Unexpected translation format');
       }
 
-      return texts.map((text, index) => (typeof parsed[index] === 'string' ? parsed[index] : text));
+      return texts.map((text, index) => {
+        const candidate = parsed[index];
+        return typeof candidate === 'string' && candidate.trim() ? candidate : text;
+      });
     } catch (error) {
       if (error?.name === 'AbortError') {
         lastError = new Error('Translation request timed out');
@@ -150,18 +153,39 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
   throw lastError || new Error('Translation failed');
 }
 
-function safeParseArray(content) {
-  try {
-    const normalized = content
-      .replace(/^```json\s*/i, '')
-      .replace(/```\s*$/i, '')
-      .trim();
-    const parsed = JSON.parse(normalized);
-    return Array.isArray(parsed) ? parsed : null;
-  } catch (error) {
-    console.warn('Failed to parse translation response as JSON, received:', content);
+function safeParseArray(content, expectedLength) {
+  const normalize = (value = '') => value.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+
+  const tryJsonParse = (value) => {
+    try {
+      const parsed = JSON.parse(normalize(value));
+      return Array.isArray(parsed) ? parsed : null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const tryLineSplit = (value) => {
+    const lines = normalize(value)
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^[-*\d]+[.)]\s*/, '').trim())
+      .filter(Boolean);
+    return lines.length ? lines : null;
+  };
+
+  const parsed = tryJsonParse(content) || tryLineSplit(content);
+  if (!Array.isArray(parsed)) {
+    console.warn('Failed to parse translation response as JSON array, received:', content);
     return null;
   }
+
+  if (expectedLength && parsed.length !== expectedLength) {
+    console.warn(
+      `Translation response length mismatch: expected ${expectedLength}, got ${parsed.length}. Adjusting output.`
+    );
+  }
+
+  return parsed;
 }
 
 async function handleTranslationProgress(message, sender) {
