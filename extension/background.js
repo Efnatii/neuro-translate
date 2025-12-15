@@ -80,7 +80,7 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
       content: [
         'You are a precise translation engine.',
         `Translate every element of the provided JSON array into ${targetLanguage}.`,
-        'Return ONLY a JSON array of translated strings with the same length and order as the input.',
+        'Return ONLY a JSON object with a "translations" array of translated strings with the same length and order as the input.',
         'Do not merge, split, skip, rephrase, or add punctuation. Avoid any commentary or formatting such as code fences.'
       ].join(' ')
     },
@@ -113,11 +113,18 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
               name: 'translations',
               strict: true,
               schema: {
-                type: 'array',
-                items: {
-                  type: 'string',
-                  description: 'Translated text fragment matching the input at the same index.'
-                }
+                type: 'object',
+                properties: {
+                  translations: {
+                    type: 'array',
+                    items: {
+                      type: 'string',
+                      description: 'Translated text fragment matching the input at the same index.'
+                    }
+                  }
+                },
+                required: ['translations'],
+                additionalProperties: false
               }
             }
           }
@@ -173,7 +180,9 @@ function safeParseArray(content, expectedLength) {
   const tryJsonParse = (value) => {
     try {
       const parsed = JSON.parse(normalize(value));
-      return Array.isArray(parsed) ? parsed : null;
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && Array.isArray(parsed.translations)) return parsed.translations;
+      return null;
     } catch (error) {
       return null;
     }
