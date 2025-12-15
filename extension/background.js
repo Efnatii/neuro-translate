@@ -80,8 +80,8 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
       content: [
         'You are a precise translation engine.',
         `Translate every element of the provided JSON array into ${targetLanguage}.`,
-        'Return only a valid JSON array of translated strings that matches the length and order of the input.',
-        'Do not merge, split, or skip any items. Do not add explanations or formatting such as code fences.'
+        'Return ONLY a JSON array of translated strings with the same length and order as the input.',
+        'Do not merge, split, skip, rephrase, or add punctuation. Avoid any commentary or formatting such as code fences.'
       ].join(' ')
     },
     {
@@ -106,7 +106,21 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
         },
         body: JSON.stringify({
           model,
-          messages: prompt
+          messages: prompt,
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'translations',
+              strict: true,
+              schema: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                  description: 'Translated text fragment matching the input at the same index.'
+                }
+              }
+            }
+          }
         }),
         signal: controller.signal
       });
@@ -165,15 +179,7 @@ function safeParseArray(content, expectedLength) {
     }
   };
 
-  const tryLineSplit = (value) => {
-    const lines = normalize(value)
-      .split(/\r?\n/)
-      .map((line) => line.replace(/^[-*\d]+[.)]\s*/, '').trim())
-      .filter(Boolean);
-    return lines.length ? lines : null;
-  };
-
-  const parsed = tryJsonParse(content) || tryLineSplit(content);
+  const parsed = tryJsonParse(content);
   if (!Array.isArray(parsed)) {
     console.warn('Failed to parse translation response as JSON array, received:', content);
     return null;
