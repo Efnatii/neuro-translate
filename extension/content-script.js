@@ -78,14 +78,15 @@ async function translatePage(settings) {
       const currentIndex = nextIndex++;
       if (currentIndex >= chunks.length) return;
       const chunk = chunks[currentIndex];
-      const texts = chunk.map(({ node }) => node.nodeValue);
+      const texts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
 
       try {
         const result = await translate(texts, settings.targetLanguage || 'ru');
         chunk.forEach(({ node, path, original }, index) => {
           const translated = result.translations[index] || node.nodeValue;
-          node.nodeValue = translated;
-          updateActiveEntry(path, original, translated);
+          const withOriginalFormatting = applyOriginalFormatting(original, translated);
+          node.nodeValue = withOriginalFormatting;
+          updateActiveEntry(path, original, withOriginalFormatting);
         });
       } catch (error) {
         console.error('Chunk translation failed', error);
@@ -229,6 +230,64 @@ function findNodeByPath(path) {
     current = current.childNodes[index];
   }
   return current && current.nodeType === Node.TEXT_NODE ? current : null;
+}
+
+function prepareTextForTranslation(text) {
+  const { core } = extractWhitespaceAndCore(text);
+  return core;
+}
+
+function applyOriginalFormatting(original, translated) {
+  const { prefix, suffix } = extractWhitespaceAndCore(original);
+  const adjustedCase = matchFirstLetterCase(original, translated || '');
+  const trimmed = typeof adjustedCase === 'string' ? adjustedCase.trim() : '';
+  return `${prefix}${trimmed}${suffix}`;
+}
+
+function extractWhitespaceAndCore(text = '') {
+  const match = text.match(/^(\s*)([\s\S]*?)(\s*)$/);
+  return {
+    prefix: match?.[1] || '',
+    core: match?.[2] || text,
+    suffix: match?.[3] || ''
+  };
+}
+
+function matchFirstLetterCase(original, translated) {
+  const desiredCase = getFirstLetterCase(original);
+  if (!desiredCase) return translated;
+
+  const match = translated.match(/\p{L}/u);
+  if (!match || match.index === undefined) return translated;
+
+  const index = match.index;
+  const letter = match[0];
+
+  if (desiredCase === 'upper') {
+    const upper = letter.toLocaleUpperCase();
+    return upper === letter
+      ? translated
+      : translated.slice(0, index) + upper + translated.slice(index + 1);
+  }
+
+  const lower = letter.toLocaleLowerCase();
+  return lower === letter
+    ? translated
+    : translated.slice(0, index) + lower + translated.slice(index + 1);
+}
+
+function getFirstLetterCase(text) {
+  const match = text.match(/\p{L}/u);
+  if (!match) return null;
+
+  const letter = match[0];
+  if (letter === letter.toLocaleUpperCase() && letter !== letter.toLocaleLowerCase()) {
+    return 'upper';
+  }
+  if (letter === letter.toLocaleLowerCase() && letter !== letter.toLocaleUpperCase()) {
+    return 'lower';
+  }
+  return null;
 }
 
 function updateActiveEntry(path, original, translated) {
