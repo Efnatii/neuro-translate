@@ -1,6 +1,7 @@
 const DEFAULT_STATE = {
   apiKey: '',
-  model: 'gpt-4.1-mini'
+  model: 'gpt-4.1-mini',
+  translationStyle: 'natural'
 };
 
 async function getState() {
@@ -51,7 +52,8 @@ async function handleGetSettings(message, sendResponse) {
   sendResponse({
     allowed: !!state.apiKey,
     apiKey: state.apiKey,
-    model: state.model
+    model: state.model,
+    translationStyle: state.translationStyle
   });
 }
 
@@ -63,7 +65,13 @@ async function handleTranslateText(message, sendResponse) {
       return;
     }
 
-    const translations = await translateTexts(message.texts, state.apiKey, message.targetLanguage, state.model);
+    const translations = await translateTexts(
+      message.texts,
+      state.apiKey,
+      message.targetLanguage,
+      state.model,
+      message.translationStyle || state.translationStyle
+    );
     sendResponse({ success: true, translations });
   } catch (error) {
     console.error('Translation failed', error);
@@ -71,7 +79,13 @@ async function handleTranslateText(message, sendResponse) {
   }
 }
 
-async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.model) {
+async function translateTexts(
+  texts,
+  apiKey,
+  targetLanguage = 'ru',
+  model = DEFAULT_STATE.model,
+  translationStyle = DEFAULT_STATE.translationStyle
+) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
   const maxAttempts = 2;
@@ -82,7 +96,7 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
     const timeout = setTimeout(() => controller.abort(), 45000);
 
     try {
-      return await performTranslationRequest(texts, apiKey, targetLanguage, model, controller.signal);
+      return await performTranslationRequest(texts, apiKey, targetLanguage, model, translationStyle, controller.signal);
     } catch (error) {
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
 
@@ -95,7 +109,7 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
-        return await translateIndividually(texts, apiKey, targetLanguage, model);
+        return await translateIndividually(texts, apiKey, targetLanguage, model, translationStyle);
       }
 
       throw lastError;
@@ -107,15 +121,26 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
   throw lastError || new Error('Translation failed');
 }
 
-async function performTranslationRequest(texts, apiKey, targetLanguage, model, signal) {
+async function performTranslationRequest(texts, apiKey, targetLanguage, model, translationStyle, signal) {
+  const styleHints = {
+    natural: 'Нейтральный, плавный русский без буквального калькирования.',
+    conversational: 'Разговорный, тёплый тон с живыми оборотами без лишней фамильярности.',
+    formal: 'Деловой, аккуратный тон с чёткими формулировками.',
+    creative: 'Выразительный и образный тон, но без потери смысла.'
+  };
+
+  const styleInstruction =
+    styleHints?.[translationStyle] || styleHints.natural;
+
   const prompt = [
     {
       role: 'system',
       content: [
-        'You are a precise translation engine.',
-        `Translate every element of the provided JSON array into ${targetLanguage}.`,
+        'You are a fluent Russian translator.',
+        `Translate every element of the provided JSON array into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
+        `Tone/style: ${styleInstruction}`,
         'Return ONLY a JSON object with a "translations" array of translated strings with the same length and order as the input.',
-        'Do not merge, split, skip, rephrase, or add punctuation. Avoid any commentary or formatting such as code fences.'
+        'Do not merge, split, or skip items. Avoid commentary or formatting such as code fences.'
       ].join(' ')
     },
     {
@@ -180,12 +205,18 @@ async function performTranslationRequest(texts, apiKey, targetLanguage, model, s
   });
 }
 
-async function translateIndividually(texts, apiKey, targetLanguage, model) {
+async function translateIndividually(texts, apiKey, targetLanguage, model, translationStyle) {
   const results = [];
 
   for (const text of texts) {
     try {
-      const [translated] = await performTranslationRequest([text], apiKey, targetLanguage, model);
+      const [translated] = await performTranslationRequest(
+        [text],
+        apiKey,
+        targetLanguage,
+        model,
+        translationStyle
+      );
       results.push(translated);
     } catch (error) {
       console.error('Single-item translation failed, keeping original text.', error);

@@ -1,5 +1,6 @@
 const apiKeyInput = document.getElementById('apiKey');
 const modelSelect = document.getElementById('model');
+const translationStyleSelect = document.getElementById('translationStyle');
 const statusLabel = document.getElementById('status');
 
 const cancelButton = document.getElementById('cancel');
@@ -7,6 +8,13 @@ const translateButton = document.getElementById('translate');
 
 let keySaveTimeout = null;
 let activeTabId = null;
+
+const translationStyles = [
+  { id: 'natural', name: 'Естественный' },
+  { id: 'conversational', name: 'Разговорный' },
+  { id: 'formal', name: 'Деловой' },
+  { id: 'creative', name: 'Выразительный' }
+];
 
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.45 },
@@ -64,12 +72,14 @@ async function init() {
   const state = await getState();
   apiKeyInput.value = state.apiKey || '';
   renderModelOptions(state.model);
+  renderStyleOptions(state.translationStyle);
   renderTranslationStatus(state.translationStatusByTab?.[activeTabId]);
 
   chrome.storage.onChanged.addListener(handleStorageChange);
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   modelSelect.addEventListener('change', handleModelChange);
+  translationStyleSelect.addEventListener('change', handleTranslationStyleChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
 }
@@ -89,12 +99,19 @@ async function handleModelChange() {
   statusLabel.textContent = 'Модель сохранена.';
 }
 
+async function handleTranslationStyleChange() {
+  const translationStyle = translationStyleSelect.value;
+  await chrome.storage.local.set({ translationStyle });
+  statusLabel.textContent = 'Стиль перевода сохранён.';
+}
+
 async function getState() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['apiKey', 'model', 'translationStatusByTab'], (data) => {
+    chrome.storage.local.get(['apiKey', 'model', 'translationStyle', 'translationStatusByTab'], (data) => {
       resolve({
         apiKey: data.apiKey || '',
         model: data.model,
+        translationStyle: data.translationStyle,
         translationStatusByTab: data.translationStatusByTab || {}
       });
     });
@@ -113,6 +130,21 @@ function renderModelOptions(selected) {
     option.textContent = `${model.name} ($${model.price}/1M токенов)`;
     option.selected = model.id === currentModel;
     modelSelect.appendChild(option);
+  });
+}
+
+function renderStyleOptions(selected) {
+  const defaultStyle = translationStyles[0]?.id;
+  const currentStyle = selected || defaultStyle;
+
+  translationStyleSelect.innerHTML = '';
+
+  translationStyles.forEach((style) => {
+    const option = document.createElement('option');
+    option.value = style.id;
+    option.textContent = style.name;
+    option.selected = style.id === currentStyle;
+    translationStyleSelect.appendChild(option);
   });
 }
 
