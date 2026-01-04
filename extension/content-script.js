@@ -57,7 +57,8 @@ async function translatePage(settings) {
   originalSnapshot = nodesWithPath.map(({ path, original }) => ({ path, original }));
   activeTranslationEntries = [];
 
-  const chunks = chunkNodes(nodesWithPath, 800);
+  const blockGroups = groupTextNodesByBlock(nodesWithPath);
+  const chunks = chunkBlocks(blockGroups, 1800);
   translationProgress = { completedChunks: 0, totalChunks: chunks.length };
 
   if (!chunks.length) {
@@ -159,27 +160,119 @@ function collectTextNodes(root) {
   return nodes;
 }
 
-function chunkNodes(nodes, maxLength) {
+function groupTextNodesByBlock(nodesWithPath) {
+  const blocks = [];
+  let currentBlock = null;
+  let currentBlockElement = null;
+
+  nodesWithPath.forEach((entry) => {
+    const blockElement = findBlockAncestor(entry.node);
+    if (blockElement !== currentBlockElement) {
+      currentBlockElement = blockElement;
+      currentBlock = [];
+      blocks.push(currentBlock);
+    }
+    currentBlock.push(entry);
+  });
+
+  return blocks;
+}
+
+function findBlockAncestor(node) {
+  let current = node.parentNode;
+  while (current && current !== document.body) {
+    if (isBlockElement(current)) return current;
+    current = current.parentNode;
+  }
+  return document.body;
+}
+
+function isBlockElement(element) {
+  const tag = element.nodeName.toLowerCase();
+  const blockTags = new Set([
+    'p',
+    'div',
+    'section',
+    'article',
+    'header',
+    'footer',
+    'aside',
+    'main',
+    'nav',
+    'li',
+    'ul',
+    'ol',
+    'pre',
+    'blockquote',
+    'figure',
+    'figcaption'
+  ]);
+  if (blockTags.has(tag)) return true;
+
+  const display = window.getComputedStyle(element)?.display || '';
+  return ['block', 'flex', 'grid', 'table', 'list-item', 'flow-root'].some((value) => display.includes(value));
+}
+
+function chunkBlocks(blocks, maxLength) {
   const chunks = [];
   let currentChunk = [];
   let currentLength = 0;
 
-  nodes.forEach((entry) => {
-    const text = entry.node.nodeValue;
-    if (currentLength + text.length > maxLength && currentChunk.length) {
+  const pushChunk = () => {
+    if (currentChunk.length) {
       chunks.push(currentChunk);
       currentChunk = [];
       currentLength = 0;
     }
-    currentChunk.push(entry);
-    currentLength += text.length;
+  };
+
+  blocks.forEach((block) => {
+    const blockLength = block.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
+
+    if (blockLength > maxLength && block.length) {
+      const splitBlocks = splitOversizedBlock(block, maxLength);
+      splitBlocks.forEach((splitBlock) => {
+        const splitLength = splitBlock.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
+        if (currentLength + splitLength > maxLength) {
+          pushChunk();
+        }
+        currentChunk.push(...splitBlock);
+        currentLength += splitLength;
+        pushChunk();
+      });
+      return;
+    }
+
+    if (currentLength + blockLength > maxLength && currentChunk.length) {
+      pushChunk();
+    }
+
+    currentChunk.push(...block);
+    currentLength += blockLength;
   });
 
-  if (currentChunk.length) {
-    chunks.push(currentChunk);
-  }
-
+  pushChunk();
   return chunks;
+}
+
+function splitOversizedBlock(block, maxLength) {
+  const splits = [];
+  let current = [];
+  let length = 0;
+
+  block.forEach((entry) => {
+    const textLength = entry.node.nodeValue?.length || 0;
+    if (length + textLength > maxLength && current.length) {
+      splits.push(current);
+      current = [];
+      length = 0;
+    }
+    current.push(entry);
+    length += textLength;
+  });
+
+  if (current.length) splits.push(current);
+  return splits;
 }
 
 function reportProgress(message, completedChunks, totalChunks) {
