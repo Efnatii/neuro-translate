@@ -82,7 +82,11 @@ async function translatePage(settings) {
       const texts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
 
       try {
-        const result = await translate(texts, settings.targetLanguage || 'ru');
+        const result = await translate(
+          texts,
+          settings.targetLanguage || 'ru',
+          settings.translationStyle
+        );
         chunk.forEach(({ node, path, original }, index) => {
           const translated = result.translations[index] || node.nodeValue;
           const withOriginalFormatting = applyOriginalFormatting(original, translated);
@@ -119,13 +123,14 @@ async function translatePage(settings) {
   await saveTranslationsToMemory(activeTranslationEntries);
 }
 
-async function translate(texts, targetLanguage) {
+async function translate(texts, targetLanguage, translationStyle) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
         type: 'TRANSLATE_TEXT',
         texts,
-        targetLanguage
+        targetLanguage,
+        translationStyle
       },
       (response) => {
         if (response?.success) {
