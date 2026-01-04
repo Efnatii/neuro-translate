@@ -74,6 +74,40 @@ async function handleTranslateText(message, sendResponse) {
 async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.model) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
+  const maxAttempts = 2;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45000);
+
+    try {
+      return await performTranslationRequest(texts, apiKey, targetLanguage, model, controller.signal);
+    } catch (error) {
+      lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
+
+      const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
+      if (attempt < maxAttempts && isTimeout) {
+        console.warn(`Translation attempt ${attempt} timed out, retrying...`);
+        continue;
+      }
+
+      const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
+      if (isLengthIssue && texts.length > 1) {
+        console.warn('Falling back to per-item translation due to length mismatch.');
+        return await translateIndividually(texts, apiKey, targetLanguage, model);
+      }
+
+      throw lastError;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error('Translation failed');
+}
+
+async function performTranslationRequest(texts, apiKey, targetLanguage, model, signal) {
   const prompt = [
     {
       role: 'system',
@@ -90,96 +124,85 @@ async function translateTexts(texts, apiKey, targetLanguage = 'ru', model = DEFA
     }
   ];
 
-  const maxAttempts = 2;
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 45000);
-
-    try {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model,
-          messages: prompt,
-          response_format: {
-            type: 'json_schema',
-            json_schema: {
-              name: 'translations',
-              strict: true,
-              schema: {
-                type: 'object',
-                properties: {
-                  translations: {
-                    type: 'array',
-                    items: {
-                      type: 'string',
-                      description: 'Translated text fragment matching the input at the same index.'
-                    }
-                  }
-                },
-                required: ['translations'],
-                additionalProperties: false
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model,
+      messages: prompt,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'translations',
+          strict: true,
+          schema: {
+            type: 'object',
+            properties: {
+              translations: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                  description: 'Translated text fragment matching the input at the same index.'
+                }
               }
-            }
+            },
+            required: ['translations'],
+            additionalProperties: false
           }
-        }),
-        signal: controller.signal
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Translation request failed: ${response.status} ${errorText}`);
+        }
       }
+    }),
+    signal
+  });
 
-      const data = await response.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) {
-        throw new Error('No translation returned');
-      }
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Translation request failed: ${response.status} ${errorText}`);
+  }
 
-      const parsed = safeParseArray(content, texts.length);
-      if (!Array.isArray(parsed)) {
-        throw new Error('Unexpected translation format');
-      }
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('No translation returned');
+  }
 
-      return texts.map((text, index) => {
-        const candidate = parsed[index];
-        return typeof candidate === 'string' && candidate.trim() ? candidate : text;
-      });
+  const parsed = safeParseArray(content, texts.length);
+  if (!Array.isArray(parsed)) {
+    throw new Error('Unexpected translation format');
+  }
+
+  return texts.map((text, index) => {
+    const candidate = parsed[index];
+    return typeof candidate === 'string' && candidate.trim() ? candidate : text;
+  });
+}
+
+async function translateIndividually(texts, apiKey, targetLanguage, model) {
+  const results = [];
+
+  for (const text of texts) {
+    try {
+      const [translated] = await performTranslationRequest([text], apiKey, targetLanguage, model);
+      results.push(translated);
     } catch (error) {
-      if (error?.name === 'AbortError') {
-        lastError = new Error('Translation request timed out');
-      } else {
-        lastError = error;
-      }
-
-      const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
-      if (attempt < maxAttempts && isTimeout) {
-        console.warn(`Translation attempt ${attempt} timed out, retrying...`);
-        continue;
-      }
-
-      throw lastError;
-    } finally {
-      clearTimeout(timeout);
+      console.error('Single-item translation failed, keeping original text.', error);
+      results.push(text);
     }
   }
 
-  throw lastError || new Error('Translation failed');
+  return results;
 }
 
 function safeParseArray(content, expectedLength) {
-  const normalize = (value = '') => value.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+  const normalizeString = (value = '') =>
+    value.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
 
   const tryJsonParse = (value) => {
     try {
-      const parsed = JSON.parse(normalize(value));
+      const parsed = JSON.parse(normalizeString(value));
       if (Array.isArray(parsed)) return parsed;
       if (parsed && Array.isArray(parsed.translations)) return parsed.translations;
       return null;
@@ -188,16 +211,40 @@ function safeParseArray(content, expectedLength) {
     }
   };
 
-  const parsed = tryJsonParse(content);
+  const extractFromObject = (value) => {
+    if (!value || typeof value !== 'object') return null;
+
+    if (Array.isArray(value.translations)) return value.translations;
+    if (Array.isArray(value.output_json?.translations)) return value.output_json.translations;
+
+    if (Array.isArray(value)) {
+      const outputPart = value.find((part) => part?.type === 'output_json' && part?.output_json);
+      if (Array.isArray(outputPart?.output_json?.translations)) return outputPart.output_json.translations;
+
+      const textParts = value
+        .filter((part) => typeof part?.text === 'string')
+        .map((part) => part.text)
+        .join('');
+      if (textParts) return tryJsonParse(textParts);
+    }
+
+    return null;
+  };
+
+  const parsed =
+    typeof content === 'string'
+      ? tryJsonParse(content)
+      : extractFromObject(content) || tryJsonParse(JSON.stringify(content));
+
   if (!Array.isArray(parsed)) {
     console.warn('Failed to parse translation response as JSON array, received:', content);
     return null;
   }
 
   if (expectedLength && parsed.length !== expectedLength) {
-    console.warn(
-      `Translation response length mismatch: expected ${expectedLength}, got ${parsed.length}. Adjusting output.`
-    );
+    const message = `Translation response length mismatch: expected ${expectedLength}, got ${parsed.length}`;
+    console.warn(message);
+    throw new Error(message);
   }
 
   return parsed;
