@@ -122,13 +122,15 @@ async function translatePage(settings) {
       const chunk = chunks[currentIndex];
       const preparedTexts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
+      const chunkContext = buildChunkContext(chunk);
 
       const startTime = performance.now();
       try {
         const result = await translate(
           uniqueTexts,
           settings.targetLanguage || 'ru',
-          settings.translationStyle
+          settings.translationStyle,
+          chunkContext
         );
         chunk.forEach(({ node, path, original }, index) => {
           const translationIndex = indexMap[index];
@@ -172,14 +174,15 @@ async function translatePage(settings) {
   await saveTranslationsToMemory(activeTranslationEntries);
 }
 
-async function translate(texts, targetLanguage, translationStyle) {
+async function translate(texts, targetLanguage, translationStyle, context) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
         type: 'TRANSLATE_TEXT',
         texts,
         targetLanguage,
-        translationStyle
+        translationStyle,
+        context
       },
       (response) => {
         if (response?.success) {
@@ -356,6 +359,19 @@ function chunkBlocks(blocks, maxLength) {
 
   pushChunk();
   return chunks;
+}
+
+function buildChunkContext(chunk, maxLength = 500) {
+  const combined = chunk
+    .map(({ node }) => (node?.nodeValue || '').trim())
+    .filter(Boolean)
+    .join(' ');
+
+  const normalized = combined.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+
+  if (normalized.length <= maxLength) return normalized;
+  return normalized.slice(0, maxLength).trimEnd();
 }
 
 function splitOversizedBlock(block, maxLength) {
