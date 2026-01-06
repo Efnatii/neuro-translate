@@ -79,16 +79,18 @@ async function translatePage(settings) {
       const currentIndex = nextIndex++;
       if (currentIndex >= chunks.length) return;
       const chunk = chunks[currentIndex];
-      const texts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
+      const preparedTexts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
+      const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
 
       try {
         const result = await translate(
-          texts,
+          uniqueTexts,
           settings.targetLanguage || 'ru',
           settings.translationStyle
         );
         chunk.forEach(({ node, path, original }, index) => {
-          const translated = result.translations[index] || node.nodeValue;
+          const translationIndex = indexMap[index];
+          const translated = result.translations[translationIndex] || node.nodeValue;
           const withOriginalFormatting = applyOriginalFormatting(original, translated);
           node.nodeValue = withOriginalFormatting;
           updateActiveEntry(path, original, withOriginalFormatting);
@@ -141,6 +143,22 @@ async function translate(texts, targetLanguage, translationStyle) {
       }
     );
   });
+}
+
+function deduplicateTexts(texts) {
+  const uniqueTexts = [];
+  const indexMap = [];
+  const seen = new Map();
+
+  texts.forEach((text) => {
+    if (!seen.has(text)) {
+      seen.set(text, uniqueTexts.length);
+      uniqueTexts.push(text);
+    }
+    indexMap.push(seen.get(text));
+  });
+
+  return { uniqueTexts, indexMap };
 }
 
 function collectTextNodes(root) {
