@@ -137,10 +137,10 @@ async function performTranslationRequest(texts, apiKey, targetLanguage, model, t
       role: 'system',
       content: [
         'You are a fluent Russian translator.',
-        `Translate every element of the provided JSON array into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
+        `Translate every element of the provided list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
         `Tone/style: ${styleInstruction}`,
-        'Return ONLY a JSON object with a "translations" array of translated strings with the same length and order as the input.',
-        'Do not merge, split, or skip items. Avoid commentary or formatting such as code fences.'
+        'Return ONLY the translated strings in the same order, one per line.',
+        'Do not include JSON, numbering, commentary, or any other wrapping.'
       ].join(' ')
     },
     {
@@ -157,28 +157,7 @@ async function performTranslationRequest(texts, apiKey, targetLanguage, model, t
     },
     body: JSON.stringify({
       model,
-      messages: prompt,
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: 'translations',
-          strict: true,
-          schema: {
-            type: 'object',
-            properties: {
-              translations: {
-                type: 'array',
-                items: {
-                  type: 'string',
-                  description: 'Translated text fragment matching the input at the same index.'
-                }
-              }
-            },
-            required: ['translations'],
-            additionalProperties: false
-          }
-        }
-      }
+      messages: prompt
     }),
     signal
   });
@@ -231,6 +210,29 @@ function safeParseArray(content, expectedLength) {
   const normalizeString = (value = '') =>
     value.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
 
+  const parsePlainText = (value) => {
+    const lines = normalizeString(value)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (!lines.length) return null;
+
+    if (expectedLength && lines.length !== expectedLength) {
+      if (expectedLength === 1 && lines.length > 1) {
+        console.warn(
+          `Translation response length mismatch for single item: expected 1, got ${lines.length}. Collapsing into one string.`
+        );
+        return [lines.join(' ')];
+      }
+      const message = `Translation response length mismatch: expected ${expectedLength}, got ${lines.length}`;
+      console.warn(message);
+      throw new Error(message);
+    }
+
+    return lines;
+  };
+
   const tryJsonParse = (value) => {
     try {
       const parsed = JSON.parse(normalizeString(value));
@@ -264,8 +266,8 @@ function safeParseArray(content, expectedLength) {
 
   const parsed =
     typeof content === 'string'
-      ? tryJsonParse(content)
-      : extractFromObject(content) || tryJsonParse(JSON.stringify(content));
+      ? tryJsonParse(content) || parsePlainText(content)
+      : extractFromObject(content) || tryJsonParse(JSON.stringify(content)) || parsePlainText(JSON.stringify(content));
 
   if (!Array.isArray(parsed)) {
     console.warn('Failed to parse translation response as JSON array, received:', content);
