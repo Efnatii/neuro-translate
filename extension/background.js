@@ -70,7 +70,8 @@ async function handleTranslateText(message, sendResponse) {
       state.apiKey,
       message.targetLanguage,
       state.model,
-      message.translationStyle || state.translationStyle
+      message.translationStyle || state.translationStyle,
+      message.context
     );
     sendResponse({ success: true, translations });
   } catch (error) {
@@ -84,7 +85,8 @@ async function translateTexts(
   apiKey,
   targetLanguage = 'ru',
   model = DEFAULT_STATE.model,
-  translationStyle = DEFAULT_STATE.translationStyle
+  translationStyle = DEFAULT_STATE.translationStyle,
+  context = ''
 ) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
@@ -96,7 +98,15 @@ async function translateTexts(
     const timeout = setTimeout(() => controller.abort(), 45000);
 
     try {
-      return await performTranslationRequest(texts, apiKey, targetLanguage, model, translationStyle, controller.signal);
+      return await performTranslationRequest(
+        texts,
+        apiKey,
+        targetLanguage,
+        model,
+        translationStyle,
+        controller.signal,
+        context
+      );
     } catch (error) {
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
 
@@ -109,7 +119,7 @@ async function translateTexts(
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
-        return await translateIndividually(texts, apiKey, targetLanguage, model, translationStyle);
+        return await translateIndividually(texts, apiKey, targetLanguage, model, translationStyle, context);
       }
 
       throw lastError;
@@ -121,7 +131,15 @@ async function translateTexts(
   throw lastError || new Error('Translation failed');
 }
 
-async function performTranslationRequest(texts, apiKey, targetLanguage, model, translationStyle, signal) {
+async function performTranslationRequest(
+  texts,
+  apiKey,
+  targetLanguage,
+  model,
+  translationStyle,
+  signal,
+  context = ''
+) {
   const styleHints = {
     natural: 'Нейтральный, плавный русский без буквального калькирования.',
     conversational: 'Разговорный, тёплый тон с живыми оборотами без лишней фамильярности.',
@@ -137,15 +155,25 @@ async function performTranslationRequest(texts, apiKey, targetLanguage, model, t
       role: 'system',
       content: [
         'You are a fluent Russian translator.',
-        `Translate every element of the provided list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
+        `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
         `Tone/style: ${styleInstruction}`,
-        'Return ONLY the translated strings in the same order, one per line.',
-        'Do not include JSON, numbering, commentary, or any other wrapping.'
-      ].join(' ')
+        context ? `Use this page context to disambiguate phrasing: ${context}` : '',
+        'Respond only with translations in the same order, one per line, without numbering or commentary.'
+      ]
+        .filter(Boolean)
+        .join(' ')
     },
     {
       role: 'user',
-      content: JSON.stringify(texts)
+      content: [
+        `Переведи следующие фрагменты на ${targetLanguage}.`,
+        `Стиль: ${styleInstruction}`,
+        context ? `Контекст страницы: ${context}` : '',
+        'Фрагменты для перевода:',
+        ...texts.map((text, index) => `${index + 1}) ${text}`)
+      ]
+        .filter(Boolean)
+        .join('\n')
     }
   ];
 
@@ -184,7 +212,7 @@ async function performTranslationRequest(texts, apiKey, targetLanguage, model, t
   });
 }
 
-async function translateIndividually(texts, apiKey, targetLanguage, model, translationStyle) {
+async function translateIndividually(texts, apiKey, targetLanguage, model, translationStyle, context = '') {
   const results = [];
 
   for (const text of texts) {
@@ -194,7 +222,9 @@ async function translateIndividually(texts, apiKey, targetLanguage, model, trans
         apiKey,
         targetLanguage,
         model,
-        translationStyle
+        translationStyle,
+        undefined,
+        context
       );
       results.push(translated);
     } catch (error) {
