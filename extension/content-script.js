@@ -57,8 +57,10 @@ async function translatePage(settings) {
   originalSnapshot = nodesWithPath.map(({ path, original }) => ({ path, original }));
   activeTranslationEntries = [];
 
+  const textStats = calculateTextLengthStats(nodesWithPath);
+  const maxChunkLength = calculateMaxChunkLength(textStats.averageNodeLength);
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
-  const chunks = chunkBlocks(blockGroups, 1800);
+  const chunks = chunkBlocks(blockGroups, maxChunkLength);
   translationProgress = { completedChunks: 0, totalChunks: chunks.length };
 
   if (!chunks.length) {
@@ -70,18 +72,58 @@ async function translatePage(settings) {
   translationError = null;
   reportProgress('Перевод запущен', 0, chunks.length);
 
-  const maxConcurrency = Math.min(4, chunks.length);
+  const averageChunkLength = chunks.length ? Math.round(textStats.totalLength / chunks.length) : 0;
+  const initialConcurrency = selectInitialConcurrency(averageChunkLength, chunks.length);
+  const maxAllowedConcurrency = Math.max(1, Math.min(6, chunks.length));
+  const requestDurations = [];
+  let dynamicMaxConcurrency = initialConcurrency;
   let nextIndex = 0;
+  let activeWorkers = 0;
+
+  const acquireSlot = async () => {
+    while (activeWorkers >= dynamicMaxConcurrency && !cancelRequested) {
+      await delay(50);
+    }
+    activeWorkers += 1;
+  };
+
+  const releaseSlot = () => {
+    activeWorkers = Math.max(0, activeWorkers - 1);
+  };
+
+  const adjustConcurrency = (durationMs) => {
+    requestDurations.push(durationMs);
+    if (requestDurations.length > 5) requestDurations.shift();
+    const averageDuration =
+      requestDurations.reduce((sum, value) => sum + value, 0) / requestDurations.length;
+
+    if (averageDuration > 4500 && dynamicMaxConcurrency > 1) {
+      dynamicMaxConcurrency = Math.max(1, dynamicMaxConcurrency - 1);
+    } else if (averageDuration < 2500 && dynamicMaxConcurrency < maxAllowedConcurrency) {
+      dynamicMaxConcurrency += 1;
+    }
+  };
 
   const worker = async () => {
     while (true) {
       if (cancelRequested) return;
+      await acquireSlot();
+
+      if (cancelRequested) {
+        releaseSlot();
+        return;
+      }
+
       const currentIndex = nextIndex++;
-      if (currentIndex >= chunks.length) return;
+      if (currentIndex >= chunks.length) {
+        releaseSlot();
+        return;
+      }
       const chunk = chunks[currentIndex];
       const preparedTexts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
 
+      const startTime = performance.now();
       try {
         const result = await translate(
           uniqueTexts,
@@ -100,15 +142,20 @@ async function translatePage(settings) {
         translationError = error;
         cancelRequested = true;
         reportProgress('Ошибка перевода', translationProgress.completedChunks, chunks.length);
+        releaseSlot();
         return;
       }
+
+      const duration = performance.now() - startTime;
+      adjustConcurrency(duration);
+      releaseSlot();
 
       translationProgress.completedChunks += 1;
       reportProgress('Перевод выполняется', translationProgress.completedChunks, chunks.length);
     }
   };
 
-  const workers = Array.from({ length: maxConcurrency }, () => worker());
+  const workers = Array.from({ length: maxAllowedConcurrency }, () => worker());
   await Promise.all(workers);
 
   if (translationError) {
@@ -234,6 +281,39 @@ function isBlockElement(element) {
 
   const display = window.getComputedStyle(element)?.display || '';
   return ['block', 'flex', 'grid', 'table', 'list-item', 'flow-root'].some((value) => display.includes(value));
+}
+
+function calculateTextLengthStats(nodesWithPath) {
+  const totalLength = nodesWithPath.reduce(
+    (sum, { node }) => sum + (node?.nodeValue?.length || 0),
+    0
+  );
+  const averageNodeLength = nodesWithPath.length ? totalLength / nodesWithPath.length : 0;
+  return { totalLength, averageNodeLength };
+}
+
+function calculateMaxChunkLength(averageNodeLength) {
+  const scaled = averageNodeLength * 6;
+  return Math.min(1500, Math.max(800, Math.round(scaled || 0)));
+}
+
+function selectInitialConcurrency(averageChunkLength, chunkCount) {
+  let concurrency;
+  if (averageChunkLength >= 1300) {
+    concurrency = 1;
+  } else if (averageChunkLength >= 1100) {
+    concurrency = 2;
+  } else if (averageChunkLength >= 900) {
+    concurrency = 3;
+  } else {
+    concurrency = 4;
+  }
+
+  return Math.min(Math.max(concurrency, 1), Math.max(1, chunkCount));
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function chunkBlocks(blocks, maxLength) {
