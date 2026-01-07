@@ -5,9 +5,11 @@ const statusLabel = document.getElementById('status');
 
 const cancelButton = document.getElementById('cancel');
 const translateButton = document.getElementById('translate');
+const toggleTranslationButton = document.getElementById('toggleTranslation');
 
 let keySaveTimeout = null;
 let activeTabId = null;
+let translationVisible = false;
 
 const translationStyles = [
   { id: 'natural', name: 'Естественный' },
@@ -74,6 +76,7 @@ async function init() {
   renderModelOptions(state.model);
   renderStyleOptions(state.translationStyle);
   renderTranslationStatus(state.translationStatusByTab?.[activeTabId]);
+  renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
 
   chrome.storage.onChanged.addListener(handleStorageChange);
 
@@ -82,6 +85,7 @@ async function init() {
   translationStyleSelect.addEventListener('change', handleTranslationStyleChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
+  toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
 }
 
 function handleApiKeyChange() {
@@ -107,12 +111,15 @@ async function handleTranslationStyleChange() {
 
 async function getState() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['apiKey', 'model', 'translationStyle', 'translationStatusByTab'], (data) => {
+    chrome.storage.local.get(
+      ['apiKey', 'model', 'translationStyle', 'translationStatusByTab', 'translationVisibilityByTab'],
+      (data) => {
       resolve({
         apiKey: data.apiKey || '',
         model: data.model,
         translationStyle: data.translationStyle,
-        translationStatusByTab: data.translationStatusByTab || {}
+        translationStatusByTab: data.translationStatusByTab || {},
+        translationVisibilityByTab: data.translationVisibilityByTab || {}
       });
     });
   });
@@ -161,6 +168,8 @@ async function sendCancel() {
       statusLabel.textContent = 'Не удалось связаться со страницей. Обновите её и попробуйте снова.';
       return;
     }
+    updateTranslationVisibility(false);
+    updateTranslationVisibilityStorage(false);
     statusLabel.textContent = 'Перевод для этой страницы отменён.';
   });
 }
@@ -173,7 +182,24 @@ async function sendTranslateRequest() {
       statusLabel.textContent = 'Не удалось подключиться к странице. Обновите её и попробуйте снова.';
       return;
     }
+    updateTranslationVisibility(true);
+    updateTranslationVisibilityStorage(true);
     statusLabel.textContent = 'Запускаем перевод страницы...';
+  });
+}
+
+async function handleToggleTranslationVisibility() {
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  const nextVisible = !translationVisible;
+  chrome.tabs.sendMessage(tab.id, { type: 'SET_TRANSLATION_VISIBILITY', visible: nextVisible }, () => {
+    if (chrome.runtime.lastError) {
+      statusLabel.textContent = 'Не удалось переключить перевод. Обновите страницу и попробуйте снова.';
+      return;
+    }
+    updateTranslationVisibility(nextVisible);
+    updateTranslationVisibilityStorage(nextVisible);
+    statusLabel.textContent = nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.';
   });
 }
 
@@ -181,6 +207,10 @@ function handleStorageChange(changes) {
   if (changes.translationStatusByTab) {
     const nextStatuses = changes.translationStatusByTab.newValue || {};
     renderTranslationStatus(activeTabId ? nextStatuses[activeTabId] : null);
+  }
+  if (changes.translationVisibilityByTab) {
+    const nextVisibility = changes.translationVisibilityByTab.newValue || {};
+    renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
   }
 }
 
@@ -194,4 +224,21 @@ function renderTranslationStatus(status) {
   const { completedChunks = 0, totalChunks = 0, message } = status;
   const progress = totalChunks ? ` (${completedChunks}/${totalChunks})` : '';
   statusLabel.textContent = message ? `${message}${progress}` : defaultText;
+}
+
+function renderTranslationVisibility(visible) {
+  updateTranslationVisibility(Boolean(visible));
+}
+
+function updateTranslationVisibility(visible) {
+  translationVisible = visible;
+  toggleTranslationButton.textContent = translationVisible ? 'Показать оригинал' : 'Показать перевод';
+  toggleTranslationButton.setAttribute('aria-pressed', translationVisible ? 'true' : 'false');
+}
+
+async function updateTranslationVisibilityStorage(visible) {
+  if (!activeTabId) return;
+  const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
+  translationVisibilityByTab[activeTabId] = visible;
+  await chrome.storage.local.set({ translationVisibilityByTab });
 }

@@ -39,6 +39,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleTranslationProgress(message, sender);
   }
 
+  if (message?.type === 'UPDATE_TRANSLATION_VISIBILITY') {
+    handleTranslationVisibility(message, sender);
+  }
+
   if (message?.type === 'GET_TRANSLATION_STATUS') {
     handleGetTranslationStatus(sendResponse, sender?.tab?.id);
     return true;
@@ -340,4 +344,12 @@ async function handleTranslationProgress(message, sender) {
 async function handleGetTranslationStatus(sendResponse, tabId) {
   const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
   sendResponse(translationStatusByTab[tabId] || null);
+}
+
+async function handleTranslationVisibility(message, sender) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) return;
+  const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
+  translationVisibilityByTab[tabId] = Boolean(message.visible);
+  await chrome.storage.local.set({ translationVisibilityByTab });
 }
