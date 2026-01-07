@@ -407,19 +407,60 @@ async function restoreFromMemory() {
   const stored = await getStoredTranslations(location.href);
   if (!stored?.length) return;
 
+  const pending = stored.map((entry) => ({ ...entry }));
+  const restoredPaths = new Set();
   const restoredSnapshot = [];
-  stored.forEach(({ path, translated, original }) => {
-    const node = findNodeByPath(path);
-    if (node) {
-      const originalValue = typeof original === 'string' ? original : node.nodeValue;
-      activeTranslationEntries.push({ path, original: originalValue, translated });
-      restoredSnapshot.push({ path, original: originalValue });
-      node.nodeValue = translated;
+
+  const applyPending = () => {
+    const remaining = [];
+    pending.forEach(({ path, translated, original }) => {
+      const pathKey = Array.isArray(path) ? path.join('.') : String(path);
+      if (restoredPaths.has(pathKey)) return;
+
+      const node = findNodeByPath(path);
+      if (node) {
+        const originalValue = typeof original === 'string' ? original : node.nodeValue;
+        restoredPaths.add(pathKey);
+        activeTranslationEntries.push({ path, original: originalValue, translated });
+        restoredSnapshot.push({ path, original: originalValue });
+        node.nodeValue = translated;
+      } else {
+        remaining.push({ path, translated, original });
+      }
+    });
+
+    pending.length = 0;
+    pending.push(...remaining);
+    if (pending.length === 0 && restoredSnapshot.length) {
+      originalSnapshot = restoredSnapshot;
+      return true;
+    }
+    return pending.length === 0;
+  };
+
+  if (applyPending()) {
+    return;
+  }
+
+  let attempts = 0;
+  const maxAttempts = 10;
+  const observer = new MutationObserver(() => {
+    if (applyPending() || attempts >= maxAttempts) {
+      observer.disconnect();
     }
   });
-  if (restoredSnapshot.length) {
-    originalSnapshot = restoredSnapshot;
+
+  if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
   }
+
+  const interval = setInterval(() => {
+    attempts += 1;
+    if (applyPending() || attempts >= maxAttempts) {
+      clearInterval(interval);
+      observer.disconnect();
+    }
+  }, 500);
 }
 
 function getNodePath(node) {
