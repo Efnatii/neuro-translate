@@ -156,6 +156,7 @@ async function performTranslationRequest(
       content: [
         'You are a fluent Russian translator.',
         `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
+        'Preserve punctuation, quotation marks, brackets, and other surrounding symbols from the source text.',
         `Tone/style: ${styleInstruction}`,
         context ? `Use this page context to disambiguate phrasing: ${context}` : '',
         'Respond only with translations in the same order, one per line, without numbering or commentary.'
@@ -169,6 +170,7 @@ async function performTranslationRequest(
         `Переведи следующие фрагменты на ${targetLanguage}.`,
         `Стиль: ${styleInstruction}`,
         context ? `Контекст страницы: ${context}` : '',
+        'Сохраняй знаки пунктуации, кавычки и скобки исходного текста.',
         'Фрагменты для перевода:',
         ...texts.map((text, index) => `${index + 1}) ${text}`)
       ]
