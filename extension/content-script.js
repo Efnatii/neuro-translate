@@ -453,23 +453,90 @@ function findNodeByPath(path) {
 
 function prepareTextForTranslation(text) {
   const { core } = extractWhitespaceAndCore(text);
-  return core;
+  const { maskedText } = maskInnerPunctuation(core);
+  return maskedText;
 }
 
 function applyOriginalFormatting(original, translated) {
-  const { prefix, suffix } = extractWhitespaceAndCore(original);
+  const { prefix, suffix, leadingPunctuation, trailingPunctuation, core } = extractWhitespaceAndCore(original);
+  const { placeholders } = maskInnerPunctuation(core);
   const adjustedCase = matchFirstLetterCase(original, translated || '');
   const trimmed = typeof adjustedCase === 'string' ? adjustedCase.trim() : '';
-  return `${prefix}${trimmed}${suffix}`;
+  const restored = restoreInnerPunctuation(trimmed, placeholders);
+  const withPunctuation = applyPunctuation(restored, leadingPunctuation, trailingPunctuation);
+  return `${prefix}${withPunctuation}${suffix}`;
 }
 
 function extractWhitespaceAndCore(text = '') {
   const match = text.match(/^(\s*)([\s\S]*?)(\s*)$/);
+  const body = match?.[2] ?? text;
+  const { leadingPunctuation, core, trailingPunctuation } = splitPunctuation(body);
   return {
     prefix: match?.[1] || '',
-    core: match?.[2] || text,
-    suffix: match?.[3] || ''
+    core,
+    suffix: match?.[3] || '',
+    leadingPunctuation,
+    trailingPunctuation
   };
+}
+
+function splitPunctuation(text = '') {
+  const punctuationPattern = `[«»“”"'()\\[\\]{}…—–!?.,]`;
+  const leadingRegex = new RegExp(`^(${punctuationPattern}+)([\\s\\S]*)$`);
+  const trailingRegex = new RegExp(`^([\\s\\S]*?)(${punctuationPattern}+)$`);
+  let leadingPunctuation = '';
+  let trailingPunctuation = '';
+  let core = text;
+
+  const leadingMatch = core.match(leadingRegex);
+  if (leadingMatch) {
+    leadingPunctuation = leadingMatch[1] || '';
+    core = leadingMatch[2] || '';
+  }
+
+  const trailingMatch = core.match(trailingRegex);
+  if (trailingMatch) {
+    core = trailingMatch[1] || '';
+    trailingPunctuation = trailingMatch[2] || '';
+  }
+
+  return {
+    leadingPunctuation,
+    core,
+    trailingPunctuation
+  };
+}
+
+function applyPunctuation(text, leadingPunctuation, trailingPunctuation) {
+  let result = text;
+  if (leadingPunctuation && !result.startsWith(leadingPunctuation)) {
+    result = `${leadingPunctuation}${result}`;
+  }
+  if (trailingPunctuation && !result.endsWith(trailingPunctuation)) {
+    result = `${result}${trailingPunctuation}`;
+  }
+  return result;
+}
+
+function maskInnerPunctuation(text = '') {
+  const punctuationRegex = /[«»“”"'()\[\]{}…—–!?.,]/g;
+  const placeholders = [];
+  let index = 0;
+  const maskedText = text.replace(punctuationRegex, (match) => {
+    const placeholder = `__PUNCT_${index}__`;
+    placeholders.push({ placeholder, value: match });
+    index += 1;
+    return placeholder;
+  });
+  return { maskedText, placeholders };
+}
+
+function restoreInnerPunctuation(text = '', placeholders = []) {
+  let result = text;
+  placeholders.forEach(({ placeholder, value }) => {
+    result = result.split(placeholder).join(value);
+  });
+  return result;
 }
 
 function matchFirstLetterCase(original, translated) {
