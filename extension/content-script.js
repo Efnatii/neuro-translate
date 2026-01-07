@@ -4,6 +4,7 @@ let translationProgress = { completedChunks: 0, totalChunks: 0 };
 let translationInProgress = false;
 let activeTranslationEntries = [];
 let originalSnapshot = [];
+let translationVisible = false;
 
 const STORAGE_KEY = 'pageTranslations';
 
@@ -16,6 +17,10 @@ chrome.runtime.onMessage.addListener((message) => {
 
   if (message?.type === 'START_TRANSLATION') {
     startTranslation();
+  }
+
+  if (message?.type === 'SET_TRANSLATION_VISIBILITY') {
+    setTranslationVisibility(Boolean(message.visible));
   }
 });
 
@@ -172,6 +177,7 @@ async function translatePage(settings) {
 
   reportProgress('Перевод завершён', translationProgress.completedChunks, chunks.length);
   await saveTranslationsToMemory(activeTranslationEntries);
+  await setTranslationVisibility(true);
 }
 
 async function translate(texts, targetLanguage, translationStyle, context) {
@@ -419,6 +425,7 @@ async function restoreFromMemory() {
   });
   if (restoredSnapshot.length) {
     originalSnapshot = restoredSnapshot;
+    await setTranslationVisibility(true);
   }
 }
 
@@ -559,5 +566,45 @@ async function cancelTranslation() {
   }
   await clearStoredTranslations(location.href);
   activeTranslationEntries = [];
+  await setTranslationVisibility(false);
   reportProgress('Перевод отменён', translationProgress.completedChunks, translationProgress.totalChunks);
+}
+
+async function setTranslationVisibility(visible) {
+  translationVisible = visible;
+  if (translationVisible) {
+    await restoreTranslations();
+  } else {
+    const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+    if (entriesToRestore.length) {
+      restoreOriginal(entriesToRestore);
+    }
+  }
+  notifyVisibilityChange();
+}
+
+async function restoreTranslations() {
+  const storedEntries = activeTranslationEntries.length ? activeTranslationEntries : await getStoredTranslations(location.href);
+  if (!storedEntries.length) return;
+
+  const restoredSnapshot = [];
+  const updatedEntries = [];
+
+  storedEntries.forEach(({ path, translated, original }) => {
+    const node = findNodeByPath(path);
+    if (!node) return;
+    const originalValue = typeof original === 'string' ? original : node.nodeValue;
+    node.nodeValue = translated;
+    restoredSnapshot.push({ path, original: originalValue });
+    updatedEntries.push({ path, original: originalValue, translated });
+  });
+
+  if (restoredSnapshot.length) {
+    originalSnapshot = restoredSnapshot;
+    activeTranslationEntries = updatedEntries;
+  }
+}
+
+function notifyVisibilityChange() {
+  chrome.runtime.sendMessage({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible });
 }
