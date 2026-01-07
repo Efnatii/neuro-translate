@@ -453,14 +453,17 @@ function findNodeByPath(path) {
 
 function prepareTextForTranslation(text) {
   const { core } = extractWhitespaceAndCore(text);
-  return core;
+  const { maskedText } = maskInnerPunctuation(core);
+  return maskedText;
 }
 
 function applyOriginalFormatting(original, translated) {
-  const { prefix, suffix, leadingPunctuation, trailingPunctuation } = extractWhitespaceAndCore(original);
+  const { prefix, suffix, leadingPunctuation, trailingPunctuation, core } = extractWhitespaceAndCore(original);
+  const { placeholders } = maskInnerPunctuation(core);
   const adjustedCase = matchFirstLetterCase(original, translated || '');
   const trimmed = typeof adjustedCase === 'string' ? adjustedCase.trim() : '';
-  const withPunctuation = applyPunctuation(trimmed, leadingPunctuation, trailingPunctuation);
+  const restored = restoreInnerPunctuation(trimmed, placeholders);
+  const withPunctuation = applyPunctuation(restored, leadingPunctuation, trailingPunctuation);
   return `${prefix}${withPunctuation}${suffix}`;
 }
 
@@ -512,6 +515,27 @@ function applyPunctuation(text, leadingPunctuation, trailingPunctuation) {
   if (trailingPunctuation && !result.endsWith(trailingPunctuation)) {
     result = `${result}${trailingPunctuation}`;
   }
+  return result;
+}
+
+function maskInnerPunctuation(text = '') {
+  const punctuationRegex = /[«»“”"'()\[\]{}…—–!?.,]/g;
+  const placeholders = [];
+  let index = 0;
+  const maskedText = text.replace(punctuationRegex, (match) => {
+    const placeholder = `__PUNCT_${index}__`;
+    placeholders.push({ placeholder, value: match });
+    index += 1;
+    return placeholder;
+  });
+  return { maskedText, placeholders };
+}
+
+function restoreInnerPunctuation(text = '', placeholders = []) {
+  let result = text;
+  placeholders.forEach(({ placeholder, value }) => {
+    result = result.split(placeholder).join(value);
+  });
   return result;
 }
 
