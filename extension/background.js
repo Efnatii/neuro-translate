@@ -5,32 +5,14 @@ const DEFAULT_STATE = {
 };
 
 const PUNCTUATION_TOKENS = new Map([
-  ['…', '⟦PUNC_ELLIPSIS⟧'],
-  ['.', '⟦PUNC_DOT⟧'],
-  [',', '⟦PUNC_COMMA⟧'],
-  ['!', '⟦PUNC_EXCLAMATION⟧'],
-  ['?', '⟦PUNC_QUESTION⟧'],
-  [':', '⟦PUNC_COLON⟧'],
-  [';', '⟦PUNC_SEMICOLON⟧'],
-  ['—', '⟦PUNC_EM_DASH⟧'],
-  ['–', '⟦PUNC_EN_DASH⟧'],
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
   ['“', '⟦PUNC_LDQUOTE⟧'],
   ['”', '⟦PUNC_RDQUOTE⟧'],
-  ['‘', '⟦PUNC_LSQUOTE⟧'],
-  ['’', '⟦PUNC_RSQUOTE⟧'],
-  ['"', '⟦PUNC_DQUOTE⟧'],
-  ["'", '⟦PUNC_SQUOTE⟧'],
-  ['(', '⟦PUNC_LPAREN⟧'],
-  [')', '⟦PUNC_RPAREN⟧'],
-  ['[', '⟦PUNC_LBRACKET⟧'],
-  [']', '⟦PUNC_RBRACKET⟧'],
-  ['{', '⟦PUNC_LBRACE⟧'],
-  ['}', '⟦PUNC_RBRACE⟧']
+  ['"', '⟦PUNC_DQUOTE⟧']
 ]);
 
-const PUNCTUATION_TOKEN_HINT = 'Tokens like ⟦PUNC_COMMA⟧ replace punctuation; keep them unchanged and in place.';
+const PUNCTUATION_TOKEN_HINT = 'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged and in place.';
 
 async function getState() {
   const stored = await chrome.storage.local.get(DEFAULT_STATE);
