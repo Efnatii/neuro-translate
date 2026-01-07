@@ -4,43 +4,6 @@ const DEFAULT_STATE = {
   translationStyle: 'natural'
 };
 
-const PUNCTUATION_TOKENS = new Map([
-  ['…', '⟦PUNC_ELLIPSIS⟧'],
-  ['.', '⟦PUNC_DOT⟧'],
-  [',', '⟦PUNC_COMMA⟧'],
-  ['!', '⟦PUNC_EXCLAMATION⟧'],
-  ['?', '⟦PUNC_QUESTION⟧'],
-  [':', '⟦PUNC_COLON⟧'],
-  [';', '⟦PUNC_SEMICOLON⟧'],
-  ['—', '⟦PUNC_EM_DASH⟧'],
-  ['–', '⟦PUNC_EN_DASH⟧'],
-  ['«', '⟦PUNC_LGUILLEMET⟧'],
-  ['»', '⟦PUNC_RGUILLEMET⟧'],
-  ['“', '⟦PUNC_LDQUOTE⟧'],
-  ['”', '⟦PUNC_RDQUOTE⟧'],
-  ['‘', '⟦PUNC_LSQUOTE⟧'],
-  ['’', '⟦PUNC_RSQUOTE⟧'],
-  ['"', '⟦PUNC_DQUOTE⟧'],
-  ["'", '⟦PUNC_SQUOTE⟧'],
-  ['(', '⟦PUNC_LPAREN⟧'],
-  [')', '⟦PUNC_RPAREN⟧'],
-  ['[', '⟦PUNC_LBRACKET⟧'],
-  [']', '⟦PUNC_RBRACKET⟧'],
-  ['{', '⟦PUNC_LBRACE⟧'],
-  ['}', '⟦PUNC_RBRACE⟧']
-]);
-
-const PUNCTUATION_TOKEN_HINT = 'Tokens like ⟦PUNC_COMMA⟧ replace punctuation; keep them unchanged and in place.';
-const PUNCTUATION_CODE_TO_TOKEN = new Map(
-  Array.from(PUNCTUATION_TOKENS.values()).map((token) => [token.replace(/[⟦⟧]/g, ''), token])
-);
-const PUNCTUATION_ALIAS_TO_TOKEN = new Map([
-  ['PUNC_QUOTE', '⟦PUNC_DQUOTE⟧'],
-  ['PUNC_LQUOTE', '⟦PUNC_LDQUOTE⟧'],
-  ['PUNC_RQUOTE', '⟦PUNC_RDQUOTE⟧'],
-  ['PUNC_APOSTROPHE', '⟦PUNC_SQUOTE⟧']
-]);
-
 async function getState() {
   const stored = await chrome.storage.local.get(DEFAULT_STATE);
   return { ...DEFAULT_STATE, ...stored };
@@ -181,7 +144,6 @@ async function performTranslationRequest(
   signal,
   context = ''
 ) {
-  const tokenizedTexts = texts.map(applyPunctuationTokens);
   const styleHints = {
     natural: 'Нейтральный, плавный русский без буквального калькирования.',
     conversational: 'Разговорный, тёплый тон с живыми оборотами без лишней фамильярности.',
@@ -198,7 +160,7 @@ async function performTranslationRequest(
       content: [
         'You are a fluent Russian translator.',
         `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
-        PUNCTUATION_TOKEN_HINT,
+        'Preserve punctuation, quotation marks, brackets, and other surrounding symbols from the source text.',
         `Tone/style: ${styleInstruction}`,
         context ? `Use this page context to disambiguate phrasing: ${context}` : '',
         'Respond only with translations in the same order, one per line, without numbering or commentary.'
@@ -212,9 +174,9 @@ async function performTranslationRequest(
         `Переведи следующие фрагменты на ${targetLanguage}.`,
         `Стиль: ${styleInstruction}`,
         context ? `Контекст страницы: ${context}` : '',
-        `Пожалуйста, не изменяй служебные токены пунктуации. ${PUNCTUATION_TOKEN_HINT}`,
+        'Сохраняй знаки пунктуации, кавычки и скобки исходного текста.',
         'Фрагменты для перевода:',
-        ...tokenizedTexts.map((text, index) => `${index + 1}) ${text}`)
+        ...texts.map((text, index) => `${index + 1}) ${text}`)
       ]
         .filter(Boolean)
         .join('\n')
@@ -252,10 +214,7 @@ async function performTranslationRequest(
 
   return texts.map((text, index) => {
     const candidate = parsed[index];
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return restorePunctuationTokens(candidate);
-    }
-    return text;
+    return typeof candidate === 'string' && candidate.trim() ? candidate : text;
   });
 }
 
@@ -365,34 +324,6 @@ function safeParseArray(content, expectedLength) {
   }
 
   return parsed;
-}
-
-function applyPunctuationTokens(text = '') {
-  let output = text;
-  for (const [punctuation, token] of PUNCTUATION_TOKENS.entries()) {
-    output = output.split(punctuation).join(token);
-  }
-  return output;
-}
-
-function restorePunctuationTokens(text = '') {
-  let output = normalizePunctuationTokens(text);
-  for (const [punctuation, token] of PUNCTUATION_TOKENS.entries()) {
-    output = output.split(token).join(punctuation);
-  }
-  return output;
-}
-
-function normalizePunctuationTokens(text = '') {
-  return text.replace(/[\[{<]?(PUNC_[A-Z_]+)[\]}>]?/g, (match, code) => {
-    if (PUNCTUATION_CODE_TO_TOKEN.has(code)) {
-      return PUNCTUATION_CODE_TO_TOKEN.get(code);
-    }
-    if (PUNCTUATION_ALIAS_TO_TOKEN.has(code)) {
-      return PUNCTUATION_ALIAS_TO_TOKEN.get(code);
-    }
-    return match;
-  });
 }
 
 async function handleTranslationProgress(message, sender) {
