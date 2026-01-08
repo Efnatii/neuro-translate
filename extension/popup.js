@@ -1,11 +1,13 @@
 const apiKeyInput = document.getElementById('apiKey');
 const modelSelect = document.getElementById('model');
 const translationStyleSelect = document.getElementById('translationStyle');
+const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const statusLabel = document.getElementById('status');
 
 const cancelButton = document.getElementById('cancel');
 const translateButton = document.getElementById('translate');
 const toggleTranslationButton = document.getElementById('toggleTranslation');
+const openDebugButton = document.getElementById('openDebug');
 
 let keySaveTimeout = null;
 let activeTabId = null;
@@ -75,6 +77,7 @@ async function init() {
   apiKeyInput.value = state.apiKey || '';
   renderModelOptions(state.model);
   renderStyleOptions(state.translationStyle);
+  renderContextGeneration(state.contextGenerationEnabled);
   renderTranslationStatus(state.translationStatusByTab?.[activeTabId]);
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
 
@@ -83,9 +86,11 @@ async function init() {
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   modelSelect.addEventListener('change', handleModelChange);
   translationStyleSelect.addEventListener('change', handleTranslationStyleChange);
+  contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
   toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
+  openDebugButton.addEventListener('click', handleOpenDebug);
 }
 
 function handleApiKeyChange() {
@@ -109,15 +114,31 @@ async function handleTranslationStyleChange() {
   statusLabel.textContent = 'Стиль перевода сохранён.';
 }
 
+async function handleContextGenerationChange() {
+  const contextGenerationEnabled = contextGenerationCheckbox.checked;
+  await chrome.storage.local.set({ contextGenerationEnabled });
+  statusLabel.textContent = contextGenerationEnabled
+    ? 'Генерация контекста включена.'
+    : 'Генерация контекста отключена.';
+}
+
 async function getState() {
   return new Promise((resolve) => {
     chrome.storage.local.get(
-      ['apiKey', 'model', 'translationStyle', 'translationStatusByTab', 'translationVisibilityByTab'],
+      [
+        'apiKey',
+        'model',
+        'translationStyle',
+        'contextGenerationEnabled',
+        'translationStatusByTab',
+        'translationVisibilityByTab'
+      ],
       (data) => {
       resolve({
         apiKey: data.apiKey || '',
         model: data.model,
         translationStyle: data.translationStyle,
+        contextGenerationEnabled: data.contextGenerationEnabled,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {}
       });
@@ -153,6 +174,10 @@ function renderStyleOptions(selected) {
     option.selected = style.id === currentStyle;
     translationStyleSelect.appendChild(option);
   });
+}
+
+function renderContextGeneration(enabled) {
+  contextGenerationCheckbox.checked = Boolean(enabled);
 }
 
 async function getActiveTab() {
@@ -241,4 +266,9 @@ async function updateTranslationVisibilityStorage(visible) {
   const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
   translationVisibilityByTab[activeTabId] = visible;
   await chrome.storage.local.set({ translationVisibilityByTab });
+}
+
+async function handleOpenDebug() {
+  const url = chrome.runtime.getURL('debug.html');
+  await chrome.tabs.create({ url });
 }
