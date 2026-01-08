@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neuro Translate — Отладка</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 16px;
+      color: #1f2937;
+      background: #f8fafc;
+    }
+    h1 {
+      margin-bottom: 8px;
+    }
+    .meta {
+      margin-bottom: 16px;
+      color: #4b5563;
+      font-size: 13px;
+    }
+    .context {
+      background: #fff;
+      border-radius: 8px;
+      padding: 12px;
+      border: 1px solid #e2e8f0;
+      margin-bottom: 16px;
+    }
+    .entry {
+      background: #fff;
+      border-radius: 8px;
+      padding: 12px;
+      border: 1px solid #e2e8f0;
+      margin-bottom: 12px;
+    }
+    .entry h2 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+    .block {
+      margin-bottom: 12px;
+    }
+    .label {
+      font-weight: bold;
+      font-size: 13px;
+      text-transform: uppercase;
+      color: #6b7280;
+      margin-bottom: 4px;
+    }
+    pre {
+      white-space: pre-wrap;
+      background: #f1f5f9;
+      padding: 8px;
+      border-radius: 6px;
+      margin: 0;
+      font-size: 13px;
+    }
+    .empty {
+      color: #9ca3af;
+      font-style: italic;
+    }
+  </style>
+</head>
+<body>
+  <h1>Отладка перевода</h1>
+  <div class="meta" id="meta"></div>
+  <div class="context" id="context"></div>
+  <div id="entries"></div>
+  <script src="debug.js"></script>
+</body>
+</html>
