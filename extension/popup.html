@@ -36,10 +36,17 @@
     Стиль перевода
     <select id="translationStyle"></select>
   </label>
+  <label>
+    <input type="checkbox" id="contextGeneration" />
+    Генерировать контекст перед переводом
+  </label>
   <div class="row">
     <button id="translate">Перевести страницу</button>
     <button id="toggleTranslation" aria-pressed="false">Показать перевод</button>
     <button id="cancel">Отменить перевод</button>
+  </div>
+  <div class="row">
+    <button id="openDebug">Открыть отладку перевода</button>
   </div>
   <p class="status" id="status"></p>
   <script src="popup.js"></script>
