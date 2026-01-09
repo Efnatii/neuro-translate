@@ -7,7 +7,7 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 12px; min-width: 320px; }
     label { display: block; margin-top: 8px; }
-    input[type="text"] { width: 100%; box-sizing: border-box; padding: 6px; }
+    input[type="text"], input[type="password"] { width: 100%; box-sizing: border-box; padding: 6px; }
     button { margin-top: 8px; padding: 6px 10px; }
     .row {
       display: flex;
@@ -19,14 +19,14 @@
       flex: 1;
       min-width: 0;
     }
-    .status { margin-top: 8px; color: #555; font-size: 12px; }
+    .status { margin-top: 8px; color: #555; font-size: 12px; white-space: pre-line; }
   </style>
 </head>
 <body>
   <h3>Neuro Translate</h3>
   <label>
     API ключ
-    <input type="text" id="apiKey" placeholder="Введите API-ключ GPT-5-Nano" />
+    <input type="password" id="apiKey" placeholder="Введите API-ключ GPT-5-Nano" autocomplete="off" />
   </label>
   <label>
     Модель
