@@ -154,47 +154,90 @@ async function getActiveTab() {
   return tab;
 }
 
+async function sendMessageWithAutoInject(tab, message) {
+  const delivered = await sendMessageToTab(tab.id, message);
+  if (delivered) return true;
+
+  const injected = await ensureContentScript(tab);
+  if (!injected) return false;
+
+  return sendMessageToTab(tab.id, message);
+}
+
+function sendMessageToTab(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, () => {
+      if (chrome.runtime.lastError) {
+        resolve(false);
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+async function ensureContentScript(tab) {
+  if (!tab?.id || !isInjectableUrl(tab?.url)) {
+    return false;
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content-script.js']
+    });
+    return true;
+  } catch (error) {
+    console.warn('Failed to inject content script', error);
+    return false;
+  }
+}
+
+function isInjectableUrl(url) {
+  if (!url) return false;
+  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
+}
+
 async function sendCancel() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  chrome.tabs.sendMessage(tab.id, { type: 'CANCEL_TRANSLATION' }, () => {
-    if (chrome.runtime.lastError) {
-      setTemporaryStatus('Не удалось связаться со страницей. Обновите её и попробуйте снова.');
-      return;
-    }
-    updateTranslationVisibility(false);
-    updateTranslationVisibilityStorage(false);
-    setTemporaryStatus('Перевод для этой страницы отменён.');
-  });
+  const delivered = await sendMessageWithAutoInject(tab, { type: 'CANCEL_TRANSLATION' });
+  if (!delivered) {
+    setTemporaryStatus('Перевод недоступен для этой страницы. Откройте обычную веб-страницу и попробуйте снова.');
+    return;
+  }
+  updateTranslationVisibility(false);
+  updateTranslationVisibilityStorage(false);
+  setTemporaryStatus('Перевод для этой страницы отменён.');
 }
 
 async function sendTranslateRequest() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  chrome.tabs.sendMessage(tab.id, { type: 'START_TRANSLATION' }, () => {
-    if (chrome.runtime.lastError) {
-      setTemporaryStatus('Не удалось подключиться к странице. Обновите её и попробуйте снова.');
-      return;
-    }
-    updateTranslationVisibility(true);
-    updateTranslationVisibilityStorage(true);
-    setTemporaryStatus('Запускаем перевод страницы...');
-  });
+  const delivered = await sendMessageWithAutoInject(tab, { type: 'START_TRANSLATION' });
+  if (!delivered) {
+    setTemporaryStatus('Перевод недоступен для этой страницы. Откройте обычную веб-страницу и попробуйте снова.');
+    return;
+  }
+  updateTranslationVisibility(true);
+  updateTranslationVisibilityStorage(true);
+  setTemporaryStatus('Запускаем перевод страницы...');
 }
 
 async function handleToggleTranslationVisibility() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
   const nextVisible = !translationVisible;
-  chrome.tabs.sendMessage(tab.id, { type: 'SET_TRANSLATION_VISIBILITY', visible: nextVisible }, () => {
-    if (chrome.runtime.lastError) {
-      setTemporaryStatus('Не удалось переключить перевод. Обновите страницу и попробуйте снова.');
-      return;
-    }
-    updateTranslationVisibility(nextVisible);
-    updateTranslationVisibilityStorage(nextVisible);
-    setTemporaryStatus(nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.');
+  const delivered = await sendMessageWithAutoInject(tab, {
+    type: 'SET_TRANSLATION_VISIBILITY',
+    visible: nextVisible
   });
+  if (!delivered) {
+    setTemporaryStatus('Перевод недоступен для этой страницы. Откройте обычную веб-страницу и попробуйте снова.');
+    return;
+  }
+  updateTranslationVisibility(nextVisible);
+  updateTranslationVisibilityStorage(nextVisible);
+  setTemporaryStatus(nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.');
 }
 
 function handleStorageChange(changes) {
