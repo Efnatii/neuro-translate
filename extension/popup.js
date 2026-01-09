@@ -11,27 +11,52 @@ const openDebugButton = document.getElementById('openDebug');
 let keySaveTimeout = null;
 let activeTabId = null;
 let translationVisible = false;
-let currentTranslationStatus = null;
-let currentThroughputInfo = null;
-let currentModelId = null;
-let temporaryStatusMessage = null;
-let temporaryStatusTimeout = null;
 
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.45 },
   { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', price: 0.5 },
   { id: 'gpt-4o-mini', name: 'GPT-4o Mini', price: 0.75 },
+  { id: 'gpt-4o-mini-audio-preview', name: 'GPT-4o Mini Audio Preview', price: 0.75 },
+  { id: 'gpt-4o-mini-search-preview', name: 'GPT-4o Mini Search Preview', price: 0.75 },
   { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', price: 2 },
+  { id: 'gpt-image-1-mini', name: 'GPT-Image-1 Mini', price: 2 },
   { id: 'gpt-5-mini', name: 'GPT-5 Mini', price: 2.25 },
+  { id: 'gpt-5.1-codex-mini', name: 'GPT-5.1 Codex Mini', price: 2.25 },
+  { id: 'gpt-realtime-mini', name: 'GPT Realtime Mini', price: 3 },
+  { id: 'gpt-4o-mini-realtime-preview', name: 'GPT-4o Mini Realtime Preview', price: 3 },
+  { id: 'gpt-audio-mini', name: 'GPT Audio Mini', price: 3 },
+  { id: 'gpt-image-1', name: 'GPT-Image-1', price: 5 },
+  { id: 'o4-mini', name: 'o4 Mini', price: 5.5 },
+  { id: 'o3-mini', name: 'o3 Mini', price: 5.5 },
+  { id: 'o1-mini', name: 'o1 Mini', price: 5.5 },
+  { id: 'codex-mini-latest', name: 'Codex Mini Latest', price: 7.5 },
   { id: 'gpt-4.1', name: 'GPT-4.1', price: 10 },
+  { id: 'o3', name: 'o3', price: 10 },
+  { id: 'o4-mini-deep-research', name: 'o4 Mini Deep Research', price: 10 },
   { id: 'gpt-5.1', name: 'GPT-5.1', price: 11.25 },
   { id: 'gpt-5', name: 'GPT-5', price: 11.25 },
   { id: 'gpt-5.1-chat-latest', name: 'GPT-5.1 Chat Latest', price: 11.25 },
   { id: 'gpt-5-chat-latest', name: 'GPT-5 Chat Latest', price: 11.25 },
+  { id: 'gpt-5.1-codex-max', name: 'GPT-5.1 Codex Max', price: 11.25 },
+  { id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex', price: 11.25 },
+  { id: 'gpt-5-codex', name: 'GPT-5 Codex', price: 11.25 },
+  { id: 'gpt-5-search-api', name: 'GPT-5 Search API', price: 11.25 },
   { id: 'gpt-4o', name: 'GPT-4o', price: 12.5 },
+  { id: 'gpt-audio', name: 'GPT Audio', price: 12.5 },
+  { id: 'gpt-4o-audio-preview', name: 'GPT-4o Audio Preview', price: 12.5 },
+  { id: 'gpt-4o-search-preview', name: 'GPT-4o Search Preview', price: 12.5 },
+  { id: 'computer-use-preview', name: 'Computer Use Preview', price: 15 },
   { id: 'gpt-5.2', name: 'GPT-5.2', price: 15.75 },
   { id: 'gpt-5.2-chat-latest', name: 'GPT-5.2 Chat Latest', price: 15.75 },
-  { id: 'gpt-4o-2024-05-13', name: 'GPT-4o (2024-05-13)', price: 20 }
+  { id: 'gpt-4o-2024-05-13', name: 'GPT-4o (2024-05-13)', price: 20 },
+  { id: 'gpt-realtime', name: 'GPT Realtime', price: 20 },
+  { id: 'gpt-4o-realtime-preview', name: 'GPT-4o Realtime Preview', price: 25 },
+  { id: 'o3-deep-research', name: 'o3 Deep Research', price: 50 },
+  { id: 'o1', name: 'o1', price: 75 },
+  { id: 'o3-pro', name: 'o3 Pro', price: 100 },
+  { id: 'gpt-5-pro', name: 'GPT-5 Pro', price: 135 },
+  { id: 'gpt-5.2-pro', name: 'GPT-5.2 Pro', price: 189 },
+  { id: 'o1-pro', name: 'o1 Pro', price: 750 }
 ].sort((a, b) => a.price - b.price);
 
 init();
@@ -43,11 +68,8 @@ async function init() {
   const state = await getState();
   apiKeyInput.value = state.apiKey || '';
   renderModelOptions(state.model);
-  currentModelId = modelSelect.value;
-  currentThroughputInfo = state.modelThroughputById?.[currentModelId] || null;
   renderContextGeneration(state.contextGenerationEnabled);
-  currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
-  renderStatus();
+  renderTranslationStatus(state.translationStatusByTab?.[activeTabId]);
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
 
   chrome.storage.onChanged.addListener(handleStorageChange);
@@ -66,27 +88,22 @@ function handleApiKeyChange() {
   const apiKey = apiKeyInput.value.trim();
   keySaveTimeout = setTimeout(async () => {
     await chrome.storage.local.set({ apiKey });
-    setTemporaryStatus('API ключ сохранён.');
+    statusLabel.textContent = 'API ключ сохранён.';
   }, 300);
 }
 
 async function handleModelChange() {
   const model = modelSelect.value;
   await chrome.storage.local.set({ model });
-  currentModelId = model;
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
-  currentThroughputInfo = modelThroughputById[model] || null;
-  renderStatus();
-  setTemporaryStatus('Модель сохранена.');
-  runModelThroughputTest(model);
+  statusLabel.textContent = 'Модель сохранена.';
 }
 
 async function handleContextGenerationChange() {
   const contextGenerationEnabled = contextGenerationCheckbox.checked;
   await chrome.storage.local.set({ contextGenerationEnabled });
-  setTemporaryStatus(
-    contextGenerationEnabled ? 'Генерация контекста включена.' : 'Генерация контекста отключена.'
-  );
+  statusLabel.textContent = contextGenerationEnabled
+    ? 'Генерация контекста включена.'
+    : 'Генерация контекста отключена.';
 }
 
 async function getState() {
@@ -97,8 +114,7 @@ async function getState() {
         'model',
         'contextGenerationEnabled',
         'translationStatusByTab',
-        'translationVisibilityByTab',
-        'modelThroughputById'
+        'translationVisibilityByTab'
       ],
       (data) => {
       resolve({
@@ -106,8 +122,7 @@ async function getState() {
         model: data.model,
         contextGenerationEnabled: data.contextGenerationEnabled,
         translationStatusByTab: data.translationStatusByTab || {},
-        translationVisibilityByTab: data.translationVisibilityByTab || {},
-        modelThroughputById: data.modelThroughputById || {}
+        translationVisibilityByTab: data.translationVisibilityByTab || {}
       });
     });
   });
@@ -132,23 +147,6 @@ function renderContextGeneration(enabled) {
   contextGenerationCheckbox.checked = Boolean(enabled);
 }
 
-function runModelThroughputTest(model) {
-  if (!model) return;
-  setTemporaryStatus('Запускаем тест пропускной способности...');
-  chrome.runtime.sendMessage({ type: 'RUN_MODEL_THROUGHPUT_TEST', model }, (response) => {
-    if (response?.success) {
-      currentThroughputInfo = response.result || null;
-      renderStatus();
-      setTemporaryStatus('Тест пропускной способности завершён.', 2000);
-      return;
-    }
-    const error = response?.error || 'Не удалось выполнить тест';
-    currentThroughputInfo = { success: false, error, timestamp: Date.now() };
-    renderStatus();
-    setTemporaryStatus('Тест пропускной способности не удался.', 3000);
-  });
-}
-
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
@@ -159,12 +157,12 @@ async function sendCancel() {
   if (!tab?.id) return;
   chrome.tabs.sendMessage(tab.id, { type: 'CANCEL_TRANSLATION' }, () => {
     if (chrome.runtime.lastError) {
-      setTemporaryStatus('Не удалось связаться со страницей. Обновите её и попробуйте снова.');
+      statusLabel.textContent = 'Не удалось связаться со страницей. Обновите её и попробуйте снова.';
       return;
     }
     updateTranslationVisibility(false);
     updateTranslationVisibilityStorage(false);
-    setTemporaryStatus('Перевод для этой страницы отменён.');
+    statusLabel.textContent = 'Перевод для этой страницы отменён.';
   });
 }
 
@@ -173,12 +171,12 @@ async function sendTranslateRequest() {
   if (!tab?.id) return;
   chrome.tabs.sendMessage(tab.id, { type: 'START_TRANSLATION' }, () => {
     if (chrome.runtime.lastError) {
-      setTemporaryStatus('Не удалось подключиться к странице. Обновите её и попробуйте снова.');
+      statusLabel.textContent = 'Не удалось подключиться к странице. Обновите её и попробуйте снова.';
       return;
     }
     updateTranslationVisibility(true);
     updateTranslationVisibilityStorage(true);
-    setTemporaryStatus('Запускаем перевод страницы...');
+    statusLabel.textContent = 'Запускаем перевод страницы...';
   });
 }
 
@@ -188,77 +186,36 @@ async function handleToggleTranslationVisibility() {
   const nextVisible = !translationVisible;
   chrome.tabs.sendMessage(tab.id, { type: 'SET_TRANSLATION_VISIBILITY', visible: nextVisible }, () => {
     if (chrome.runtime.lastError) {
-      setTemporaryStatus('Не удалось переключить перевод. Обновите страницу и попробуйте снова.');
+      statusLabel.textContent = 'Не удалось переключить перевод. Обновите страницу и попробуйте снова.';
       return;
     }
     updateTranslationVisibility(nextVisible);
     updateTranslationVisibilityStorage(nextVisible);
-    setTemporaryStatus(nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.');
+    statusLabel.textContent = nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.';
   });
 }
 
 function handleStorageChange(changes) {
   if (changes.translationStatusByTab) {
     const nextStatuses = changes.translationStatusByTab.newValue || {};
-    currentTranslationStatus = activeTabId ? nextStatuses[activeTabId] : null;
-    renderStatus();
+    renderTranslationStatus(activeTabId ? nextStatuses[activeTabId] : null);
   }
   if (changes.translationVisibilityByTab) {
     const nextVisibility = changes.translationVisibilityByTab.newValue || {};
     renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
   }
-  if (changes.modelThroughputById) {
-    const nextThroughput = changes.modelThroughputById.newValue || {};
-    currentThroughputInfo = currentModelId ? nextThroughput[currentModelId] : null;
-    renderStatus();
-  }
 }
 
-function renderStatus() {
-  const baseMessage = getBaseStatusMessage();
-  const throughputMessage = formatThroughputStatus(currentThroughputInfo);
-  statusLabel.textContent = throughputMessage ? `${baseMessage}\n${throughputMessage}` : baseMessage;
-}
-
-function getBaseStatusMessage() {
-  if (temporaryStatusMessage) {
-    return temporaryStatusMessage;
-  }
-  return formatTranslationStatus(currentTranslationStatus);
-}
-
-function formatTranslationStatus(status) {
+function renderTranslationStatus(status) {
   const defaultText = 'Статус: перевод не выполняется.';
   if (!status) {
-    return defaultText;
+    statusLabel.textContent = defaultText;
+    return;
   }
 
   const { completedChunks = 0, totalChunks = 0, message } = status;
   const progress = totalChunks ? ` (${completedChunks}/${totalChunks})` : '';
-  return message ? `${message}${progress}` : defaultText;
-}
-
-function formatThroughputStatus(info) {
-  if (!info) return '';
-  if (info.success === false) {
-    const errorText = info.error ? ` (${info.error})` : '';
-    return `Тест пропускной способности: ошибка${errorText}`;
-  }
-  if (!info.tokensPerSecond || !info.durationMs) return '';
-  const tokensPerSecond = Number(info.tokensPerSecond).toFixed(1);
-  const durationSeconds = (info.durationMs / 1000).toFixed(1);
-  return `Пропускная способность: ${tokensPerSecond} ток/с • ${durationSeconds}с`;
-}
-
-function setTemporaryStatus(message, durationMs = 2500) {
-  temporaryStatusMessage = message;
-  renderStatus();
-  clearTimeout(temporaryStatusTimeout);
-  if (durationMs <= 0) return;
-  temporaryStatusTimeout = setTimeout(() => {
-    temporaryStatusMessage = null;
-    renderStatus();
-  }, durationMs);
+  statusLabel.textContent = message ? `${message}${progress}` : defaultText;
 }
 
 function renderTranslationVisibility(visible) {
