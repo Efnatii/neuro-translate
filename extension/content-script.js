@@ -1,4 +1,10 @@
-let cancelRequested = false;
+(() => {
+  if (window.__neuroTranslateContentScriptLoaded) {
+    return;
+  }
+  window.__neuroTranslateContentScriptLoaded = true;
+
+  let cancelRequested = false;
 let translationError = null;
 let translationProgress = { completedChunks: 0, totalChunks: 0 };
 let translationInProgress = false;
@@ -33,7 +39,11 @@ async function startTranslation() {
     return;
   }
 
-  const settings = await requestSettings();
+  let settings = await requestSettings();
+  if (!settings?.allowed) {
+    await delay(500);
+    settings = await requestSettings();
+  }
   if (!settings?.allowed) {
     reportProgress('Перевод недоступен для этой страницы', translationProgress.completedChunks, translationProgress.totalChunks);
     return;
@@ -684,3 +694,4 @@ async function restoreTranslations() {
 function notifyVisibilityChange() {
   chrome.runtime.sendMessage({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible });
 }
+})();

@@ -171,6 +171,7 @@ async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', m
         'Не пересказывай текст, не оценивай и не добавляй факты вне источника.',
         'Если информации нет, укажи "не указано".',
         'Фокусируйся на деталях, влияющих на точность, единообразие терминов, стиль и смысл.',
+        'Не предлагай оставлять имена/названия/термины без перевода, если это не явно указано в тексте.',
         'Ответ должен быть структурированным и лаконичным.'
       ].join(' ')
     },
@@ -205,11 +206,11 @@ async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', m
         '6) Терминология и единообразие:',
         '- термины/понятия/аббревиатуры, которые должны переводиться одинаково',
         '- рекомендуемые варианты перевода, если явно вытекают из контекста',
-        '- что нельзя переводить или что оставлять как есть',
+        '- что нельзя переводить или что оставлять как есть (только если это прямо следует из текста)',
         '',
         '7) Собственные имена и ономастика:',
         '- имена, бренды, продукты, организации, топонимы',
-        '- как передавать: перевод/транслитерация/оставить как есть',
+        '- как передавать: перевод/транслитерация/оставить как есть (оставлять как есть только при явном указании)',
         '',
         '8) Тональность и стиль:',
         '- официальный/разговорный/нейтральный/художественный/ирония и т.п.',
@@ -357,6 +358,7 @@ async function performTranslationRequest(
       content: [
         'You are a fluent Russian translator.',
         `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
+        'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
         PUNCTUATION_TOKEN_HINT,
         styleInstruction ? `Tone/style: ${styleInstruction}` : 'Determine the most appropriate tone/style based on the provided context.',
         context ? `Use this page context to disambiguate phrasing: ${context}` : '',
@@ -371,6 +373,7 @@ async function performTranslationRequest(
         `Переведи следующие фрагменты на ${targetLanguage}.`,
         styleInstruction ? `Стиль: ${styleInstruction}` : 'Определи стиль автоматически на основе контекста.',
         context ? `Контекст страницы: ${context}` : '',
+        'Переводи имена/названия/термины; если не уверен — транслитерируй, не оставляй без перевода, кроме устоявшихся брендов.',
         `Пожалуйста, не изменяй служебные токены пунктуации. ${PUNCTUATION_TOKEN_HINT}`,
         'Фрагменты для перевода:',
         ...tokenizedTexts.map((text, index) => `${index + 1}) ${text}`)
