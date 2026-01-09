@@ -289,12 +289,16 @@ async function translateTexts(
 ) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
-  const maxAttempts = 2;
+  const maxTimeoutAttempts = 2;
+  const maxRateLimitRetries = 3;
+  let timeoutAttempts = 0;
+  let rateLimitRetries = 0;
   let lastError = null;
+  let lastRateLimitDelayMs = null;
   const throughputInfo = await getModelThroughputInfo(model);
   const timeoutMs = calculateTranslationTimeoutMs(texts, throughputInfo);
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  while (true) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -312,8 +316,19 @@ async function translateTexts(
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
 
       const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
-      if (attempt < maxAttempts && isTimeout) {
-        console.warn(`Translation attempt ${attempt} timed out, retrying...`);
+      if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
+        timeoutAttempts += 1;
+        console.warn(`Translation attempt timed out, retrying...`);
+        continue;
+      }
+
+      const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
+      if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
+        rateLimitRetries += 1;
+        const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
+        lastRateLimitDelayMs = retryDelayMs;
+        console.warn(`Translation attempt rate-limited, retrying after ${retryDelayMs}ms...`);
+        await sleep(retryDelayMs);
         continue;
       }
 
@@ -321,6 +336,11 @@ async function translateTexts(
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
         return await translateIndividually(texts, apiKey, targetLanguage, model, translationStyle, context);
+      }
+
+      if (isRateLimit) {
+        const waitSeconds = Math.max(1, Math.ceil((lastRateLimitDelayMs || error?.retryAfterMs || 30000) / 1000));
+        throw new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
       }
 
       throw lastError;
@@ -398,7 +418,20 @@ async function performTranslationRequest(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Translation request failed: ${response.status} ${errorText}`);
+    let errorPayload = null;
+    try {
+      errorPayload = JSON.parse(errorText);
+    } catch (parseError) {
+      errorPayload = null;
+    }
+    const retryAfterMs = parseRetryAfterMs(response, errorPayload);
+    const errorMessage =
+      errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
+    const error = new Error(`Translation request failed: ${response.status} ${errorMessage}`);
+    error.status = response.status;
+    error.retryAfterMs = retryAfterMs;
+    error.isRateLimit = response.status === 429 || response.status === 503;
+    throw error;
   }
 
   const data = await response.json();
@@ -419,6 +452,50 @@ async function performTranslationRequest(
     }
     return text;
   });
+}
+
+function parseRetryAfterMs(response, errorPayload) {
+  const retryAfterHeader = response?.headers?.get?.('Retry-After');
+  if (retryAfterHeader) {
+    const asSeconds = Number(retryAfterHeader);
+    if (!Number.isNaN(asSeconds) && asSeconds >= 0) {
+      return Math.round(asSeconds * 1000);
+    }
+    const asDate = Date.parse(retryAfterHeader);
+    if (!Number.isNaN(asDate)) {
+      const deltaMs = asDate - Date.now();
+      if (deltaMs > 0) return deltaMs;
+    }
+  }
+
+  const retryAfterSeconds =
+    errorPayload?.error?.retry_after ??
+    errorPayload?.error?.retry_after_seconds ??
+    errorPayload?.retry_after ??
+    errorPayload?.retry_after_seconds;
+  if (typeof retryAfterSeconds === 'number' && retryAfterSeconds >= 0) {
+    return Math.round(retryAfterSeconds * 1000);
+  }
+
+  const retryAfterMs = errorPayload?.error?.retry_after_ms ?? errorPayload?.retry_after_ms;
+  if (typeof retryAfterMs === 'number' && retryAfterMs >= 0) {
+    return Math.round(retryAfterMs);
+  }
+
+  return null;
+}
+
+function calculateRetryDelayMs(attempt, retryAfterMs) {
+  const baseDelayMs = 1000;
+  const exponentialDelayMs = baseDelayMs * 2 ** Math.max(0, attempt - 1);
+  const jitterMs = Math.floor(Math.random() * 250);
+  const computedDelayMs = exponentialDelayMs + jitterMs;
+  const fallbackDelayMs = retryAfterMs ? Math.max(retryAfterMs, computedDelayMs) : computedDelayMs;
+  return Math.min(fallbackDelayMs, 30000);
+}
+
+function sleep(durationMs) {
+  return new Promise(resolve => setTimeout(resolve, durationMs));
 }
 
 async function translateIndividually(texts, apiKey, targetLanguage, model, translationStyle, context = '') {
