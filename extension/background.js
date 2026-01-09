@@ -5,6 +5,10 @@ const DEFAULT_STATE = {
   contextGenerationEnabled: false
 };
 
+const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
+const MAX_TRANSLATION_TIMEOUT_MS = 180000;
+const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
+
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -48,6 +52,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'GENERATE_CONTEXT') {
     handleGenerateContext(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'RUN_MODEL_THROUGHPUT_TEST') {
+    handleModelThroughputTest(message, sendResponse);
     return true;
   }
 
@@ -123,6 +132,31 @@ async function handleGenerateContext(message, sendResponse) {
   } catch (error) {
     console.error('Context generation failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
+  }
+}
+
+async function handleModelThroughputTest(message, sendResponse) {
+  try {
+    const state = await getState();
+    if (!state.apiKey) {
+      sendResponse({ success: false, error: 'API key is missing.' });
+      return;
+    }
+
+    const model = message?.model || state.model;
+    const result = await runModelThroughputTest(state.apiKey, model);
+    await saveModelThroughputResult(model, result);
+    sendResponse({ success: true, result });
+  } catch (error) {
+    const model = message?.model || DEFAULT_STATE.model;
+    const failure = {
+      success: false,
+      error: error?.message || 'Throughput test failed',
+      timestamp: Date.now(),
+      model
+    };
+    await saveModelThroughputResult(model, failure);
+    sendResponse({ success: false, error: failure.error });
   }
 }
 
@@ -226,6 +260,24 @@ async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', m
   return typeof content === 'string' ? content.trim() : '';
 }
 
+async function getModelThroughputInfo(model) {
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
+  return modelThroughputById?.[model] || null;
+}
+
+function calculateTranslationTimeoutMs(texts, throughputInfo) {
+  if (!throughputInfo?.tokensPerSecond || throughputInfo.tokensPerSecond <= 0) {
+    return DEFAULT_TRANSLATION_TIMEOUT_MS;
+  }
+
+  const totalChars = texts.reduce((sum, text) => sum + (text?.length || 0), 0);
+  const estimatedTokens = Math.max(1, Math.ceil(totalChars / 4) + 200);
+  const estimatedMs = (estimatedTokens / throughputInfo.tokensPerSecond) * 1000;
+  const paddedMs = estimatedMs * 2.5;
+
+  return Math.min(Math.max(DEFAULT_TRANSLATION_TIMEOUT_MS, Math.round(paddedMs)), MAX_TRANSLATION_TIMEOUT_MS);
+}
+
 async function translateTexts(
   texts,
   apiKey,
@@ -238,10 +290,12 @@ async function translateTexts(
 
   const maxAttempts = 2;
   let lastError = null;
+  const throughputInfo = await getModelThroughputInfo(model);
+  const timeoutMs = calculateTranslationTimeoutMs(texts, throughputInfo);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 45000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       return await performTranslationRequest(
@@ -386,6 +440,59 @@ async function translateIndividually(texts, apiKey, targetLanguage, model, trans
   }
 
   return results;
+}
+
+async function runModelThroughputTest(apiKey, model) {
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MODEL_THROUGHPUT_TEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 24,
+        messages: [
+          { role: 'system', content: 'Reply with the word OK.' },
+          { role: 'user', content: 'OK' }
+        ]
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Throughput test failed: ${response.status} ${errorText}`);
+    }
+
+    const data = await response.json();
+    const durationMs = Math.max(1, Math.round(performance.now() - startedAt));
+    const totalTokens = Number(data?.usage?.total_tokens) || null;
+    const tokensPerSecond = totalTokens ? Number((totalTokens / (durationMs / 1000)).toFixed(2)) : null;
+
+    return {
+      success: true,
+      model,
+      durationMs,
+      totalTokens,
+      tokensPerSecond,
+      timestamp: Date.now()
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function saveModelThroughputResult(model, result) {
+  if (!model) return;
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
+  modelThroughputById[model] = result;
+  await chrome.storage.local.set({ modelThroughputById });
 }
 
 function safeParseArray(content, expectedLength) {
