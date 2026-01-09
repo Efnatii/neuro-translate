@@ -5,8 +5,11 @@ let translationInProgress = false;
 let activeTranslationEntries = [];
 let originalSnapshot = [];
 let translationVisible = false;
+let latestContextSummary = '';
+let debugEntries = [];
 
 const STORAGE_KEY = 'pageTranslations';
+const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 
 restoreFromMemory();
 
@@ -61,6 +64,9 @@ async function translatePage(settings) {
   }));
   originalSnapshot = nodesWithPath.map(({ path, original }) => ({ path, original }));
   activeTranslationEntries = [];
+  debugEntries = [];
+  latestContextSummary = '';
+  await clearTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
   const maxChunkLength = calculateMaxChunkLength(textStats.averageNodeLength);
@@ -76,6 +82,21 @@ async function translatePage(settings) {
   cancelRequested = false;
   translationError = null;
   reportProgress('Перевод запущен', 0, chunks.length);
+
+  if (settings.contextGenerationEnabled) {
+    reportProgress('Генерация контекста', 0, chunks.length);
+    const pageText = buildPageText(nodesWithPath);
+    if (pageText) {
+      try {
+        latestContextSummary = await requestTranslationContext(
+          pageText,
+          settings.targetLanguage || 'ru'
+        );
+      } catch (error) {
+        console.warn('Context generation failed, continuing without it.', error);
+      }
+    }
+  }
 
   const averageChunkLength = chunks.length ? Math.round(textStats.totalLength / chunks.length) : 0;
   const initialConcurrency = selectInitialConcurrency(averageChunkLength, chunks.length);
@@ -127,7 +148,7 @@ async function translatePage(settings) {
       const chunk = chunks[currentIndex];
       const preparedTexts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
-      const chunkContext = buildChunkContext(chunk);
+      const chunkTranslations = [];
 
       const startTime = performance.now();
       try {
@@ -135,14 +156,26 @@ async function translatePage(settings) {
           uniqueTexts,
           settings.targetLanguage || 'ru',
           settings.translationStyle,
-          chunkContext
+          latestContextSummary
         );
         chunk.forEach(({ node, path, original }, index) => {
           const translationIndex = indexMap[index];
           const translated = result.translations[translationIndex] || node.nodeValue;
           const withOriginalFormatting = applyOriginalFormatting(original, translated);
           node.nodeValue = withOriginalFormatting;
+          chunkTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting);
+        });
+        const debugEntry = {
+          index: currentIndex + 1,
+          original: formatChunkText(chunk.map(({ original }) => original)),
+          translated: formatChunkText(chunkTranslations)
+        };
+        debugEntries.push(debugEntry);
+        await saveTranslationDebugInfo(location.href, {
+          context: latestContextSummary,
+          items: debugEntries,
+          updatedAt: Date.now()
         });
       } catch (error) {
         console.error('Chunk translation failed', error);
@@ -195,6 +228,25 @@ async function translate(texts, targetLanguage, translationStyle, context) {
           resolve(response);
         } else {
           reject(new Error(response?.error || 'Не удалось выполнить перевод.'));
+        }
+      }
+    );
+  });
+}
+
+async function requestTranslationContext(text, targetLanguage) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        type: 'GENERATE_CONTEXT',
+        text,
+        targetLanguage
+      },
+      (response) => {
+        if (response?.success) {
+          resolve(response.context || '');
+        } else {
+          reject(new Error(response?.error || 'Не удалось сгенерировать контекст.'));
         }
       }
     );
@@ -367,19 +419,6 @@ function chunkBlocks(blocks, maxLength) {
   return chunks;
 }
 
-function buildChunkContext(chunk, maxLength = 500) {
-  const combined = chunk
-    .map(({ node }) => (node?.nodeValue || '').trim())
-    .filter(Boolean)
-    .join(' ');
-
-  const normalized = combined.replace(/\s+/g, ' ').trim();
-  if (!normalized) return '';
-
-  if (normalized.length <= maxLength) return normalized;
-  return normalized.slice(0, maxLength).trimEnd();
-}
-
 function splitOversizedBlock(block, maxLength) {
   const splits = [];
   let current = [];
@@ -398,6 +437,21 @@ function splitOversizedBlock(block, maxLength) {
 
   if (current.length) splits.push(current);
   return splits;
+}
+
+function buildPageText(nodesWithPath, maxLength) {
+  const combined = nodesWithPath
+    .map(({ node }) => node?.nodeValue || '')
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!combined) return '';
+  if (!maxLength || combined.length <= maxLength) return combined;
+  return combined.slice(0, maxLength).trimEnd();
+}
+
+function formatChunkText(texts) {
+  return texts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
 function reportProgress(message, completedChunks, totalChunks) {
@@ -541,10 +595,31 @@ async function clearStoredTranslations(url) {
   await chrome.storage.local.set({ [STORAGE_KEY]: existing });
 }
 
+async function saveTranslationDebugInfo(url, data) {
+  if (!url) return;
+  const existing = await getTranslationDebugObject();
+  existing[url] = data;
+  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+}
+
+async function clearTranslationDebugInfo(url) {
+  const existing = await getTranslationDebugObject();
+  delete existing[url];
+  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+}
+
 async function getTranslationsObject() {
   return new Promise((resolve) => {
     chrome.storage.local.get([STORAGE_KEY], (data) => {
       resolve(data?.[STORAGE_KEY] || {});
+    });
+  });
+}
+
+async function getTranslationDebugObject() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([DEBUG_STORAGE_KEY], (data) => {
+      resolve(data?.[DEBUG_STORAGE_KEY] || {});
     });
   });
 }
@@ -565,6 +640,7 @@ async function cancelTranslation() {
     restoreOriginal(entriesToRestore);
   }
   await clearStoredTranslations(location.href);
+  await clearTranslationDebugInfo(location.href);
   activeTranslationEntries = [];
   await setTranslationVisibility(false);
   reportProgress('Перевод отменён', translationProgress.completedChunks, translationProgress.totalChunks);
