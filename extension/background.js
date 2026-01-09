@@ -1,8 +1,7 @@
 const DEFAULT_STATE = {
   apiKey: '',
   model: 'gpt-4.1-mini',
-  translationStyle: 'natural',
-  contextGenerationEnabled: false
+  translationStyle: 'natural'
 };
 
 const PUNCTUATION_TOKENS = new Map([
@@ -42,11 +41,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === 'GENERATE_CONTEXT') {
-    handleGenerateContext(message, sendResponse);
-    return true;
-  }
-
   if (message?.type === 'CANCEL_PAGE_TRANSLATION' && sender?.tab?.id) {
     chrome.tabs.sendMessage(sender.tab.id, { type: 'CANCEL_TRANSLATION' });
   }
@@ -73,8 +67,7 @@ async function handleGetSettings(message, sendResponse) {
     allowed: !!state.apiKey,
     apiKey: state.apiKey,
     model: state.model,
-    translationStyle: state.translationStyle,
-    contextGenerationEnabled: state.contextGenerationEnabled
+    translationStyle: state.translationStyle
   });
 }
 
@@ -99,77 +92,6 @@ async function handleTranslateText(message, sendResponse) {
     console.error('Translation failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
   }
-}
-
-async function handleGenerateContext(message, sendResponse) {
-  try {
-    const state = await getState();
-    if (!state.apiKey) {
-      sendResponse({ success: false, error: 'API key is missing.' });
-      return;
-    }
-
-    const context = await generateTranslationContext(
-      message.text,
-      state.apiKey,
-      message.targetLanguage,
-      state.model
-    );
-    sendResponse({ success: true, context });
-  } catch (error) {
-    console.error('Context generation failed', error);
-    sendResponse({ success: false, error: error?.message || 'Unknown error' });
-  }
-}
-
-async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.model) {
-  if (!text?.trim()) return '';
-
-  const prompt = [
-    {
-      role: 'system',
-      content: [
-        'Ты помощник переводчика.',
-        `Составь краткое описание контекста исходного текста, чтобы улучшить перевод на ${targetLanguage}.`,
-        'Укажи место действия, персонажей и их имена, пол персонажей, названия мест и терминов, которые должны переводиться одинаково.',
-        'Если уместно, добавь отношения между персонажами и важные факты.',
-        'Ответ должен быть коротким, структурированным и без лишних деталей.'
-      ].join(' ')
-    },
-    {
-      role: 'user',
-      content: [
-        `Текст для анализа (полный текст страницы):`,
-        text,
-        'Ответ дай списком или короткими абзацами, без лишних предисловий.'
-      ].join('\n')
-    }
-  ];
-
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      messages: prompt
-    })
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Context request failed: ${response.status} ${errorText}`);
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('No context returned');
-  }
-
-  return typeof content === 'string' ? content.trim() : '';
 }
 
 async function translateTexts(
