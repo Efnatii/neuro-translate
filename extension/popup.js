@@ -1,6 +1,5 @@
 const apiKeyInput = document.getElementById('apiKey');
 const modelSelect = document.getElementById('model');
-const translationStyleSelect = document.getElementById('translationStyle');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const statusLabel = document.getElementById('status');
 
@@ -12,13 +11,6 @@ const openDebugButton = document.getElementById('openDebug');
 let keySaveTimeout = null;
 let activeTabId = null;
 let translationVisible = false;
-
-const translationStyles = [
-  { id: 'natural', name: 'Естественный' },
-  { id: 'conversational', name: 'Разговорный' },
-  { id: 'formal', name: 'Деловой' },
-  { id: 'creative', name: 'Выразительный' }
-];
 
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.45 },
@@ -76,7 +68,6 @@ async function init() {
   const state = await getState();
   apiKeyInput.value = state.apiKey || '';
   renderModelOptions(state.model);
-  renderStyleOptions(state.translationStyle);
   renderContextGeneration(state.contextGenerationEnabled);
   renderTranslationStatus(state.translationStatusByTab?.[activeTabId]);
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
@@ -85,7 +76,6 @@ async function init() {
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   modelSelect.addEventListener('change', handleModelChange);
-  translationStyleSelect.addEventListener('change', handleTranslationStyleChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
@@ -108,12 +98,6 @@ async function handleModelChange() {
   statusLabel.textContent = 'Модель сохранена.';
 }
 
-async function handleTranslationStyleChange() {
-  const translationStyle = translationStyleSelect.value;
-  await chrome.storage.local.set({ translationStyle });
-  statusLabel.textContent = 'Стиль перевода сохранён.';
-}
-
 async function handleContextGenerationChange() {
   const contextGenerationEnabled = contextGenerationCheckbox.checked;
   await chrome.storage.local.set({ contextGenerationEnabled });
@@ -128,7 +112,6 @@ async function getState() {
       [
         'apiKey',
         'model',
-        'translationStyle',
         'contextGenerationEnabled',
         'translationStatusByTab',
         'translationVisibilityByTab'
@@ -137,7 +120,6 @@ async function getState() {
       resolve({
         apiKey: data.apiKey || '',
         model: data.model,
-        translationStyle: data.translationStyle,
         contextGenerationEnabled: data.contextGenerationEnabled,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {}
@@ -158,21 +140,6 @@ function renderModelOptions(selected) {
     option.textContent = `${model.name} ($${model.price}/1M токенов)`;
     option.selected = model.id === currentModel;
     modelSelect.appendChild(option);
-  });
-}
-
-function renderStyleOptions(selected) {
-  const defaultStyle = translationStyles[0]?.id;
-  const currentStyle = selected || defaultStyle;
-
-  translationStyleSelect.innerHTML = '';
-
-  translationStyles.forEach((style) => {
-    const option = document.createElement('option');
-    option.value = style.id;
-    option.textContent = style.name;
-    option.selected = style.id === currentStyle;
-    translationStyleSelect.appendChild(option);
   });
 }
 

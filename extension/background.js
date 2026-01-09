@@ -1,7 +1,7 @@
 const DEFAULT_STATE = {
   apiKey: '',
   model: 'gpt-4.1-mini',
-  translationStyle: 'natural',
+  translationStyle: 'auto',
   contextGenerationEnabled: false
 };
 
@@ -17,7 +17,11 @@ const PUNCTUATION_TOKEN_HINT = 'Tokens like ⟦PUNC_DQUOTE⟧ replace double quo
 
 async function getState() {
   const stored = await chrome.storage.local.get(DEFAULT_STATE);
-  return { ...DEFAULT_STATE, ...stored };
+  const merged = { ...DEFAULT_STATE, ...stored };
+  if (merged.translationStyle !== 'auto') {
+    merged.translationStyle = 'auto';
+  }
+  return merged;
 }
 
 async function saveState(partial) {
@@ -129,19 +133,69 @@ async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', m
     {
       role: 'system',
       content: [
-        'Ты помощник переводчика.',
-        `Составь краткое описание контекста исходного текста, чтобы улучшить перевод на ${targetLanguage}.`,
-        'Укажи место действия, персонажей и их имена, пол персонажей, названия мест и терминов, которые должны переводиться одинаково.',
-        'Если уместно, добавь отношения между персонажами и важные факты.',
-        'Ответ должен быть коротким, структурированным и без лишних деталей.'
+        'Ты — ассистент переводчика. Составь контекст для качественного перевода.',
+        'Не пересказывай текст, не оценивай и не добавляй факты вне источника.',
+        'Если информации нет, укажи "не указано".',
+        'Фокусируйся на деталях, влияющих на точность, единообразие терминов, стиль и смысл.',
+        'Ответ должен быть структурированным и лаконичным.'
       ].join(' ')
     },
     {
       role: 'user',
       content: [
-        `Текст для анализа (полный текст страницы):`,
+        `Проанализируй исходный текст и составь контекст для перевода на ${targetLanguage}.`,
+        'Нужны максимально полезные детали для переводчика.',
+        'Формат — строго по разделам ниже (кратко, пунктами).',
+        '',
+        '1) Тип текста и назначение:',
+        '- жанр/домен (художественный, техдок, маркетинг, UI, новости и т.п.)',
+        '- цель (информировать, убедить, инструктировать, описать, продать и т.п.)',
+        '- предполагаемая аудитория (если явно видно)',
+        '',
+        '2) Сеттинг:',
+        '- место действия, география, организации/локации (если указано)',
+        '- время/эпоха/период (если указано)',
+        '',
+        '3) Участники/персонажи:',
+        '- имена/роли/должности',
+        '- пол/род/местоимения (если явно указано)',
+        '- говорящие/адресаты (кто кому говорит)',
+        '',
+        '4) Отношения и социальные связи:',
+        '- отношения между персонажами (если явно есть)',
+        '- статус/иерархия (начальник‑подчинённый, клиент‑служба поддержки и т.п.)',
+        '',
+        '5) Сюжетные/фактологические опорные точки:',
+        '- ключевые события/факты, которые нельзя исказить',
+        '',
+        '6) Терминология и единообразие:',
+        '- термины/понятия/аббревиатуры, которые должны переводиться одинаково',
+        '- рекомендуемые варианты перевода, если явно вытекают из контекста',
+        '- что нельзя переводить или что оставлять как есть',
+        '',
+        '7) Собственные имена и ономастика:',
+        '- имена, бренды, продукты, организации, топонимы',
+        '- как передавать: перевод/транслитерация/оставить как есть',
+        '',
+        '8) Тональность и стиль:',
+        '- официальный/разговорный/нейтральный/художественный/ирония и т.п.',
+        '- уровень формальности и вежливости (ты/вы, обращения)',
+        '',
+        '9) Лингвистические особенности:',
+        '- сленг, жаргон, диалект, архаизмы',
+        '- игра слов/идиомы (если есть)',
+        '- цитаты/цитируемая речь',
+        '',
+        '10) Формат и технические требования:',
+        '- единицы измерения, валюты, даты, форматы',
+        '- требования к краткости/структуре',
+        '- повторяющиеся шаблоны/плейсхолдеры (если есть)',
+        '',
+        'Текст:',
         text,
-        'Ответ дай списком или короткими абзацами, без лишних предисловий.'
+        '',
+        'Выводи только разделы с краткими пунктами.',
+        'Если раздел не заполнен — напиши "не указано".'
       ].join('\n')
     }
   ];
@@ -240,8 +294,8 @@ async function performTranslationRequest(
     creative: 'Выразительный и образный тон, но без потери смысла.'
   };
 
-  const styleInstruction =
-    styleHints?.[translationStyle] || styleHints.natural;
+  const isAutoStyle = translationStyle === 'auto';
+  const styleInstruction = isAutoStyle ? null : styleHints?.[translationStyle] || styleHints.natural;
 
   const prompt = [
     {
@@ -250,7 +304,7 @@ async function performTranslationRequest(
         'You are a fluent Russian translator.',
         `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
         PUNCTUATION_TOKEN_HINT,
-        `Tone/style: ${styleInstruction}`,
+        styleInstruction ? `Tone/style: ${styleInstruction}` : 'Determine the most appropriate tone/style based on the provided context.',
         context ? `Use this page context to disambiguate phrasing: ${context}` : '',
         'Respond only with translations in the same order, one per line, without numbering or commentary.'
       ]
@@ -261,7 +315,7 @@ async function performTranslationRequest(
       role: 'user',
       content: [
         `Переведи следующие фрагменты на ${targetLanguage}.`,
-        `Стиль: ${styleInstruction}`,
+        styleInstruction ? `Стиль: ${styleInstruction}` : 'Определи стиль автоматически на основе контекста.',
         context ? `Контекст страницы: ${context}` : '',
         `Пожалуйста, не изменяй служебные токены пунктуации. ${PUNCTUATION_TOKEN_HINT}`,
         'Фрагменты для перевода:',
