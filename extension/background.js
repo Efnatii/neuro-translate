@@ -156,7 +156,8 @@ async function handleTranslateText(message, sendResponse) {
       state.translationModel,
       message.translationStyle || state.translationStyle,
       message.context,
-      apiBaseUrl
+      apiBaseUrl,
+      message.keepPunctuationTokens
     );
     sendResponse({ success: true, translations });
   } catch (error) {
@@ -363,6 +364,7 @@ async function proofreadTranslation(
         'Never add commentary, explanations, or extra keys.',
         'Only fix clear errors: grammar, agreement, punctuation, typo, or terminology consistency.',
         'Do not paraphrase or change meaning. Do not reorder sentences.',
+        PUNCTUATION_TOKEN_HINT,
         'If no corrections are needed, return an empty JSON array: [].'
       ].join(' ')
     },
@@ -441,7 +443,8 @@ async function translateTexts(
   model = DEFAULT_STATE.translationModel,
   translationStyle = DEFAULT_STATE.translationStyle,
   context = '',
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  keepPunctuationTokens = false
 ) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
@@ -467,7 +470,8 @@ async function translateTexts(
         translationStyle,
         controller.signal,
         context,
-        apiBaseUrl
+        apiBaseUrl,
+        !keepPunctuationTokens
       );
     } catch (error) {
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
@@ -499,7 +503,8 @@ async function translateTexts(
           model,
           translationStyle,
           context,
-          apiBaseUrl
+          apiBaseUrl,
+          keepPunctuationTokens
         );
       }
 
@@ -525,7 +530,8 @@ async function performTranslationRequest(
   translationStyle,
   signal,
   context = '',
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  restorePunctuation = true
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const styleHints = {
@@ -614,7 +620,7 @@ async function performTranslationRequest(
   return texts.map((text, index) => {
     const candidate = parsed[index];
     if (typeof candidate === 'string' && candidate.trim()) {
-      return restorePunctuationTokens(candidate);
+      return restorePunctuation ? restorePunctuationTokens(candidate) : candidate;
     }
     return text;
   });
@@ -671,7 +677,8 @@ async function translateIndividually(
   model,
   translationStyle,
   context = '',
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  keepPunctuationTokens = false
 ) {
   const results = [];
 
@@ -685,7 +692,8 @@ async function translateIndividually(
         translationStyle,
         undefined,
         context,
-        apiBaseUrl
+        apiBaseUrl,
+        !keepPunctuationTokens
       );
       results.push(translated);
     } catch (error) {
