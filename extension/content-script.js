@@ -16,6 +16,13 @@ let debugEntries = [];
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const PUNCTUATION_TOKENS = new Map([
+  ['«', '⟦PUNC_LGUILLEMET⟧'],
+  ['»', '⟦PUNC_RGUILLEMET⟧'],
+  ['“', '⟦PUNC_LDQUOTE⟧'],
+  ['”', '⟦PUNC_RDQUOTE⟧'],
+  ['"', '⟦PUNC_DQUOTE⟧']
+]);
 
 restoreFromMemory();
 
@@ -163,11 +170,13 @@ async function translatePage(settings) {
 
       const startTime = performance.now();
       try {
+        const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
         const result = await translate(
           uniqueTexts,
           settings.targetLanguage || 'ru',
           settings.translationStyle,
-          latestContextSummary
+          latestContextSummary,
+          keepPunctuationTokens
         );
         const translatedTexts = chunk.map(({ node, original }, index) => {
           const translationIndex = indexMap[index];
@@ -188,6 +197,10 @@ async function translatePage(settings) {
           } catch (error) {
             console.warn('Proofreading failed, keeping original translations.', error);
           }
+        }
+
+        if (keepPunctuationTokens) {
+          finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
         }
 
         chunk.forEach(({ node, path, original }, index) => {
@@ -245,7 +258,7 @@ async function translatePage(settings) {
   await setTranslationVisibility(true);
 }
 
-async function translate(texts, targetLanguage, translationStyle, context) {
+async function translate(texts, targetLanguage, translationStyle, context, keepPunctuationTokens = false) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -253,7 +266,8 @@ async function translate(texts, targetLanguage, translationStyle, context) {
         texts,
         targetLanguage,
         translationStyle,
-        context
+        context,
+        keepPunctuationTokens
       },
       (response) => {
         if (response?.success) {
@@ -296,6 +310,14 @@ function applyProofreadingReplacements(texts, replacements) {
     });
     return result;
   });
+}
+
+function restorePunctuationTokens(text = '') {
+  let output = text;
+  for (const [punctuation, token] of PUNCTUATION_TOKENS.entries()) {
+    output = output.split(token).join(punctuation);
+  }
+  return output;
 }
 
 async function requestTranslationContext(text, targetLanguage) {
