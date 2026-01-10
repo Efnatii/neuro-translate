@@ -159,6 +159,7 @@ async function translatePage(settings) {
       const preparedTexts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
       const chunkTranslations = [];
+      let proofreadReplacements = [];
 
       const startTime = performance.now();
       try {
@@ -168,10 +169,29 @@ async function translatePage(settings) {
           settings.translationStyle,
           latestContextSummary
         );
-        chunk.forEach(({ node, path, original }, index) => {
+        const translatedTexts = chunk.map(({ node, original }, index) => {
           const translationIndex = indexMap[index];
           const translated = result.translations[translationIndex] || node.nodeValue;
-          const withOriginalFormatting = applyOriginalFormatting(original, translated);
+          return applyOriginalFormatting(original, translated);
+        });
+
+        let finalTranslations = translatedTexts;
+        if (settings.proofreadEnabled) {
+          try {
+            proofreadReplacements = await requestProofreading(
+              translatedTexts,
+              settings.targetLanguage || 'ru'
+            );
+            if (proofreadReplacements.length) {
+              finalTranslations = applyProofreadingReplacements(translatedTexts, proofreadReplacements);
+            }
+          } catch (error) {
+            console.warn('Proofreading failed, keeping original translations.', error);
+          }
+        }
+
+        chunk.forEach(({ node, path, original }, index) => {
+          const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
           node.nodeValue = withOriginalFormatting;
           chunkTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting);
@@ -179,7 +199,9 @@ async function translatePage(settings) {
         const debugEntry = {
           index: currentIndex + 1,
           original: formatChunkText(chunk.map(({ original }) => original)),
-          translated: formatChunkText(chunkTranslations)
+          translated: formatChunkText(chunkTranslations),
+          proofread: proofreadReplacements,
+          proofreadApplied: Boolean(settings.proofreadEnabled)
         };
         debugEntries.push(debugEntry);
         await saveTranslationDebugInfo(location.href, {
@@ -241,6 +263,38 @@ async function translate(texts, targetLanguage, translationStyle, context) {
         }
       }
     );
+  });
+}
+
+async function requestProofreading(texts, targetLanguage) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        type: 'PROOFREAD_TEXT',
+        texts,
+        targetLanguage
+      },
+      (response) => {
+        if (response?.success) {
+          resolve(Array.isArray(response.replacements) ? response.replacements : []);
+        } else {
+          reject(new Error(response?.error || 'Не удалось выполнить вычитку.'));
+        }
+      }
+    );
+  });
+}
+
+function applyProofreadingReplacements(texts, replacements) {
+  return texts.map((text) => {
+    let result = text;
+    replacements.forEach((replacement) => {
+      if (!replacement?.from) return;
+      const from = replacement.from;
+      const to = replacement.to ?? '';
+      result = result.split(from).join(to);
+    });
+    return result;
   });
 }
 

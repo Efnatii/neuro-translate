@@ -2,7 +2,9 @@ const apiKeyInput = document.getElementById('apiKey');
 const deepseekApiKeyInput = document.getElementById('deepseekApiKey');
 const translationModelSelect = document.getElementById('translationModel');
 const contextModelSelect = document.getElementById('contextModel');
+const proofreadModelSelect = document.getElementById('proofreadModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
+const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
 const statusLabel = document.getElementById('status');
 
 const cancelButton = document.getElementById('cancel');
@@ -18,6 +20,7 @@ let currentTranslationStatus = null;
 let currentThroughputInfo = null;
 let currentTranslationModelId = null;
 let currentContextModelId = null;
+let currentProofreadModelId = null;
 let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
 
@@ -51,10 +54,13 @@ async function init() {
   deepseekApiKeyInput.value = state.deepseekApiKey || '';
   renderModelOptions(translationModelSelect, state.translationModel);
   renderModelOptions(contextModelSelect, state.contextModel);
+  renderModelOptions(proofreadModelSelect, state.proofreadModel);
   currentTranslationModelId = translationModelSelect.value;
   currentContextModelId = contextModelSelect.value;
+  currentProofreadModelId = proofreadModelSelect.value;
   currentThroughputInfo = state.modelThroughputById?.[currentTranslationModelId] || null;
   renderContextGeneration(state.contextGenerationEnabled);
+  renderProofreadEnabled(state.proofreadEnabled);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   renderStatus();
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
@@ -65,7 +71,9 @@ async function init() {
   deepseekApiKeyInput.addEventListener('input', handleDeepseekApiKeyChange);
   translationModelSelect.addEventListener('change', handleTranslationModelChange);
   contextModelSelect.addEventListener('change', handleContextModelChange);
+  proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
+  proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
   toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
@@ -108,12 +116,25 @@ async function handleContextModelChange() {
   setTemporaryStatus('Модель для контекста сохранена.');
 }
 
+async function handleProofreadModelChange() {
+  const proofreadModel = proofreadModelSelect.value;
+  await chrome.storage.local.set({ proofreadModel });
+  currentProofreadModelId = proofreadModel;
+  setTemporaryStatus('Модель для вычитки сохранена.');
+}
+
 async function handleContextGenerationChange() {
   const contextGenerationEnabled = contextGenerationCheckbox.checked;
   await chrome.storage.local.set({ contextGenerationEnabled });
   setTemporaryStatus(
     contextGenerationEnabled ? 'Генерация контекста включена.' : 'Генерация контекста отключена.'
   );
+}
+
+async function handleProofreadEnabledChange() {
+  const proofreadEnabled = proofreadEnabledCheckbox.checked;
+  await chrome.storage.local.set({ proofreadEnabled });
+  setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
 async function getState() {
@@ -125,7 +146,9 @@ async function getState() {
         'deepseekApiKey',
         'translationModel',
         'contextModel',
+        'proofreadModel',
         'contextGenerationEnabled',
+        'proofreadEnabled',
         'translationStatusByTab',
         'translationVisibilityByTab',
         'modelThroughputById'
@@ -136,7 +159,9 @@ async function getState() {
         deepseekApiKey: data.deepseekApiKey || '',
         translationModel: data.translationModel || data.model,
         contextModel: data.contextModel || data.model,
+        proofreadModel: data.proofreadModel || data.model,
         contextGenerationEnabled: data.contextGenerationEnabled,
+        proofreadEnabled: data.proofreadEnabled,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {},
         modelThroughputById: data.modelThroughputById || {}
@@ -162,6 +187,10 @@ function renderModelOptions(select, selected) {
 
 function renderContextGeneration(enabled) {
   contextGenerationCheckbox.checked = Boolean(enabled);
+}
+
+function renderProofreadEnabled(enabled) {
+  proofreadEnabledCheckbox.checked = Boolean(enabled);
 }
 
 function runModelThroughputTest(model) {

@@ -3,8 +3,10 @@ const DEFAULT_STATE = {
   deepseekApiKey: '',
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
+  proofreadModel: 'gpt-4.1-mini',
   translationStyle: 'auto',
-  contextGenerationEnabled: false
+  contextGenerationEnabled: false,
+  proofreadEnabled: false
 };
 
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
@@ -85,6 +87,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'PROOFREAD_TEXT') {
+    handleProofreadText(message, sendResponse);
+    return true;
+  }
+
   if (message?.type === 'RUN_MODEL_THROUGHPUT_TEST') {
     handleModelThroughputTest(message, sendResponse);
     return true;
@@ -114,15 +121,22 @@ async function handleGetSettings(message, sendResponse) {
   const state = await getState();
   const translationConfig = getApiConfigForModel(state.translationModel, state);
   const contextConfig = getApiConfigForModel(state.contextModel, state);
+  const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
   const hasTranslationKey = Boolean(translationConfig.apiKey);
   const hasContextKey = Boolean(contextConfig.apiKey);
+  const hasProofreadKey = Boolean(proofreadConfig.apiKey);
   sendResponse({
-    allowed: hasTranslationKey && (!state.contextGenerationEnabled || hasContextKey),
+    allowed:
+      hasTranslationKey &&
+      (!state.contextGenerationEnabled || hasContextKey) &&
+      (!state.proofreadEnabled || hasProofreadKey),
     apiKey: state.apiKey,
     translationModel: state.translationModel,
     contextModel: state.contextModel,
+    proofreadModel: state.proofreadModel,
     translationStyle: state.translationStyle,
-    contextGenerationEnabled: state.contextGenerationEnabled
+    contextGenerationEnabled: state.contextGenerationEnabled,
+    proofreadEnabled: state.proofreadEnabled
   });
 }
 
@@ -170,6 +184,29 @@ async function handleGenerateContext(message, sendResponse) {
     sendResponse({ success: true, context });
   } catch (error) {
     console.error('Context generation failed', error);
+    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+  }
+}
+
+async function handleProofreadText(message, sendResponse) {
+  try {
+    const state = await getState();
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.proofreadModel, state);
+    if (!apiKey) {
+      sendResponse({ success: false, error: 'API key is missing.' });
+      return;
+    }
+
+    const replacements = await proofreadTranslation(
+      message.texts,
+      apiKey,
+      message.targetLanguage,
+      state.proofreadModel,
+      apiBaseUrl
+    );
+    sendResponse({ success: true, replacements });
+  } catch (error) {
+    console.error('Proofreading failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
   }
 }
@@ -305,6 +342,78 @@ async function generateTranslationContext(
   }
 
   return typeof content === 'string' ? content.trim() : '';
+}
+
+async function proofreadTranslation(
+  texts,
+  apiKey,
+  targetLanguage = 'ru',
+  model = DEFAULT_STATE.proofreadModel,
+  apiBaseUrl = OPENAI_API_URL
+) {
+  if (!Array.isArray(texts) || !texts.length) return [];
+
+  const prompt = [
+    {
+      role: 'system',
+      content: [
+        'You are a strict proofreading engine for translated text.',
+        'Return only a JSON array of objects with "from" and "to" fields.',
+        'Each object describes an exact substring to replace ("from") and the replacement ("to").',
+        'Never add commentary, explanations, or extra keys.',
+        'Only fix clear errors: grammar, agreement, punctuation, typo, or terminology consistency.',
+        'Do not paraphrase or change meaning. Do not reorder sentences.',
+        'If no corrections are needed, return an empty JSON array: [].'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: [
+        `Target language: ${targetLanguage}.`,
+        'Review the translated text below and return only the JSON array of replacements.',
+        'Translated text:',
+        ...texts.map((text) => text)
+      ].join('\n')
+    }
+  ];
+
+  const response = await fetch(apiBaseUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model,
+      messages: prompt
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Proofread request failed: ${response.status} ${errorText}`);
+  }
+
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('No proofreading result returned');
+  }
+
+  const parsed = safeParseArray(content, null);
+  if (!Array.isArray(parsed)) {
+    throw new Error('Unexpected proofreading format');
+  }
+
+  return parsed
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const from = typeof item.from === 'string' ? item.from : '';
+      const to = typeof item.to === 'string' ? item.to : '';
+      if (!from) return null;
+      return { from, to };
+    })
+    .filter(Boolean);
 }
 
 async function getModelThroughputInfo(model) {
