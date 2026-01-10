@@ -46,6 +46,24 @@
       flex-direction: column;
       gap: 10px;
     }
+    details.section {
+      gap: 8px;
+    }
+    details.section > summary {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+    }
+    details.section > summary::-webkit-details-marker {
+      display: none;
+    }
+    .details-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
     label {
       display: flex;
       flex-direction: column;
@@ -163,11 +181,20 @@
       <h3 class="title">Neuro Translate</h3>
       <p class="subtitle">Быстрая настройка перевода и контекста</p>
     </div>
+    <details class="section" id="apiKeys">
+      <summary>API ключи</summary>
+      <div class="details-body">
+        <label>
+          OpenAI API ключ
+          <input type="password" id="apiKey" placeholder="Введите API-ключ OpenAI" autocomplete="off" />
+        </label>
+        <label>
+          DeepSeek API ключ
+          <input type="password" id="deepseekApiKey" placeholder="Введите API-ключ DeepSeek" autocomplete="off" />
+        </label>
+      </div>
+    </details>
     <div class="section">
-      <label>
-        API ключ
-        <input type="password" id="apiKey" placeholder="Введите API-ключ GPT-5-Nano" autocomplete="off" />
-      </label>
       <label>
         Модель для перевода
         <select id="translationModel"></select>

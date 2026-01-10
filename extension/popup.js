@@ -1,4 +1,5 @@
 const apiKeyInput = document.getElementById('apiKey');
+const deepseekApiKeyInput = document.getElementById('deepseekApiKey');
 const translationModelSelect = document.getElementById('translationModel');
 const contextModelSelect = document.getElementById('contextModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
@@ -10,6 +11,7 @@ const toggleTranslationButton = document.getElementById('toggleTranslation');
 const openDebugButton = document.getElementById('openDebug');
 
 let keySaveTimeout = null;
+let deepseekKeySaveTimeout = null;
 let activeTabId = null;
 let translationVisible = false;
 let currentTranslationStatus = null;
@@ -24,6 +26,8 @@ const models = [
   { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', price: 0.5 },
   { id: 'gpt-4o-mini', name: 'GPT-4o Mini', price: 0.75 },
   { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', price: 2 },
+  { id: 'deepseek-chat', name: 'DeepSeek Chat', price: 0.7 },
+  { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', price: 0.7 },
   { id: 'gpt-5-mini', name: 'GPT-5 Mini', price: 2.25 },
   { id: 'gpt-4.1', name: 'GPT-4.1', price: 10 },
   { id: 'gpt-5.1', name: 'GPT-5.1', price: 11.25 },
@@ -44,6 +48,7 @@ async function init() {
 
   const state = await getState();
   apiKeyInput.value = state.apiKey || '';
+  deepseekApiKeyInput.value = state.deepseekApiKey || '';
   renderModelOptions(translationModelSelect, state.translationModel);
   renderModelOptions(contextModelSelect, state.contextModel);
   currentTranslationModelId = translationModelSelect.value;
@@ -57,6 +62,7 @@ async function init() {
   chrome.storage.onChanged.addListener(handleStorageChange);
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
+  deepseekApiKeyInput.addEventListener('input', handleDeepseekApiKeyChange);
   translationModelSelect.addEventListener('change', handleTranslationModelChange);
   contextModelSelect.addEventListener('change', handleContextModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
@@ -72,6 +78,15 @@ function handleApiKeyChange() {
   keySaveTimeout = setTimeout(async () => {
     await chrome.storage.local.set({ apiKey });
     setTemporaryStatus('API ключ сохранён.');
+  }, 300);
+}
+
+function handleDeepseekApiKeyChange() {
+  clearTimeout(deepseekKeySaveTimeout);
+  const deepseekApiKey = deepseekApiKeyInput.value.trim();
+  deepseekKeySaveTimeout = setTimeout(async () => {
+    await chrome.storage.local.set({ deepseekApiKey });
+    setTemporaryStatus('DeepSeek ключ сохранён.');
   }, 300);
 }
 
@@ -107,6 +122,7 @@ async function getState() {
       [
         'apiKey',
         'model',
+        'deepseekApiKey',
         'translationModel',
         'contextModel',
         'contextGenerationEnabled',
@@ -117,6 +133,7 @@ async function getState() {
       (data) => {
       resolve({
         apiKey: data.apiKey || '',
+        deepseekApiKey: data.deepseekApiKey || '',
         translationModel: data.translationModel || data.model,
         contextModel: data.contextModel || data.model,
         contextGenerationEnabled: data.contextGenerationEnabled,
