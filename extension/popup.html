@@ -5,50 +5,245 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Neuro Translate</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 12px; min-width: 320px; }
-    label { display: block; margin-top: 8px; }
-    input[type="text"], input[type="password"] { width: 100%; box-sizing: border-box; padding: 6px; }
-    button { margin-top: 8px; padding: 6px 10px; }
-    .row {
+    :root {
+      color-scheme: light;
+      --text-primary: #1f2937;
+      --text-secondary: #4b5563;
+      --text-muted: #6b7280;
+      --border: #9ca3af;
+      --surface: #ffffff;
+    }
+    body {
+      font-family: "Inter", "Segoe UI", Arial, sans-serif;
+      margin: 12px;
+      min-width: 320px;
+      color: var(--text-primary);
+      background: var(--surface);
+    }
+    .card {
       display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .header {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .title {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .subtitle {
+      margin: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    select,
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      background: var(--surface);
+      font-size: 13px;
+    }
+    .toggle {
+      flex-direction: row;
+      align-items: center;
       gap: 8px;
-      flex-wrap: wrap;
-      align-items: stretch;
+      font-size: 12px;
     }
-    .row button {
-      flex: 1;
-      min-width: 0;
+    .toggle input {
+      margin: 0;
     }
-    .status { margin-top: 8px; color: #555; font-size: 12px; white-space: pre-line; }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+      gap: 8px;
+    }
+    button {
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid var(--text-primary);
+      background: var(--surface);
+      color: var(--text-primary);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.2s ease, color 0.2s ease;
+    }
+    button:hover {
+      background: var(--text-primary);
+      color: var(--surface);
+    }
+    button:active {
+      transform: translateY(1px);
+    }
+    .secondary-row button {
+      border-color: var(--border);
+      color: var(--text-secondary);
+    }
+    .secondary-row button:hover {
+      background: var(--text-secondary);
+      color: var(--surface);
+    }
+    .icon-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 44px;
+      gap: 6px;
+    }
+    .icon {
+      width: 18px;
+      height: 18px;
+      display: inline-flex;
+    }
+    .icon svg {
+      width: 100%;
+      height: 100%;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .icon-pressed {
+      display: none;
+    }
+    button[aria-pressed="true"] .icon-default {
+      display: none;
+    }
+    button[aria-pressed="true"] .icon-pressed {
+      display: inline-flex;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      border: 0;
+    }
+    .status {
+      margin: 0;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px dashed var(--border);
+      color: var(--text-muted);
+      font-size: 12px;
+      white-space: pre-line;
+      min-height: 18px;
+    }
   </style>
 </head>
 <body>
-  <h3>Neuro Translate</h3>
-  <label>
-    API ключ
-    <input type="password" id="apiKey" placeholder="Введите API-ключ GPT-5-Nano" autocomplete="off" />
-  </label>
-  <label>
-    Модель для перевода
-    <select id="translationModel"></select>
-  </label>
-  <label>
-    Модель для контекста
-    <select id="contextModel"></select>
-  </label>
-  <label>
-    <input type="checkbox" id="contextGeneration" />
-    Генерировать контекст перед переводом
-  </label>
-  <div class="row">
-    <button id="translate">Перевести страницу</button>
-    <button id="toggleTranslation" aria-pressed="false">Показать перевод</button>
-    <button id="cancel">Отменить перевод</button>
+  <div class="card">
+    <div class="header">
+      <h3 class="title">Neuro Translate</h3>
+      <p class="subtitle">Быстрая настройка перевода и контекста</p>
+    </div>
+    <div class="section">
+      <label>
+        API ключ
+        <input type="password" id="apiKey" placeholder="Введите API-ключ GPT-5-Nano" autocomplete="off" />
+      </label>
+      <label>
+        Модель для перевода
+        <select id="translationModel"></select>
+      </label>
+      <label>
+        Модель для контекста
+        <select id="contextModel"></select>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="contextGeneration" />
+        Генерировать контекст перед переводом
+      </label>
+    </div>
+    <div class="section">
+      <div class="row">
+        <button class="icon-button" id="translate" aria-label="Перевести страницу" title="Перевести страницу">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9"></circle>
+              <path d="M3 12h18"></path>
+              <path d="M12 3a15 15 0 0 1 0 18"></path>
+              <path d="M12 3a15 15 0 0 0 0 18"></path>
+            </svg>
+          </span>
+          <span class="sr-only">Перевести страницу</span>
+        </button>
+        <button class="icon-button" id="toggleTranslation" aria-pressed="false" aria-label="Показать перевод" title="Показать перевод">
+          <span class="icon icon-default" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M4 7h10"></path>
+              <path d="M4 7l3-3"></path>
+              <path d="M4 7l3 3"></path>
+              <path d="M20 17H10"></path>
+              <path d="M20 17l-3-3"></path>
+              <path d="M20 17l-3 3"></path>
+              <circle cx="17" cy="7" r="2"></circle>
+            </svg>
+          </span>
+          <span class="icon icon-pressed" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M20 7H10"></path>
+              <path d="M20 7l-3-3"></path>
+              <path d="M20 7l-3 3"></path>
+              <path d="M4 17h10"></path>
+              <path d="M4 17l3-3"></path>
+              <path d="M4 17l3 3"></path>
+              <circle cx="7" cy="17" r="2"></circle>
+            </svg>
+          </span>
+          <span class="sr-only">Показать перевод</span>
+        </button>
+        <button class="icon-button" id="cancel" aria-label="Отменить перевод" title="Отменить перевод">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="7" y="7" width="10" height="10" rx="1"></rect>
+            </svg>
+          </span>
+          <span class="sr-only">Отменить перевод</span>
+        </button>
+      </div>
+      <div class="row secondary-row">
+        <button class="icon-button" id="openDebug" aria-label="Открыть отладку перевода" title="Открыть отладку перевода">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M14 7a4 4 0 1 0-4 4"></path>
+              <path d="M2 20l6-6"></path>
+              <path d="M13 11l5 5"></path>
+              <path d="M18 16l4-4"></path>
+            </svg>
+          </span>
+          <span class="sr-only">Открыть отладку перевода</span>
+        </button>
+      </div>
+    </div>
+    <p class="status" id="status"></p>
   </div>
-  <div class="row">
-    <button id="openDebug">Открыть отладку перевода</button>
-  </div>
-  <p class="status" id="status"></p>
   <script src="popup.js"></script>
 </body>
 </html>

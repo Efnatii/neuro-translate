@@ -325,8 +325,14 @@ function renderTranslationVisibility(visible) {
 
 function updateTranslationVisibility(visible) {
   translationVisible = visible;
-  toggleTranslationButton.textContent = translationVisible ? 'Показать оригинал' : 'Показать перевод';
+  const label = translationVisible ? 'Показать оригинал' : 'Показать перевод';
+  const labelNode = toggleTranslationButton.querySelector('.sr-only');
+  if (labelNode) {
+    labelNode.textContent = label;
+  }
   toggleTranslationButton.setAttribute('aria-pressed', translationVisible ? 'true' : 'false');
+  toggleTranslationButton.setAttribute('aria-label', label);
+  toggleTranslationButton.title = label;
 }
 
 async function updateTranslationVisibilityStorage(visible) {
