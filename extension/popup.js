@@ -1,5 +1,6 @@
 const apiKeyInput = document.getElementById('apiKey');
-const modelSelect = document.getElementById('model');
+const translationModelSelect = document.getElementById('translationModel');
+const contextModelSelect = document.getElementById('contextModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const statusLabel = document.getElementById('status');
 
@@ -13,7 +14,8 @@ let activeTabId = null;
 let translationVisible = false;
 let currentTranslationStatus = null;
 let currentThroughputInfo = null;
-let currentModelId = null;
+let currentTranslationModelId = null;
+let currentContextModelId = null;
 let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
 
@@ -42,9 +44,11 @@ async function init() {
 
   const state = await getState();
   apiKeyInput.value = state.apiKey || '';
-  renderModelOptions(state.model);
-  currentModelId = modelSelect.value;
-  currentThroughputInfo = state.modelThroughputById?.[currentModelId] || null;
+  renderModelOptions(translationModelSelect, state.translationModel);
+  renderModelOptions(contextModelSelect, state.contextModel);
+  currentTranslationModelId = translationModelSelect.value;
+  currentContextModelId = contextModelSelect.value;
+  currentThroughputInfo = state.modelThroughputById?.[currentTranslationModelId] || null;
   renderContextGeneration(state.contextGenerationEnabled);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   renderStatus();
@@ -53,7 +57,8 @@ async function init() {
   chrome.storage.onChanged.addListener(handleStorageChange);
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
-  modelSelect.addEventListener('change', handleModelChange);
+  translationModelSelect.addEventListener('change', handleTranslationModelChange);
+  contextModelSelect.addEventListener('change', handleContextModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
@@ -70,15 +75,22 @@ function handleApiKeyChange() {
   }, 300);
 }
 
-async function handleModelChange() {
-  const model = modelSelect.value;
-  await chrome.storage.local.set({ model });
-  currentModelId = model;
+async function handleTranslationModelChange() {
+  const translationModel = translationModelSelect.value;
+  await chrome.storage.local.set({ translationModel });
+  currentTranslationModelId = translationModel;
   const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
-  currentThroughputInfo = modelThroughputById[model] || null;
+  currentThroughputInfo = modelThroughputById[translationModel] || null;
   renderStatus();
-  setTemporaryStatus('Модель сохранена.');
-  runModelThroughputTest(model);
+  setTemporaryStatus('Модель для перевода сохранена.');
+  runModelThroughputTest(translationModel);
+}
+
+async function handleContextModelChange() {
+  const contextModel = contextModelSelect.value;
+  await chrome.storage.local.set({ contextModel });
+  currentContextModelId = contextModel;
+  setTemporaryStatus('Модель для контекста сохранена.');
 }
 
 async function handleContextGenerationChange() {
@@ -95,6 +107,8 @@ async function getState() {
       [
         'apiKey',
         'model',
+        'translationModel',
+        'contextModel',
         'contextGenerationEnabled',
         'translationStatusByTab',
         'translationVisibilityByTab',
@@ -103,7 +117,8 @@ async function getState() {
       (data) => {
       resolve({
         apiKey: data.apiKey || '',
-        model: data.model,
+        translationModel: data.translationModel || data.model,
+        contextModel: data.contextModel || data.model,
         contextGenerationEnabled: data.contextGenerationEnabled,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {},
@@ -113,18 +128,18 @@ async function getState() {
   });
 }
 
-function renderModelOptions(selected) {
+function renderModelOptions(select, selected) {
   const defaultModel = models[0]?.id;
   const currentModel = selected || defaultModel;
 
-  modelSelect.innerHTML = '';
+  select.innerHTML = '';
 
   models.forEach((model) => {
     const option = document.createElement('option');
     option.value = model.id;
     option.textContent = `${model.name} ($${model.price}/1M токенов)`;
     option.selected = model.id === currentModel;
-    modelSelect.appendChild(option);
+    select.appendChild(option);
   });
 }
 
@@ -252,7 +267,7 @@ function handleStorageChange(changes) {
   }
   if (changes.modelThroughputById) {
     const nextThroughput = changes.modelThroughputById.newValue || {};
-    currentThroughputInfo = currentModelId ? nextThroughput[currentModelId] : null;
+    currentThroughputInfo = currentTranslationModelId ? nextThroughput[currentTranslationModelId] : null;
     renderStatus();
   }
 }

@@ -1,6 +1,7 @@
 const DEFAULT_STATE = {
   apiKey: '',
-  model: 'gpt-4.1-mini',
+  translationModel: 'gpt-4.1-mini',
+  contextModel: 'gpt-4.1-mini',
   translationStyle: 'auto',
   contextGenerationEnabled: false
 };
@@ -20,8 +21,14 @@ const PUNCTUATION_TOKENS = new Map([
 const PUNCTUATION_TOKEN_HINT = 'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged and in place.';
 
 async function getState() {
-  const stored = await chrome.storage.local.get(DEFAULT_STATE);
+  const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null });
   const merged = { ...DEFAULT_STATE, ...stored };
+  if (!merged.translationModel && merged.model) {
+    merged.translationModel = merged.model;
+  }
+  if (!merged.contextModel && merged.model) {
+    merged.contextModel = merged.model;
+  }
   if (merged.translationStyle !== 'auto') {
     merged.translationStyle = 'auto';
   }
@@ -85,7 +92,8 @@ async function handleGetSettings(message, sendResponse) {
   sendResponse({
     allowed: !!state.apiKey,
     apiKey: state.apiKey,
-    model: state.model,
+    translationModel: state.translationModel,
+    contextModel: state.contextModel,
     translationStyle: state.translationStyle,
     contextGenerationEnabled: state.contextGenerationEnabled
   });
@@ -103,7 +111,7 @@ async function handleTranslateText(message, sendResponse) {
       message.texts,
       state.apiKey,
       message.targetLanguage,
-      state.model,
+      state.translationModel,
       message.translationStyle || state.translationStyle,
       message.context
     );
@@ -126,7 +134,7 @@ async function handleGenerateContext(message, sendResponse) {
       message.text,
       state.apiKey,
       message.targetLanguage,
-      state.model
+      state.contextModel
     );
     sendResponse({ success: true, context });
   } catch (error) {
@@ -143,12 +151,12 @@ async function handleModelThroughputTest(message, sendResponse) {
       return;
     }
 
-    const model = message?.model || state.model;
+    const model = message?.model || state.translationModel;
     const result = await runModelThroughputTest(state.apiKey, model);
     await saveModelThroughputResult(model, result);
     sendResponse({ success: true, result });
   } catch (error) {
-    const model = message?.model || DEFAULT_STATE.model;
+    const model = message?.model || DEFAULT_STATE.translationModel;
     const failure = {
       success: false,
       error: error?.message || 'Throughput test failed',
@@ -160,7 +168,7 @@ async function handleModelThroughputTest(message, sendResponse) {
   }
 }
 
-async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.model) {
+async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.contextModel) {
   if (!text?.trim()) return '';
 
   const prompt = [
@@ -283,7 +291,7 @@ async function translateTexts(
   texts,
   apiKey,
   targetLanguage = 'ru',
-  model = DEFAULT_STATE.model,
+  model = DEFAULT_STATE.translationModel,
   translationStyle = DEFAULT_STATE.translationStyle,
   context = ''
 ) {
