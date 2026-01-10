@@ -453,7 +453,7 @@ async function performTranslationRequest(
         'Переводи имена/названия/термины; если не уверен — транслитерируй, не оставляй без перевода, кроме устоявшихся брендов.',
         `Пожалуйста, не изменяй служебные токены пунктуации. ${PUNCTUATION_TOKEN_HINT}`,
         'Фрагменты для перевода:',
-        ...tokenizedTexts.map((text, index) => `${index + 1}) ${text}`)
+        ...tokenizedTexts.map((text) => text)
       ]
         .filter(Boolean)
         .join('\n')
