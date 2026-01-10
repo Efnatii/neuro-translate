@@ -62,6 +62,7 @@ function renderDebug(url, data) {
   items.forEach((item) => {
     const entry = document.createElement('div');
     entry.className = 'entry';
+    const proofreadSection = renderProofreadSection(item);
     entry.innerHTML = `
       <h2>Блок ${item.index || ''}</h2>
       <div class="block">
@@ -72,9 +73,26 @@ function renderDebug(url, data) {
         <div class="label">Перевод</div>
         <pre>${escapeHtml(item.translated || '')}</pre>
       </div>
+      ${proofreadSection}
     `;
     entriesEl.appendChild(entry);
   });
+}
+
+function renderProofreadSection(item) {
+  if (!item?.proofreadApplied) return '';
+  const replacements = Array.isArray(item.proofread) ? item.proofread : [];
+  const content = replacements.length
+    ? replacements
+        .map((replacement) => `${replacement.from} → ${replacement.to ?? ''}`)
+        .join('\n')
+    : 'Нет правок.';
+  return `
+      <div class="block">
+        <div class="label">Вычитка</div>
+        <pre>${escapeHtml(content)}</pre>
+      </div>
+    `;
 }
 
 function escapeHtml(value) {
