@@ -1,5 +1,6 @@
 const DEFAULT_STATE = {
   apiKey: '',
+  deepseekApiKey: '',
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   translationStyle: 'auto',
@@ -9,6 +10,8 @@ const DEFAULT_STATE = {
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
 const MAX_TRANSLATION_TIMEOUT_MS = 180000;
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
+const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
@@ -19,6 +22,26 @@ const PUNCTUATION_TOKENS = new Map([
 ]);
 
 const PUNCTUATION_TOKEN_HINT = 'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged and in place.';
+
+function isDeepseekModel(model = '') {
+  return model.startsWith('deepseek');
+}
+
+function getApiConfigForModel(model, state) {
+  if (isDeepseekModel(model)) {
+    return {
+      apiKey: state.deepseekApiKey,
+      apiBaseUrl: DEEPSEEK_API_URL,
+      provider: 'deepseek'
+    };
+  }
+
+  return {
+    apiKey: state.apiKey,
+    apiBaseUrl: OPENAI_API_URL,
+    provider: 'openai'
+  };
+}
 
 async function getState() {
   const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null });
@@ -89,8 +112,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleGetSettings(message, sendResponse) {
   const state = await getState();
+  const translationConfig = getApiConfigForModel(state.translationModel, state);
+  const contextConfig = getApiConfigForModel(state.contextModel, state);
+  const hasTranslationKey = Boolean(translationConfig.apiKey);
+  const hasContextKey = Boolean(contextConfig.apiKey);
   sendResponse({
-    allowed: !!state.apiKey,
+    allowed: hasTranslationKey && (!state.contextGenerationEnabled || hasContextKey),
     apiKey: state.apiKey,
     translationModel: state.translationModel,
     contextModel: state.contextModel,
@@ -102,18 +129,20 @@ async function handleGetSettings(message, sendResponse) {
 async function handleTranslateText(message, sendResponse) {
   try {
     const state = await getState();
-    if (!state.apiKey) {
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.translationModel, state);
+    if (!apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
     }
 
     const translations = await translateTexts(
       message.texts,
-      state.apiKey,
+      apiKey,
       message.targetLanguage,
       state.translationModel,
       message.translationStyle || state.translationStyle,
-      message.context
+      message.context,
+      apiBaseUrl
     );
     sendResponse({ success: true, translations });
   } catch (error) {
@@ -125,16 +154,18 @@ async function handleTranslateText(message, sendResponse) {
 async function handleGenerateContext(message, sendResponse) {
   try {
     const state = await getState();
-    if (!state.apiKey) {
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.contextModel, state);
+    if (!apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
     }
 
     const context = await generateTranslationContext(
       message.text,
-      state.apiKey,
+      apiKey,
       message.targetLanguage,
-      state.contextModel
+      state.contextModel,
+      apiBaseUrl
     );
     sendResponse({ success: true, context });
   } catch (error) {
@@ -146,13 +177,14 @@ async function handleGenerateContext(message, sendResponse) {
 async function handleModelThroughputTest(message, sendResponse) {
   try {
     const state = await getState();
-    if (!state.apiKey) {
+    const model = message?.model || state.translationModel;
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(model, state);
+    if (!apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
     }
 
-    const model = message?.model || state.translationModel;
-    const result = await runModelThroughputTest(state.apiKey, model);
+    const result = await runModelThroughputTest(apiKey, model, apiBaseUrl);
     await saveModelThroughputResult(model, result);
     sendResponse({ success: true, result });
   } catch (error) {
@@ -168,7 +200,13 @@ async function handleModelThroughputTest(message, sendResponse) {
   }
 }
 
-async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', model = DEFAULT_STATE.contextModel) {
+async function generateTranslationContext(
+  text,
+  apiKey,
+  targetLanguage = 'ru',
+  model = DEFAULT_STATE.contextModel,
+  apiBaseUrl = OPENAI_API_URL
+) {
   if (!text?.trim()) return '';
 
   const prompt = [
@@ -243,7 +281,7 @@ async function generateTranslationContext(text, apiKey, targetLanguage = 'ru', m
     }
   ];
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -293,7 +331,8 @@ async function translateTexts(
   targetLanguage = 'ru',
   model = DEFAULT_STATE.translationModel,
   translationStyle = DEFAULT_STATE.translationStyle,
-  context = ''
+  context = '',
+  apiBaseUrl = OPENAI_API_URL
 ) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
@@ -318,7 +357,8 @@ async function translateTexts(
         model,
         translationStyle,
         controller.signal,
-        context
+        context,
+        apiBaseUrl
       );
     } catch (error) {
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
@@ -343,7 +383,15 @@ async function translateTexts(
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
-        return await translateIndividually(texts, apiKey, targetLanguage, model, translationStyle, context);
+        return await translateIndividually(
+          texts,
+          apiKey,
+          targetLanguage,
+          model,
+          translationStyle,
+          context,
+          apiBaseUrl
+        );
       }
 
       if (isRateLimit) {
@@ -367,7 +415,8 @@ async function performTranslationRequest(
   model,
   translationStyle,
   signal,
-  context = ''
+  context = '',
+  apiBaseUrl = OPENAI_API_URL
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const styleHints = {
@@ -411,7 +460,7 @@ async function performTranslationRequest(
     }
   ];
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -506,7 +555,15 @@ function sleep(durationMs) {
   return new Promise(resolve => setTimeout(resolve, durationMs));
 }
 
-async function translateIndividually(texts, apiKey, targetLanguage, model, translationStyle, context = '') {
+async function translateIndividually(
+  texts,
+  apiKey,
+  targetLanguage,
+  model,
+  translationStyle,
+  context = '',
+  apiBaseUrl = OPENAI_API_URL
+) {
   const results = [];
 
   for (const text of texts) {
@@ -518,7 +575,8 @@ async function translateIndividually(texts, apiKey, targetLanguage, model, trans
         model,
         translationStyle,
         undefined,
-        context
+        context,
+        apiBaseUrl
       );
       results.push(translated);
     } catch (error) {
@@ -530,13 +588,13 @@ async function translateIndividually(texts, apiKey, targetLanguage, model, trans
   return results;
 }
 
-async function runModelThroughputTest(apiKey, model) {
+async function runModelThroughputTest(apiKey, model, apiBaseUrl = OPENAI_API_URL) {
   const startedAt = performance.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), MODEL_THROUGHPUT_TEST_TIMEOUT_MS);
 
   try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch(apiBaseUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
