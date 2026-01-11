@@ -203,8 +203,7 @@ async function handleProofreadText(message, sendResponse) {
       apiKey,
       message.targetLanguage,
       state.proofreadModel,
-      apiBaseUrl,
-      message.context
+      apiBaseUrl
     );
     sendResponse({ success: true, replacements });
   } catch (error) {
@@ -351,8 +350,7 @@ async function proofreadTranslation(
   apiKey,
   targetLanguage = 'ru',
   model = DEFAULT_STATE.proofreadModel,
-  apiBaseUrl = OPENAI_API_URL,
-  context = ''
+  apiBaseUrl = OPENAI_API_URL
 ) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
@@ -366,24 +364,18 @@ async function proofreadTranslation(
         'Never add commentary, explanations, or extra keys.',
         'Only fix clear errors: grammar, agreement, punctuation, typo, or terminology consistency.',
         'Do not paraphrase or change meaning. Do not reorder sentences.',
-        context ? 'Use the provided translation context to maintain terminology consistency.' : '',
         PUNCTUATION_TOKEN_HINT,
         'If no corrections are needed, return an empty JSON array: [].'
-      ]
-        .filter(Boolean)
-        .join(' ')
+      ].join(' ')
     },
     {
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
         'Review the translated text below and return only the JSON array of replacements.',
-        context ? `Context: ${context}` : '',
         'Translated text:',
         ...texts.map((text) => text)
-      ]
-        .filter(Boolean)
-        .join('\n')
+      ].join('\n')
     }
   ];
 
