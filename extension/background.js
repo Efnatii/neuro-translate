@@ -203,7 +203,9 @@ async function handleProofreadText(message, sendResponse) {
       apiKey,
       message.targetLanguage,
       state.proofreadModel,
-      apiBaseUrl
+      apiBaseUrl,
+      message.context,
+      message.sourceTexts
     );
     sendResponse({ success: true, replacements });
   } catch (error) {
@@ -350,10 +352,13 @@ async function proofreadTranslation(
   apiKey,
   targetLanguage = 'ru',
   model = DEFAULT_STATE.proofreadModel,
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  context = '',
+  sourceTexts = []
 ) {
   if (!Array.isArray(texts) || !texts.length) return [];
 
+  const normalizedSourceTexts = Array.isArray(sourceTexts) ? sourceTexts : [];
   const prompt = [
     {
       role: 'system',
@@ -364,18 +369,29 @@ async function proofreadTranslation(
         'Never add commentary, explanations, or extra keys.',
         'Only fix clear errors: grammar, agreement, punctuation, typo, or terminology consistency.',
         'Do not paraphrase or change meaning. Do not reorder sentences.',
+        'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
+        'If a punctuation token appears in the translated text, keep it unchanged and in the same position.',
+        'Use the source text only to verify correctness; do not alter style beyond fixing errors.',
+        context ? 'Use the provided translation context to maintain terminology consistency.' : '',
         PUNCTUATION_TOKEN_HINT,
         'If no corrections are needed, return an empty JSON array: [].'
-      ].join(' ')
+      ]
+        .filter(Boolean)
+        .join(' ')
     },
     {
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
         'Review the translated text below and return only the JSON array of replacements.',
+        context ? `Context: ${context}` : '',
+        normalizedSourceTexts.length ? 'Source text:' : '',
+        ...normalizedSourceTexts.map((text) => text),
         'Translated text:',
         ...texts.map((text) => text)
-      ].join('\n')
+      ]
+        .filter(Boolean)
+        .join('\n')
     }
   ];
 
