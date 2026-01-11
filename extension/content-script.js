@@ -189,8 +189,7 @@ async function translatePage(settings) {
           try {
             proofreadReplacements = await requestProofreading(
               translatedTexts,
-              settings.targetLanguage || 'ru',
-              latestContextSummary
+              settings.targetLanguage || 'ru'
             );
             if (proofreadReplacements.length) {
               finalTranslations = applyProofreadingReplacements(translatedTexts, proofreadReplacements);
@@ -281,14 +280,13 @@ async function translate(texts, targetLanguage, translationStyle, context, keepP
   });
 }
 
-async function requestProofreading(texts, targetLanguage, context) {
+async function requestProofreading(texts, targetLanguage) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
         type: 'PROOFREAD_TEXT',
         texts,
-        targetLanguage,
-        context
+        targetLanguage
       },
       (response) => {
         if (response?.success) {
