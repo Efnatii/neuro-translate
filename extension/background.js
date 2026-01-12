@@ -568,10 +568,14 @@ async function performTranslationRequest(
       content: [
         'You are a fluent Russian translator.',
         `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
+        'Never omit, add, or generalize information. Preserve modality, tense, aspect, tone, and level of certainty.',
+        'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
+        'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
         'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
+        'Ensure terminology consistency within the same request.',
         PUNCTUATION_TOKEN_HINT,
         styleInstruction ? `Tone/style: ${styleInstruction}` : 'Determine the most appropriate tone/style based on the provided context.',
-        context ? `Use this page context to disambiguate phrasing: ${context}` : '',
+        context ? `Use this page context only to disambiguate phrasing; never introduce new facts: ${context}` : '',
         'Respond only with translations in the same order, one per line, without numbering or commentary.'
       ]
         .filter(Boolean)
@@ -583,7 +587,11 @@ async function performTranslationRequest(
         `Переведи следующие фрагменты на ${targetLanguage}.`,
         styleInstruction ? `Стиль: ${styleInstruction}` : 'Определи стиль автоматически на основе контекста.',
         context ? `Контекст страницы: ${context}` : '',
+        'Не опускай и не добавляй информацию; сохраняй модальность, время, аспект, тон и степень уверенности.',
+        'Сохраняй числа, единицы, валюты, даты и форматирование, если явно не указано иное.',
+        'Не изменяй плейсхолдеры, разметку и код (например, {name}, {{count}}, <tag>, **bold**).',
         'Переводи имена/названия/термины; если не уверен — транслитерируй, не оставляй без перевода, кроме устоявшихся брендов.',
+        'Следи за единообразием терминов внутри одного запроса.',
         `Пожалуйста, не изменяй служебные токены пунктуации. ${PUNCTUATION_TOKEN_HINT}`,
         'Фрагменты для перевода:',
         ...tokenizedTexts.map((text) => text)
