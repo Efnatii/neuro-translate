@@ -88,7 +88,7 @@ async function translatePage(settings) {
   const textStats = calculateTextLengthStats(nodesWithPath);
   const maxChunkLength = calculateMaxChunkLength(textStats.averageNodeLength);
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
-  const chunks = chunkBlocks(blockGroups, maxChunkLength);
+  const chunks = chunkBlocks(blockGroups, maxChunkLength, settings.strictBlockTranslation);
   translationProgress = { completedChunks: 0, totalChunks: chunks.length };
 
   if (!chunks.length) {
@@ -472,7 +472,23 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function chunkBlocks(blocks, maxLength) {
+function chunkBlocks(blocks, maxLength, strictBlockTranslation = false) {
+  if (strictBlockTranslation) {
+    const strictChunks = [];
+    blocks.forEach((block) => {
+      const blockLength = block.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
+      if (blockLength > maxLength && block.length) {
+        const splitBlocks = splitOversizedBlock(block, maxLength);
+        splitBlocks.forEach((splitBlock) => {
+          if (splitBlock.length) strictChunks.push([...splitBlock]);
+        });
+        return;
+      }
+      if (block.length) strictChunks.push([...block]);
+    });
+    return strictChunks;
+  }
+
   const chunks = [];
   let currentChunk = [];
   let currentLength = 0;

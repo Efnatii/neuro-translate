@@ -6,7 +6,8 @@ const DEFAULT_STATE = {
   proofreadModel: 'gpt-4.1-mini',
   translationStyle: 'auto',
   contextGenerationEnabled: false,
-  proofreadEnabled: false
+  proofreadEnabled: false,
+  strictBlockTranslation: false
 };
 
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
@@ -137,7 +138,8 @@ async function handleGetSettings(message, sendResponse) {
     proofreadModel: state.proofreadModel,
     translationStyle: state.translationStyle,
     contextGenerationEnabled: state.contextGenerationEnabled,
-    proofreadEnabled: state.proofreadEnabled
+    proofreadEnabled: state.proofreadEnabled,
+    strictBlockTranslation: state.strictBlockTranslation
   });
 }
 
