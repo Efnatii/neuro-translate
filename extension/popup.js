@@ -5,7 +5,8 @@ const contextModelSelect = document.getElementById('contextModel');
 const proofreadModelSelect = document.getElementById('proofreadModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
-const strictBlockTranslationCheckbox = document.getElementById('strictBlockTranslation');
+const chunkLengthLimitInput = document.getElementById('chunkLengthLimit');
+const chunkLengthValueLabel = document.getElementById('chunkLengthValue');
 const statusLabel = document.getElementById('status');
 
 const cancelButton = document.getElementById('cancel');
@@ -62,7 +63,7 @@ async function init() {
   currentThroughputInfo = state.modelThroughputById?.[currentTranslationModelId] || null;
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
-  renderStrictBlockTranslation(state.strictBlockTranslation);
+  renderChunkLengthLimit(state.chunkLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   renderStatus();
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
@@ -76,7 +77,7 @@ async function init() {
   proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
-  strictBlockTranslationCheckbox.addEventListener('change', handleStrictBlockTranslationChange);
+  chunkLengthLimitInput.addEventListener('input', handleChunkLengthLimitChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
   toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
@@ -140,14 +141,11 @@ async function handleProofreadEnabledChange() {
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
-async function handleStrictBlockTranslationChange() {
-  const strictBlockTranslation = strictBlockTranslationCheckbox.checked;
-  await chrome.storage.local.set({ strictBlockTranslation });
-  setTemporaryStatus(
-    strictBlockTranslation
-      ? 'Перевод блоков без склейки включён.'
-      : 'Перевод блоков без склейки отключён.'
-  );
+async function handleChunkLengthLimitChange() {
+  const chunkLengthLimit = Number(chunkLengthLimitInput.value);
+  await chrome.storage.local.set({ chunkLengthLimit });
+  renderChunkLengthLimit(chunkLengthLimit);
+  setTemporaryStatus(`Лимит длины чанка: ${chunkLengthLimit} символов.`);
 }
 
 async function getState() {
@@ -162,7 +160,7 @@ async function getState() {
         'proofreadModel',
         'contextGenerationEnabled',
         'proofreadEnabled',
-        'strictBlockTranslation',
+        'chunkLengthLimit',
         'translationStatusByTab',
         'translationVisibilityByTab',
         'modelThroughputById'
@@ -176,7 +174,7 @@ async function getState() {
         proofreadModel: data.proofreadModel || data.model,
         contextGenerationEnabled: data.contextGenerationEnabled,
         proofreadEnabled: data.proofreadEnabled,
-        strictBlockTranslation: data.strictBlockTranslation,
+        chunkLengthLimit: data.chunkLengthLimit,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {},
         modelThroughputById: data.modelThroughputById || {}
@@ -208,8 +206,12 @@ function renderProofreadEnabled(enabled) {
   proofreadEnabledCheckbox.checked = Boolean(enabled);
 }
 
-function renderStrictBlockTranslation(enabled) {
-  strictBlockTranslationCheckbox.checked = Boolean(enabled);
+function renderChunkLengthLimit(limit) {
+  const fallback = Number(chunkLengthLimitInput.min) || 600;
+  const parsed = Number(limit);
+  const normalized = Number.isFinite(parsed) ? parsed : fallback;
+  chunkLengthLimitInput.value = String(normalized);
+  chunkLengthValueLabel.textContent = String(normalized);
 }
 
 function runModelThroughputTest(model) {
