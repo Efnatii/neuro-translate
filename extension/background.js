@@ -362,6 +362,10 @@ async function proofreadTranslation(
   if (!Array.isArray(texts) || !texts.length) return [];
 
   const normalizedSourceTexts = Array.isArray(sourceTexts) ? sourceTexts : [];
+  const maxRateLimitRetries = 3;
+  let rateLimitRetries = 0;
+  let lastRateLimitDelayMs = null;
+  let lastError = null;
   const prompt = [
     {
       role: 'system',
@@ -403,43 +407,78 @@ async function proofreadTranslation(
     }
   ];
 
-  const response = await fetch(apiBaseUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      messages: prompt
-    })
-  });
+  while (true) {
+    try {
+      const response = await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model,
+          messages: prompt
+        })
+      });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Proofread request failed: ${response.status} ${errorText}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorPayload = null;
+        try {
+          errorPayload = JSON.parse(errorText);
+        } catch (parseError) {
+          errorPayload = null;
+        }
+        const retryAfterMs = parseRetryAfterMs(response, errorPayload);
+        const errorMessage =
+          errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
+        const error = new Error(`Proofread request failed: ${response.status} ${errorMessage}`);
+        error.status = response.status;
+        error.retryAfterMs = retryAfterMs;
+        error.isRateLimit = response.status === 429 || response.status === 503;
+        throw error;
+      }
+
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error('No proofreading result returned');
+      }
+
+      const parsed = safeParseArray(content, null);
+      if (!Array.isArray(parsed)) {
+        throw new Error('Unexpected proofreading format');
+      }
+
+      return parsed
+        .map((item) => {
+          if (!item || typeof item !== 'object') return null;
+          const from = typeof item.from === 'string' ? item.from : '';
+          const to = typeof item.to === 'string' ? item.to : '';
+          if (!from) return null;
+          return { from, to };
+        })
+        .filter(Boolean);
+    } catch (error) {
+      lastError = error;
+      const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
+      if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
+        rateLimitRetries += 1;
+        const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
+        lastRateLimitDelayMs = retryDelayMs;
+        console.warn(`Proofreading rate-limited, retrying after ${retryDelayMs}ms...`);
+        await sleep(retryDelayMs);
+        continue;
+      }
+
+      if (isRateLimit) {
+        const waitSeconds = Math.max(1, Math.ceil((lastRateLimitDelayMs || error?.retryAfterMs || 30000) / 1000));
+        throw new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
+      }
+
+      throw lastError;
+    }
   }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('No proofreading result returned');
-  }
-
-  const parsed = safeParseArray(content, null);
-  if (!Array.isArray(parsed)) {
-    throw new Error('Unexpected proofreading format');
-  }
-
-  return parsed
-    .map((item) => {
-      if (!item || typeof item !== 'object') return null;
-      const from = typeof item.from === 'string' ? item.from : '';
-      const to = typeof item.to === 'string' ? item.to : '';
-      if (!from) return null;
-      return { from, to };
-    })
-    .filter(Boolean);
 }
 
 async function getModelThroughputInfo(model) {
