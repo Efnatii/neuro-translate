@@ -686,6 +686,40 @@ function parseRetryAfterMs(response, errorPayload) {
     return Math.round(retryAfterMs);
   }
 
+  const message =
+    errorPayload?.error?.message ||
+    errorPayload?.message ||
+    errorPayload?.error?.detail ||
+    errorPayload?.detail ||
+    '';
+  const retryAfterFromMessageMs = parseRetryAfterMsFromMessage(message);
+  if (typeof retryAfterFromMessageMs === 'number' && retryAfterFromMessageMs >= 0) {
+    return Math.round(retryAfterFromMessageMs);
+  }
+
+  return null;
+}
+
+function parseRetryAfterMsFromMessage(message = '') {
+  if (typeof message !== 'string' || !message.trim()) return null;
+  const retryMatch = message.match(/try again in\s*([\d.]+)\s*(ms|msec|millis|s|sec|secs|seconds)/i);
+  if (retryMatch) {
+    const value = Number(retryMatch[1]);
+    if (Number.isNaN(value)) return null;
+    const unit = retryMatch[2].toLowerCase();
+    if (unit.startsWith('m')) return Math.round(value);
+    return Math.round(value * 1000);
+  }
+
+  const retryMsMatch = message.match(/retry(?:ing)? in\s*([\d.]+)\s*(ms|msec|millis|s|sec|secs|seconds)/i);
+  if (retryMsMatch) {
+    const value = Number(retryMsMatch[1]);
+    if (Number.isNaN(value)) return null;
+    const unit = retryMsMatch[2].toLowerCase();
+    if (unit.startsWith('m')) return Math.round(value);
+    return Math.round(value * 1000);
+  }
+
   return null;
 }
 
@@ -713,24 +747,40 @@ async function translateIndividually(
   keepPunctuationTokens = false
 ) {
   const results = [];
+  const maxRateLimitRetries = 3;
 
   for (const text of texts) {
-    try {
-      const [translated] = await performTranslationRequest(
-        [text],
-        apiKey,
-        targetLanguage,
-        model,
-        translationStyle,
-        undefined,
-        context,
-        apiBaseUrl,
-        !keepPunctuationTokens
-      );
-      results.push(translated);
-    } catch (error) {
-      console.error('Single-item translation failed, keeping original text.', error);
-      results.push(text);
+    let rateLimitRetries = 0;
+
+    while (true) {
+      try {
+        const [translated] = await performTranslationRequest(
+          [text],
+          apiKey,
+          targetLanguage,
+          model,
+          translationStyle,
+          undefined,
+          context,
+          apiBaseUrl,
+          !keepPunctuationTokens
+        );
+        results.push(translated);
+        break;
+      } catch (error) {
+        const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
+        if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
+          rateLimitRetries += 1;
+          const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
+          console.warn(`Single-item translation rate-limited, retrying after ${retryDelayMs}ms...`);
+          await sleep(retryDelayMs);
+          continue;
+        }
+
+        console.error('Single-item translation failed, keeping original text.', error);
+        results.push(text);
+        break;
+      }
     }
   }
 
