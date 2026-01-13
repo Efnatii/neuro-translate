@@ -253,70 +253,70 @@ async function generateTranslationContext(
     {
       role: 'system',
       content: [
-        'Ты — ассистент переводчика. Составь контекст для качественного перевода.',
-        'Не пересказывай текст, не оценивай и не добавляй факты вне источника.',
-        'Если информации нет, укажи "не указано".',
-        'Фокусируйся на деталях, влияющих на точность, единообразие терминов, стиль и смысл.',
-        'Не предлагай оставлять имена/названия/термины без перевода, если это не явно указано в тексте.',
-        'Ответ должен быть структурированным и лаконичным.'
+        'You are a translator assistant. Produce context that improves translation quality.',
+        'Do not paraphrase the text, do not evaluate it, and do not add facts not present in the source.',
+        'If information is missing, write "not specified".',
+        'Focus on details that affect accuracy, terminology consistency, style, and meaning.',
+        'Do not suggest leaving names/titles/terms untranslated unless explicitly stated in the text.',
+        'Your response must be structured and concise.'
       ].join(' ')
     },
     {
       role: 'user',
       content: [
-        `Проанализируй исходный текст и составь контекст для перевода на ${targetLanguage}.`,
-        'Нужны максимально полезные детали для переводчика.',
-        'Формат — строго по разделам ниже (кратко, пунктами).',
+        `Analyze the source text and produce translation context for ${targetLanguage}.`,
+        'Provide the most useful details for the translator.',
+        'Format strictly by the sections below (brief, bullet points).',
         '',
-        '1) Тип текста и назначение:',
-        '- жанр/домен (художественный, техдок, маркетинг, UI, новости и т.п.)',
-        '- цель (информировать, убедить, инструктировать, описать, продать и т.п.)',
-        '- предполагаемая аудитория (если явно видно)',
+        '1) Text type and purpose:',
+        '- genre/domain (fiction, tech docs, marketing, UI, news, etc.)',
+        '- goal (inform, persuade, instruct, describe, sell, etc.)',
+        '- intended audience (if explicitly clear)',
         '',
-        '2) Сеттинг:',
-        '- место действия, география, организации/локации (если указано)',
-        '- время/эпоха/период (если указано)',
+        '2) Setting:',
+        '- place, geography, organizations/locations (if stated)',
+        '- time/era/period (if stated)',
         '',
-        '3) Участники/персонажи:',
-        '- имена/роли/должности',
-        '- пол/род/местоимения (если явно указано)',
-        '- говорящие/адресаты (кто кому говорит)',
+        '3) Participants/characters:',
+        '- names/roles/titles',
+        '- gender/pronouns (if explicitly stated)',
+        '- speakers/addressees (who speaks to whom)',
         '',
-        '4) Отношения и социальные связи:',
-        '- отношения между персонажами (если явно есть)',
-        '- статус/иерархия (начальник‑подчинённый, клиент‑служба поддержки и т.п.)',
+        '4) Relationships and social ties:',
+        '- relationships between characters (if explicit)',
+        '- status/hierarchy (manager-subordinate, customer-support, etc.)',
         '',
-        '5) Сюжетные/фактологические опорные точки:',
-        '- ключевые события/факты, которые нельзя исказить',
+        '5) Plot/factual anchor points:',
+        '- key events/facts that must not be distorted',
         '',
-        '6) Терминология и единообразие:',
-        '- термины/понятия/аббревиатуры, которые должны переводиться одинаково',
-        '- рекомендуемые варианты перевода, если явно вытекают из контекста',
-        '- что нельзя переводить или что оставлять как есть (только если это прямо следует из текста)',
+        '6) Terminology and consistency:',
+        '- terms/concepts/abbreviations that must be translated consistently',
+        '- recommended translations if clearly implied by context',
+        '- what must not be translated or must be left as-is (only if explicitly stated)',
         '',
-        '7) Собственные имена и ономастика:',
-        '- имена, бренды, продукты, организации, топонимы',
-        '- как передавать: перевод/транслитерация/оставить как есть (оставлять как есть только при явном указании)',
+        '7) Proper names and onomastics:',
+        '- names, brands, products, organizations, toponyms',
+        '- how to render: translate/transliterate/leave as-is (leave as-is only with explicit instruction)',
         '',
-        '8) Тональность и стиль:',
-        '- официальный/разговорный/нейтральный/художественный/ирония и т.п.',
-        '- уровень формальности и вежливости (ты/вы, обращения)',
+        '8) Tone and style:',
+        '- formal/informal/neutral/literary/ironic, etc.',
+        '- level of formality and politeness (tu/vous, honorifics)',
         '',
-        '9) Лингвистические особенности:',
-        '- сленг, жаргон, диалект, архаизмы',
-        '- игра слов/идиомы (если есть)',
-        '- цитаты/цитируемая речь',
+        '9) Linguistic features:',
+        '- slang, jargon, dialect, archaisms',
+        '- wordplay/idioms (if any)',
+        '- quotes/quoted speech',
         '',
-        '10) Формат и технические требования:',
-        '- единицы измерения, валюты, даты, форматы',
-        '- требования к краткости/структуре',
-        '- повторяющиеся шаблоны/плейсхолдеры (если есть)',
+        '10) Format and technical requirements:',
+        '- units, currencies, dates, formats',
+        '- brevity/structure requirements',
+        '- recurring templates/placeholders (if any)',
         '',
-        'Текст:',
+        'Text:',
         text,
         '',
-        'Выводи только разделы с краткими пунктами.',
-        'Если раздел не заполнен — напиши "не указано".'
+        'Output only the sections with brief bullet points.',
+        'If a section is empty, write "not specified".'
       ].join('\n')
     }
   ];
@@ -374,7 +374,9 @@ async function proofreadTranslation(
         'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
         'If a punctuation token appears in the translated text, keep it unchanged and in the same position.',
         'Use the source text only to verify correctness and preserve meaning.',
-        context ? 'Use the provided translation context to maintain terminology consistency.' : '',
+        context
+          ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
+          : 'If no context is provided, do not invent context or add assumptions.',
         PUNCTUATION_TOKEN_HINT,
         'If no corrections are needed, return an empty JSON array: [].'
       ]
@@ -386,7 +388,7 @@ async function proofreadTranslation(
       content: [
         `Target language: ${targetLanguage}.`,
         'Review the translated text below and return only the JSON array of replacements.',
-        context ? `Context: ${context}` : '',
+        context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? 'Source text:' : '',
         ...normalizedSourceTexts.map((text) => text),
         'Translated text:',
@@ -553,10 +555,10 @@ async function performTranslationRequest(
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const styleHints = {
-    natural: 'Нейтральный, плавный русский без буквального калькирования.',
-    conversational: 'Разговорный, тёплый тон с живыми оборотами без лишней фамильярности.',
-    formal: 'Деловой, аккуратный тон с чёткими формулировками.',
-    creative: 'Выразительный и образный тон, но без потери смысла.'
+    natural: 'Neutral, smooth Russian without literal calques.',
+    conversational: 'Conversational, warm tone with vivid phrasing and no excessive familiarity.',
+    formal: 'Business-like, precise tone with clear wording.',
+    creative: 'Expressive, imagery-rich tone without losing meaning.'
   };
 
   const isAutoStyle = translationStyle === 'auto';
@@ -576,7 +578,9 @@ async function performTranslationRequest(
         'Ensure terminology consistency within the same request.',
         PUNCTUATION_TOKEN_HINT,
         styleInstruction ? `Tone/style: ${styleInstruction}` : 'Determine the most appropriate tone/style based on the provided context.',
-        context ? `Use this page context only to disambiguate phrasing; never introduce new facts: ${context}` : '',
+        context
+          ? `Rely on the provided page context for disambiguation only; never introduce new facts: ${context}`
+          : 'If no context is provided, do not invent context or add assumptions.',
         'Respond only with translations in the same order, one per line, without numbering or commentary.'
       ]
         .filter(Boolean)
@@ -585,17 +589,17 @@ async function performTranslationRequest(
     {
       role: 'user',
       content: [
-        `Переведи следующие фрагменты на ${targetLanguage}.`,
-        styleInstruction ? `Стиль: ${styleInstruction}` : 'Определи стиль автоматически на основе контекста.',
-        context ? `Контекст страницы: ${context}` : '',
-        'Не опускай и не добавляй информацию; сохраняй модальность, время, аспект, тон и степень уверенности.',
-        'Сохраняй числа, единицы, валюты, даты и форматирование, если явно не указано иное.',
-        'Не изменяй плейсхолдеры, разметку и код (например, {name}, {{count}}, <tag>, **bold**).',
-        'Переводи имена/названия/термины; если не уверен — транслитерируй, не оставляй без перевода, кроме устоявшихся брендов.',
-        'Не оставляй исходный текст без перевода. Не копируй фрагмент дословно, кроме плейсхолдеров, разметки, токенов пунктуации или текста, который уже на языке перевода.',
-        'Следи за единообразием терминов внутри одного запроса.',
-        `Пожалуйста, не изменяй служебные токены пунктуации. ${PUNCTUATION_TOKEN_HINT}`,
-        'Фрагменты для перевода:',
+        `Translate the following segments into ${targetLanguage}.`,
+        styleInstruction ? `Style: ${styleInstruction}` : 'Determine the style automatically based on context.',
+        context ? `Page context (use it for disambiguation only): ${context}` : '',
+        'Do not omit or add information; preserve modality, tense, aspect, tone, and level of certainty.',
+        'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
+        'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
+        'Translate names/titles/terms; if unsure, transliterate rather than leaving them untranslated, except for established brands.',
+        'Do not leave any source text untranslated. Do not copy segments verbatim except for placeholders, markup, punctuation tokens, or text already in the target language.',
+        'Keep terminology consistent within a single request.',
+        `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
+        'Segments to translate:',
         ...tokenizedTexts.map((text) => text)
       ]
         .filter(Boolean)
