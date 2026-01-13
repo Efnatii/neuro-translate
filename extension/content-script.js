@@ -16,6 +16,7 @@ let debugEntries = [];
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const GLUE_MARKER = '⟦BLOCK_GLUE⟧';
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -86,9 +87,9 @@ async function translatePage(settings) {
   await clearTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
-  const maxChunkLength = calculateMaxChunkLength(textStats.averageNodeLength);
+  const maxChunkLength = normalizeChunkLength(settings.chunkLengthLimit, textStats.averageNodeLength);
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
-  const chunks = chunkBlocks(blockGroups, maxChunkLength, settings.strictBlockTranslation);
+  const chunks = chunkBlocks(blockGroups, maxChunkLength);
   translationProgress = { completedChunks: 0, totalChunks: chunks.length };
 
   if (!chunks.length) {
@@ -163,7 +164,9 @@ async function translatePage(settings) {
         return;
       }
       const chunk = chunks[currentIndex];
-      const preparedTexts = chunk.map(({ node }) => prepareTextForTranslation(node.nodeValue));
+      const preparedTexts = chunk.map(({ node, glueMarker }) =>
+        prepareTextForTranslation(node.nodeValue, glueMarker)
+      );
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
       const chunkTranslations = [];
       let proofreadReplacements = [];
@@ -181,7 +184,8 @@ async function translatePage(settings) {
         const translatedTexts = chunk.map(({ node, original }, index) => {
           const translationIndex = indexMap[index];
           const translated = result.translations[translationIndex] || node.nodeValue;
-          return applyOriginalFormatting(original, translated);
+          const cleaned = stripGlueMarker(translated);
+          return applyOriginalFormatting(original, cleaned);
         });
 
         let finalTranslations = translatedTexts;
@@ -453,6 +457,14 @@ function calculateMaxChunkLength(averageNodeLength) {
   return Math.min(1500, Math.max(800, Math.round(scaled || 0)));
 }
 
+function normalizeChunkLength(limit, averageNodeLength) {
+  const parsed = Number(limit);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.round(parsed);
+  }
+  return calculateMaxChunkLength(averageNodeLength);
+}
+
 function selectInitialConcurrency(averageChunkLength, chunkCount) {
   let concurrency;
   if (averageChunkLength >= 1300) {
@@ -472,23 +484,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function chunkBlocks(blocks, maxLength, strictBlockTranslation = false) {
-  if (strictBlockTranslation) {
-    const strictChunks = [];
-    blocks.forEach((block) => {
-      const blockLength = block.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
-      if (blockLength > maxLength && block.length) {
-        const splitBlocks = splitOversizedBlock(block, maxLength);
-        splitBlocks.forEach((splitBlock) => {
-          if (splitBlock.length) strictChunks.push([...splitBlock]);
-        });
-        return;
-      }
-      if (block.length) strictChunks.push([...block]);
-    });
-    return strictChunks;
-  }
-
+function chunkBlocks(blocks, maxLength) {
   const chunks = [];
   let currentChunk = [];
   let currentLength = 0;
@@ -522,6 +518,9 @@ function chunkBlocks(blocks, maxLength, strictBlockTranslation = false) {
       pushChunk();
     }
 
+    if (currentChunk.length && block.length) {
+      currentChunk[currentChunk.length - 1].glueMarker = true;
+    }
     currentChunk.push(...block);
     currentLength += blockLength;
   });
@@ -616,9 +615,10 @@ function findNodeByPath(path) {
   return current && current.nodeType === Node.TEXT_NODE ? current : null;
 }
 
-function prepareTextForTranslation(text) {
+function prepareTextForTranslation(text, addGlueMarker = false) {
   const { core } = extractWhitespaceAndCore(text);
-  return core;
+  if (!addGlueMarker) return core;
+  return `${core}${GLUE_MARKER}`;
 }
 
 function applyOriginalFormatting(original, translated) {
@@ -626,6 +626,12 @@ function applyOriginalFormatting(original, translated) {
   const adjustedCase = matchFirstLetterCase(original, translated || '');
   const trimmed = typeof adjustedCase === 'string' ? adjustedCase.trim() : '';
   return `${prefix}${trimmed}${suffix}`;
+}
+
+function stripGlueMarker(text = '') {
+  if (!text) return '';
+  const markerRegex = new RegExp(`\\s*${escapeRegex(GLUE_MARKER)}\\s*`, 'g');
+  return text.replace(markerRegex, ' ');
 }
 
 function extractWhitespaceAndCore(text = '') {
