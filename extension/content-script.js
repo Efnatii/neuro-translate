@@ -316,10 +316,15 @@ function applyProofreadingReplacements(texts, replacements) {
   });
 }
 
+function escapeRegex(value = '') {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function restorePunctuationTokens(text = '') {
   let output = text;
   for (const [punctuation, token] of PUNCTUATION_TOKENS.entries()) {
-    output = output.split(token).join(punctuation);
+    const tokenRegex = new RegExp(escapeRegex(token), 'gi');
+    output = output.replace(tokenRegex, punctuation);
   }
   return output;
 }

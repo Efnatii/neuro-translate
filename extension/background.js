@@ -23,7 +23,8 @@ const PUNCTUATION_TOKENS = new Map([
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
 
-const PUNCTUATION_TOKEN_HINT = 'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged and in place.';
+const PUNCTUATION_TOKEN_HINT =
+  'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
 
 function isDeepseekModel(model = '') {
   return model.startsWith('deepseek');
@@ -369,6 +370,7 @@ async function proofreadTranslation(
         'Never add commentary, explanations, or extra keys.',
         'Improve fluency and naturalness so the translation reads like it was written by a native speaker.',
         'Fix grammar, agreement, punctuation, typos, or terminology consistency as needed.',
+        'You may add or adjust punctuation marks for naturalness, but do not modify punctuation tokens.',
         'You may rephrase locally to improve naturalness, but never change meaning or add/remove information.',
         'Do not reorder sentences unless it is required for naturalness in the target language.',
         'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
@@ -571,6 +573,7 @@ async function performTranslationRequest(
         'You are a fluent Russian translator.',
         `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
         'Never omit, add, or generalize information. Preserve modality, tense, aspect, tone, and level of certainty.',
+        'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
         'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
         'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
         'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
@@ -593,6 +596,7 @@ async function performTranslationRequest(
         styleInstruction ? `Style: ${styleInstruction}` : 'Determine the style automatically based on context.',
         context ? `Page context (use it for disambiguation only): ${context}` : '',
         'Do not omit or add information; preserve modality, tense, aspect, tone, and level of certainty.',
+        'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
         'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
         'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
         'Translate names/titles/terms; if unsure, transliterate rather than leaving them untranslated, except for established brands.',
@@ -932,10 +936,15 @@ function applyPunctuationTokens(text = '') {
   return output;
 }
 
+function escapeRegex(value = '') {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function restorePunctuationTokens(text = '') {
   let output = text;
   for (const [punctuation, token] of PUNCTUATION_TOKENS.entries()) {
-    output = output.split(token).join(punctuation);
+    const tokenRegex = new RegExp(escapeRegex(token), 'gi');
+    output = output.replace(tokenRegex, punctuation);
   }
   return output;
 }
