@@ -98,10 +98,10 @@ async function translatePage(settings) {
 
   cancelRequested = false;
   translationError = null;
-  reportProgress('Перевод запущен', 0, blocks.length);
+  reportProgress('Перевод запущен', 0, blocks.length, 0);
 
   if (settings.contextGenerationEnabled) {
-    reportProgress('Генерация контекста', 0, blocks.length);
+    reportProgress('Генерация контекста', 0, blocks.length, 0);
     const pageText = buildPageText(nodesWithPath);
     if (pageText) {
       try {
@@ -230,8 +230,8 @@ async function translatePage(settings) {
         console.error('Block translation failed', error);
         translationError = error;
         cancelRequested = true;
-        reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length);
         releaseSlot();
+        reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, activeWorkers);
         return;
       }
 
@@ -240,7 +240,7 @@ async function translatePage(settings) {
       releaseSlot();
 
       translationProgress.completedBlocks += 1;
-      reportProgress('Перевод выполняется', translationProgress.completedBlocks, blocks.length);
+      reportProgress('Перевод выполняется', translationProgress.completedBlocks, blocks.length, activeWorkers);
     }
   };
 
@@ -248,16 +248,16 @@ async function translatePage(settings) {
   await Promise.all(workers);
 
   if (translationError) {
-    reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length);
+    reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, activeWorkers);
     return;
   }
 
   if (cancelRequested) {
-    reportProgress('Перевод отменён', translationProgress.completedBlocks, blocks.length);
+    reportProgress('Перевод отменён', translationProgress.completedBlocks, blocks.length, activeWorkers);
     return;
   }
 
-  reportProgress('Перевод завершён', translationProgress.completedBlocks, blocks.length);
+  reportProgress('Перевод завершён', translationProgress.completedBlocks, blocks.length, activeWorkers);
   await saveTranslationsToMemory(activeTranslationEntries);
   await setTranslationVisibility(true);
 }
@@ -485,7 +485,7 @@ function delay(ms) {
 function normalizeBlocksByLength(blocks, maxLength) {
   const normalized = [];
   blocks.forEach((block) => {
-    const blockLength = block.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
+    const blockLength = getBlockLength(block);
     if (blockLength > maxLength && block.length) {
       normalized.push(...splitOversizedBlock(block, maxLength));
       return;
@@ -494,7 +494,8 @@ function normalizeBlocksByLength(blocks, maxLength) {
       normalized.push(block);
     }
   });
-  return normalized;
+
+  return mergeAdjacentBlocksByLength(normalized, maxLength);
 }
 
 function splitOversizedBlock(block, maxLength) {
@@ -517,6 +518,38 @@ function splitOversizedBlock(block, maxLength) {
   return splits;
 }
 
+function mergeAdjacentBlocksByLength(blocks, maxLength) {
+  const merged = [];
+  let current = [];
+  let currentLength = 0;
+
+  blocks.forEach((block) => {
+    const blockLength = getBlockLength(block);
+    if (!current.length) {
+      current = block.slice();
+      currentLength = blockLength;
+      return;
+    }
+
+    if (currentLength + blockLength <= maxLength) {
+      current.push(...block);
+      currentLength += blockLength;
+      return;
+    }
+
+    merged.push(current);
+    current = block.slice();
+    currentLength = blockLength;
+  });
+
+  if (current.length) merged.push(current);
+  return merged;
+}
+
+function getBlockLength(block) {
+  return block.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
+}
+
 function buildPageText(nodesWithPath, maxLength) {
   const combined = nodesWithPath
     .map(({ node }) => node?.nodeValue || '')
@@ -532,12 +565,13 @@ function formatBlockText(texts) {
   return texts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-function reportProgress(message, completedBlocks, totalBlocks) {
+function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0) {
   chrome.runtime.sendMessage({
     type: 'TRANSLATION_PROGRESS',
     message,
     completedBlocks,
-    totalBlocks
+    totalBlocks,
+    inProgressBlocks
   });
 }
 

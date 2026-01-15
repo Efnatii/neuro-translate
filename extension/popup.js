@@ -142,7 +142,7 @@ async function handleProofreadEnabledChange() {
 }
 
 async function handleBlockLengthLimitChange() {
-  const blockLengthLimit = Number(blockLengthLimitInput.value);
+  const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
   await chrome.storage.local.set({ blockLengthLimit });
   renderBlockLengthLimit(blockLengthLimit);
   setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
@@ -210,9 +210,16 @@ function renderProofreadEnabled(enabled) {
 function renderBlockLengthLimit(limit) {
   const fallback = Number(blockLengthLimitInput.min) || 600;
   const parsed = Number(limit);
-  const normalized = Number.isFinite(parsed) ? parsed : fallback;
+  const normalized = clampBlockLengthLimit(Number.isFinite(parsed) ? parsed : fallback);
   blockLengthLimitInput.value = String(normalized);
   blockLengthValueLabel.textContent = String(normalized);
+}
+
+function clampBlockLengthLimit(value) {
+  const min = Number(blockLengthLimitInput.min) || 0;
+  const max = Number(blockLengthLimitInput.max) || Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(value, min), max);
 }
 
 function runModelThroughputTest(model) {
@@ -361,9 +368,15 @@ function formatTranslationStatus(status) {
 
   const completedBlocks = status.completedBlocks ?? status.completedChunks ?? 0;
   const totalBlocks = status.totalBlocks ?? status.totalChunks ?? 0;
+  const inProgressBlocks = status.inProgressBlocks ?? status.inProgressChunks ?? 0;
   const { message } = status;
-  const progress = totalBlocks ? ` (${completedBlocks}/${totalBlocks})` : '';
-  return message ? `${message}${progress}` : defaultText;
+  if (!message) {
+    return defaultText;
+  }
+  if (!totalBlocks) {
+    return message;
+  }
+  return `${message} ${completedBlocks}(+${inProgressBlocks}) из ${totalBlocks}`;
 }
 
 function formatThroughputStatus(info) {
