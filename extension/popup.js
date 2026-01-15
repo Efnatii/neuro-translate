@@ -255,6 +255,17 @@ async function sendMessageWithAutoInject(tab, message) {
   return sendMessageToTab(tab.id, message);
 }
 
+async function sendMessageWithAutoInjectAndResponse(tab, message) {
+  const initial = await sendMessageToTabWithResponse(tab.id, message);
+  if (initial.delivered) return initial.response;
+
+  const injected = await ensureContentScript(tab);
+  if (!injected) return null;
+
+  const retry = await sendMessageToTabWithResponse(tab.id, message);
+  return retry.response;
+}
+
 function sendMessageToTab(tabId, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, () => {
@@ -263,6 +274,18 @@ function sendMessageToTab(tabId, message) {
         return;
       }
       resolve(true);
+    });
+  });
+}
+
+function sendMessageToTabWithResponse(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ delivered: false, response: null });
+        return;
+      }
+      resolve({ delivered: true, response });
     });
   });
 }
@@ -440,8 +463,18 @@ async function handleOpenDebug() {
 async function sendBlockLengthLimitUpdate(blockLengthLimit) {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  await sendMessageWithAutoInject(tab, {
+  const response = await sendMessageWithAutoInjectAndResponse(tab, {
     type: 'RECALCULATE_BLOCKS',
     blockLengthLimit
   });
+  if (response?.updated && typeof response.totalBlocks === 'number') {
+    currentTranslationStatus = {
+      completedBlocks: 0,
+      totalBlocks: response.totalBlocks,
+      inProgressBlocks: 0,
+      message: response.message || 'Готово к переводу',
+      timestamp: Date.now()
+    };
+    renderStatus();
+  }
 }
