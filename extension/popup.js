@@ -78,6 +78,7 @@ async function init() {
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
+  blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
   toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
@@ -147,6 +148,12 @@ async function handleBlockLengthLimitChange() {
   renderBlockLengthLimit(blockLengthLimit);
   setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
   await sendBlockLengthLimitUpdate(blockLengthLimit);
+}
+
+async function handleBlockLengthLimitCommit() {
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  await chrome.tabs.reload(tab.id);
 }
 
 async function getState() {
@@ -316,7 +323,6 @@ async function sendCancel() {
   if (!tab?.id) return;
   const delivered = await sendMessageWithAutoInject(tab, { type: 'CANCEL_TRANSLATION' });
   if (!delivered) {
-    setTemporaryStatus('Перевод недоступен для этой страницы. Откройте обычную веб-страницу и попробуйте снова.');
     return;
   }
   updateTranslationVisibility(false);
@@ -329,7 +335,6 @@ async function sendTranslateRequest() {
   if (!tab?.id) return;
   const delivered = await sendMessageWithAutoInject(tab, { type: 'START_TRANSLATION' });
   if (!delivered) {
-    setTemporaryStatus('Перевод недоступен для этой страницы. Откройте обычную веб-страницу и попробуйте снова.');
     return;
   }
   updateTranslationVisibility(true);
@@ -346,7 +351,6 @@ async function handleToggleTranslationVisibility() {
     visible: nextVisible
   });
   if (!delivered) {
-    setTemporaryStatus('Перевод недоступен для этой страницы. Откройте обычную веб-страницу и попробуйте снова.');
     return;
   }
   updateTranslationVisibility(nextVisible);
