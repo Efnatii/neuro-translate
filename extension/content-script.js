@@ -4,9 +4,9 @@
   }
   window.__neuroTranslateContentScriptLoaded = true;
 
-  let cancelRequested = false;
+let cancelRequested = false;
 let translationError = null;
-let translationProgress = { completedChunks: 0, totalChunks: 0 };
+let translationProgress = { completedBlocks: 0, totalBlocks: 0 };
 let translationInProgress = false;
 let activeTranslationEntries = [];
 let originalSnapshot = [];
@@ -16,7 +16,6 @@ let debugEntries = [];
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
-const GLUE_MARKER = '⟦BLOCK_GLUE⟧';
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -43,7 +42,7 @@ chrome.runtime.onMessage.addListener((message) => {
 
 async function startTranslation() {
   if (translationInProgress) {
-    reportProgress('Перевод уже выполняется', translationProgress.completedChunks, translationProgress.totalChunks);
+    reportProgress('Перевод уже выполняется', translationProgress.completedBlocks, translationProgress.totalBlocks);
     return;
   }
 
@@ -53,7 +52,7 @@ async function startTranslation() {
     settings = await requestSettings();
   }
   if (!settings?.allowed) {
-    reportProgress('Перевод недоступен для этой страницы', translationProgress.completedChunks, translationProgress.totalChunks);
+    reportProgress('Перевод недоступен для этой страницы', translationProgress.completedBlocks, translationProgress.totalBlocks);
     return;
   }
 
@@ -87,22 +86,22 @@ async function translatePage(settings) {
   await clearTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
-  const maxChunkLength = normalizeChunkLength(settings.chunkLengthLimit, textStats.averageNodeLength);
+  const maxBlockLength = normalizeBlockLength(settings.blockLengthLimit, textStats.averageNodeLength);
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
-  const chunks = chunkBlocks(blockGroups, maxChunkLength);
-  translationProgress = { completedChunks: 0, totalChunks: chunks.length };
+  const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
+  translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
 
-  if (!chunks.length) {
+  if (!blocks.length) {
     reportProgress('Перевод не требуется', 0, 0);
     return;
   }
 
   cancelRequested = false;
   translationError = null;
-  reportProgress('Перевод запущен', 0, chunks.length);
+  reportProgress('Перевод запущен', 0, blocks.length);
 
   if (settings.contextGenerationEnabled) {
-    reportProgress('Генерация контекста', 0, chunks.length);
+    reportProgress('Генерация контекста', 0, blocks.length);
     const pageText = buildPageText(nodesWithPath);
     if (pageText) {
       try {
@@ -116,9 +115,9 @@ async function translatePage(settings) {
     }
   }
 
-  const averageChunkLength = chunks.length ? Math.round(textStats.totalLength / chunks.length) : 0;
-  const initialConcurrency = selectInitialConcurrency(averageChunkLength, chunks.length);
-  const maxAllowedConcurrency = Math.max(1, Math.min(6, chunks.length));
+  const averageBlockLength = blocks.length ? Math.round(textStats.totalLength / blocks.length) : 0;
+  const initialConcurrency = selectInitialConcurrency(averageBlockLength, blocks.length);
+  const maxAllowedConcurrency = Math.max(1, Math.min(6, blocks.length));
   const requestDurations = [];
   let dynamicMaxConcurrency = initialConcurrency;
   let nextIndex = 0;
@@ -159,16 +158,16 @@ async function translatePage(settings) {
       }
 
       const currentIndex = nextIndex++;
-      if (currentIndex >= chunks.length) {
+      if (currentIndex >= blocks.length) {
         releaseSlot();
         return;
       }
-      const chunk = chunks[currentIndex];
-      const preparedTexts = chunk.map(({ node, glueMarker }) =>
-        prepareTextForTranslation(node.nodeValue, glueMarker)
+      const block = blocks[currentIndex];
+      const preparedTexts = block.map(({ node }) =>
+        prepareTextForTranslation(node.nodeValue)
       );
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
-      const chunkTranslations = [];
+      const blockTranslations = [];
       let proofreadReplacements = [];
 
       const startTime = performance.now();
@@ -181,11 +180,10 @@ async function translatePage(settings) {
           latestContextSummary,
           keepPunctuationTokens
         );
-        const translatedTexts = chunk.map(({ node, original }, index) => {
+        const translatedTexts = block.map(({ node, original }, index) => {
           const translationIndex = indexMap[index];
           const translated = result.translations[translationIndex] || node.nodeValue;
-          const cleaned = stripGlueMarker(translated);
-          return applyOriginalFormatting(original, cleaned);
+          return applyOriginalFormatting(original, translated);
         });
 
         let finalTranslations = translatedTexts;
@@ -195,7 +193,7 @@ async function translatePage(settings) {
               translatedTexts,
               settings.targetLanguage || 'ru',
               latestContextSummary,
-              chunk.map(({ original }) => original)
+              block.map(({ original }) => original)
             );
             if (proofreadReplacements.length) {
               finalTranslations = applyProofreadingReplacements(translatedTexts, proofreadReplacements);
@@ -209,16 +207,16 @@ async function translatePage(settings) {
           finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
         }
 
-        chunk.forEach(({ node, path, original }, index) => {
+        block.forEach(({ node, path, original }, index) => {
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
           node.nodeValue = withOriginalFormatting;
-          chunkTranslations.push(withOriginalFormatting);
+          blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting);
         });
         const debugEntry = {
           index: currentIndex + 1,
-          original: formatChunkText(chunk.map(({ original }) => original)),
-          translated: formatChunkText(chunkTranslations),
+          original: formatBlockText(block.map(({ original }) => original)),
+          translated: formatBlockText(blockTranslations),
           proofread: proofreadReplacements,
           proofreadApplied: Boolean(settings.proofreadEnabled)
         };
@@ -229,10 +227,10 @@ async function translatePage(settings) {
           updatedAt: Date.now()
         });
       } catch (error) {
-        console.error('Chunk translation failed', error);
+        console.error('Block translation failed', error);
         translationError = error;
         cancelRequested = true;
-        reportProgress('Ошибка перевода', translationProgress.completedChunks, chunks.length);
+        reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length);
         releaseSlot();
         return;
       }
@@ -241,8 +239,8 @@ async function translatePage(settings) {
       adjustConcurrency(duration);
       releaseSlot();
 
-      translationProgress.completedChunks += 1;
-      reportProgress('Перевод выполняется', translationProgress.completedChunks, chunks.length);
+      translationProgress.completedBlocks += 1;
+      reportProgress('Перевод выполняется', translationProgress.completedBlocks, blocks.length);
     }
   };
 
@@ -250,16 +248,16 @@ async function translatePage(settings) {
   await Promise.all(workers);
 
   if (translationError) {
-    reportProgress('Ошибка перевода', translationProgress.completedChunks, chunks.length);
+    reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length);
     return;
   }
 
   if (cancelRequested) {
-    reportProgress('Перевод отменён', translationProgress.completedChunks, chunks.length);
+    reportProgress('Перевод отменён', translationProgress.completedBlocks, blocks.length);
     return;
   }
 
-  reportProgress('Перевод завершён', translationProgress.completedChunks, chunks.length);
+  reportProgress('Перевод завершён', translationProgress.completedBlocks, blocks.length);
   await saveTranslationsToMemory(activeTranslationEntries);
   await setTranslationVisibility(true);
 }
@@ -452,81 +450,51 @@ function calculateTextLengthStats(nodesWithPath) {
   return { totalLength, averageNodeLength };
 }
 
-function calculateMaxChunkLength(averageNodeLength) {
+function calculateMaxBlockLength(averageNodeLength) {
   const scaled = averageNodeLength * 6;
   return Math.min(1500, Math.max(800, Math.round(scaled || 0)));
 }
 
-function normalizeChunkLength(limit, averageNodeLength) {
+function normalizeBlockLength(limit, averageNodeLength) {
   const parsed = Number(limit);
   if (Number.isFinite(parsed) && parsed > 0) {
     return Math.round(parsed);
   }
-  return calculateMaxChunkLength(averageNodeLength);
+  return calculateMaxBlockLength(averageNodeLength);
 }
 
-function selectInitialConcurrency(averageChunkLength, chunkCount) {
+function selectInitialConcurrency(averageBlockLength, blockCount) {
   let concurrency;
-  if (averageChunkLength >= 1300) {
+  if (averageBlockLength >= 1300) {
     concurrency = 1;
-  } else if (averageChunkLength >= 1100) {
+  } else if (averageBlockLength >= 1100) {
     concurrency = 2;
-  } else if (averageChunkLength >= 900) {
+  } else if (averageBlockLength >= 900) {
     concurrency = 3;
   } else {
     concurrency = 4;
   }
 
-  return Math.min(Math.max(concurrency, 1), Math.max(1, chunkCount));
+  return Math.min(Math.max(concurrency, 1), Math.max(1, blockCount));
 }
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function chunkBlocks(blocks, maxLength) {
-  const chunks = [];
-  let currentChunk = [];
-  let currentLength = 0;
-
-  const pushChunk = () => {
-    if (currentChunk.length) {
-      chunks.push(currentChunk);
-      currentChunk = [];
-      currentLength = 0;
-    }
-  };
-
+function normalizeBlocksByLength(blocks, maxLength) {
+  const normalized = [];
   blocks.forEach((block) => {
     const blockLength = block.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
-
     if (blockLength > maxLength && block.length) {
-      const splitBlocks = splitOversizedBlock(block, maxLength);
-      splitBlocks.forEach((splitBlock) => {
-        const splitLength = splitBlock.reduce((sum, entry) => sum + (entry.node.nodeValue?.length || 0), 0);
-        if (currentLength + splitLength > maxLength) {
-          pushChunk();
-        }
-        currentChunk.push(...splitBlock);
-        currentLength += splitLength;
-        pushChunk();
-      });
+      normalized.push(...splitOversizedBlock(block, maxLength));
       return;
     }
-
-    if (currentLength + blockLength > maxLength && currentChunk.length) {
-      pushChunk();
+    if (block.length) {
+      normalized.push(block);
     }
-
-    if (currentChunk.length && block.length) {
-      currentChunk[currentChunk.length - 1].glueMarker = true;
-    }
-    currentChunk.push(...block);
-    currentLength += blockLength;
   });
-
-  pushChunk();
-  return chunks;
+  return normalized;
 }
 
 function splitOversizedBlock(block, maxLength) {
@@ -560,16 +528,16 @@ function buildPageText(nodesWithPath, maxLength) {
   return combined.slice(0, maxLength).trimEnd();
 }
 
-function formatChunkText(texts) {
+function formatBlockText(texts) {
   return texts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-function reportProgress(message, completedChunks, totalChunks) {
+function reportProgress(message, completedBlocks, totalBlocks) {
   chrome.runtime.sendMessage({
     type: 'TRANSLATION_PROGRESS',
     message,
-    completedChunks,
-    totalChunks
+    completedBlocks,
+    totalBlocks
   });
 }
 
@@ -615,10 +583,9 @@ function findNodeByPath(path) {
   return current && current.nodeType === Node.TEXT_NODE ? current : null;
 }
 
-function prepareTextForTranslation(text, addGlueMarker = false) {
+function prepareTextForTranslation(text) {
   const { core } = extractWhitespaceAndCore(text);
-  if (!addGlueMarker) return core;
-  return `${core}${GLUE_MARKER}`;
+  return core;
 }
 
 function applyOriginalFormatting(original, translated) {
@@ -626,12 +593,6 @@ function applyOriginalFormatting(original, translated) {
   const adjustedCase = matchFirstLetterCase(original, translated || '');
   const trimmed = typeof adjustedCase === 'string' ? adjustedCase.trim() : '';
   return `${prefix}${trimmed}${suffix}`;
-}
-
-function stripGlueMarker(text = '') {
-  if (!text) return '';
-  const markerRegex = new RegExp(`\\s*${escapeRegex(GLUE_MARKER)}\\s*`, 'g');
-  return text.replace(markerRegex, ' ');
 }
 
 function extractWhitespaceAndCore(text = '') {
@@ -760,7 +721,7 @@ async function cancelTranslation() {
   await clearTranslationDebugInfo(location.href);
   activeTranslationEntries = [];
   await setTranslationVisibility(false);
-  reportProgress('Перевод отменён', translationProgress.completedChunks, translationProgress.totalChunks);
+  reportProgress('Перевод отменён', translationProgress.completedBlocks, translationProgress.totalBlocks);
 }
 
 async function setTranslationVisibility(visible) {
