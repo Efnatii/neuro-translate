@@ -26,7 +26,7 @@ const PUNCTUATION_TOKENS = new Map([
 
 restoreFromMemory();
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'CANCEL_TRANSLATION') {
     cancelTranslation();
   }
@@ -41,10 +41,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === 'RECALCULATE_BLOCKS') {
     const limit = message.blockLengthLimit;
-    const result = recalculateBlockCount(limit);
-    if (typeof sendResponse === 'function') {
-      sendResponse(result);
-    }
+    recalculateBlockCount(limit);
   }
 });
 
@@ -491,9 +488,7 @@ function delay(ms) {
 }
 
 function recalculateBlockCount(blockLengthLimit) {
-  if (translationInProgress) {
-    return { updated: false, totalBlocks: translationProgress.totalBlocks || 0 };
-  }
+  if (translationInProgress) return;
   const textNodes = collectTextNodes(document.body);
   const nodesWithPath = textNodes.map((node) => ({
     node,
@@ -507,10 +502,9 @@ function recalculateBlockCount(blockLengthLimit) {
   translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
   if (!blocks.length) {
     reportProgress('Перевод не требуется', 0, 0);
-    return { updated: true, totalBlocks: 0, message: 'Перевод не требуется' };
+    return;
   }
   reportProgress('Готово к переводу', 0, blocks.length, 0);
-  return { updated: true, totalBlocks: blocks.length, message: 'Готово к переводу' };
 }
 
 function normalizeBlocksByLength(blocks, maxLength) {
