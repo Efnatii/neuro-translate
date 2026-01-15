@@ -5,8 +5,8 @@ const contextModelSelect = document.getElementById('contextModel');
 const proofreadModelSelect = document.getElementById('proofreadModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
-const chunkLengthLimitInput = document.getElementById('chunkLengthLimit');
-const chunkLengthValueLabel = document.getElementById('chunkLengthValue');
+const blockLengthLimitInput = document.getElementById('blockLengthLimit');
+const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
 
 const cancelButton = document.getElementById('cancel');
@@ -63,7 +63,7 @@ async function init() {
   currentThroughputInfo = state.modelThroughputById?.[currentTranslationModelId] || null;
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
-  renderChunkLengthLimit(state.chunkLengthLimit);
+  renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   renderStatus();
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
@@ -77,7 +77,7 @@ async function init() {
   proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
-  chunkLengthLimitInput.addEventListener('input', handleChunkLengthLimitChange);
+  blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   cancelButton.addEventListener('click', sendCancel);
   translateButton.addEventListener('click', sendTranslateRequest);
   toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
@@ -141,11 +141,11 @@ async function handleProofreadEnabledChange() {
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
-async function handleChunkLengthLimitChange() {
-  const chunkLengthLimit = Number(chunkLengthLimitInput.value);
-  await chrome.storage.local.set({ chunkLengthLimit });
-  renderChunkLengthLimit(chunkLengthLimit);
-  setTemporaryStatus(`Лимит длины чанка: ${chunkLengthLimit} символов.`);
+async function handleBlockLengthLimitChange() {
+  const blockLengthLimit = Number(blockLengthLimitInput.value);
+  await chrome.storage.local.set({ blockLengthLimit });
+  renderBlockLengthLimit(blockLengthLimit);
+  setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
 }
 
 async function getState() {
@@ -160,6 +160,7 @@ async function getState() {
         'proofreadModel',
         'contextGenerationEnabled',
         'proofreadEnabled',
+        'blockLengthLimit',
         'chunkLengthLimit',
         'translationStatusByTab',
         'translationVisibilityByTab',
@@ -174,7 +175,7 @@ async function getState() {
         proofreadModel: data.proofreadModel || data.model,
         contextGenerationEnabled: data.contextGenerationEnabled,
         proofreadEnabled: data.proofreadEnabled,
-        chunkLengthLimit: data.chunkLengthLimit,
+        blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {},
         modelThroughputById: data.modelThroughputById || {}
@@ -206,12 +207,12 @@ function renderProofreadEnabled(enabled) {
   proofreadEnabledCheckbox.checked = Boolean(enabled);
 }
 
-function renderChunkLengthLimit(limit) {
-  const fallback = Number(chunkLengthLimitInput.min) || 600;
+function renderBlockLengthLimit(limit) {
+  const fallback = Number(blockLengthLimitInput.min) || 600;
   const parsed = Number(limit);
   const normalized = Number.isFinite(parsed) ? parsed : fallback;
-  chunkLengthLimitInput.value = String(normalized);
-  chunkLengthValueLabel.textContent = String(normalized);
+  blockLengthLimitInput.value = String(normalized);
+  blockLengthValueLabel.textContent = String(normalized);
 }
 
 function runModelThroughputTest(model) {
@@ -358,8 +359,10 @@ function formatTranslationStatus(status) {
     return defaultText;
   }
 
-  const { completedChunks = 0, totalChunks = 0, message } = status;
-  const progress = totalChunks ? ` (${completedChunks}/${totalChunks})` : '';
+  const completedBlocks = status.completedBlocks ?? status.completedChunks ?? 0;
+  const totalBlocks = status.totalBlocks ?? status.totalChunks ?? 0;
+  const { message } = status;
+  const progress = totalBlocks ? ` (${completedBlocks}/${totalBlocks})` : '';
   return message ? `${message}${progress}` : defaultText;
 }
 

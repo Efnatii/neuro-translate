@@ -7,7 +7,7 @@ const DEFAULT_STATE = {
   translationStyle: 'auto',
   contextGenerationEnabled: false,
   proofreadEnabled: false,
-  chunkLengthLimit: 1200
+  blockLengthLimit: 1200
 };
 
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
@@ -24,11 +24,8 @@ const PUNCTUATION_TOKENS = new Map([
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
 
-const GLUE_MARKER = '⟦BLOCK_GLUE⟧';
-
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
-const GLUE_MARKER_HINT = `Token ${GLUE_MARKER} marks glued block boundaries; keep it unchanged and in place.`;
 
 function isDeepseekModel(model = '') {
   return model.startsWith('deepseek');
@@ -51,8 +48,11 @@ function getApiConfigForModel(model, state) {
 }
 
 async function getState() {
-  const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null });
+  const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
   const merged = { ...DEFAULT_STATE, ...stored };
+  if (!merged.blockLengthLimit && stored.chunkLengthLimit) {
+    merged.blockLengthLimit = stored.chunkLengthLimit;
+  }
   if (!merged.translationModel && merged.model) {
     merged.translationModel = merged.model;
   }
@@ -142,7 +142,7 @@ async function handleGetSettings(message, sendResponse) {
     translationStyle: state.translationStyle,
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
-    chunkLengthLimit: state.chunkLengthLimit
+    blockLengthLimit: state.blockLengthLimit
   });
 }
 
@@ -389,7 +389,6 @@ async function proofreadTranslation(
           ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
           : 'If no context is provided, do not invent context or add assumptions.',
         PUNCTUATION_TOKEN_HINT,
-        GLUE_MARKER_HINT,
         'If no corrections are needed, return an empty JSON array: [].'
       ]
         .filter(Boolean)
@@ -625,7 +624,6 @@ async function performTranslationRequest(
         'Do not leave any source text untranslated. Do not copy the source text verbatim except for placeholders, markup, punctuation tokens, or text that is already in the target language.',
         'Ensure terminology consistency within the same request.',
         PUNCTUATION_TOKEN_HINT,
-        GLUE_MARKER_HINT,
         styleInstruction ? `Tone/style: ${styleInstruction}` : 'Determine the most appropriate tone/style based on the provided context.',
         context
           ? `Rely on the provided page context for disambiguation only; never introduce new facts: ${context}`
@@ -648,7 +646,7 @@ async function performTranslationRequest(
         'Translate names/titles/terms; if unsure, transliterate rather than leaving them untranslated, except for established brands.',
         'Do not leave any source text untranslated. Do not copy segments verbatim except for placeholders, markup, punctuation tokens, or text already in the target language.',
         'Keep terminology consistent within a single request.',
-        `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT} ${GLUE_MARKER_HINT}`,
+        `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
         'Segments to translate:',
         ...tokenizedTexts.map((text) => text)
       ]
@@ -1000,8 +998,8 @@ async function handleTranslationProgress(message, sender) {
   if (!tabId) return;
 
   const status = {
-    completedChunks: message.completedChunks || 0,
-    totalChunks: message.totalChunks || 0,
+    completedBlocks: message.completedBlocks || 0,
+    totalBlocks: message.totalBlocks || 0,
     message: message.message || '',
     timestamp: Date.now()
   };
