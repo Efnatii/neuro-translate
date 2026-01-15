@@ -146,6 +146,7 @@ async function handleBlockLengthLimitChange() {
   await chrome.storage.local.set({ blockLengthLimit });
   renderBlockLengthLimit(blockLengthLimit);
   setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
+  await sendBlockLengthLimitUpdate(blockLengthLimit);
 }
 
 async function getState() {
@@ -434,4 +435,13 @@ async function handleOpenDebug() {
   }
   const debugUrl = chrome.runtime.getURL(`debug.html?source=${encodeURIComponent(tab.url)}`);
   await chrome.tabs.create({ url: debugUrl });
+}
+
+async function sendBlockLengthLimitUpdate(blockLengthLimit) {
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  await sendMessageWithAutoInject(tab, {
+    type: 'RECALCULATE_BLOCKS',
+    blockLengthLimit
+  });
 }

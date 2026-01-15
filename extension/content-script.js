@@ -38,6 +38,11 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'SET_TRANSLATION_VISIBILITY') {
     setTranslationVisibility(Boolean(message.visible));
   }
+
+  if (message?.type === 'RECALCULATE_BLOCKS') {
+    const limit = message.blockLengthLimit;
+    recalculateBlockCount(limit);
+  }
 });
 
 async function startTranslation() {
@@ -482,40 +487,35 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function recalculateBlockCount(blockLengthLimit) {
+  if (translationInProgress) return;
+  const textNodes = collectTextNodes(document.body);
+  const nodesWithPath = textNodes.map((node) => ({
+    node,
+    path: getNodePath(node),
+    original: node.nodeValue
+  }));
+  const textStats = calculateTextLengthStats(nodesWithPath);
+  const maxBlockLength = normalizeBlockLength(blockLengthLimit, textStats.averageNodeLength);
+  const blockGroups = groupTextNodesByBlock(nodesWithPath);
+  const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
+  translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
+  if (!blocks.length) {
+    reportProgress('Перевод не требуется', 0, 0);
+    return;
+  }
+  reportProgress('Готово к переводу', 0, blocks.length, 0);
+}
+
 function normalizeBlocksByLength(blocks, maxLength) {
   const normalized = [];
   blocks.forEach((block) => {
-    const blockLength = getBlockLength(block);
-    if (blockLength > maxLength && block.length) {
-      normalized.push(...splitOversizedBlock(block, maxLength));
-      return;
-    }
     if (block.length) {
       normalized.push(block);
     }
   });
 
   return mergeAdjacentBlocksByLength(normalized, maxLength);
-}
-
-function splitOversizedBlock(block, maxLength) {
-  const splits = [];
-  let current = [];
-  let length = 0;
-
-  block.forEach((entry) => {
-    const textLength = entry.node.nodeValue?.length || 0;
-    if (length + textLength > maxLength && current.length) {
-      splits.push(current);
-      current = [];
-      length = 0;
-    }
-    current.push(entry);
-    length += textLength;
-  });
-
-  if (current.length) splits.push(current);
-  return splits;
 }
 
 function mergeAdjacentBlocksByLength(blocks, maxLength) {
