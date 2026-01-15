@@ -1000,6 +1000,7 @@ async function handleTranslationProgress(message, sender) {
   const status = {
     completedBlocks: message.completedBlocks || 0,
     totalBlocks: message.totalBlocks || 0,
+    inProgressBlocks: message.inProgressBlocks || 0,
     message: message.message || '',
     timestamp: Date.now()
   };
