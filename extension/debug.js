@@ -229,7 +229,7 @@ function renderProofreadSection(item) {
   if (item?.proofreadApplied) {
     content = replacements.length
       ? replacements
-          .map((replacement, index) => formatProofreadReplacement(replacement, index))
+          .map((replacement, index) => formatProofreadReplacement(replacement, index, item))
           .filter(Boolean)
           .join('\n')
       : 'Нет правок.';
@@ -260,26 +260,43 @@ function renderProofreadSection(item) {
     `;
 }
 
-function formatProofreadReplacement(replacement, index) {
+function formatProofreadReplacement(replacement, index, item) {
   if (!replacement || typeof replacement !== 'object') return '';
   const hasFromTo = 'from' in replacement || 'to' in replacement;
   if (hasFromTo) {
     const fromText = typeof replacement.from === 'string' ? replacement.from : '';
     const toText = typeof replacement.to === 'string' ? replacement.to : '';
     if (!fromText && !toText) return '';
-    return `${fromText} → ${toText}`;
+    return `${fromText} -> ${toText}`;
   }
 
   if ('revisedText' in replacement) {
     const revisedText = typeof replacement.revisedText === 'string' ? replacement.revisedText : '';
     if (!revisedText) return '';
     const segmentIndex = Number(replacement.segmentIndex);
-    const segmentLabel = Number.isInteger(segmentIndex)
-      ? `Сегмент ${segmentIndex + 1}`
-      : `Правка ${index + 1}`;
-    return `${segmentLabel}: ${revisedText}`;
+    const sourceText = resolveProofreadSourceText(item, segmentIndex);
+    if (!sourceText) return '';
+    return `${sourceText} -> ${revisedText}`;
   }
 
+  return '';
+}
+
+function resolveProofreadSourceText(item, segmentIndex) {
+  const translatedSegments = Array.isArray(item?.translatedSegments) ? item.translatedSegments : [];
+  const originalSegments = Array.isArray(item?.originalSegments) ? item.originalSegments : [];
+  if (Number.isInteger(segmentIndex)) {
+    const translatedSegment = translatedSegments[segmentIndex];
+    if (typeof translatedSegment === 'string' && translatedSegment) return translatedSegment;
+    const originalSegment = originalSegments[segmentIndex];
+    if (typeof originalSegment === 'string' && originalSegment) return originalSegment;
+  }
+  if (!translatedSegments.length && typeof item?.translated === 'string' && item.translated) {
+    return item.translated;
+  }
+  if (!originalSegments.length && typeof item?.original === 'string' && item.original) {
+    return item.original;
+  }
   return '';
 }
 

@@ -273,6 +273,7 @@ async function translatePage(settings) {
         });
         await updateDebugEntry(currentIndex + 1, {
           translated: formatBlockText(blockTranslations),
+          translatedSegments: translatedTexts,
           translationStatus: 'done',
           translationRaw: result.rawTranslation || ''
         });
@@ -1253,7 +1254,9 @@ async function initializeDebugState(blocks, settings = {}) {
   debugEntries = blocks.map((block, index) => ({
     index: index + 1,
     original: formatBlockText(block.map(({ original }) => original)),
+    originalSegments: block.map(({ original }) => original),
     translated: '',
+    translatedSegments: [],
     translationRaw: '',
     proofread: [],
     proofreadRaw: '',
