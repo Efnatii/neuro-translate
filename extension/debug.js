@@ -154,6 +154,14 @@ function renderDebug(url, data) {
             : `<div class="empty">Перевод ещё не получен.</div>`
         }
       </div>
+      <div class="block">
+        <div class="label">Ответ ИИ (перевод)</div>
+        ${
+          item.translationRaw
+            ? `<pre>${escapeHtml(item.translationRaw)}</pre>`
+            : `<div class="empty">Ответ ИИ ещё не получен.</div>`
+        }
+      </div>
       ${proofreadSection}
     `;
     entriesEl.appendChild(entry);
@@ -228,6 +236,16 @@ function renderProofreadSection(item) {
         ${
           item?.proofreadApplied
             ? `<pre>${escapeHtml(content)}</pre>`
+            : `<div class="empty">Вычитка выключена.</div>`
+        }
+      </div>
+      <div class="block">
+        <div class="label">Ответ ИИ (вычитка)</div>
+        ${
+          item?.proofreadApplied
+            ? item.proofreadRaw
+              ? `<pre>${escapeHtml(item.proofreadRaw)}</pre>`
+              : `<div class="empty">Ответ ИИ ещё не получен.</div>`
             : `<div class="empty">Вычитка выключена.</div>`
         }
       </div>

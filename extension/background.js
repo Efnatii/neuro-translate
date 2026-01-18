@@ -21,7 +21,6 @@ const DEFAULT_STATE = {
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
-  translationStyle: 'auto',
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   blockLengthLimit: 1200,
@@ -87,9 +86,6 @@ async function getState() {
   }
   if (!merged.contextModel && merged.model) {
     merged.contextModel = merged.model;
-  }
-  if (merged.translationStyle !== 'auto') {
-    merged.translationStyle = 'auto';
   }
   return merged;
 }
@@ -173,7 +169,6 @@ async function handleGetSettings(message, sendResponse) {
     translationModel: state.translationModel,
     contextModel: state.contextModel,
     proofreadModel: state.proofreadModel,
-    translationStyle: state.translationStyle,
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
     blockLengthLimit: state.blockLengthLimit,
@@ -195,17 +190,16 @@ async function handleTranslateText(message, sendResponse) {
       return;
     }
 
-    const translations = await translateTexts(
+    const { translations, rawTranslation } = await translateTexts(
       message.texts,
       apiKey,
       message.targetLanguage,
       state.translationModel,
-      message.translationStyle || state.translationStyle,
       message.context,
       apiBaseUrl,
       message.keepPunctuationTokens
     );
-    sendResponse({ success: true, translations });
+    sendResponse({ success: true, translations, rawTranslation });
   } catch (error) {
     console.error('Translation failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
@@ -244,7 +238,7 @@ async function handleProofreadText(message, sendResponse) {
       return;
     }
 
-    const replacements = await proofreadTranslation(
+    const { replacements, rawProofread } = await proofreadTranslation(
       message.texts,
       apiKey,
       message.targetLanguage,
@@ -253,7 +247,7 @@ async function handleProofreadText(message, sendResponse) {
       message.context,
       message.sourceTexts
     );
-    sendResponse({ success: true, replacements });
+    sendResponse({ success: true, replacements, rawProofread });
   } catch (error) {
     console.error('Proofreading failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
@@ -402,7 +396,7 @@ async function proofreadTranslation(
   context = '',
   sourceTexts = []
 ) {
-  if (!Array.isArray(texts) || !texts.length) return [];
+  if (!Array.isArray(texts) || !texts.length) return { replacements: [], rawProofread: '' };
 
   const normalizedSourceTexts = Array.isArray(sourceTexts) ? sourceTexts : [];
   const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
@@ -417,10 +411,9 @@ async function proofreadTranslation(
       role: 'system',
       content: [
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        'Return only a JSON array of objects with "segmentIndex" and "revisedText" fields.',
-        'Each object describes a full corrected segment where "segmentIndex" is the 0-based index of the segment',
-        `in the translated text split by the ${PROOFREAD_SEGMENT_TOKEN} token.`,
-        'Never add commentary, explanations, or extra keys.',
+        'Return only a plain list of revised segments, one per line, in the same order and count as the input segments.',
+        'If a segment requires no corrections, return an empty line for that segment.',
+        'Never add commentary, explanations, numbering, or extra markup.',
         'Prioritize readability and clarity of meaning over strict literalness.',
         'Improve fluency and naturalness so the translation reads like it was written by a native speaker.',
         'Fix grammar, agreement, punctuation, typos, or terminology consistency as needed.',
@@ -434,13 +427,13 @@ async function proofreadTranslation(
         'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
         'If a punctuation token appears in the translated text, keep it unchanged and in the same position.',
         `Segments are separated by the token ${PROOFREAD_SEGMENT_TOKEN}; keep it unchanged and in place.`,
-        'Only return revised segments, and do not include the segment separator in "revisedText".',
+        'Do not include the segment separator in any line.',
         'Use the source text only to verify correctness and preserve meaning.',
         context
           ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
           : 'If no context is provided, do not invent context or add assumptions.',
         PUNCTUATION_TOKEN_HINT,
-        'If no corrections are needed, return an empty JSON array: [].'
+        'Return only the revised list without any JSON.'
       ]
         .filter(Boolean)
         .join(' ')
@@ -449,8 +442,9 @@ async function proofreadTranslation(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Review the translated text below and return only the JSON array of revised segments.',
-        `The translated text is split by ${PROOFREAD_SEGMENT_TOKEN}; the first segment has segmentIndex 0.`,
+        'Review the translated text below and return only the revised segments as a plain list, one per line.',
+        `The translated text is split by ${PROOFREAD_SEGMENT_TOKEN}; the first line corresponds to segmentIndex 0.`,
+        'If a segment needs no corrections, return an empty line in its place.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
         normalizedSourceTexts.length ? combinedSourceText : '',
@@ -500,20 +494,16 @@ async function proofreadTranslation(
         throw new Error('No proofreading result returned');
       }
 
-      const parsed = safeParseArray(content, null);
-      if (!Array.isArray(parsed)) {
-        throw new Error('Unexpected proofreading format');
-      }
-
-      return parsed
-        .map((item) => {
-          if (!item || typeof item !== 'object') return null;
-          const segmentIndex = Number(item.segmentIndex);
-          if (!Number.isInteger(segmentIndex)) return null;
-          const revisedText = typeof item.revisedText === 'string' ? item.revisedText : '';
-          return { segmentIndex, revisedText };
+      const parsed = parseLineList(content, texts.length, 'proofread');
+      const replacements = parsed
+        .map((item, index) => {
+          const revisedText = typeof item === 'string' ? item : '';
+          if (!revisedText) return null;
+          return { segmentIndex: index, revisedText };
         })
         .filter(Boolean);
+
+      return { replacements, rawProofread: content };
     } catch (error) {
       lastError = error;
       const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
@@ -568,12 +558,11 @@ async function translateTexts(
   apiKey,
   targetLanguage = 'ru',
   model = DEFAULT_STATE.translationModel,
-  translationStyle = DEFAULT_STATE.translationStyle,
   context = '',
   apiBaseUrl = OPENAI_API_URL,
   keepPunctuationTokens = false
 ) {
-  if (!Array.isArray(texts) || !texts.length) return [];
+  if (!Array.isArray(texts) || !texts.length) return { translations: [], rawTranslation: '' };
 
   const maxTimeoutAttempts = 2;
   const maxRetryableRetries = 3;
@@ -581,6 +570,7 @@ async function translateTexts(
   let retryableRetries = 0;
   let lastError = null;
   let lastRetryDelayMs = null;
+  let lastRawTranslation = '';
   const throughputInfo = await getModelThroughputInfo(model);
   const timeoutMs = calculateTranslationTimeoutMs(texts, throughputInfo);
 
@@ -589,17 +579,18 @@ async function translateTexts(
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      return await performTranslationRequest(
+      const result = await performTranslationRequest(
         texts,
         apiKey,
         targetLanguage,
         model,
-        translationStyle,
         controller.signal,
         context,
         apiBaseUrl,
         !keepPunctuationTokens
       );
+      lastRawTranslation = result.rawTranslation;
+      return result;
     } catch (error) {
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
 
@@ -625,16 +616,16 @@ async function translateTexts(
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
-        return await translateIndividually(
+        const translations = await translateIndividually(
           texts,
           apiKey,
           targetLanguage,
           model,
-          translationStyle,
           context,
           apiBaseUrl,
           keepPunctuationTokens
         );
+        return { translations, rawTranslation: lastRawTranslation };
       }
 
       if (isRateLimit) {
@@ -656,7 +647,6 @@ async function performTranslationRequest(
   apiKey,
   targetLanguage,
   model,
-  translationStyle,
   signal,
   context = '',
   apiBaseUrl = OPENAI_API_URL,
@@ -665,15 +655,6 @@ async function performTranslationRequest(
   allowRefusalRetry = true
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
-  const styleHints = {
-    natural: 'Neutral, smooth Russian without literal calques.',
-    conversational: 'Conversational, warm tone with vivid phrasing and no excessive familiarity.',
-    formal: 'Business-like, precise tone with clear wording.',
-    creative: 'Expressive, imagery-rich tone without losing meaning.'
-  };
-
-  const isAutoStyle = translationStyle === 'auto';
-  const styleInstruction = isAutoStyle ? null : styleHints?.[translationStyle] || styleHints.natural;
 
   const prompt = [
     {
@@ -692,7 +673,7 @@ async function performTranslationRequest(
           ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
           : null,
         PUNCTUATION_TOKEN_HINT,
-        styleInstruction ? `Tone/style: ${styleInstruction}` : 'Determine the most appropriate tone/style based on the provided context.',
+        'Determine the most appropriate tone/style based on the provided context.',
         context
           ? `Rely on the provided page context for disambiguation only; never introduce new facts: ${context}`
           : 'If no context is provided, do not invent context or add assumptions.',
@@ -705,7 +686,7 @@ async function performTranslationRequest(
       role: 'user',
       content: [
         `Translate the following segments into ${targetLanguage}.`,
-        styleInstruction ? `Style: ${styleInstruction}` : 'Determine the style automatically based on context.',
+        'Determine the style automatically based on context.',
         context ? `Page context (use it for disambiguation only): ${context}` : '',
         'Do not omit or add information; preserve modality, tense, aspect, tone, and level of certainty.',
         'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
@@ -767,11 +748,7 @@ async function performTranslationRequest(
     throw new Error('No translation returned');
   }
 
-  const parsed = safeParseArray(content, texts.length);
-  if (!Array.isArray(parsed)) {
-    throw new Error('Unexpected translation format');
-  }
-
+  const parsed = parseLineList(content, texts.length, 'translation');
   const translations = parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
   const refusalIndices = translations
     .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
@@ -791,7 +768,6 @@ async function performTranslationRequest(
       apiKey,
       targetLanguage,
       model,
-      translationStyle,
       context,
       apiBaseUrl,
       !restorePunctuation,
@@ -828,7 +804,6 @@ async function performTranslationRequest(
         apiKey,
         targetLanguage,
         model,
-        translationStyle,
         signal,
         context,
         apiBaseUrl,
@@ -836,22 +811,26 @@ async function performTranslationRequest(
         true,
         allowRefusalRetry
       );
+      const retryTranslations = retryResults?.translations || [];
 
       retryIndices.forEach((index, retryPosition) => {
-        if (retryResults?.[retryPosition]) {
-          translations[index] = retryResults[retryPosition];
+        if (retryTranslations?.[retryPosition]) {
+          translations[index] = retryTranslations[retryPosition];
         }
       });
     }
   }
 
-  return texts.map((text, index) => {
-    const candidate = translations[index];
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return restorePunctuation ? restorePunctuationTokens(candidate) : candidate;
-    }
-    return text;
-  });
+  return {
+    translations: texts.map((text, index) => {
+      const candidate = translations[index];
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return restorePunctuation ? restorePunctuationTokens(candidate) : candidate;
+      }
+      return text;
+    }),
+    rawTranslation: content
+  };
 }
 
 function parseRetryAfterMs(response, errorPayload) {
@@ -943,7 +922,6 @@ async function translateIndividually(
   apiKey,
   targetLanguage,
   model,
-  translationStyle,
   context = '',
   apiBaseUrl = OPENAI_API_URL,
   keepPunctuationTokens = false,
@@ -957,12 +935,11 @@ async function translateIndividually(
 
     while (true) {
       try {
-        const [translated] = await performTranslationRequest(
+        const result = await performTranslationRequest(
           [text],
           apiKey,
           targetLanguage,
           model,
-          translationStyle,
           undefined,
           context,
           apiBaseUrl,
@@ -970,7 +947,7 @@ async function translateIndividually(
           false,
           allowRefusalRetry
         );
-        results.push(translated);
+        results.push(result.translations[0]);
         break;
       } catch (error) {
         const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
@@ -1047,95 +1024,37 @@ async function saveModelThroughputResult(model, result) {
   await chrome.storage.local.set({ modelThroughputById });
 }
 
-function safeParseArray(content, expectedLength) {
+function parseLineList(content, expectedLength, label = 'response') {
   const normalizeString = (value = '') =>
-    value.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
   const collapseSingleItemLines = (lines) => {
     if (!Array.isArray(lines) || !lines.length) return null;
     if (lines.length === 1) return lines;
-    const sortedByLength = [...lines].sort((a, b) => b.length - a.length);
-    const longest = sortedByLength[0] || '';
-    return [longest.trim()].filter(Boolean);
+    const combined = lines.join('\n').trim();
+    return combined ? [combined] : [''];
   };
 
-  const parsePlainText = (value) => {
-    const lines = normalizeString(value)
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    if (!lines.length) return null;
-
-    if (expectedLength && lines.length !== expectedLength) {
-      if (expectedLength === 1 && lines.length > 1) {
-        console.warn(
-          `Translation response length mismatch for single item: expected 1, got ${lines.length}. Using the longest line.`
-        );
-        return collapseSingleItemLines(lines);
-      }
-      const message = `Translation response length mismatch: expected ${expectedLength}, got ${lines.length}`;
-      console.warn(message);
-      throw new Error(message);
+  const rawLines = normalizeString(String(content ?? '')).replace(/\r\n/g, '\n').split('\n');
+  if (expectedLength) {
+    while (rawLines.length > expectedLength && rawLines[rawLines.length - 1] === '') {
+      rawLines.pop();
     }
-
-    return lines;
-  };
-
-  const tryJsonParse = (value) => {
-    try {
-      const parsed = JSON.parse(normalizeString(value));
-      if (Array.isArray(parsed)) return parsed;
-      if (parsed && Array.isArray(parsed.translations)) return parsed.translations;
-      return null;
-    } catch (error) {
-      return null;
-    }
-  };
-
-  const extractFromObject = (value) => {
-    if (!value || typeof value !== 'object') return null;
-
-    if (Array.isArray(value.translations)) return value.translations;
-    if (Array.isArray(value.output_json?.translations)) return value.output_json.translations;
-
-    if (Array.isArray(value)) {
-      const outputPart = value.find((part) => part?.type === 'output_json' && part?.output_json);
-      if (Array.isArray(outputPart?.output_json?.translations)) return outputPart.output_json.translations;
-
-      const textParts = value
-        .filter((part) => typeof part?.text === 'string')
-        .map((part) => part.text)
-        .join('');
-      if (textParts) return tryJsonParse(textParts);
-    }
-
-    return null;
-  };
-
-  const parsed =
-    typeof content === 'string'
-      ? tryJsonParse(content) || parsePlainText(content)
-      : extractFromObject(content) || tryJsonParse(JSON.stringify(content)) || parsePlainText(JSON.stringify(content));
-
-  if (!Array.isArray(parsed)) {
-    console.warn('Failed to parse translation response as JSON array, received:', content);
-    return null;
   }
+  const lines = rawLines.map((line) => line.trim());
 
-  if (expectedLength && parsed.length !== expectedLength) {
-    if (expectedLength === 1 && parsed.length > 1) {
+  if (expectedLength && lines.length !== expectedLength) {
+    if (expectedLength === 1 && lines.length > 1) {
       console.warn(
-        `Translation response length mismatch for single item: expected 1, got ${parsed.length}. Using the longest line.`
+        `${label} response length mismatch for single item: expected 1, got ${lines.length}. Combining lines.`
       );
-      return collapseSingleItemLines(parsed);
+      return collapseSingleItemLines(lines);
     }
-
-    const message = `Translation response length mismatch: expected ${expectedLength}, got ${parsed.length}`;
+    const message = `${label} response length mismatch: expected ${expectedLength}, got ${lines.length}`;
     console.warn(message);
     throw new Error(message);
   }
 
-  return parsed;
+  return lines;
 }
 
 function countMatches(value = '', regex) {
