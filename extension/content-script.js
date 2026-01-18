@@ -250,7 +250,6 @@ async function translatePage(settings) {
         const result = await translate(
           uniqueTexts,
           settings.targetLanguage || 'ru',
-          settings.translationStyle,
           latestContextSummary,
           keepPunctuationTokens
         );
@@ -273,7 +272,8 @@ async function translatePage(settings) {
         });
         await updateDebugEntry(currentIndex + 1, {
           translated: formatBlockText(blockTranslations),
-          translationStatus: 'done'
+          translationStatus: 'done',
+          translationRaw: result.rawTranslation || ''
         });
 
         if (settings.proofreadEnabled) {
@@ -330,12 +330,13 @@ async function translatePage(settings) {
       activeProofreadWorkers += 1;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress' });
-        const replacements = await requestProofreading(
+        const proofreadResult = await requestProofreading(
           task.translatedTexts,
           settings.targetLanguage || 'ru',
           latestContextSummary,
           task.originalTexts
         );
+        const replacements = proofreadResult.replacements;
         let finalTranslations = applyProofreadingReplacements(task.translatedTexts, replacements);
         finalTranslations = finalTranslations.map((text, index) =>
           applyOriginalFormatting(task.originalTexts[index], text)
@@ -350,7 +351,8 @@ async function translatePage(settings) {
 
         await updateDebugEntry(task.index + 1, {
           proofreadStatus: 'done',
-          proofread: replacements
+          proofread: replacements,
+          proofreadRaw: proofreadResult.rawProofread || ''
         });
         reportProgress('Вычитка выполняется');
       } catch (error) {
@@ -399,7 +401,7 @@ async function translatePage(settings) {
   await setTranslationVisibility(true);
 }
 
-async function translate(texts, targetLanguage, translationStyle, context, keepPunctuationTokens = false) {
+async function translate(texts, targetLanguage, context, keepPunctuationTokens = false) {
   const estimatedTokens = estimateTokensForRole('translation', {
     texts,
     context
@@ -412,7 +414,6 @@ async function translate(texts, targetLanguage, translationStyle, context, keepP
         type: 'TRANSLATE_TEXT',
         texts,
         targetLanguage,
-        translationStyle,
         context,
         keepPunctuationTokens
       },
@@ -446,7 +447,10 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
       },
       (response) => {
         if (response?.success) {
-          resolve(normalizeProofreadReplacements(response.replacements));
+          resolve({
+            replacements: normalizeProofreadReplacements(response.replacements),
+            rawProofread: response.rawProofread || ''
+          });
         } else {
           reject(new Error(response?.error || 'Не удалось выполнить вычитку.'));
         }
@@ -1200,7 +1204,9 @@ async function initializeDebugState(blocks, settings = {}) {
     index: index + 1,
     original: formatBlockText(block.map(({ original }) => original)),
     translated: '',
+    translationRaw: '',
     proofread: [],
+    proofreadRaw: '',
     proofreadApplied: proofreadEnabled,
     translationStatus: 'pending',
     proofreadStatus: proofreadEnabled ? 'pending' : 'disabled'
