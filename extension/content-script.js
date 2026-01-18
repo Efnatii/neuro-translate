@@ -14,6 +14,15 @@ let translationVisible = false;
 let latestContextSummary = '';
 let debugEntries = [];
 let debugState = null;
+let tpmLimiter = null;
+let tpmSettings = {
+  outputRatioByRole: {
+    translation: 0.6,
+    context: 0.4,
+    proofread: 0.5
+  },
+  safetyBufferTokens: 100
+};
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
@@ -70,6 +79,7 @@ async function startTranslation() {
     return;
   }
 
+  configureTpmLimiter(settings);
   translationInProgress = true;
   try {
     await translatePage(settings);
@@ -293,6 +303,11 @@ async function translatePage(settings) {
 }
 
 async function translate(texts, targetLanguage, translationStyle, context, keepPunctuationTokens = false) {
+  const estimatedTokens = estimateTokensForRole('translation', {
+    texts,
+    context
+  });
+  await ensureTpmBudget('translation', estimatedTokens);
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -315,6 +330,12 @@ async function translate(texts, targetLanguage, translationStyle, context, keepP
 }
 
 async function requestProofreading(texts, targetLanguage, context, sourceTexts) {
+  const estimatedTokens = estimateTokensForRole('proofread', {
+    texts,
+    context,
+    sourceTexts
+  });
+  await ensureTpmBudget('proofread', estimatedTokens);
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -383,6 +404,10 @@ function restorePunctuationTokens(text = '') {
 }
 
 async function requestTranslationContext(text, targetLanguage) {
+  const estimatedTokens = estimateTokensForRole('context', {
+    texts: [text]
+  });
+  await ensureTpmBudget('context', estimatedTokens);
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -531,6 +556,104 @@ function selectInitialConcurrency(averageBlockLength, blockCount) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function configureTpmLimiter(settings = {}) {
+  const limitsByRole = settings?.tpmLimitsByRole || {};
+  tpmSettings = {
+    outputRatioByRole: {
+      ...tpmSettings.outputRatioByRole,
+      ...(settings?.outputRatioByRole || {})
+    },
+    safetyBufferTokens: Number.isFinite(settings?.tpmSafetyBufferTokens)
+      ? settings.tpmSafetyBufferTokens
+      : tpmSettings.safetyBufferTokens
+  };
+  tpmLimiter = createTpmLimiter(limitsByRole, tpmSettings.safetyBufferTokens);
+}
+
+function createTpmLimiter(limitsByRole = {}, safetyBufferTokens = 0) {
+  const entriesByRole = new Map();
+  const windowMs = 60000;
+
+  const getEntries = (role) => {
+    if (!entriesByRole.has(role)) {
+      entriesByRole.set(role, []);
+    }
+    return entriesByRole.get(role);
+  };
+
+  const prune = (role, now) => {
+    const entries = getEntries(role);
+    while (entries.length && entries[0].timestamp <= now - windowMs) {
+      entries.shift();
+    }
+  };
+
+  const getUsedTokens = (role, now) => {
+    prune(role, now);
+    const entries = getEntries(role);
+    return entries.reduce((sum, entry) => sum + entry.tokens, 0);
+  };
+
+  const recordUsage = (role, tokens, now) => {
+    const entries = getEntries(role);
+    entries.push({ timestamp: now, tokens });
+  };
+
+  const getNextAvailableDelay = (role, now) => {
+    const entries = getEntries(role);
+    if (!entries.length) return 0;
+    const earliest = entries[0];
+    const expiresAt = earliest.timestamp + windowMs;
+    return Math.max(25, expiresAt - now + 25);
+  };
+
+  const waitForBudget = async (role, tokens) => {
+    const limit = Number(limitsByRole?.[role]);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return;
+    }
+
+    const bufferedLimit = Math.max(0, limit - safetyBufferTokens);
+    if (tokens > bufferedLimit) {
+      recordUsage(role, tokens, Date.now());
+      return;
+    }
+
+    while (true) {
+      const now = Date.now();
+      const used = getUsedTokens(role, now);
+      if (used + tokens <= bufferedLimit) {
+        recordUsage(role, tokens, now);
+        return;
+      }
+      const waitMs = getNextAvailableDelay(role, now);
+      await delay(waitMs || 50);
+    }
+  };
+
+  return { waitForBudget };
+}
+
+function estimateTokensForRole(role, { texts = [], context = '', sourceTexts = [] } = {}) {
+  const allTexts = Array.isArray(texts) ? texts : [texts];
+  const allSources = Array.isArray(sourceTexts) ? sourceTexts : [sourceTexts];
+  const inputChars = [context, ...allTexts, ...allSources]
+    .filter((item) => typeof item === 'string' && item.length)
+    .reduce((sum, item) => sum + item.length, 0);
+  const inputTokens = Math.max(1, Math.ceil(inputChars / 4));
+  const ratio = Number(tpmSettings?.outputRatioByRole?.[role]);
+  const outputRatio = Number.isFinite(ratio) ? ratio : 0.5;
+  const estimatedOutput = Math.ceil(inputTokens * outputRatio);
+  return inputTokens + estimatedOutput;
+}
+
+async function ensureTpmBudget(role, tokens) {
+  if (!tpmLimiter || !Number.isFinite(tokens) || tokens <= 0) {
+    return;
+  }
+  await tpmLimiter.waitForBudget(role, tokens);
 }
 
 function recalculateBlockCount(blockLengthLimit) {
