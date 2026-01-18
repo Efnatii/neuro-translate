@@ -151,18 +151,48 @@ async function translatePage(settings) {
   const maxAllowedConcurrency = Math.max(1, Math.min(6, blocks.length));
   const requestDurations = [];
   let dynamicMaxConcurrency = initialConcurrency;
-  let nextIndex = 0;
-  let activeWorkers = 0;
+  let activeTranslationWorkers = 0;
+  let activeProofreadWorkers = 0;
+  let translationQueueDone = false;
+  const translationQueue = [];
+  const proofreadQueue = [];
+  const translationQueueKeys = new Set();
+  const proofreadQueueKeys = new Set();
+  const proofreadConcurrency = Math.max(1, Math.min(4, blocks.length));
 
-  const acquireSlot = async () => {
-    while (activeWorkers >= dynamicMaxConcurrency && !cancelRequested) {
-      await delay(50);
+  const getBlockKey = (block) =>
+    block
+      .map(({ path, original }) => `${JSON.stringify(path)}::${original}`)
+      .join('||');
+
+  const enqueueTranslationBlock = (block, index) => {
+    const key = getBlockKey(block);
+    if (translationQueueKeys.has(key)) {
+      return false;
     }
-    activeWorkers += 1;
+    translationQueueKeys.add(key);
+    translationQueue.push({ block, index, key });
+    return true;
   };
 
-  const releaseSlot = () => {
-    activeWorkers = Math.max(0, activeWorkers - 1);
+  const enqueueProofreadTask = (task) => {
+    if (!task?.key || proofreadQueueKeys.has(task.key)) {
+      return false;
+    }
+    proofreadQueueKeys.add(task.key);
+    proofreadQueue.push(task);
+    return true;
+  };
+
+  const acquireTranslationSlot = async () => {
+    while (activeTranslationWorkers >= dynamicMaxConcurrency && !cancelRequested) {
+      await delay(50);
+    }
+    activeTranslationWorkers += 1;
+  };
+
+  const releaseTranslationSlot = () => {
+    activeTranslationWorkers = Math.max(0, activeTranslationWorkers - 1);
   };
 
   const adjustConcurrency = (durationMs) => {
@@ -178,22 +208,23 @@ async function translatePage(settings) {
     }
   };
 
-  const worker = async () => {
+  const translationWorker = async () => {
     while (true) {
       if (cancelRequested) return;
-      await acquireSlot();
+      await acquireTranslationSlot();
 
       if (cancelRequested) {
-        releaseSlot();
+        releaseTranslationSlot();
         return;
       }
 
-      const currentIndex = nextIndex++;
-      if (currentIndex >= blocks.length) {
-        releaseSlot();
+      const queuedItem = translationQueue.shift();
+      if (!queuedItem) {
+        releaseTranslationSlot();
         return;
       }
-      const block = blocks[currentIndex];
+      const currentIndex = queuedItem.index;
+      const block = queuedItem.block;
       await updateDebugEntry(currentIndex + 1, {
         translationStatus: 'in_progress',
         proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
@@ -203,7 +234,6 @@ async function translatePage(settings) {
       );
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
       const blockTranslations = [];
-      let proofreadReplacements = [];
 
       const startTime = performance.now();
       try {
@@ -222,31 +252,6 @@ async function translatePage(settings) {
         });
 
         let finalTranslations = translatedTexts;
-        if (settings.proofreadEnabled) {
-          try {
-            await updateDebugEntry(currentIndex + 1, { proofreadStatus: 'in_progress' });
-            proofreadReplacements = await requestProofreading(
-              translatedTexts,
-              settings.targetLanguage || 'ru',
-              latestContextSummary,
-              block.map(({ original }) => original)
-            );
-            if (proofreadReplacements.length) {
-              finalTranslations = applyProofreadingReplacements(translatedTexts, proofreadReplacements);
-            }
-            await updateDebugEntry(currentIndex + 1, {
-              proofreadStatus: 'done',
-              proofread: proofreadReplacements
-            });
-          } catch (error) {
-            console.warn('Proofreading failed, keeping original translations.', error);
-            await updateDebugEntry(currentIndex + 1, {
-              proofreadStatus: 'failed',
-              proofread: []
-            });
-          }
-        }
-
         if (keepPunctuationTokens) {
           finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
         }
@@ -259,9 +264,18 @@ async function translatePage(settings) {
         });
         await updateDebugEntry(currentIndex + 1, {
           translated: formatBlockText(blockTranslations),
-          translationStatus: 'done',
-          proofread: proofreadReplacements
+          translationStatus: 'done'
         });
+
+        if (settings.proofreadEnabled) {
+          enqueueProofreadTask({
+            block,
+            index: currentIndex,
+            key: queuedItem.key,
+            translatedTexts,
+            originalTexts: block.map(({ original }) => original)
+          });
+        }
       } catch (error) {
         console.error('Block translation failed', error);
         translationError = error;
@@ -270,34 +284,106 @@ async function translatePage(settings) {
           translationStatus: 'failed',
           proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled'
         });
-        releaseSlot();
-        reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, activeWorkers);
+        releaseTranslationSlot();
+        reportProgress(
+          'Ошибка перевода',
+          translationProgress.completedBlocks,
+          totalBlocks,
+          activeTranslationWorkers
+        );
         return;
       }
 
       const duration = performance.now() - startTime;
       adjustConcurrency(duration);
-      releaseSlot();
+      releaseTranslationSlot();
 
       translationProgress.completedBlocks += 1;
-      reportProgress('Перевод выполняется', translationProgress.completedBlocks, blocks.length, activeWorkers);
+      reportProgress(
+        'Перевод выполняется',
+        translationProgress.completedBlocks,
+        totalBlocks,
+        activeTranslationWorkers
+      );
     }
   };
 
-  const workers = Array.from({ length: maxAllowedConcurrency }, () => worker());
+  const proofreadWorker = async () => {
+    while (true) {
+      if (cancelRequested) return;
+      const task = proofreadQueue.shift();
+      if (!task) {
+        if (translationQueueDone) return;
+        await delay(50);
+        continue;
+      }
+
+      activeProofreadWorkers += 1;
+      try {
+        await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress' });
+        const replacements = await requestProofreading(
+          task.translatedTexts,
+          settings.targetLanguage || 'ru',
+          latestContextSummary,
+          task.originalTexts
+        );
+        let finalTranslations = applyProofreadingReplacements(task.translatedTexts, replacements);
+        finalTranslations = finalTranslations.map((text, index) =>
+          applyOriginalFormatting(task.originalTexts[index], text)
+        );
+        finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
+
+        task.block.forEach(({ node, path, original }, index) => {
+          const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
+          node.nodeValue = withOriginalFormatting;
+          updateActiveEntry(path, original, withOriginalFormatting);
+        });
+
+        await updateDebugEntry(task.index + 1, {
+          proofreadStatus: 'done',
+          proofread: replacements
+        });
+      } catch (error) {
+        console.warn('Proofreading failed, keeping original translations.', error);
+        await updateDebugEntry(task.index + 1, {
+          proofreadStatus: 'failed',
+          proofread: []
+        });
+      } finally {
+        activeProofreadWorkers = Math.max(0, activeProofreadWorkers - 1);
+      }
+    }
+  };
+
+  blocks.forEach((block, index) => {
+    enqueueTranslationBlock(block, index);
+  });
+  translationProgress.totalBlocks = translationQueue.length;
+  const totalBlocks = translationProgress.totalBlocks;
+
+  if (totalBlocks !== blocks.length) {
+    reportProgress('Перевод запущен', translationProgress.completedBlocks, totalBlocks, 0);
+  }
+
+  const workers = Array.from({ length: maxAllowedConcurrency }, () => translationWorker());
+  const proofreadWorkers = settings.proofreadEnabled
+    ? Array.from({ length: proofreadConcurrency }, () => proofreadWorker())
+    : [];
   await Promise.all(workers);
+  translationQueueDone = true;
+  await Promise.all(proofreadWorkers);
 
   if (translationError) {
-    reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, activeWorkers);
+    reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
   if (cancelRequested) {
-    reportProgress('Перевод отменён', translationProgress.completedBlocks, blocks.length, activeWorkers);
+    reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
-  reportProgress('Перевод завершён', translationProgress.completedBlocks, blocks.length, activeWorkers);
+  reportProgress('Перевод завершён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
   await saveTranslationsToMemory(activeTranslationEntries);
   await setTranslationVisibility(true);
 }
