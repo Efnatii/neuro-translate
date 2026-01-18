@@ -27,22 +27,14 @@
       margin-bottom: 16px;
     }
     .summary {
-      background: #fff;
-      border-radius: 10px;
-      padding: 14px 16px;
-      border: 1px solid #e2e8f0;
       margin-bottom: 16px;
     }
     .summary-header {
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: flex-start;
       gap: 12px;
-      margin-bottom: 8px;
-    }
-    .summary-title {
-      margin: 0;
-      font-size: 16px;
+      margin-bottom: 6px;
     }
     .summary-meta {
       font-size: 12px;
@@ -158,25 +150,13 @@
     .ai-tests {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 10px;
       margin-bottom: 16px;
     }
-    .ai-test-section {
-      background: #fff;
-      border-radius: 8px;
-      padding: 12px;
-      border: 1px solid #e2e8f0;
-    }
-    .ai-test-header {
+    .ai-tests-header {
       display: flex;
-      justify-content: space-between;
+      justify-content: flex-end;
       align-items: center;
-      gap: 8px;
-      margin-bottom: 10px;
-    }
-    .ai-test-header h3 {
-      margin: 0;
-      font-size: 15px;
     }
     .ai-test-refresh {
       border: 1px solid #cbd5f5;
@@ -188,20 +168,23 @@
       cursor: pointer;
     }
     .ai-test-list {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
     }
-    .ai-test-card {
-      background: #f8fafc;
-      border-radius: 8px;
-      padding: 8px 10px;
-      border: 1px solid #e2e8f0;
+    .ai-test-row {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    .ai-test-row:last-child {
+      border-bottom: none;
     }
     .ai-test-title {
       font-weight: bold;
       font-size: 13px;
-      margin-bottom: 4px;
       color: #1f2937;
     }
     .ai-test-desc {
@@ -213,10 +196,10 @@
 </head>
 <body>
   <h1>Отладка перевода</h1>
+  <div class="ai-tests" id="aiTests"></div>
   <div class="summary" id="summary"></div>
   <div class="meta" id="meta"></div>
   <div class="context" id="context"></div>
-  <div class="ai-tests" id="aiTests"></div>
   <div id="entries"></div>
   <script src="debug.js"></script>
 </body>
