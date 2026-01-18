@@ -101,9 +101,14 @@ async function translatePage(settings) {
   const nodesWithPath = textNodes.map((node) => ({
     node,
     path: getNodePath(node),
-    original: node.nodeValue
+    original: node.nodeValue,
+    originalHash: computeTextHash(node.nodeValue || '')
   }));
-  originalSnapshot = nodesWithPath.map(({ path, original }) => ({ path, original }));
+  originalSnapshot = nodesWithPath.map(({ path, original, originalHash }) => ({
+    path,
+    original,
+    originalHash
+  }));
   activeTranslationEntries = [];
   debugEntries = [];
   debugState = null;
@@ -162,7 +167,10 @@ async function translatePage(settings) {
 
   const getBlockKey = (block) =>
     block
-      .map(({ path, original }) => `${JSON.stringify(path)}::${original}`)
+      .map(({ path, original, originalHash }) => {
+        const hashValue = getOriginalHash(original, originalHash);
+        return `${JSON.stringify(path)}::${original}::${hashValue ?? 'nohash'}`;
+      })
       .join('||');
 
   const enqueueTranslationBlock = (block, index) => {
@@ -257,11 +265,11 @@ async function translatePage(settings) {
           finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
         }
 
-        block.forEach(({ node, path, original }, index) => {
+        block.forEach(({ node, path, original, originalHash }, index) => {
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
           node.nodeValue = withOriginalFormatting;
           blockTranslations.push(withOriginalFormatting);
-          updateActiveEntry(path, original, withOriginalFormatting);
+          updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
         await updateDebugEntry(currentIndex + 1, {
           translated: formatBlockText(blockTranslations),
@@ -334,10 +342,10 @@ async function translatePage(settings) {
         );
         finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
 
-        task.block.forEach(({ node, path, original }, index) => {
+        task.block.forEach(({ node, path, original, originalHash }, index) => {
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
           node.nodeValue = withOriginalFormatting;
-          updateActiveEntry(path, original, withOriginalFormatting);
+          updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
 
         await updateDebugEntry(task.index + 1, {
@@ -821,7 +829,8 @@ function recalculateBlockCount(blockLengthLimit) {
   const nodesWithPath = textNodes.map((node) => ({
     node,
     path: getNodePath(node),
-    original: node.nodeValue
+    original: node.nodeValue,
+    originalHash: computeTextHash(node.nodeValue || '')
   }));
   const textStats = calculateTextLengthStats(nodesWithPath);
   const maxBlockLength = normalizeBlockLength(blockLengthLimit, textStats.averageNodeLength);
@@ -990,12 +999,21 @@ async function restoreFromMemory() {
   if (!stored?.length) return;
 
   const restoredSnapshot = [];
-  stored.forEach(({ path, translated, original }) => {
+  stored.forEach(({ path, translated, original, originalHash }) => {
     const node = findNodeByPath(path);
     if (node) {
       const originalValue = typeof original === 'string' ? original : node.nodeValue;
-      activeTranslationEntries.push({ path, original: originalValue, translated });
-      restoredSnapshot.push({ path, original: originalValue });
+      const resolvedOriginalHash = getOriginalHash(originalValue, originalHash);
+      if (!shouldApplyTranslation(node, originalValue, resolvedOriginalHash)) {
+        return;
+      }
+      activeTranslationEntries.push({
+        path,
+        original: originalValue,
+        originalHash: resolvedOriginalHash,
+        translated
+      });
+      restoredSnapshot.push({ path, original: originalValue, originalHash: resolvedOriginalHash });
       node.nodeValue = translated;
     }
   });
@@ -1025,6 +1043,36 @@ function findNodeByPath(path) {
     current = current.childNodes[index];
   }
   return current && current.nodeType === Node.TEXT_NODE ? current : null;
+}
+
+function computeTextHash(text = '') {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) + hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash >>> 0;
+}
+
+function getOriginalHash(original, originalHash) {
+  if (Number.isFinite(originalHash)) {
+    return originalHash;
+  }
+  if (typeof original === 'string') {
+    return computeTextHash(original);
+  }
+  return null;
+}
+
+function shouldApplyTranslation(node, original, originalHash) {
+  const currentText = node?.nodeValue ?? '';
+  if (typeof original === 'string') {
+    return currentText === original;
+  }
+  if (Number.isFinite(originalHash)) {
+    return computeTextHash(currentText) === originalHash;
+  }
+  return false;
 }
 
 function prepareTextForTranslation(text) {
@@ -1085,12 +1133,23 @@ function getFirstLetterCase(text) {
   return null;
 }
 
-function updateActiveEntry(path, original, translated) {
+function updateActiveEntry(path, original, translated, originalHash) {
   const existingIndex = activeTranslationEntries.findIndex((entry) => isSamePath(entry.path, path));
+  const resolvedOriginalHash = getOriginalHash(original, originalHash);
   if (existingIndex >= 0) {
-    activeTranslationEntries[existingIndex] = { path, original, translated };
+    activeTranslationEntries[existingIndex] = {
+      path,
+      original,
+      originalHash: resolvedOriginalHash,
+      translated
+    };
   } else {
-    activeTranslationEntries.push({ path, original, translated });
+    activeTranslationEntries.push({
+      path,
+      original,
+      originalHash: resolvedOriginalHash,
+      translated
+    });
   }
 }
 
@@ -1247,13 +1306,26 @@ async function restoreTranslations() {
   const restoredSnapshot = [];
   const updatedEntries = [];
 
-  storedEntries.forEach(({ path, translated, original }) => {
+  storedEntries.forEach(({ path, translated, original, originalHash }) => {
     const node = findNodeByPath(path);
     if (!node) return;
     const originalValue = typeof original === 'string' ? original : node.nodeValue;
+    const resolvedOriginalHash = getOriginalHash(originalValue, originalHash);
+    if (!shouldApplyTranslation(node, originalValue, resolvedOriginalHash)) {
+      return;
+    }
     node.nodeValue = translated;
-    restoredSnapshot.push({ path, original: originalValue });
-    updatedEntries.push({ path, original: originalValue, translated });
+    restoredSnapshot.push({
+      path,
+      original: originalValue,
+      originalHash: resolvedOriginalHash
+    });
+    updatedEntries.push({
+      path,
+      original: originalValue,
+      originalHash: resolvedOriginalHash,
+      translated
+    });
   });
 
   if (restoredSnapshot.length) {
