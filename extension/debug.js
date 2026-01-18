@@ -216,7 +216,8 @@ function renderProofreadSection(item) {
   if (item?.proofreadApplied) {
     content = replacements.length
       ? replacements
-          .map((replacement) => `${replacement.from} → ${replacement.to ?? ''}`)
+          .map((replacement, index) => formatProofreadReplacement(replacement, index))
+          .filter(Boolean)
           .join('\n')
       : 'Нет правок.';
   }
@@ -230,6 +231,29 @@ function renderProofreadSection(item) {
         }
       </div>
     `;
+}
+
+function formatProofreadReplacement(replacement, index) {
+  if (!replacement || typeof replacement !== 'object') return '';
+  const hasFromTo = 'from' in replacement || 'to' in replacement;
+  if (hasFromTo) {
+    const fromText = typeof replacement.from === 'string' ? replacement.from : '';
+    const toText = typeof replacement.to === 'string' ? replacement.to : '';
+    if (!fromText && !toText) return '';
+    return `${fromText} → ${toText}`;
+  }
+
+  if ('revisedText' in replacement) {
+    const revisedText = typeof replacement.revisedText === 'string' ? replacement.revisedText : '';
+    if (!revisedText) return '';
+    const segmentIndex = Number(replacement.segmentIndex);
+    const segmentLabel = Number.isInteger(segmentIndex)
+      ? `Сегмент ${segmentIndex + 1}`
+      : `Правка ${index + 1}`;
+    return `${segmentLabel}: ${revisedText}`;
+  }
+
+  return '';
 }
 
 function getOverallEntryStatus(item) {
