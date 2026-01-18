@@ -98,12 +98,23 @@ async function translatePage(settings) {
   latestContextSummary = '';
   await clearTranslationDebugInfo(location.href);
 
+  const textStats = calculateTextLengthStats(nodesWithPath);
+  const maxBlockLength = normalizeBlockLength(settings.blockLengthLimit, textStats.averageNodeLength);
+  const blockGroups = groupTextNodesByBlock(nodesWithPath);
+  const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
+  translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
+
+  if (!blocks.length) {
+    reportProgress('Перевод не требуется', 0, 0);
+    return;
+  }
+
   cancelRequested = false;
   translationError = null;
-  reportProgress('Перевод запущен', 0, 0, 0);
+  reportProgress('Перевод запущен', 0, blocks.length, 0);
 
   if (settings.contextGenerationEnabled) {
-    reportProgress('Генерация контекста', 0, 0, 0);
+    reportProgress('Генерация контекста', 0, blocks.length, 0);
     const pageText = buildPageText(nodesWithPath);
     if (pageText) {
       try {
@@ -116,25 +127,6 @@ async function translatePage(settings) {
       }
     }
   }
-
-  const textStats = calculateTextLengthStats(nodesWithPath);
-  const maxBlockLength = normalizeBlockLength(settings.blockLengthLimit, textStats.averageNodeLength);
-  const blockGroups = groupTextNodesByBlock(nodesWithPath);
-  const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
-  translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
-
-  if (!blocks.length) {
-    reportProgress('Перевод не требуется', 0, 0);
-    return;
-  }
-
-  reportProgress('Перевод запущен', 0, blocks.length, 0);
-
-  const translationLimiter = await createModelLimiter(settings.translationModel);
-  const proofreadLimiter = settings.proofreadEnabled
-    ? await createModelLimiter(settings.proofreadModel)
-    : null;
-  const blockPromiseCache = new Map();
 
   const averageBlockLength = blocks.length ? Math.round(textStats.totalLength / blocks.length) : 0;
   const initialConcurrency = selectInitialConcurrency(averageBlockLength, blocks.length);
@@ -168,7 +160,6 @@ async function translatePage(settings) {
     }
   };
 
-  const proofreadTasks = [];
   const worker = async () => {
     while (true) {
       if (cancelRequested) return;
@@ -190,48 +181,56 @@ async function translatePage(settings) {
       );
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
       const blockTranslations = [];
-      const blockKey = JSON.stringify({
-        texts: preparedTexts,
-        target: settings.targetLanguage || 'ru',
-        style: settings.translationStyle,
-        context: latestContextSummary
-      });
+      let proofreadReplacements = [];
 
       const startTime = performance.now();
       try {
         const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
-        const translationPromise = getOrCreateBlockTranslation(
-          blockPromiseCache,
-          blockKey,
+        const result = await translate(
           uniqueTexts,
-          settings,
+          settings.targetLanguage || 'ru',
+          settings.translationStyle,
           latestContextSummary,
-          keepPunctuationTokens,
-          translationLimiter
+          keepPunctuationTokens
         );
-        const result = await translationPromise;
-        const translatedTextsRaw = block.map(({ node, original }, index) => {
+        const translatedTexts = block.map(({ node, original }, index) => {
           const translationIndex = indexMap[index];
           const translated = result.translations[translationIndex] || node.nodeValue;
           return applyOriginalFormatting(original, translated);
         });
 
-        const displayTranslations = keepPunctuationTokens
-          ? translatedTextsRaw.map((text) => restorePunctuationTokens(text))
-          : translatedTextsRaw;
+        let finalTranslations = translatedTexts;
+        if (settings.proofreadEnabled) {
+          try {
+            proofreadReplacements = await requestProofreading(
+              translatedTexts,
+              settings.targetLanguage || 'ru',
+              latestContextSummary,
+              block.map(({ original }) => original)
+            );
+            if (proofreadReplacements.length) {
+              finalTranslations = applyProofreadingReplacements(translatedTexts, proofreadReplacements);
+            }
+          } catch (error) {
+            console.warn('Proofreading failed, keeping original translations.', error);
+          }
+        }
+
+        if (keepPunctuationTokens) {
+          finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
+        }
 
         block.forEach(({ node, path, original }, index) => {
-          const withOriginalFormatting = displayTranslations[index] || node.nodeValue;
+          const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
           node.nodeValue = withOriginalFormatting;
           blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting);
         });
-
         const debugEntry = {
           index: currentIndex + 1,
           original: formatBlockText(block.map(({ original }) => original)),
           translated: formatBlockText(blockTranslations),
-          proofread: [],
+          proofread: proofreadReplacements,
           proofreadApplied: Boolean(settings.proofreadEnabled)
         };
         debugEntries.push(debugEntry);
@@ -240,20 +239,6 @@ async function translatePage(settings) {
           items: debugEntries,
           updatedAt: Date.now()
         });
-
-        if (settings.proofreadEnabled) {
-          const proofreadTask = queueProofreadTask({
-            block,
-            translatedTextsRaw,
-            originalTexts: block.map(({ original }) => original),
-            targetLanguage: settings.targetLanguage || 'ru',
-            context: latestContextSummary,
-            limiter: proofreadLimiter,
-            debugEntry,
-            applyTokens: keepPunctuationTokens
-          });
-          proofreadTasks.push(proofreadTask);
-        }
       } catch (error) {
         console.error('Block translation failed', error);
         translationError = error;
@@ -274,10 +259,6 @@ async function translatePage(settings) {
 
   const workers = Array.from({ length: maxAllowedConcurrency }, () => worker());
   await Promise.all(workers);
-
-  if (!translationError && !cancelRequested && proofreadTasks.length) {
-    await Promise.all(proofreadTasks);
-  }
 
   if (translationError) {
     reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, activeWorkers);
@@ -417,156 +398,6 @@ function deduplicateTexts(texts) {
   });
 
   return { uniqueTexts, indexMap };
-}
-
-function estimateTokensForTexts(texts = [], options = {}) {
-  const {
-    outputRatio = 1.15,
-    overheadTokens = 320,
-    context = ''
-  } = options;
-  const totalChars = texts.reduce((sum, text) => sum + (text?.length || 0), 0);
-  const contextChars = context?.length || 0;
-  const inputTokens = Math.max(1, Math.ceil((totalChars + contextChars) / 4));
-  const outputTokens = Math.max(1, Math.ceil(inputTokens * outputRatio));
-  return inputTokens + outputTokens + overheadTokens;
-}
-
-function createTokenLimiter(tokensPerMinute) {
-  if (!tokensPerMinute || tokensPerMinute <= 0) {
-    return {
-      async schedule(estimatedTokens, task) {
-        return task();
-      }
-    };
-  }
-
-  let capacity = Math.max(1, Math.floor(tokensPerMinute));
-  let availableTokens = capacity;
-  let lastRefill = Date.now();
-
-  const refill = () => {
-    const now = Date.now();
-    const elapsedMs = now - lastRefill;
-    if (elapsedMs <= 0) return;
-    const tokensToAdd = (elapsedMs / 60000) * tokensPerMinute;
-    if (tokensToAdd > 0) {
-      availableTokens = Math.min(capacity, availableTokens + tokensToAdd);
-      lastRefill = now;
-    }
-  };
-
-  const waitForTokens = async (estimatedTokens) => {
-    while (true) {
-      refill();
-      if (availableTokens >= estimatedTokens) {
-        availableTokens -= estimatedTokens;
-        return;
-      }
-      const deficit = Math.max(0, estimatedTokens - availableTokens);
-      const waitMs = Math.max(250, Math.ceil((deficit / tokensPerMinute) * 60000));
-      await delay(waitMs);
-    }
-  };
-
-  return {
-    async schedule(estimatedTokens, task) {
-      if (estimatedTokens > capacity) {
-        capacity = Math.ceil(estimatedTokens);
-        availableTokens = Math.min(availableTokens, capacity);
-      }
-      await waitForTokens(estimatedTokens);
-      return task();
-    }
-  };
-}
-
-async function createModelLimiter(model) {
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
-  const throughputInfo = modelThroughputById?.[model];
-  const tokensPerSecond = Number(throughputInfo?.tokensPerSecond || 0);
-  if (!tokensPerSecond) {
-    return createTokenLimiter(null);
-  }
-  const tokensPerMinute = tokensPerSecond * 60 * 0.9;
-  return createTokenLimiter(tokensPerMinute);
-}
-
-function getOrCreateBlockTranslation(
-  cache,
-  blockKey,
-  uniqueTexts,
-  settings,
-  context,
-  keepPunctuationTokens,
-  limiter
-) {
-  if (cache.has(blockKey)) {
-    return cache.get(blockKey);
-  }
-
-  const estimatedTokens = estimateTokensForTexts(uniqueTexts, { context });
-  const promise = limiter
-    .schedule(estimatedTokens, () =>
-      translate(
-        uniqueTexts,
-        settings.targetLanguage || 'ru',
-        settings.translationStyle,
-        context,
-        keepPunctuationTokens
-      )
-    )
-    .catch((error) => {
-      cache.delete(blockKey);
-      throw error;
-    });
-  cache.set(blockKey, promise);
-  return promise;
-}
-
-function queueProofreadTask({
-  block,
-  translatedTextsRaw,
-  originalTexts,
-  targetLanguage,
-  context,
-  limiter,
-  debugEntry,
-  applyTokens
-}) {
-  const estimatedTokens = estimateTokensForTexts(translatedTextsRaw, {
-    context,
-    outputRatio: 0.5,
-    overheadTokens: 220
-  });
-
-  return limiter
-    .schedule(estimatedTokens, async () =>
-      requestProofreading(translatedTextsRaw, targetLanguage, context, originalTexts)
-    )
-    .then((replacements) => {
-      if (!Array.isArray(replacements)) return;
-      if (!replacements.length) return;
-      const proofreadTexts = applyProofreadingReplacements(translatedTextsRaw, replacements);
-      const finalTranslations = applyTokens
-        ? proofreadTexts.map((text) => restorePunctuationTokens(text))
-        : proofreadTexts;
-      block.forEach(({ node, path, original }, index) => {
-        const nextText = finalTranslations[index] || node.nodeValue;
-        node.nodeValue = nextText;
-        updateActiveEntry(path, original, nextText);
-      });
-      debugEntry.translated = formatBlockText(finalTranslations);
-      debugEntry.proofread = replacements;
-      return saveTranslationDebugInfo(location.href, {
-        context: latestContextSummary,
-        items: debugEntries,
-        updatedAt: Date.now()
-      });
-    })
-    .catch((error) => {
-      console.warn('Proofreading failed, keeping original translations.', error);
-    });
 }
 
 function collectTextNodes(root) {
