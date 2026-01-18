@@ -417,8 +417,9 @@ async function proofreadTranslation(
       role: 'system',
       content: [
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        'Return only a JSON array of objects with "from" and "to" fields.',
-        'Each object describes an exact substring to replace ("from") and the replacement ("to").',
+        'Return only a JSON array of objects with "segmentIndex" and "revisedText" fields.',
+        'Each object describes a full corrected segment where "segmentIndex" is the 0-based index of the segment',
+        `in the translated text split by the ${PROOFREAD_SEGMENT_TOKEN} token.`,
         'Never add commentary, explanations, or extra keys.',
         'Prioritize readability and clarity of meaning over strict literalness.',
         'Improve fluency and naturalness so the translation reads like it was written by a native speaker.',
@@ -430,6 +431,7 @@ async function proofreadTranslation(
         'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
         'If a punctuation token appears in the translated text, keep it unchanged and in the same position.',
         `Segments are separated by the token ${PROOFREAD_SEGMENT_TOKEN}; keep it unchanged and in place.`,
+        'Only return revised segments, and do not include the segment separator in "revisedText".',
         'Use the source text only to verify correctness and preserve meaning.',
         context
           ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
@@ -444,7 +446,8 @@ async function proofreadTranslation(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Review the translated text below and return only the JSON array of replacements.',
+        'Review the translated text below and return only the JSON array of revised segments.',
+        `The translated text is split by ${PROOFREAD_SEGMENT_TOKEN}; the first segment has segmentIndex 0.`,
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
         normalizedSourceTexts.length ? combinedSourceText : '',
@@ -502,10 +505,10 @@ async function proofreadTranslation(
       return parsed
         .map((item) => {
           if (!item || typeof item !== 'object') return null;
-          const from = typeof item.from === 'string' ? item.from : '';
-          const to = typeof item.to === 'string' ? item.to : '';
-          if (!from) return null;
-          return { from, to };
+          const segmentIndex = Number(item.segmentIndex);
+          if (!Number.isInteger(segmentIndex)) return null;
+          const revisedText = typeof item.revisedText === 'string' ? item.revisedText : '';
+          return { segmentIndex, revisedText };
         })
         .filter(Boolean);
     } catch (error) {
