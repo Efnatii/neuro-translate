@@ -1,3 +1,20 @@
+const DEFAULT_TPM_LIMITS_BY_MODEL = {
+  default: 200000,
+  'gpt-4.1-mini': 200000,
+  'gpt-4.1': 300000,
+  'gpt-4o-mini': 200000,
+  'gpt-4o': 300000,
+  'o4-mini': 200000,
+  'deepseek-chat': 200000,
+  'deepseek-reasoner': 100000
+};
+const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
+  translation: 0.6,
+  context: 0.4,
+  proofread: 0.5
+};
+const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
+
 const DEFAULT_STATE = {
   apiKey: '',
   deepseekApiKey: '',
@@ -7,7 +24,10 @@ const DEFAULT_STATE = {
   translationStyle: 'auto',
   contextGenerationEnabled: false,
   proofreadEnabled: false,
-  blockLengthLimit: 1200
+  blockLengthLimit: 1200,
+  tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
+  outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
 
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
@@ -46,6 +66,14 @@ function getApiConfigForModel(model, state) {
     apiBaseUrl: OPENAI_API_URL,
     provider: 'openai'
   };
+}
+
+function getTpmLimitForModel(model, tpmLimitsByModel) {
+  if (!tpmLimitsByModel || typeof tpmLimitsByModel !== 'object') {
+    return DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  }
+  const fallback = tpmLimitsByModel.default ?? DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  return tpmLimitsByModel[model] ?? fallback;
 }
 
 async function getState() {
@@ -128,6 +156,11 @@ async function handleGetSettings(message, sendResponse) {
   const translationConfig = getApiConfigForModel(state.translationModel, state);
   const contextConfig = getApiConfigForModel(state.contextModel, state);
   const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
+  const tpmLimitsByRole = {
+    translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
+    context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
+    proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
+  };
   const hasTranslationKey = Boolean(translationConfig.apiKey);
   const hasContextKey = Boolean(contextConfig.apiKey);
   const hasProofreadKey = Boolean(proofreadConfig.apiKey);
@@ -143,7 +176,13 @@ async function handleGetSettings(message, sendResponse) {
     translationStyle: state.translationStyle,
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
-    blockLengthLimit: state.blockLengthLimit
+    blockLengthLimit: state.blockLengthLimit,
+    tpmLimitsByRole,
+    outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
+    tpmSafetyBufferTokens:
+      Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
+        ? state.tpmSafetyBufferTokens
+        : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
   });
 }
 
