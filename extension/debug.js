@@ -24,6 +24,18 @@ async function init() {
     return;
   }
 
+  if (contextEl) {
+    contextEl.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const button = target.closest('[data-action="clear-context"]');
+      if (button) {
+        event.preventDefault();
+        clearContext();
+      }
+    });
+  }
+
   await refreshDebug();
   startAutoRefresh();
 }
@@ -44,6 +56,36 @@ async function getDebugData(url) {
       resolve(store[url]);
     });
   });
+}
+
+async function getDebugStore() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+    return null;
+  }
+  return new Promise((resolve) => {
+    chrome.storage.local.get([DEBUG_STORAGE_KEY], (data) => {
+      resolve(data?.[DEBUG_STORAGE_KEY] || {});
+    });
+  });
+}
+
+async function clearContext() {
+  if (!sourceUrl) return;
+  const store = await getDebugStore();
+  if (!store) return;
+  const current = store[sourceUrl];
+  if (!current) return;
+  const nextStatus = current.contextStatus === 'disabled' ? 'disabled' : 'pending';
+  store[sourceUrl] = {
+    ...current,
+    context: '',
+    contextStatus: nextStatus,
+    updatedAt: Date.now()
+  };
+  await new Promise((resolve) => {
+    chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: store }, () => resolve());
+  });
+  await refreshDebug();
 }
 
 function startAutoRefresh() {
@@ -101,6 +143,9 @@ function renderDebug(url, data) {
              <span class="status-label">Статус</span>
              ${renderStatusBadge(contextStatus)}
            </div>
+           <div class="context-actions">
+             <button class="action-button" type="button" data-action="clear-context">Сбросить</button>
+           </div>
          </div>
        </div>
        <pre>${escapeHtml(contextText)}</pre>`
@@ -110,6 +155,9 @@ function renderDebug(url, data) {
            <div class="status-group">
              <span class="status-label">Статус</span>
              ${renderStatusBadge(contextStatus)}
+           </div>
+           <div class="context-actions">
+             <button class="action-button" type="button" data-action="clear-context">Сбросить</button>
            </div>
          </div>
        </div>

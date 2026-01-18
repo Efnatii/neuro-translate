@@ -1276,6 +1276,23 @@ async function clearTranslationDebugInfo(url) {
   await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
 }
 
+async function resetTranslationDebugInfo(url) {
+  if (!url) return;
+  const existing = await getTranslationDebugObject();
+  const entry = existing[url];
+  if (!entry) return;
+  const context = typeof entry.context === 'string' ? entry.context : '';
+  const contextStatus = entry.contextStatus || (context ? 'done' : 'pending');
+  existing[url] = {
+    context,
+    contextStatus,
+    items: [],
+    aiRequestCount: 0,
+    updatedAt: Date.now()
+  };
+  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+}
+
 async function initializeDebugState(blocks, settings = {}) {
   const proofreadEnabled = Boolean(settings.proofreadEnabled);
   debugEntries = blocks.map((block, index) => ({
@@ -1369,7 +1386,7 @@ async function cancelTranslation() {
     restoreOriginal(entriesToRestore);
   }
   await clearStoredTranslations(location.href);
-  await clearTranslationDebugInfo(location.href);
+  await resetTranslationDebugInfo(location.href);
   activeTranslationEntries = [];
   debugState = null;
   translationProgress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
