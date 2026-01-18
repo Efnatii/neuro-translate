@@ -865,19 +865,16 @@ function mergeAdjacentBlocksByLength(blocks, maxLength) {
   const merged = [];
   let current = [];
   let currentLength = 0;
-  let currentBlockElement = null;
 
   blocks.forEach((block) => {
     const blockLength = getBlockLength(block);
-    const blockElement = block[0]?.blockElement ?? null;
     if (!current.length) {
       current = block.slice();
       currentLength = blockLength;
-      currentBlockElement = blockElement;
       return;
     }
 
-    if (currentBlockElement === blockElement && currentLength + blockLength <= maxLength) {
+    if (currentLength + blockLength <= maxLength) {
       current.push(...block);
       currentLength += blockLength;
       return;
@@ -886,7 +883,6 @@ function mergeAdjacentBlocksByLength(blocks, maxLength) {
     merged.push(current);
     current = block.slice();
     currentLength = blockLength;
-    currentBlockElement = blockElement;
   });
 
   if (current.length) merged.push(current);
