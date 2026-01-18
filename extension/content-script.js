@@ -530,20 +530,36 @@ function formatLogDetails(details) {
   }
 }
 
+function hasMeaningfulOverlap(originalText, revisedText) {
+  const normalizedOriginal = normalizeSegmentForComparison(originalText);
+  const normalizedRevised = normalizeSegmentForComparison(revisedText);
+  if (!normalizedOriginal || !normalizedRevised) return false;
+  const minLength = Math.min(normalizedOriginal.length, normalizedRevised.length);
+  if (minLength < 8) return false;
+  return (
+    normalizedOriginal.includes(normalizedRevised) || normalizedRevised.includes(normalizedOriginal)
+  );
+}
+
 function isSuspiciousLengthChange(originalText, revisedText) {
   const originalLength = originalText.length;
   const revisedLength = revisedText.length;
+  const hasOverlap = hasMeaningfulOverlap(originalText, revisedText);
 
   if (originalLength === 0) {
-    return revisedLength > 120;
+    return revisedLength > 200;
   }
 
   const ratio = revisedLength / originalLength;
   if (originalLength >= 20) {
-    return ratio < 0.4 || ratio > 2.5;
+    const minRatio = hasOverlap ? 0.25 : 0.35;
+    const maxRatio = hasOverlap ? 4 : 3;
+    return ratio < minRatio || ratio > maxRatio;
   }
 
-  return revisedLength - originalLength > 80;
+  const maxIncrease = originalLength < 8 ? 80 : 120;
+  const allowedIncrease = hasOverlap ? maxIncrease + 40 : maxIncrease;
+  return revisedLength - originalLength > allowedIncrease;
 }
 
 function isSimilarToNeighbor(revisedText, neighborText) {
@@ -601,7 +617,11 @@ function applyProofreadingReplacements(texts, replacements) {
     }
     const previousSegment = segments[segmentIndex - 1];
     const nextSegment = segments[segmentIndex + 1];
-    if (isSimilarToNeighbor(revisedText, previousSegment) || isSimilarToNeighbor(revisedText, nextSegment)) {
+    const resemblesNeighbor =
+      isSimilarToNeighbor(revisedText, previousSegment) || isSimilarToNeighbor(revisedText, nextSegment);
+    const originalResemblesNeighbor =
+      isSimilarToNeighbor(originalText, previousSegment) || isSimilarToNeighbor(originalText, nextSegment);
+    if (resemblesNeighbor && !originalResemblesNeighbor) {
       console.warn(
         `Proofread segment resembles a neighbor, skipping.${formatLogDetails({ segmentIndex })}`
       );
