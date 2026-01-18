@@ -71,6 +71,18 @@
       font-size: 12px;
       color: var(--text-secondary);
     }
+    .range-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .range-value {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
     select,
     input[type="text"],
     input[type="password"] {
@@ -206,7 +218,6 @@
   <div class="card">
     <div class="header">
       <h3 class="title">Neuro Translate</h3>
-      <p class="subtitle">Быстрая настройка перевода и контекста</p>
     </div>
     <details class="section" id="apiKeys">
       <summary>API ключи</summary>
@@ -243,7 +254,10 @@
         Выполнять вычитку перевода
       </label>
       <label>
-        Максимальная длина блока: <span id="blockLengthValue">1200</span>
+        <div class="range-label">
+          <span>Максимальная длина блока:</span>
+          <span class="range-value" id="blockLengthValue">1200</span>
+        </div>
         <input type="range" id="blockLengthLimit" min="300" max="4000" step="100" />
       </label>
     </div>
