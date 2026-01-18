@@ -376,6 +376,9 @@ function handleStorageChange(changes) {
 }
 
 function renderStatus() {
+  if (!statusLabel) {
+    return;
+  }
   const baseMessage = getBaseStatusMessage();
   const throughputMessage = formatThroughputStatus(currentThroughputInfo);
   statusLabel.textContent = throughputMessage ? `${baseMessage}\n${throughputMessage}` : baseMessage;
