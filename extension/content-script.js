@@ -559,13 +559,13 @@ function isSuspiciousLengthChange(originalText, revisedText) {
 
   const ratio = revisedLength / originalLength;
   if (originalLength >= 20) {
-    const minRatio = hasOverlap ? 0.25 : 0.35;
-    const maxRatio = hasOverlap ? 4 : 3;
+    const minRatio = hasOverlap ? 0.2 : 0.3;
+    const maxRatio = hasOverlap ? 5 : 4;
     return ratio < minRatio || ratio > maxRatio;
   }
 
-  const maxIncrease = originalLength < 8 ? 80 : 120;
-  const allowedIncrease = hasOverlap ? maxIncrease + 40 : maxIncrease;
+  const maxIncrease = originalLength < 8 ? 120 : 160;
+  const allowedIncrease = hasOverlap ? maxIncrease + 60 : maxIncrease;
   return revisedLength - originalLength > allowedIncrease;
 }
 
