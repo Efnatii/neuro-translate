@@ -229,6 +229,7 @@ async function translatePage(settings) {
         translationStatus: 'in_progress',
         proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
       });
+      reportProgress('Перевод выполняется');
       const preparedTexts = block.map(({ node }) =>
         prepareTextForTranslation(node.nodeValue)
       );
@@ -343,12 +344,14 @@ async function translatePage(settings) {
           proofreadStatus: 'done',
           proofread: replacements
         });
+        reportProgress('Вычитка выполняется');
       } catch (error) {
         console.warn('Proofreading failed, keeping original translations.', error);
         await updateDebugEntry(task.index + 1, {
           proofreadStatus: 'failed',
           proofread: []
         });
+        reportProgress('Вычитка выполняется');
       } finally {
         activeProofreadWorkers = Math.max(0, activeProofreadWorkers - 1);
       }
@@ -824,13 +827,94 @@ function formatBlockText(texts) {
 }
 
 function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0) {
+  const snapshot = getProgressSnapshot();
+  const resolvedCompleted = Number.isFinite(snapshot?.completedBlocks)
+    ? snapshot.completedBlocks
+    : completedBlocks || 0;
+  const resolvedTotal = Number.isFinite(snapshot?.totalBlocks) ? snapshot.totalBlocks : totalBlocks || 0;
+  const resolvedInProgress = Number.isFinite(snapshot?.inProgressBlocks)
+    ? snapshot.inProgressBlocks
+    : inProgressBlocks || 0;
+  translationProgress = {
+    completedBlocks: resolvedCompleted,
+    totalBlocks: resolvedTotal,
+    inProgressBlocks: resolvedInProgress
+  };
   chrome.runtime.sendMessage({
     type: 'TRANSLATION_PROGRESS',
     message,
+    completedBlocks: resolvedCompleted,
+    totalBlocks: resolvedTotal,
+    inProgressBlocks: resolvedInProgress
+  });
+}
+
+function getProgressSnapshot() {
+  if (Array.isArray(debugEntries) && debugEntries.length) {
+    return computeTranslationProgress(debugEntries);
+  }
+  return null;
+}
+
+function computeTranslationProgress(entries) {
+  const totalBlocks = entries.length;
+  let completedBlocks = 0;
+  let inProgressBlocks = 0;
+  let failedBlocks = 0;
+
+  entries.forEach((entry) => {
+    const status = getOverallEntryStatus(entry);
+    if (status === 'done') {
+      completedBlocks += 1;
+    } else if (status === 'in_progress') {
+      inProgressBlocks += 1;
+    } else if (status === 'failed') {
+      failedBlocks += 1;
+    }
+  });
+
+  return {
     completedBlocks,
     totalBlocks,
-    inProgressBlocks
-  });
+    inProgressBlocks,
+    failedBlocks
+  };
+}
+
+function getOverallEntryStatus(entry) {
+  if (!entry) return 'pending';
+  const translationStatus = normalizeEntryStatus(entry.translationStatus, entry.translated);
+  const proofreadApplied = entry.proofreadApplied !== false;
+  const proofreadStatus = normalizeEntryStatus(
+    entry.proofreadStatus,
+    entry.proofread,
+    proofreadApplied
+  );
+
+  if (translationStatus === 'failed') return 'failed';
+  if (proofreadApplied) {
+    if (proofreadStatus === 'failed') return 'failed';
+    if (translationStatus === 'done' && proofreadStatus === 'done') return 'done';
+    if (translationStatus === 'in_progress' || proofreadStatus === 'in_progress') return 'in_progress';
+    if (translationStatus === 'done' && proofreadStatus === 'pending') return 'in_progress';
+    return 'pending';
+  }
+
+  if (translationStatus === 'done') return 'done';
+  if (translationStatus === 'in_progress') return 'in_progress';
+  return 'pending';
+}
+
+function normalizeEntryStatus(status, value, proofreadApplied = true) {
+  if (status) return status;
+  if (proofreadApplied === false) return 'disabled';
+  if (Array.isArray(value)) {
+    return 'done';
+  }
+  if (typeof value === 'string' && value.trim()) {
+    return 'done';
+  }
+  return 'pending';
 }
 
 async function restoreFromMemory() {
