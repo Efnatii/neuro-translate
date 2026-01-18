@@ -1151,9 +1151,8 @@ async function cancelTranslation() {
   await clearTranslationDebugInfo(location.href);
   activeTranslationEntries = [];
   debugState = null;
-  translationProgress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
   await setTranslationVisibility(false);
-  reportProgress('Перевод отменён', 0, 0, 0);
+  reportProgress('Перевод отменён', translationProgress.completedBlocks, translationProgress.totalBlocks);
 }
 
 async function setTranslationVisibility(visible) {
