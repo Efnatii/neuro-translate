@@ -893,6 +893,13 @@ async function saveModelThroughputResult(model, result) {
 function safeParseArray(content, expectedLength) {
   const normalizeString = (value = '') =>
     value.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+  const collapseSingleItemLines = (lines) => {
+    if (!Array.isArray(lines) || !lines.length) return null;
+    if (lines.length === 1) return lines;
+    const sortedByLength = [...lines].sort((a, b) => b.length - a.length);
+    const longest = sortedByLength[0] || '';
+    return [longest.trim()].filter(Boolean);
+  };
 
   const parsePlainText = (value) => {
     const lines = normalizeString(value)
@@ -905,9 +912,9 @@ function safeParseArray(content, expectedLength) {
     if (expectedLength && lines.length !== expectedLength) {
       if (expectedLength === 1 && lines.length > 1) {
         console.warn(
-          `Translation response length mismatch for single item: expected 1, got ${lines.length}. Collapsing into one string.`
+          `Translation response length mismatch for single item: expected 1, got ${lines.length}. Using the longest line.`
         );
-        return [lines.join(' ')];
+        return collapseSingleItemLines(lines);
       }
       const message = `Translation response length mismatch: expected ${expectedLength}, got ${lines.length}`;
       console.warn(message);
@@ -961,9 +968,9 @@ function safeParseArray(content, expectedLength) {
   if (expectedLength && parsed.length !== expectedLength) {
     if (expectedLength === 1 && parsed.length > 1) {
       console.warn(
-        `Translation response length mismatch for single item: expected 1, got ${parsed.length}. Collapsing into one string.`
+        `Translation response length mismatch for single item: expected 1, got ${parsed.length}. Using the longest line.`
       );
-      return [parsed.join(' ')];
+      return collapseSingleItemLines(parsed);
     }
 
     const message = `Translation response length mismatch: expected ${expectedLength}, got ${parsed.length}`;
