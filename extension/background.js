@@ -509,6 +509,12 @@ function calculateTranslationTimeoutMs(texts, throughputInfo) {
   return Math.min(Math.max(DEFAULT_TRANSLATION_TIMEOUT_MS, Math.round(paddedMs)), MAX_TRANSLATION_TIMEOUT_MS);
 }
 
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526]);
+
+function isRetryableStatus(status) {
+  return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
+}
+
 async function translateTexts(
   texts,
   apiKey,
@@ -522,11 +528,11 @@ async function translateTexts(
   if (!Array.isArray(texts) || !texts.length) return [];
 
   const maxTimeoutAttempts = 2;
-  const maxRateLimitRetries = 3;
+  const maxRetryableRetries = 3;
   let timeoutAttempts = 0;
-  let rateLimitRetries = 0;
+  let retryableRetries = 0;
   let lastError = null;
-  let lastRateLimitDelayMs = null;
+  let lastRetryDelayMs = null;
   const throughputInfo = await getModelThroughputInfo(model);
   const timeoutMs = calculateTranslationTimeoutMs(texts, throughputInfo);
 
@@ -557,11 +563,13 @@ async function translateTexts(
       }
 
       const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
-      if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
-        rateLimitRetries += 1;
-        const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
-        lastRateLimitDelayMs = retryDelayMs;
-        console.warn(`Translation attempt rate-limited, retrying after ${retryDelayMs}ms...`);
+      const isRetryable = isRetryableStatus(error?.status) || error?.isRetryable || isRateLimit;
+      if (isRetryable && retryableRetries < maxRetryableRetries) {
+        retryableRetries += 1;
+        const retryDelayMs = calculateRetryDelayMs(retryableRetries, error?.retryAfterMs);
+        lastRetryDelayMs = retryDelayMs;
+        const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
+        console.warn(`Translation attempt ${retryLabel}, retrying after ${retryDelayMs}ms...`);
         await sleep(retryDelayMs);
         continue;
       }
@@ -582,7 +590,7 @@ async function translateTexts(
       }
 
       if (isRateLimit) {
-        const waitSeconds = Math.max(1, Math.ceil((lastRateLimitDelayMs || error?.retryAfterMs || 30000) / 1000));
+        const waitSeconds = Math.max(1, Math.ceil((lastRetryDelayMs || error?.retryAfterMs || 30000) / 1000));
         throw new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
       }
 
@@ -684,12 +692,16 @@ async function performTranslationRequest(
       errorPayload = null;
     }
     const retryAfterMs = parseRetryAfterMs(response, errorPayload);
+    const sanitizedErrorText = isHtmlPayload(errorText)
+      ? response.statusText || 'Bad Gateway'
+      : errorText;
     const errorMessage =
-      errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
+      errorPayload?.error?.message || errorPayload?.message || sanitizedErrorText || 'Unknown error';
     const error = new Error(`Translation request failed: ${response.status} ${errorMessage}`);
     error.status = response.status;
     error.retryAfterMs = retryAfterMs;
     error.isRateLimit = response.status === 429 || response.status === 503;
+    error.isRetryable = isRetryableStatus(response.status);
     throw error;
   }
 
@@ -755,6 +767,12 @@ function parseRetryAfterMs(response, errorPayload) {
   return null;
 }
 
+function isHtmlPayload(payload = '') {
+  if (typeof payload !== 'string') return false;
+  const trimmed = payload.trim().toLowerCase();
+  return trimmed.startsWith('<!doctype html') || trimmed.startsWith('<html') || trimmed.includes('<html');
+}
+
 function parseRetryAfterMsFromMessage(message = '') {
   if (typeof message !== 'string' || !message.trim()) return null;
   const retryMatch = message.match(/try again in\s*([\d.]+)\s*(ms|msec|millis|s|sec|secs|seconds)/i);
@@ -802,10 +820,10 @@ async function translateIndividually(
   keepPunctuationTokens = false
 ) {
   const results = [];
-  const maxRateLimitRetries = 3;
+  const maxRetryableRetries = 3;
 
   for (const text of texts) {
-    let rateLimitRetries = 0;
+    let retryableRetries = 0;
 
     while (true) {
       try {
@@ -824,10 +842,12 @@ async function translateIndividually(
         break;
       } catch (error) {
         const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
-        if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
-          rateLimitRetries += 1;
-          const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
-          console.warn(`Single-item translation rate-limited, retrying after ${retryDelayMs}ms...`);
+        const isRetryable = isRetryableStatus(error?.status) || error?.isRetryable || isRateLimit;
+        if (isRetryable && retryableRetries < maxRetryableRetries) {
+          retryableRetries += 1;
+          const retryDelayMs = calculateRetryDelayMs(retryableRetries, error?.retryAfterMs);
+          const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
+          console.warn(`Single-item translation ${retryLabel}, retrying after ${retryDelayMs}ms...`);
           await sleep(retryDelayMs);
           continue;
         }
