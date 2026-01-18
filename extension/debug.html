@@ -40,6 +40,12 @@
       flex: 1;
       min-width: 160px;
     }
+    .summary-status {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      min-width: 140px;
+    }
     .summary-meta {
       font-size: 12px;
       color: #6b7280;
@@ -154,11 +160,11 @@
     .ai-tests {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 8px;
       margin-bottom: 16px;
       background: #fff;
       border-radius: 10px;
-      padding: 12px;
+      padding: 10px 12px;
       border: 1px solid #e2e8f0;
     }
     .ai-tests-header {
@@ -195,10 +201,10 @@
       gap: 6px;
     }
     .ai-test-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px 12px;
       padding-bottom: 6px;
       border-bottom: 1px solid #e2e8f0;
     }
@@ -223,27 +229,31 @@
     }
     .ai-test-status {
       display: flex;
-      flex-direction: column;
-      align-items: flex-end;
-      gap: 4px;
+      align-items: center;
+      gap: 8px;
       font-size: 11px;
       color: #6b7280;
       text-align: right;
-      min-width: 140px;
+      min-width: 180px;
     }
     .ai-test-detail {
-      max-width: 180px;
+      max-width: 200px;
+      font-size: 11px;
     }
     @media (max-width: 700px) {
       .summary-header {
         flex-direction: column;
         align-items: flex-start;
       }
+      .summary-status {
+        justify-content: flex-start;
+        min-width: auto;
+      }
       .summary-progress {
         width: 100%;
       }
       .ai-test-row {
-        flex-direction: column;
+        grid-template-columns: 1fr;
         align-items: flex-start;
       }
       .ai-test-status {

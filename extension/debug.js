@@ -25,60 +25,25 @@ const aiTestState = {
 
 const AI_TESTS = [
   {
-    id: 'tpm',
-    title: 'TPM',
-    description: 'Проверить лимит tokens per minute и текущий запас.',
-    success: 'Лимит в норме, запас достаточный.',
-    failure: 'Запас лимита мал, возможны очереди.'
-  },
-  {
-    id: 'throughput',
-    title: 'Пропускная способность',
-    description: 'Оценить tokens/sec при типичном запросе.',
-    success: 'Скорость соответствует ожиданиям.',
-    failure: 'Скорость ниже нормы, требуется оптимизация.'
-  },
-  {
-    id: 'cost',
-    title: 'Стоимость',
-    description: 'Проверить цену за 1k токенов и итоговую стоимость пакета.',
-    success: 'Стоимость в пределах бюджета.',
-    failure: 'Стоимость выше целевой, нужен пересмотр.'
-  },
-  {
-    id: 'rpm',
-    title: 'Лимит запросов',
-    description: 'Проверить RPM и пиковую нагрузку.',
-    success: 'Лимиты устойчивы к пику.',
-    failure: 'Пики превышают лимиты.'
-  },
-  {
-    id: 'latency',
-    title: 'Задержка',
-    description: 'Сравнить p50/p95 latency для моделей.',
-    success: 'Задержки стабильны.',
-    failure: 'Высокие p95 задержки.'
+    id: 'translation',
+    title: 'ИИ перевода',
+    description: 'Проверка модели перевода и скорости ответа.',
+    success: 'Перевод отвечает стабильно.',
+    failure: 'Перевод отвечает с ошибкой.'
   },
   {
     id: 'context',
-    title: 'Контекстное окно',
-    description: 'Проверить запас по максимальному контексту.',
-    success: 'Запас по контексту достаточный.',
-    failure: 'Риск переполнения контекста.'
+    title: 'ИИ контекста',
+    description: 'Проверка генерации контекста перед переводом.',
+    success: 'Контекст формируется без задержек.',
+    failure: 'Контекст не сформирован.'
   },
   {
-    id: 'stability',
-    title: 'Стабильность',
-    description: 'Проверить долю ошибок/ретраев.',
-    success: 'Ошибок почти нет.',
-    failure: 'Много ретраев, нужен разбор.'
-  },
-  {
-    id: 'cache',
-    title: 'Кэширование',
-    description: 'Оценить экономию при повторных запросах.',
-    success: 'Кэш даёт заметную экономию.',
-    failure: 'Кэш почти не используется.'
+    id: 'proofread',
+    title: 'ИИ вычитки',
+    description: 'Проверка модели вычитки и правок.',
+    success: 'Вычитка работает корректно.',
+    failure: 'Вычитка вернула ошибку.'
   }
 ];
 
@@ -252,15 +217,15 @@ function renderSummary(data, fallbackMessage = '') {
     : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
-      <div class="status-row">
-        <div class="status-group">
-          <span class="status-label">Статус</span>
-          ${renderStatusBadge(overallStatus)}
-        </div>
-      </div>
       <div class="summary-progress">
         <div class="progress-bar">
           <div class="progress-fill" style="width: ${progress}%"></div>
+        </div>
+      </div>
+      <div class="summary-status">
+        <div class="status-group">
+          <span class="status-label">Статус</span>
+          ${renderStatusBadge(overallStatus)}
         </div>
       </div>
     </div>
