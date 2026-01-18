@@ -1,7 +1,6 @@
 const metaEl = document.getElementById('meta');
 const contextEl = document.getElementById('context');
 const summaryEl = document.getElementById('summary');
-const aiTestsEl = document.getElementById('aiTests');
 const entriesEl = document.getElementById('entries');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
@@ -16,36 +15,6 @@ const STATUS_CONFIG = {
 
 let sourceUrl = '';
 let refreshTimer = null;
-const aiTestState = {
-  items: [],
-  running: false,
-  lastRunAt: null,
-  timeouts: []
-};
-
-const AI_TESTS = [
-  {
-    id: 'translation',
-    title: 'ИИ перевода',
-    description: 'Проверка модели перевода и скорости ответа.',
-    success: 'Перевод отвечает стабильно.',
-    failure: 'Перевод отвечает с ошибкой.'
-  },
-  {
-    id: 'context',
-    title: 'ИИ контекста',
-    description: 'Проверка генерации контекста перед переводом.',
-    success: 'Контекст формируется без задержек.',
-    failure: 'Контекст не сформирован.'
-  },
-  {
-    id: 'proofread',
-    title: 'ИИ вычитки',
-    description: 'Проверка модели вычитки и правок.',
-    success: 'Вычитка работает корректно.',
-    failure: 'Вычитка вернула ошибку.'
-  }
-];
 
 init();
 
@@ -56,8 +25,6 @@ async function init() {
     return;
   }
 
-  initAiTests();
-  aiTestsEl?.addEventListener('click', handleAiTestAction);
   await refreshDebug();
   startAutoRefresh();
 }
@@ -283,97 +250,4 @@ function escapeHtml(value) {
   const div = document.createElement('div');
   div.textContent = value;
   return div.innerHTML;
-}
-
-function initAiTests() {
-  aiTestState.items = AI_TESTS.map((test) => ({
-    ...test,
-    status: 'pending',
-    detail: 'Не запускался.'
-  }));
-  aiTestState.running = false;
-  aiTestState.lastRunAt = null;
-  clearAiTestTimers();
-  renderAiTests();
-}
-
-function handleAiTestAction(event) {
-  const button = event.target.closest('button[data-action="run-tests"]');
-  if (!button) return;
-  runAiTests();
-}
-
-function runAiTests() {
-  if (aiTestState.running) return;
-  aiTestState.running = true;
-  aiTestState.lastRunAt = new Date();
-  clearAiTestTimers();
-  aiTestState.items = aiTestState.items.map((item) => ({
-    ...item,
-    status: 'in_progress',
-    detail: 'Запуск...'
-  }));
-  renderAiTests();
-
-  let remaining = aiTestState.items.length;
-  aiTestState.items.forEach((item, index) => {
-    const timeout = window.setTimeout(() => {
-      const isSuccess = Math.random() > 0.2;
-      const status = isSuccess ? 'done' : 'failed';
-      const detail = isSuccess ? item.success : item.failure;
-      aiTestState.items[index] = {
-        ...aiTestState.items[index],
-        status,
-        detail
-      };
-      remaining -= 1;
-      if (remaining === 0) {
-        aiTestState.running = false;
-      }
-      renderAiTests();
-    }, 300 + Math.random() * 900);
-    aiTestState.timeouts.push(timeout);
-  });
-}
-
-function clearAiTestTimers() {
-  aiTestState.timeouts.forEach((timeout) => window.clearTimeout(timeout));
-  aiTestState.timeouts = [];
-}
-
-function renderAiTests() {
-  if (!aiTestsEl) return;
-  const tests = aiTestState.items || [];
-  const finished = tests.filter((test) => ['done', 'failed'].includes(test.status)).length;
-  const lastRunAt = aiTestState.lastRunAt
-    ? aiTestState.lastRunAt.toLocaleTimeString('ru-RU')
-    : '—';
-  const rows = tests
-    .map(
-      (test) => `
-        <div class="ai-test-row">
-          <div class="ai-test-main">
-            <div class="ai-test-title">${escapeHtml(test.title)}</div>
-            <p class="ai-test-desc">${escapeHtml(test.description)}</p>
-          </div>
-          <div class="ai-test-status">
-            ${renderStatusBadge(test.status)}
-            <div class="ai-test-detail">${escapeHtml(test.detail)}</div>
-          </div>
-        </div>
-      `
-    )
-    .join('');
-  aiTestsEl.innerHTML = `
-    <div class="ai-tests-header">
-      <div>
-        <div class="ai-tests-title">Тесты ИИ</div>
-        <div class="ai-tests-meta">Последний запуск: ${lastRunAt} • Готово: ${finished}/${tests.length}</div>
-      </div>
-      <button class="ai-test-refresh" type="button" data-action="run-tests" ${aiTestState.running ? 'disabled' : ''}>
-        ${aiTestState.running ? 'Выполняется...' : 'Запустить'}
-      </button>
-    </div>
-    <div class="ai-test-list">${rows}</div>
-  `;
 }
