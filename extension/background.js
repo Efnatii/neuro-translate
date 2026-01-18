@@ -412,10 +412,10 @@ async function proofreadTranslation(
       role: 'system',
       content: [
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        `Return the revised segments as a plain list with exactly ${expectedSegments} lines, in the same order as the input segments.`,
+        `Return a JSON array of strings with exactly ${expectedSegments} items, in the same order as the input segments.`,
         'If a segment requires no corrections, return an empty string for that segment.',
         'Never add commentary, explanations, numbering, or extra markup.',
-        'Do not wrap the output in markdown code fences.',
+        'Do not wrap the JSON in markdown code fences.',
         'Prioritize readability and clarity of meaning over strict literalness.',
         'Improve fluency and naturalness so the translation reads like it was written by a native speaker.',
         'Fix grammar, agreement, punctuation, typos, or terminology consistency as needed.',
@@ -435,7 +435,7 @@ async function proofreadTranslation(
           ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
           : 'If no context is provided, do not invent context or add assumptions.',
         PUNCTUATION_TOKEN_HINT,
-        'Return only the list.'
+        'Return only the JSON array.'
       ]
         .filter(Boolean)
         .join(' ')
@@ -452,7 +452,7 @@ async function proofreadTranslation(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        `Review the translated text below and return only the revised segments as a list with exactly ${expectedSegments} lines.`,
+        `Review the translated text below and return only the revised segments as a JSON array with exactly ${expectedSegments} items.`,
         `The translated text is split by ${PROOFREAD_SEGMENT_TOKEN}; array index 0 corresponds to segmentIndex 0.`,
         'If a segment needs no corrections, return an empty string in its place.',
         'Use the context metadata only for disambiguation; do not quote or include it in the output.',
@@ -688,7 +688,7 @@ async function performTranslationRequest(
           ? 'Rely on the provided page context for disambiguation only; never introduce new facts. Do not quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.'
           : 'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
-        'Return a list of strings with exactly the same number of lines as the input segments, in the same order.',
+        'Return a JSON array of strings with exactly the same number of items as the input segments, in the same order.',
         'Never include numbering, commentary, or markdown code fences.'
       ]
         .filter(Boolean)
@@ -720,7 +720,7 @@ async function performTranslationRequest(
           ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
           : null,
         `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
-        `Return a list with exactly ${texts.length} lines in the same order; use an empty string if a segment is empty.`,
+        `Return a JSON array of strings with exactly ${texts.length} items in the same order; use an empty string if a segment is empty.`,
         'Segments to translate:',
         ...tokenizedTexts.map((text) => text)
       ]
