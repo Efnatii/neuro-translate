@@ -636,6 +636,7 @@ function groupTextNodesByBlock(nodesWithPath) {
 
   nodesWithPath.forEach((entry) => {
     const blockElement = findBlockAncestor(entry.node);
+    entry.blockElement = blockElement;
     if (blockElement !== currentBlockElement) {
       currentBlockElement = blockElement;
       currentBlock = [];
@@ -860,16 +861,19 @@ function mergeAdjacentBlocksByLength(blocks, maxLength) {
   const merged = [];
   let current = [];
   let currentLength = 0;
+  let currentBlockElement = null;
 
   blocks.forEach((block) => {
     const blockLength = getBlockLength(block);
+    const blockElement = block[0]?.blockElement ?? null;
     if (!current.length) {
       current = block.slice();
       currentLength = blockLength;
+      currentBlockElement = blockElement;
       return;
     }
 
-    if (currentLength + blockLength <= maxLength) {
+    if (currentBlockElement === blockElement && currentLength + blockLength <= maxLength) {
       current.push(...block);
       currentLength += blockLength;
       return;
@@ -878,6 +882,7 @@ function mergeAdjacentBlocksByLength(blocks, maxLength) {
     merged.push(current);
     current = block.slice();
     currentLength = blockLength;
+    currentBlockElement = blockElement;
   });
 
   if (current.length) merged.push(current);
