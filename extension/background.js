@@ -428,7 +428,7 @@ async function proofreadTranslation(
         'Preserve the relative order of sentences within each segment.',
         'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
         'If a punctuation token appears in the translated text, keep it unchanged and in the same position.',
-        `Segments are separated by the token ${PROOFREAD_SEGMENT_TOKEN}; keep it unchanged and in place.`,
+        'If a segment separator token appears in the translated text, keep it unchanged and in the same position.',
         'Do not include the segment separator in any line.',
         'Use the source text only to verify correctness and preserve meaning.',
         context
@@ -445,7 +445,6 @@ async function proofreadTranslation(
       content: [
         `Target language: ${targetLanguage}.`,
         `Review the translated text below and return only the revised segments as a JSON array with exactly ${expectedSegments} items.`,
-        `The translated text is split by ${PROOFREAD_SEGMENT_TOKEN}; array index 0 corresponds to segmentIndex 0.`,
         'If a segment needs no corrections, return an empty string in its place.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
@@ -496,7 +495,7 @@ async function proofreadTranslation(
         throw new Error('No proofreading result returned');
       }
 
-      const parsed = parseLineList(content, texts.length, 'proofread');
+      const parsed = parseJsonArrayStrict(content, texts.length, 'proofread');
       const replacements = parsed
         .map((item, index) => {
           const revisedText = typeof item === 'string' ? item : '';
@@ -680,7 +679,8 @@ async function performTranslationRequest(
           ? `Rely on the provided page context for disambiguation only; never introduce new facts. Do not quote, paraphrase, or include the context text in the output unless it is required to translate the source segments: ${context}`
           : 'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
-        'Respond only with translations in the same order, one per line, without numbering or commentary.'
+        `Respond only with a JSON array of strings containing exactly ${tokenizedTexts.length} items in the same order as the input segments.`,
+        'Do not wrap the JSON in markdown code fences or add commentary.'
       ]
         .filter(Boolean)
         .join(' ')
@@ -705,6 +705,7 @@ async function performTranslationRequest(
           ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
           : null,
         `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
+        `Return only a JSON array of strings with exactly ${tokenizedTexts.length} items, one per segment, in the same order.`,
         'Segments to translate:',
         ...tokenizedTexts.map((text) => text)
       ]
@@ -754,7 +755,7 @@ async function performTranslationRequest(
     throw new Error('No translation returned');
   }
 
-  const parsed = parseLineList(content, texts.length, 'translation');
+  const parsed = parseJsonArrayStrict(content, texts.length, 'translation');
   const translations = parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
   const refusalIndices = translations
     .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
@@ -1030,99 +1031,32 @@ async function saveModelThroughputResult(model, result) {
   await chrome.storage.local.set({ modelThroughputById });
 }
 
-function parseLineList(content, expectedLength, label = 'response') {
+function parseJsonArrayStrict(content, expectedLength, label = 'response') {
   const normalizeString = (value = '') =>
     value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
-  const tryParseJsonArray = (value = '') => {
-    const trimmed = value.trim();
-    if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return null;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (!Array.isArray(parsed)) return null;
-      return parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
-    } catch (error) {
-      return null;
-    }
-  };
-  const collapseSingleItemLines = (lines) => {
-    if (!Array.isArray(lines) || !lines.length) return null;
-    if (lines.length === 1) return lines;
-    const combined = lines.join('\n').trim();
-    return combined ? [combined] : [''];
-  };
-  const collapseConsecutiveBlankLines = (lines) => {
-    if (!Array.isArray(lines) || lines.length === 0) return lines;
-    const collapsed = [];
-    for (const line of lines) {
-      if (line === '' && collapsed[collapsed.length - 1] === '') continue;
-      collapsed.push(line);
-    }
-    return collapsed;
-  };
 
   const normalizedContent = normalizeString(String(content ?? '')).trim();
-  const jsonArray = tryParseJsonArray(normalizedContent);
-  if (jsonArray) {
-    const jsonLines = jsonArray.map((line) => (typeof line === 'string' ? line.trim() : String(line ?? '').trim()));
-    if (!expectedLength || jsonLines.length === expectedLength) return jsonLines;
-    const message = `${label} response length mismatch: expected ${expectedLength}, got ${jsonLines.length}`;
-    if (label === 'proofread') {
-      console.warn(`${message}. Using best-effort JSON parsing.`);
-      const bestEffort = jsonLines.slice(0, expectedLength);
-      while (bestEffort.length < expectedLength) bestEffort.push('');
-      return bestEffort;
-    }
-    console.warn(message);
-    throw new Error(message);
+  if (!normalizedContent.startsWith('[') || !normalizedContent.endsWith(']')) {
+    throw new Error(`${label} response is not a JSON array.`);
   }
 
-  const rawLines = normalizedContent.replace(/\r\n/g, '\n').split('\n');
-  if (expectedLength) {
-    while (rawLines.length > expectedLength && rawLines[rawLines.length - 1] === '') {
-      rawLines.pop();
-    }
-  }
-  const lines = rawLines.map((line) => line.trim());
-
-  if (expectedLength && lines.length !== expectedLength) {
-    const isBlankLineSeparatorPattern =
-      lines.length === expectedLength * 2 - 1 &&
-      lines.every((line, index) => (index % 2 === 1 ? line === '' : true));
-    const isTrailingBlankSeparatorPattern =
-      lines.length === expectedLength * 2 &&
-      lines[lines.length - 1] === '' &&
-      lines.slice(0, -1).every((line, index) => (index % 2 === 1 ? line === '' : true));
-    if (isBlankLineSeparatorPattern || isTrailingBlankSeparatorPattern) {
-      console.warn(
-        `${label} response length mismatch: expected ${expectedLength}, got ${lines.length}. Collapsing blank-line separators.`
-      );
-      return lines.filter((_, index) => index % 2 === 0).slice(0, expectedLength);
-    }
-    const collapsedBlankLines = collapseConsecutiveBlankLines(lines);
-    if (collapsedBlankLines.length === expectedLength && collapsedBlankLines.length !== lines.length) {
-      console.warn(
-        `${label} response length mismatch: expected ${expectedLength}, got ${lines.length}. Collapsing consecutive blank lines.`
-      );
-      return collapsedBlankLines;
-    }
-    if (expectedLength === 1 && lines.length > 1) {
-      console.warn(
-        `${label} response length mismatch for single item: expected 1, got ${lines.length}. Combining lines.`
-      );
-      return collapseSingleItemLines(lines);
-    }
-    const message = `${label} response length mismatch: expected ${expectedLength}, got ${lines.length}`;
-    if (label === 'proofread') {
-      console.warn(`${message}. Using best-effort parsing.`);
-      const bestEffort = lines.slice(0, expectedLength);
-      while (bestEffort.length < expectedLength) bestEffort.push('');
-      return bestEffort;
-    }
-    console.warn(message);
-    throw new Error(message);
+  let parsed = null;
+  try {
+    parsed = JSON.parse(normalizedContent);
+  } catch (error) {
+    throw new Error(`${label} response JSON parsing failed.`);
   }
 
-  return lines;
+  if (!Array.isArray(parsed)) {
+    throw new Error(`${label} response is not a JSON array.`);
+  }
+
+  const normalizedArray = parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
+  if (expectedLength && normalizedArray.length !== expectedLength) {
+    throw new Error(`${label} response length mismatch: expected ${expectedLength}, got ${normalizedArray.length}`);
+  }
+
+  return normalizedArray;
 }
 
 function countMatches(value = '', regex) {

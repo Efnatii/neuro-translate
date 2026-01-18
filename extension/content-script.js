@@ -263,11 +263,22 @@ async function translatePage(settings) {
           latestContextSummary,
           keepPunctuationTokens
         );
+        if (result.translations.length !== uniqueTexts.length) {
+          throw new Error(
+            `Translation length mismatch: expected ${uniqueTexts.length}, got ${result.translations.length}`
+          );
+        }
         const translatedTexts = block.map(({ original }, index) => {
           const translationIndex = indexMap[index];
+          if (translationIndex == null || translationIndex < 0 || translationIndex >= result.translations.length) {
+            throw new Error(`Translation index mismatch at segment ${index}`);
+          }
           const translated = result.translations[translationIndex] || original;
           return applyOriginalFormatting(original, translated);
         });
+        if (translatedTexts.length !== block.length) {
+          throw new Error(`Block translation length mismatch: expected ${block.length}, got ${translatedTexts.length}`);
+        }
 
         let finalTranslations = translatedTexts;
         if (keepPunctuationTokens) {
@@ -357,6 +368,11 @@ async function translatePage(settings) {
           applyOriginalFormatting(task.originalTexts[index], text)
         );
         finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
+        if (finalTranslations.length !== task.block.length) {
+          throw new Error(
+            `Proofread length mismatch: expected ${task.block.length}, got ${finalTranslations.length}`
+          );
+        }
 
         task.block.forEach(({ node, path, original, originalHash }, index) => {
           if (!shouldApplyTranslation(node, original, originalHash)) {
