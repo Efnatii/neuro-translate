@@ -677,8 +677,9 @@ async function performTranslationRequest(
         PUNCTUATION_TOKEN_HINT,
         'Determine the most appropriate tone/style based on the provided context.',
         context
-          ? `Rely on the provided page context for disambiguation only; never introduce new facts: ${context}`
+          ? `Rely on the provided page context for disambiguation only; never introduce new facts. Do not quote, paraphrase, or include the context text in the output unless it is required to translate the source segments: ${context}`
           : 'If no context is provided, do not invent context or add assumptions.',
+        'Never include page context text in the translations unless it is explicitly part of the source segments.',
         'Respond only with translations in the same order, one per line, without numbering or commentary.'
       ]
         .filter(Boolean)
@@ -689,13 +690,16 @@ async function performTranslationRequest(
       content: [
         `Translate the following segments into ${targetLanguage}.`,
         'Determine the style automatically based on context.',
-        context ? `Page context (use it for disambiguation only): ${context}` : '',
+        context
+          ? `Page context (use it for disambiguation only; do not quote or include it in the output unless it is required to translate the source segments): ${context}`
+          : '',
         'Do not omit or add information; preserve modality, tense, aspect, tone, and level of certainty.',
         'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
         'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
         'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
         'Translate names/titles/terms; if unsure, transliterate rather than leaving them untranslated, except for established brands.',
         'Do not leave any source text untranslated. Do not copy segments verbatim except for placeholders, markup, punctuation tokens, or text already in the target language.',
+        'Never include page context text in the translations unless it is explicitly part of the source segments.',
         'Keep terminology consistent within a single request.',
         strictTargetLanguage
           ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
