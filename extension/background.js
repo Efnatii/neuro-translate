@@ -522,7 +522,10 @@ async function proofreadTranslation(
 
       if (isRateLimit) {
         const waitSeconds = Math.max(1, Math.ceil((lastRateLimitDelayMs || error?.retryAfterMs || 30000) / 1000));
-        throw new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
+        const waitMs = waitSeconds * 1000;
+        console.warn(`Proofreading rate limit reached—waiting ${waitSeconds}s before retrying.`);
+        await sleep(waitMs);
+        continue;
       }
 
       throw lastError;

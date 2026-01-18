@@ -447,6 +447,31 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
 
 function applyProofreadingReplacements(texts, replacements) {
   const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
+  const hasUnsafeReplacement = replacements.some((replacement) => {
+    if (!replacement?.from && !replacement?.to) return false;
+    const from = replacement?.from ?? '';
+    const to = replacement?.to ?? '';
+    return (
+      from.includes(segmentDelimiter) ||
+      to.includes(segmentDelimiter) ||
+      from.includes(PROOFREAD_SEGMENT_TOKEN) ||
+      to.includes(PROOFREAD_SEGMENT_TOKEN)
+    );
+  });
+
+  if (hasUnsafeReplacement) {
+    return texts.map((text) => {
+      let result = text;
+      replacements.forEach((replacement) => {
+        if (!replacement?.from) return;
+        const from = replacement.from;
+        const to = replacement.to ?? '';
+        result = result.split(from).join(to);
+      });
+      return result;
+    });
+  }
+
   const combinedText = texts.join(segmentDelimiter);
   let combinedResult = combinedText;
 
