@@ -170,6 +170,7 @@ function renderSummary(data, fallbackMessage = '') {
   const failed = overallStatuses.filter((status) => status === 'failed').length;
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const progress = total ? Math.round((completed / total) * 100) : 0;
+  const aiRequestCount = Number.isFinite(data.aiRequestCount) ? data.aiRequestCount : 0;
   const overallStatus = getOverallStatus({
     completed,
     inProgress,
@@ -179,7 +180,7 @@ function renderSummary(data, fallbackMessage = '') {
   });
   const summaryLine = fallbackMessage
     ? fallbackMessage
-    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed}`;
+    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>
