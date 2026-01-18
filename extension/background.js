@@ -412,8 +412,10 @@ async function proofreadTranslation(
       role: 'system',
       content: [
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        `Return a JSON array of strings with exactly ${expectedSegments} items, in the same order as the input segments.`,
-        'If a segment requires no corrections, return an empty string for that segment.',
+        'Return a JSON array of JSON arrays, each with exactly two elements: [segmentIndex, replacementText].',
+        'segmentIndex is the 0-based index of the segment in the translated text array.',
+        'replacementText is the full corrected segment text to replace the original.',
+        'Only include segments that require corrections. If no corrections are needed, return an empty array.',
         'Never add commentary, explanations, numbering, or extra markup.',
         'Do not wrap the JSON in markdown code fences.',
         'Prioritize readability and clarity of meaning over strict literalness.',
@@ -444,8 +446,8 @@ async function proofreadTranslation(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        `Review the translated text below and return only the revised segments as a JSON array with exactly ${expectedSegments} items.`,
-        'If a segment needs no corrections, return an empty string in its place.',
+        'Review the translated text below and return only the revised segments as a JSON array of [segmentIndex, replacementText] pairs.',
+        'Only include segments that need corrections. If no corrections are needed, return an empty array.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
         normalizedSourceTexts.length ? combinedSourceText : '',
@@ -495,14 +497,7 @@ async function proofreadTranslation(
         throw new Error('No proofreading result returned');
       }
 
-      const parsed = parseJsonArrayStrict(content, texts.length, 'proofread');
-      const replacements = parsed
-        .map((item, index) => {
-          const revisedText = typeof item === 'string' ? item : '';
-          if (!revisedText) return null;
-          return { segmentIndex: index, revisedText };
-        })
-        .filter(Boolean);
+      const replacements = parseProofreadReplacements(content, texts.length);
 
       return { replacements, rawProofread: content };
     } catch (error) {
@@ -1057,6 +1052,46 @@ function parseJsonArrayStrict(content, expectedLength, label = 'response') {
   }
 
   return normalizedArray;
+}
+
+function parseProofreadReplacements(content, expectedSegments) {
+  const normalizeString = (value = '') =>
+    value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
+
+  const normalizedContent = normalizeString(String(content ?? '')).trim();
+  if (!normalizedContent.startsWith('[') || !normalizedContent.endsWith(']')) {
+    throw new Error('proofread response is not a JSON array.');
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(normalizedContent);
+  } catch (error) {
+    throw new Error('proofread response JSON parsing failed.');
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error('proofread response is not a JSON array.');
+  }
+
+  const replacements = [];
+  for (const item of parsed) {
+    if (!Array.isArray(item) || item.length !== 2) {
+      throw new Error('proofread response items must be [segmentIndex, replacementText] pairs.');
+    }
+    const [segmentIndexRaw, replacementRaw] = item;
+    const segmentIndex = Number(segmentIndexRaw);
+    if (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= expectedSegments) {
+      throw new Error('proofread response contains invalid segment index.');
+    }
+    const revisedText = typeof replacementRaw === 'string' ? replacementRaw : String(replacementRaw ?? '');
+    if (!revisedText) {
+      continue;
+    }
+    replacements.push({ segmentIndex, revisedText });
+  }
+
+  return replacements;
 }
 
 function countMatches(value = '', regex) {
