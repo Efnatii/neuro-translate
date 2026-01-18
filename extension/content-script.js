@@ -26,6 +26,7 @@ let tpmSettings = {
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const RATE_LIMIT_RETRY_ATTEMPTS = 2;
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -408,24 +409,28 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
   });
   await ensureTpmBudget('translation', estimatedTokens);
   await incrementDebugAiRequestCount();
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
-      {
-        type: 'TRANSLATE_TEXT',
-        texts,
-        targetLanguage,
-        context,
-        keepPunctuationTokens
-      },
-      (response) => {
-        if (response?.success) {
-          resolve(response);
-        } else {
-          reject(new Error(response?.error || 'Не удалось выполнить перевод.'));
-        }
-      }
-    );
-  });
+  return withRateLimitRetry(
+    () =>
+      new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
+          {
+            type: 'TRANSLATE_TEXT',
+            texts,
+            targetLanguage,
+            context,
+            keepPunctuationTokens
+          },
+          (response) => {
+            if (response?.success) {
+              resolve(response);
+            } else {
+              reject(new Error(response?.error || 'Не удалось выполнить перевод.'));
+            }
+          }
+        );
+      }),
+    'Translation'
+  );
 }
 
 async function requestProofreading(texts, targetLanguage, context, sourceTexts) {
@@ -436,27 +441,58 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
   });
   await ensureTpmBudget('proofread', estimatedTokens);
   await incrementDebugAiRequestCount();
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
-      {
-        type: 'PROOFREAD_TEXT',
-        texts,
-        targetLanguage,
-        context,
-        sourceTexts
-      },
-      (response) => {
-        if (response?.success) {
-          resolve({
-            replacements: normalizeProofreadReplacements(response.replacements),
-            rawProofread: response.rawProofread || ''
-          });
-        } else {
-          reject(new Error(response?.error || 'Не удалось выполнить вычитку.'));
-        }
+  return withRateLimitRetry(
+    () =>
+      new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
+          {
+            type: 'PROOFREAD_TEXT',
+            texts,
+            targetLanguage,
+            context,
+            sourceTexts
+          },
+          (response) => {
+            if (response?.success) {
+              resolve({
+                replacements: normalizeProofreadReplacements(response.replacements),
+                rawProofread: response.rawProofread || ''
+              });
+            } else {
+              reject(new Error(response?.error || 'Не удалось выполнить вычитку.'));
+            }
+          }
+        );
+      }),
+    'Proofreading'
+  );
+}
+
+function parseRateLimitDelayMs(error) {
+  const message = error?.message;
+  if (!message) return null;
+  const match = message.match(/retry in\s+(\d+(?:\.\d+)?)\s*seconds/i);
+  if (!match) return null;
+  const seconds = Number(match[1]);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.max(1000, Math.round(seconds * 1000));
+}
+
+async function withRateLimitRetry(requestFn, label) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await requestFn();
+    } catch (error) {
+      const delayMs = parseRateLimitDelayMs(error);
+      if (!delayMs || attempt >= RATE_LIMIT_RETRY_ATTEMPTS || cancelRequested) {
+        throw error;
       }
-    );
-  });
+      attempt += 1;
+      console.warn(`${label} rate-limited, retrying after ${Math.ceil(delayMs / 1000)}s...`);
+      await delay(delayMs);
+    }
+  }
 }
 
 function normalizeProofreadReplacements(replacements) {
@@ -481,6 +517,16 @@ function normalizeSegmentForComparison(value = '') {
     .replace(/\s+/g, ' ')
     .replace(/[^\p{L}\p{N}\s]/gu, '')
     .trim();
+}
+
+function formatLogDetails(details) {
+  if (details === null || details === undefined) return '';
+  try {
+    const serialized = JSON.stringify(details);
+    return serialized ? ` ${serialized}` : '';
+  } catch (error) {
+    return ` ${String(details)}`;
+  }
 }
 
 function isSuspiciousLengthChange(originalText, revisedText) {
@@ -526,30 +572,38 @@ function applyProofreadingReplacements(texts, replacements) {
     const segmentIndex = Number(replacement.segmentIndex);
     if (!Number.isInteger(segmentIndex)) return;
     if (segmentIndex < 0 || segmentIndex >= segments.length) {
-      console.warn('Proofread segment index out of range, skipping.', {
-        segmentIndex,
-        segmentCount: segments.length
-      });
+      console.warn(
+        `Proofread segment index out of range, skipping.${formatLogDetails({
+          segmentIndex,
+          segmentCount: segments.length
+        })}`
+      );
       return;
     }
     const revisedText = typeof replacement.revisedText === 'string' ? replacement.revisedText : '';
     const originalText = segments[segmentIndex] ?? '';
     if (revisedText.includes(PROOFREAD_SEGMENT_TOKEN)) {
-      console.warn('Proofread segment contains segment token, skipping.', { segmentIndex });
+      console.warn(
+        `Proofread segment contains segment token, skipping.${formatLogDetails({ segmentIndex })}`
+      );
       return;
     }
     if (isSuspiciousLengthChange(originalText, revisedText)) {
-      console.warn('Proofread segment length looks suspicious, skipping.', {
-        segmentIndex,
-        originalLength: originalText.length,
-        revisedLength: revisedText.length
-      });
+      console.warn(
+        `Proofread segment length looks suspicious, skipping.${formatLogDetails({
+          segmentIndex,
+          originalLength: originalText.length,
+          revisedLength: revisedText.length
+        })}`
+      );
       return;
     }
     const previousSegment = segments[segmentIndex - 1];
     const nextSegment = segments[segmentIndex + 1];
     if (isSimilarToNeighbor(revisedText, previousSegment) || isSimilarToNeighbor(revisedText, nextSegment)) {
-      console.warn('Proofread segment resembles a neighbor, skipping.', { segmentIndex });
+      console.warn(
+        `Proofread segment resembles a neighbor, skipping.${formatLogDetails({ segmentIndex })}`
+      );
       return;
     }
     segments[segmentIndex] = revisedText;
