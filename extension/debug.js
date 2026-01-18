@@ -164,12 +164,10 @@ function renderSummary(data, fallbackMessage = '') {
   if (!summaryEl) return;
   const items = Array.isArray(data.items) ? data.items : [];
   const total = items.length;
-  const translationStatuses = items.map((item) =>
-    normalizeStatus(item.translationStatus, item.translated)
-  );
-  const completed = translationStatuses.filter((status) => status === 'done').length;
-  const inProgress = translationStatuses.filter((status) => status === 'in_progress').length;
-  const failed = translationStatuses.filter((status) => status === 'failed').length;
+  const overallStatuses = items.map((item) => getOverallEntryStatus(item));
+  const completed = overallStatuses.filter((status) => status === 'done').length;
+  const inProgress = overallStatuses.filter((status) => status === 'in_progress').length;
+  const failed = overallStatuses.filter((status) => status === 'failed').length;
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const overallStatus = getOverallStatus({
@@ -232,6 +230,26 @@ function renderProofreadSection(item) {
         }
       </div>
     `;
+}
+
+function getOverallEntryStatus(item) {
+  if (!item) return 'pending';
+  const translationStatus = normalizeStatus(item.translationStatus, item.translated);
+  const proofreadApplied = item.proofreadApplied !== false;
+  const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, proofreadApplied);
+
+  if (translationStatus === 'failed') return 'failed';
+  if (proofreadApplied) {
+    if (proofreadStatus === 'failed') return 'failed';
+    if (translationStatus === 'done' && proofreadStatus === 'done') return 'done';
+    if (translationStatus === 'in_progress' || proofreadStatus === 'in_progress') return 'in_progress';
+    if (translationStatus === 'done' && proofreadStatus === 'pending') return 'in_progress';
+    return 'pending';
+  }
+
+  if (translationStatus === 'done') return 'done';
+  if (translationStatus === 'in_progress') return 'in_progress';
+  return 'pending';
 }
 
 function normalizeStatus(status, value, proofreadApplied = true) {
