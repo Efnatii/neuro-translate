@@ -657,7 +657,8 @@ async function performTranslationRequest(
   signal,
   context = '',
   apiBaseUrl = OPENAI_API_URL,
-  restorePunctuation = true
+  restorePunctuation = true,
+  strictTargetLanguage = false
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const styleHints = {
@@ -683,6 +684,9 @@ async function performTranslationRequest(
         'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
         'Do not leave any source text untranslated. Do not copy the source text verbatim except for placeholders, markup, punctuation tokens, or text that is already in the target language.',
         'Ensure terminology consistency within the same request.',
+        strictTargetLanguage
+          ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
+          : null,
         PUNCTUATION_TOKEN_HINT,
         styleInstruction ? `Tone/style: ${styleInstruction}` : 'Determine the most appropriate tone/style based on the provided context.',
         context
@@ -706,6 +710,9 @@ async function performTranslationRequest(
         'Translate names/titles/terms; if unsure, transliterate rather than leaving them untranslated, except for established brands.',
         'Do not leave any source text untranslated. Do not copy segments verbatim except for placeholders, markup, punctuation tokens, or text already in the target language.',
         'Keep terminology consistent within a single request.',
+        strictTargetLanguage
+          ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
+          : null,
         `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
         'Segments to translate:',
         ...tokenizedTexts.map((text) => text)
@@ -761,8 +768,39 @@ async function performTranslationRequest(
     throw new Error('Unexpected translation format');
   }
 
+  const translations = parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
+  if (!strictTargetLanguage && targetLanguage?.toLowerCase?.().startsWith('ru')) {
+    const retryIndices = translations
+      .map((translation, index) =>
+        shouldRetryRussianTranslation(texts[index] || '', translation || '') ? index : null
+      )
+      .filter((value) => Number.isInteger(value));
+
+    if (retryIndices.length) {
+      const retryTexts = retryIndices.map((index) => texts[index]);
+      const retryResults = await performTranslationRequest(
+        retryTexts,
+        apiKey,
+        targetLanguage,
+        model,
+        translationStyle,
+        signal,
+        context,
+        apiBaseUrl,
+        restorePunctuation,
+        true
+      );
+
+      retryIndices.forEach((index, retryPosition) => {
+        if (retryResults?.[retryPosition]) {
+          translations[index] = retryResults[retryPosition];
+        }
+      });
+    }
+  }
+
   return texts.map((text, index) => {
-    const candidate = parsed[index];
+    const candidate = translations[index];
     if (typeof candidate === 'string' && candidate.trim()) {
       return restorePunctuation ? restorePunctuationTokens(candidate) : candidate;
     }
@@ -1049,6 +1087,56 @@ function safeParseArray(content, expectedLength) {
   }
 
   return parsed;
+}
+
+function countMatches(value = '', regex) {
+  if (!value) return 0;
+  const matches = value.match(regex);
+  return matches ? matches.length : 0;
+}
+
+function normalizeTextForComparison(value = '') {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function shouldRetryRussianTranslation(source = '', translated = '') {
+  const normalizedSource = normalizeTextForComparison(source);
+  const normalizedTranslated = normalizeTextForComparison(translated);
+  if (!normalizedSource || !normalizedTranslated) return false;
+
+  const cyrillicCount = countMatches(translated, /[\p{Script=Cyrillic}]/gu);
+  const latinCount = countMatches(translated, /[\p{Script=Latin}]/gu);
+  const sourceCyrillicCount = countMatches(source, /[\p{Script=Cyrillic}]/gu);
+  const sourceLatinCount = countMatches(source, /[\p{Script=Latin}]/gu);
+  const sourceWordCount = normalizedSource ? normalizedSource.split(' ').length : 0;
+  const translatedWordCount = normalizedTranslated ? normalizedTranslated.split(' ').length : 0;
+  const sourceLetterCount = countMatches(source, /[\p{L}]/gu);
+  const translatedLetterCount = countMatches(translated, /[\p{L}]/gu);
+
+  if (
+    normalizedSource === normalizedTranslated &&
+    sourceCyrillicCount === 0 &&
+    sourceLatinCount > 0 &&
+    (sourceWordCount >= 2 || sourceLetterCount >= 10)
+  ) {
+    return true;
+  }
+
+  if (
+    cyrillicCount === 0 &&
+    latinCount > 0 &&
+    sourceCyrillicCount === 0 &&
+    sourceLatinCount > 0 &&
+    (translatedWordCount >= 3 || translatedLetterCount >= 18)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function applyPunctuationTokens(text = '') {
