@@ -463,6 +463,47 @@ function normalizeProofreadReplacements(replacements) {
     .filter(Boolean);
 }
 
+function normalizeSegmentForComparison(value = '') {
+  return value
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    .trim();
+}
+
+function isSuspiciousLengthChange(originalText, revisedText) {
+  const originalLength = originalText.length;
+  const revisedLength = revisedText.length;
+
+  if (originalLength === 0) {
+    return revisedLength > 120;
+  }
+
+  const ratio = revisedLength / originalLength;
+  if (originalLength >= 20) {
+    return ratio < 0.4 || ratio > 2.5;
+  }
+
+  return revisedLength - originalLength > 80;
+}
+
+function isSimilarToNeighbor(revisedText, neighborText) {
+  if (!neighborText) return false;
+  const normalizedRevised = normalizeSegmentForComparison(revisedText);
+  const normalizedNeighbor = normalizeSegmentForComparison(neighborText);
+  if (!normalizedRevised || !normalizedNeighbor) return false;
+  if (normalizedRevised === normalizedNeighbor) return true;
+  if (
+    normalizedRevised.length >= 20 &&
+    (normalizedRevised.includes(normalizedNeighbor) || normalizedNeighbor.includes(normalizedRevised))
+  ) {
+    const minLength = Math.min(normalizedRevised.length, normalizedNeighbor.length);
+    const maxLength = Math.max(normalizedRevised.length, normalizedNeighbor.length);
+    return minLength / maxLength > 0.8;
+  }
+  return false;
+}
+
 function applyProofreadingReplacements(texts, replacements) {
   const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
   const combinedText = texts.join(segmentDelimiter);
@@ -480,6 +521,25 @@ function applyProofreadingReplacements(texts, replacements) {
       return;
     }
     const revisedText = typeof replacement.revisedText === 'string' ? replacement.revisedText : '';
+    const originalText = segments[segmentIndex] ?? '';
+    if (revisedText.includes(PROOFREAD_SEGMENT_TOKEN)) {
+      console.warn('Proofread segment contains segment token, skipping.', { segmentIndex });
+      return;
+    }
+    if (isSuspiciousLengthChange(originalText, revisedText)) {
+      console.warn('Proofread segment length looks suspicious, skipping.', {
+        segmentIndex,
+        originalLength: originalText.length,
+        revisedLength: revisedText.length
+      });
+      return;
+    }
+    const previousSegment = segments[segmentIndex - 1];
+    const nextSegment = segments[segmentIndex + 1];
+    if (isSimilarToNeighbor(revisedText, previousSegment) || isSimilarToNeighbor(revisedText, nextSegment)) {
+      console.warn('Proofread segment resembles a neighbor, skipping.', { segmentIndex });
+      return;
+    }
     segments[segmentIndex] = revisedText;
   });
 
