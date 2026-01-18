@@ -239,8 +239,8 @@ async function translatePage(settings) {
         proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
       });
       reportProgress('Перевод выполняется');
-      const preparedTexts = block.map(({ node }) =>
-        prepareTextForTranslation(node.nodeValue)
+      const preparedTexts = block.map(({ original }) =>
+        prepareTextForTranslation(original)
       );
       const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
       const blockTranslations = [];
@@ -254,9 +254,9 @@ async function translatePage(settings) {
           latestContextSummary,
           keepPunctuationTokens
         );
-        const translatedTexts = block.map(({ node, original }, index) => {
+        const translatedTexts = block.map(({ original }, index) => {
           const translationIndex = indexMap[index];
-          const translated = result.translations[translationIndex] || node.nodeValue;
+          const translated = result.translations[translationIndex] || original;
           return applyOriginalFormatting(original, translated);
         });
 
@@ -266,6 +266,10 @@ async function translatePage(settings) {
         }
 
         block.forEach(({ node, path, original, originalHash }, index) => {
+          if (!shouldApplyTranslation(node, original, originalHash)) {
+            blockTranslations.push(node.nodeValue);
+            return;
+          }
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
           node.nodeValue = withOriginalFormatting;
           blockTranslations.push(withOriginalFormatting);
@@ -346,6 +350,9 @@ async function translatePage(settings) {
         finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
 
         task.block.forEach(({ node, path, original, originalHash }, index) => {
+          if (!shouldApplyTranslation(node, original, originalHash)) {
+            return;
+          }
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
           node.nodeValue = withOriginalFormatting;
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
