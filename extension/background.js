@@ -1054,35 +1054,65 @@ function parseJsonArrayStrict(content, expectedLength, label = 'response') {
   return normalizedArray;
 }
 
-function parseProofreadReplacements(content, expectedSegments) {
+function extractJsonArray(content = '', label = 'response') {
   const normalizeString = (value = '') =>
     value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
 
   const normalizedContent = normalizeString(String(content ?? '')).trim();
-  if (!normalizedContent.startsWith('[') || !normalizedContent.endsWith(']')) {
-    throw new Error('proofread response is not a JSON array.');
+  if (!normalizedContent) {
+    throw new Error(`${label} response is empty.`);
   }
 
+  const startIndex = normalizedContent.indexOf('[');
+  const endIndex = normalizedContent.lastIndexOf(']');
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+    throw new Error(`${label} response does not contain a JSON array.`);
+  }
+
+  const slice = normalizedContent.slice(startIndex, endIndex + 1);
   let parsed = null;
   try {
-    parsed = JSON.parse(normalizedContent);
+    parsed = JSON.parse(slice);
   } catch (error) {
-    throw new Error('proofread response JSON parsing failed.');
+    throw new Error(`${label} response JSON parsing failed.`);
   }
 
   if (!Array.isArray(parsed)) {
-    throw new Error('proofread response is not a JSON array.');
+    throw new Error(`${label} response is not a JSON array.`);
+  }
+
+  return parsed;
+}
+
+function parseProofreadReplacements(content, expectedSegments) {
+  let parsed = null;
+  try {
+    parsed = extractJsonArray(content, 'proofread');
+  } catch (error) {
+    console.warn('Proofread response parsing failed; returning no replacements.', error);
+    return [];
   }
 
   const replacements = [];
   for (const item of parsed) {
-    if (!Array.isArray(item) || item.length !== 2) {
-      throw new Error('proofread response items must be [segmentIndex, replacementText] pairs.');
+    let segmentIndexRaw = null;
+    let replacementRaw = null;
+
+    if (Array.isArray(item) && item.length >= 2) {
+      [segmentIndexRaw, replacementRaw] = item;
+    } else if (item && typeof item === 'object') {
+      segmentIndexRaw = item.segmentIndex ?? item.index ?? item.segment ?? null;
+      replacementRaw =
+        item.replacementText ?? item.revisedText ?? item.text ?? item.value ?? item.replacement ?? null;
+    } else {
+      console.warn('Skipping invalid proofread item.', item);
+      continue;
     }
-    const [segmentIndexRaw, replacementRaw] = item;
+
     const segmentIndex = Number(segmentIndexRaw);
     if (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= expectedSegments) {
-      throw new Error('proofread response contains invalid segment index.');
+      console.warn('Skipping proofread item with invalid segment index.', item);
+      continue;
     }
     const revisedText = typeof replacementRaw === 'string' ? replacementRaw : String(replacementRaw ?? '');
     if (!revisedText) {
