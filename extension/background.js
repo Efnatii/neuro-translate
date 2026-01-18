@@ -1043,6 +1043,19 @@ function parseLineList(content, expectedLength, label = 'response') {
   const lines = rawLines.map((line) => line.trim());
 
   if (expectedLength && lines.length !== expectedLength) {
+    const isBlankLineSeparatorPattern =
+      lines.length === expectedLength * 2 - 1 &&
+      lines.every((line, index) => (index % 2 === 1 ? line === '' : true));
+    const isTrailingBlankSeparatorPattern =
+      lines.length === expectedLength * 2 &&
+      lines[lines.length - 1] === '' &&
+      lines.slice(0, -1).every((line, index) => (index % 2 === 1 ? line === '' : true));
+    if (isBlankLineSeparatorPattern || isTrailingBlankSeparatorPattern) {
+      console.warn(
+        `${label} response length mismatch: expected ${expectedLength}, got ${lines.length}. Collapsing blank-line separators.`
+      );
+      return lines.filter((_, index) => index % 2 === 0).slice(0, expectedLength);
+    }
     if (expectedLength === 1 && lines.length > 1) {
       console.warn(
         `${label} response length mismatch for single item: expected 1, got ${lines.length}. Combining lines.`
