@@ -658,7 +658,8 @@ async function performTranslationRequest(
   context = '',
   apiBaseUrl = OPENAI_API_URL,
   restorePunctuation = true,
-  strictTargetLanguage = false
+  strictTargetLanguage = false,
+  allowRefusalRetry = true
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const styleHints = {
@@ -769,6 +770,47 @@ async function performTranslationRequest(
   }
 
   const translations = parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
+  const refusalIndices = translations
+    .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
+    .filter((value) => Number.isInteger(value));
+
+  if (allowRefusalRetry && refusalIndices.length) {
+    refusalIndices.forEach((index) => {
+      console.warn('Translation refusal/limit detected; retrying segment individually.', {
+        segmentIndex: index,
+        text: texts[index]
+      });
+    });
+
+    const retryTexts = refusalIndices.map((index) => texts[index]);
+    const retryResults = await translateIndividually(
+      retryTexts,
+      apiKey,
+      targetLanguage,
+      model,
+      translationStyle,
+      context,
+      apiBaseUrl,
+      !restorePunctuation,
+      false
+    );
+
+    refusalIndices.forEach((index, retryPosition) => {
+      const retryCandidate = retryResults?.[retryPosition];
+      if (typeof retryCandidate === 'string' && retryCandidate.trim() && !isRefusalOrLimitTranslation(retryCandidate)) {
+        translations[index] = retryCandidate;
+        return;
+      }
+
+      console.warn('Translation refusal persisted after retry; keeping source segment.', {
+        segmentIndex: index,
+        text: texts[index],
+        retry: retryCandidate
+      });
+      translations[index] = texts[index];
+    });
+  }
+
   if (!strictTargetLanguage && targetLanguage?.toLowerCase?.().startsWith('ru')) {
     const retryIndices = translations
       .map((translation, index) =>
@@ -788,7 +830,8 @@ async function performTranslationRequest(
         context,
         apiBaseUrl,
         restorePunctuation,
-        true
+        true,
+        allowRefusalRetry
       );
 
       retryIndices.forEach((index, retryPosition) => {
@@ -900,7 +943,8 @@ async function translateIndividually(
   translationStyle,
   context = '',
   apiBaseUrl = OPENAI_API_URL,
-  keepPunctuationTokens = false
+  keepPunctuationTokens = false,
+  allowRefusalRetry = true
 ) {
   const results = [];
   const maxRetryableRetries = 3;
@@ -919,7 +963,9 @@ async function translateIndividually(
           undefined,
           context,
           apiBaseUrl,
-          !keepPunctuationTokens
+          !keepPunctuationTokens,
+          false,
+          allowRefusalRetry
         );
         results.push(translated);
         break;
@@ -1101,6 +1147,27 @@ function normalizeTextForComparison(value = '') {
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function isRefusalOrLimitTranslation(translated = '') {
+  const normalized = normalizeTextForComparison(translated);
+  if (!normalized) return false;
+
+  const refusalPatterns = [
+    /слишком\s+(?:больш|длинн|объ[её]м|много)\b/,
+    /(?:текст|запрос|ввод|объем)\s+слишком\s+(?:длинн|больш|объ[её]м|много)\b/,
+    /пожалуйста\s+(?:сократит|укоротит|сделайт)\s+(?:текст|запрос|сообщени)/,
+    /пожалуйста\s+(?:предоставьте|пришлите)\s+более\s+коротк/,
+    /(?:не\s+могу|невозможн)\s+перевест/,
+    /не\s+уда[её]тся\s+перевест/,
+    /please\s+(?:provide|send|give)\s+(?:a\s+)?shorter/,
+    /please\s+(?:shorten|reduce)\s+(?:the\s+)?(?:text|request|input)/,
+    /(?:text|request|input)\s+is\s+too\s+long/,
+    /request\s+too\s+(?:large|long)/,
+    /(?:cannot|can\s+t|unable\s+to)\s+translate/
+  ];
+
+  return refusalPatterns.some((pattern) => pattern.test(normalized));
 }
 
 function shouldRetryRussianTranslation(source = '', translated = '') {
