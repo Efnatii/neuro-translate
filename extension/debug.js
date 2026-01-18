@@ -17,44 +17,19 @@ const STATUS_CONFIG = {
 let sourceUrl = '';
 let refreshTimer = null;
 const aiTestState = {
-  context: [],
-  translation: [],
-  proofread: []
+  items: []
 };
 
-const AI_TESTS = {
-  context: [
-    { title: 'Портрет аудитории', description: 'Описание целевой аудитории и проверка релевантности терминов.' },
-    { title: 'География', description: 'Уточнить региональные особенности и локальные идиомы.' },
-    { title: 'Тональность', description: 'Сравнить формальный и дружелюбный тон при равном смысле.' },
-    { title: 'Домен', description: 'Проверить корректность термина в медицине/финансах/юриспруденции.' },
-    { title: 'Сжатие', description: 'Сократить контекст без потери ключевой информации.' },
-    { title: 'Расширение', description: 'Добавить недостающие детали и проверить логическую связность.' },
-    { title: 'Глоссарий', description: 'Проверить единообразие терминов в контексте.' },
-    { title: 'Мета-цель', description: 'Определить цель текста и проверить отражение в переводе.' }
-  ],
-  translation: [
-    { title: 'Сложные числа', description: 'Перевод чисел, дат и единиц измерения без потерь.' },
-    { title: 'Идиомы', description: 'Передать смысл устойчивых выражений без буквального перевода.' },
-    { title: 'Терминология', description: 'Согласованность терминов на протяжении всего блока.' },
-    { title: 'Короткие фразы', description: 'Сохранить лаконичность UI-текстов.' },
-    { title: 'Длинные предложения', description: 'Разбить сложные конструкции без искажения смысла.' },
-    { title: 'Сленг', description: 'Адаптация разговорной лексики под аудиторию.' },
-    { title: 'Знаки препинания', description: 'Корректная пунктуация после перевода.' },
-    { title: 'Смешанные языки', description: 'Сохранить брендовые слова и названия продуктов.' },
-    { title: 'Капитализация', description: 'Сохранить правила заглавных букв.' }
-  ],
-  proofread: [
-    { title: 'Единообразие', description: 'Проверить одинаковые термины на идентичность.' },
-    { title: 'Грамматика', description: 'Исправить согласование родов, падежей и чисел.' },
-    { title: 'Стиль', description: 'Устранить канцеляризмы и сделать текст живее.' },
-    { title: 'Опечатки', description: 'Найти и исправить очевидные ошибки.' },
-    { title: 'Пунктуация', description: 'Проверить запятые и тире в сложных конструкциях.' },
-    { title: 'Согласованность', description: 'Проверить связь между соседними предложениями.' },
-    { title: 'Клише', description: 'Заменить избитые обороты на более точные.' },
-    { title: 'Смысловые повторы', description: 'Убрать дублирующие фразы.' }
-  ]
-};
+const AI_TESTS = [
+  { title: 'TPM', description: 'Проверить лимит tokens per minute и текущий запас.' },
+  { title: 'Пропускная способность', description: 'Оценить tokens/sec при типичном запросе.' },
+  { title: 'Стоимость', description: 'Проверить цену за 1k токенов и итоговую стоимость пакета.' },
+  { title: 'Лимит запросов', description: 'Проверить RPM и пиковую нагрузку.' },
+  { title: 'Задержка', description: 'Сравнить p50/p95 latency для моделей.' },
+  { title: 'Контекстное окно', description: 'Проверить запас по максимальному контексту.' },
+  { title: 'Стабильность', description: 'Проверить долю ошибок/ретраев.' },
+  { title: 'Кэширование', description: 'Оценить экономию при повторных запросах.' }
+];
 
 init();
 
@@ -78,6 +53,9 @@ function getSourceUrlFromQuery() {
 }
 
 async function getDebugData(url) {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+    return null;
+  }
   return new Promise((resolve) => {
     chrome.storage.local.get([DEBUG_STORAGE_KEY], (data) => {
       const store = data?.[DEBUG_STORAGE_KEY] || {};
@@ -94,6 +72,9 @@ function startAutoRefresh() {
     refreshDebug();
   }, AUTO_REFRESH_INTERVAL);
 
+  if (typeof chrome === 'undefined' || !chrome.storage?.onChanged) {
+    return;
+  }
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== 'local') return;
     if (!changes[DEBUG_STORAGE_KEY]) return;
@@ -220,7 +201,6 @@ function renderSummary(data, fallbackMessage = '') {
     : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
-      <h2 class="summary-title">Общий статус</h2>
       <div class="status-row">
         <div class="status-group">
           <span class="status-label">Статус</span>
@@ -288,56 +268,39 @@ function escapeHtml(value) {
 }
 
 function initAiTests() {
-  Object.keys(aiTestState).forEach((type) => {
-    aiTestState[type] = pickRandomTests(type);
-  });
+  aiTestState.items = pickRandomTests();
   renderAiTests();
 }
 
-function pickRandomTests(type, count = 3) {
-  const pool = AI_TESTS[type] || [];
-  const shuffled = [...pool].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, Math.min(count, pool.length));
+function pickRandomTests(count = 4) {
+  const shuffled = [...AI_TESTS].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, Math.min(count, AI_TESTS.length));
 }
 
 function handleAiTestRefresh(event) {
-  const button = event.target.closest('button[data-test-type]');
+  const button = event.target.closest('button[data-action="refresh-tests"]');
   if (!button) return;
-  const type = button.dataset.testType;
-  if (!aiTestState[type]) return;
-  aiTestState[type] = pickRandomTests(type);
+  aiTestState.items = pickRandomTests();
   renderAiTests();
 }
 
 function renderAiTests() {
   if (!aiTestsEl) return;
-  aiTestsEl.innerHTML = ['context', 'translation', 'proofread']
-    .map((type) => {
-      const titleMap = {
-        context: 'ИИ тесты контекста',
-        translation: 'ИИ тесты перевода',
-        proofread: 'ИИ тесты вычитки'
-      };
-      const tests = aiTestState[type] || [];
-      const cards = tests
-        .map(
-          (test) => `
-            <div class="ai-test-card">
-              <div class="ai-test-title">${escapeHtml(test.title)}</div>
-              <p class="ai-test-desc">${escapeHtml(test.description)}</p>
-            </div>
-          `
-        )
-        .join('');
-      return `
-        <section class="ai-test-section">
-          <div class="ai-test-header">
-            <h3>${titleMap[type]}</h3>
-            <button class="ai-test-refresh" type="button" data-test-type="${type}">Обновить</button>
-          </div>
-          <div class="ai-test-list">${cards}</div>
-        </section>
-      `;
-    })
+  const tests = aiTestState.items || [];
+  const rows = tests
+    .map(
+      (test) => `
+        <div class="ai-test-row">
+          <div class="ai-test-title">${escapeHtml(test.title)}</div>
+          <p class="ai-test-desc">${escapeHtml(test.description)}</p>
+        </div>
+      `
+    )
     .join('');
+  aiTestsEl.innerHTML = `
+    <div class="ai-tests-header">
+      <button class="ai-test-refresh" type="button" data-action="refresh-tests">Обновить</button>
+    </div>
+    <div class="ai-test-list">${rows}</div>
+  `;
 }
