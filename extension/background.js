@@ -23,6 +23,7 @@ const PUNCTUATION_TOKENS = new Map([
   ['”', '⟦PUNC_RDQUOTE⟧'],
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
+const PROOFREAD_SEGMENT_TOKEN = '⟦SEGMENT_BREAK⟧';
 
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
@@ -365,6 +366,9 @@ async function proofreadTranslation(
   if (!Array.isArray(texts) || !texts.length) return [];
 
   const normalizedSourceTexts = Array.isArray(sourceTexts) ? sourceTexts : [];
+  const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
+  const combinedSourceText = normalizedSourceTexts.join(segmentDelimiter);
+  const combinedTranslatedText = texts.join(segmentDelimiter);
   const maxRateLimitRetries = 3;
   let rateLimitRetries = 0;
   let lastRateLimitDelayMs = null;
@@ -386,6 +390,7 @@ async function proofreadTranslation(
         'Do not reorder sentences unless it is required for readability or naturalness in the target language.',
         'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
         'If a punctuation token appears in the translated text, keep it unchanged and in the same position.',
+        `Segments are separated by the token ${PROOFREAD_SEGMENT_TOKEN}; keep it unchanged and in place.`,
         'Use the source text only to verify correctness and preserve meaning.',
         context
           ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
@@ -402,10 +407,10 @@ async function proofreadTranslation(
         `Target language: ${targetLanguage}.`,
         'Review the translated text below and return only the JSON array of replacements.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
-        normalizedSourceTexts.length ? 'Source text:' : '',
-        ...normalizedSourceTexts.map((text) => text),
+        normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
+        normalizedSourceTexts.length ? combinedSourceText : '',
         'Translated text:',
-        ...texts.map((text) => text)
+        combinedTranslatedText
       ]
         .filter(Boolean)
         .join('\n')

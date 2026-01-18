@@ -23,6 +23,7 @@ const PUNCTUATION_TOKENS = new Map([
   ['”', '⟦PUNC_RDQUOTE⟧'],
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
+const PROOFREAD_SEGMENT_TOKEN = '⟦SEGMENT_BREAK⟧';
 
 restoreFromMemory();
 
@@ -318,6 +319,27 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
 }
 
 function applyProofreadingReplacements(texts, replacements) {
+  const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
+  const combinedText = texts.join(segmentDelimiter);
+  let combinedResult = combinedText;
+
+  replacements.forEach((replacement) => {
+    if (!replacement?.from) return;
+    const from = replacement.from;
+    const to = replacement.to ?? '';
+    combinedResult = combinedResult.split(from).join(to);
+  });
+
+  if (combinedResult === combinedText) {
+    return texts;
+  }
+
+  const segments = combinedResult.split(segmentDelimiter);
+  if (segments.length === texts.length) {
+    return segments;
+  }
+
+  console.warn('Proofreading replacements produced unexpected segment count, applying per-text fallback.');
   return texts.map((text) => {
     let result = text;
     replacements.forEach((replacement) => {
