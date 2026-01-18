@@ -99,6 +99,12 @@ async function requestSettings() {
 
 async function translatePage(settings) {
   const textNodes = collectTextNodes(document.body);
+  const existingDebugStore = await getTranslationDebugObject();
+  const existingDebugEntry = existingDebugStore?.[location.href];
+  const existingContext =
+    settings.contextGenerationEnabled && typeof existingDebugEntry?.context === 'string'
+      ? existingDebugEntry.context.trim()
+      : '';
   const nodesWithPath = textNodes.map((node) => ({
     node,
     path: getNodePath(node),
@@ -113,7 +119,7 @@ async function translatePage(settings) {
   activeTranslationEntries = [];
   debugEntries = [];
   debugState = null;
-  latestContextSummary = '';
+  latestContextSummary = existingContext;
   await clearTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
@@ -122,6 +128,9 @@ async function translatePage(settings) {
   const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
   translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
   await initializeDebugState(blocks, settings);
+  if (latestContextSummary) {
+    await updateDebugContext(latestContextSummary, 'done');
+  }
 
   if (!blocks.length) {
     reportProgress('Перевод не требуется', 0, 0);
@@ -132,7 +141,7 @@ async function translatePage(settings) {
   translationError = null;
   reportProgress('Перевод запущен', 0, blocks.length, 0);
 
-  if (settings.contextGenerationEnabled) {
+  if (settings.contextGenerationEnabled && !latestContextSummary) {
     await updateDebugContextStatus('in_progress');
     reportProgress('Генерация контекста', 0, blocks.length, 0);
     const pageText = buildPageText(nodesWithPath);
