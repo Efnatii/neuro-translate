@@ -157,89 +157,6 @@
       color: #9ca3af;
       font-style: italic;
     }
-    .ai-tests {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      margin-bottom: 16px;
-      background: #fff;
-      border-radius: 10px;
-      padding: 10px 12px;
-      border: 1px solid #e2e8f0;
-    }
-    .ai-tests-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-    }
-    .ai-tests-title {
-      font-weight: bold;
-      font-size: 15px;
-      color: #1f2937;
-    }
-    .ai-tests-meta {
-      font-size: 12px;
-      color: #6b7280;
-    }
-    .ai-test-refresh {
-      border: 1px solid #cbd5f5;
-      background: #eef2ff;
-      color: #3730a3;
-      border-radius: 6px;
-      padding: 4px 8px;
-      font-size: 12px;
-      cursor: pointer;
-    }
-    .ai-test-refresh:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-    .ai-test-list {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .ai-test-row {
-      display: grid;
-      grid-template-columns: 1fr auto;
-      align-items: center;
-      gap: 8px 12px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid #e2e8f0;
-    }
-    .ai-test-row:last-child {
-      border-bottom: none;
-    }
-    .ai-test-main {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .ai-test-title {
-      font-weight: bold;
-      font-size: 13px;
-      color: #1f2937;
-    }
-    .ai-test-desc {
-      font-size: 12px;
-      color: #4b5563;
-      margin: 0;
-    }
-    .ai-test-status {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 11px;
-      color: #6b7280;
-      text-align: right;
-      min-width: 180px;
-    }
-    .ai-test-detail {
-      max-width: 200px;
-      font-size: 11px;
-    }
     @media (max-width: 700px) {
       .summary-header {
         flex-direction: column;
@@ -252,24 +169,11 @@
       .summary-progress {
         width: 100%;
       }
-      .ai-test-row {
-        grid-template-columns: 1fr;
-        align-items: flex-start;
-      }
-      .ai-test-status {
-        align-items: flex-start;
-        text-align: left;
-        min-width: auto;
-      }
-      .ai-test-detail {
-        max-width: none;
-      }
     }
   </style>
 </head>
 <body>
   <h1>Отладка перевода</h1>
-  <div class="ai-tests" id="aiTests"></div>
   <div class="summary" id="summary"></div>
   <div class="meta" id="meta"></div>
   <div class="context" id="context"></div>
