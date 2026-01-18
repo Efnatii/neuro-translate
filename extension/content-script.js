@@ -436,7 +436,7 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
       },
       (response) => {
         if (response?.success) {
-          resolve(Array.isArray(response.replacements) ? response.replacements : []);
+          resolve(normalizeProofreadReplacements(response.replacements));
         } else {
           reject(new Error(response?.error || 'Не удалось выполнить вычитку.'));
         }
@@ -445,63 +445,43 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
   });
 }
 
+function normalizeProofreadReplacements(replacements) {
+  if (!Array.isArray(replacements)) {
+    return [];
+  }
+
+  return replacements
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const segmentIndex = Number(item.segmentIndex);
+      if (!Number.isInteger(segmentIndex)) return null;
+      const revisedText = typeof item.revisedText === 'string' ? item.revisedText : '';
+      return { segmentIndex, revisedText };
+    })
+    .filter(Boolean);
+}
+
 function applyProofreadingReplacements(texts, replacements) {
   const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
-  const hasUnsafeReplacement = replacements.some((replacement) => {
-    if (!replacement?.from && !replacement?.to) return false;
-    const from = replacement?.from ?? '';
-    const to = replacement?.to ?? '';
-    return (
-      from.includes(segmentDelimiter) ||
-      to.includes(segmentDelimiter) ||
-      from.includes(PROOFREAD_SEGMENT_TOKEN) ||
-      to.includes(PROOFREAD_SEGMENT_TOKEN)
-    );
-  });
-
-  if (hasUnsafeReplacement) {
-    return texts.map((text) => {
-      let result = text;
-      replacements.forEach((replacement) => {
-        if (!replacement?.from) return;
-        const from = replacement.from;
-        const to = replacement.to ?? '';
-        result = result.split(from).join(to);
-      });
-      return result;
-    });
-  }
-
   const combinedText = texts.join(segmentDelimiter);
-  let combinedResult = combinedText;
+  const segments = combinedText.split(segmentDelimiter);
 
   replacements.forEach((replacement) => {
-    if (!replacement?.from) return;
-    const from = replacement.from;
-    const to = replacement.to ?? '';
-    combinedResult = combinedResult.split(from).join(to);
+    if (!replacement) return;
+    const segmentIndex = Number(replacement.segmentIndex);
+    if (!Number.isInteger(segmentIndex)) return;
+    if (segmentIndex < 0 || segmentIndex >= segments.length) {
+      console.warn('Proofread segment index out of range, skipping.', {
+        segmentIndex,
+        segmentCount: segments.length
+      });
+      return;
+    }
+    const revisedText = typeof replacement.revisedText === 'string' ? replacement.revisedText : '';
+    segments[segmentIndex] = revisedText;
   });
 
-  if (combinedResult === combinedText) {
-    return texts;
-  }
-
-  const segments = combinedResult.split(segmentDelimiter);
-  if (segments.length === texts.length) {
-    return segments;
-  }
-
-  console.warn('Proofreading replacements produced unexpected segment count, applying per-text fallback.');
-  return texts.map((text) => {
-    let result = text;
-    replacements.forEach((replacement) => {
-      if (!replacement?.from) return;
-      const from = replacement.from;
-      const to = replacement.to ?? '';
-      result = result.split(from).join(to);
-    });
-    return result;
-  });
+  return segments;
 }
 
 function escapeRegex(value = '') {
