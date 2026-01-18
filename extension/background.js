@@ -414,6 +414,7 @@ async function proofreadTranslation(
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
         'Return a JSON array of JSON arrays, each with exactly two elements: [segmentIndex, replacementText].',
         'segmentIndex is the 0-based index of the segment in the translated text array.',
+        'Indexing starts at 0 (the first segment is 0, the second is 1). Do not use 1-based indices.',
         'replacementText is the full corrected segment text to replace the original.',
         'Only include segments that require corrections. If no corrections are needed, return an empty array.',
         'Never add commentary, explanations, numbering, or extra markup.',
@@ -447,6 +448,7 @@ async function proofreadTranslation(
       content: [
         `Target language: ${targetLanguage}.`,
         'Review the translated text below and return only the revised segments as a JSON array of [segmentIndex, replacementText] pairs.',
+        'Important: segmentIndex is 0-based (first segment is index 0).',
         'Only include segments that need corrections. If no corrections are needed, return an empty array.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
@@ -1093,7 +1095,7 @@ function parseProofreadReplacements(content, expectedSegments) {
     return [];
   }
 
-  const replacements = [];
+  const rawItems = [];
   for (const item of parsed) {
     let segmentIndexRaw = null;
     let replacementRaw = null;
@@ -1110,11 +1112,43 @@ function parseProofreadReplacements(content, expectedSegments) {
     }
 
     const segmentIndex = Number(segmentIndexRaw);
-    if (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= expectedSegments) {
+    if (!Number.isInteger(segmentIndex)) {
       console.warn('Skipping proofread item with invalid segment index.', item);
       continue;
     }
-    const revisedText = typeof replacementRaw === 'string' ? replacementRaw : String(replacementRaw ?? '');
+    rawItems.push({ segmentIndex, replacementRaw, item });
+  }
+
+  if (!rawItems.length) {
+    return [];
+  }
+
+  const hasZeroIndex = rawItems.some((entry) => entry.segmentIndex === 0);
+  const allPositive = rawItems.every((entry) => entry.segmentIndex > 0);
+  const minIndex = Math.min(...rawItems.map((entry) => entry.segmentIndex));
+  const maxIndex = Math.max(...rawItems.map((entry) => entry.segmentIndex));
+  const looksOneBased =
+    !hasZeroIndex &&
+    allPositive &&
+    minIndex >= 1 &&
+    maxIndex <= expectedSegments &&
+    expectedSegments > 0;
+  const indexOffset = looksOneBased ? -1 : 0;
+  if (indexOffset) {
+    console.warn('Detected 1-based proofread indices; converting to 0-based indices.');
+  }
+
+  const replacements = [];
+  for (const entry of rawItems) {
+    const segmentIndex = entry.segmentIndex + indexOffset;
+    if (segmentIndex < 0 || segmentIndex >= expectedSegments) {
+      console.warn('Skipping proofread item with invalid segment index.', entry.item);
+      continue;
+    }
+    const revisedText =
+      typeof entry.replacementRaw === 'string'
+        ? entry.replacementRaw
+        : String(entry.replacementRaw ?? '');
     if (!revisedText) {
       continue;
     }
