@@ -3,23 +3,29 @@ const contextEl = document.getElementById('context');
 const entriesEl = document.getElementById('entries');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const AUTO_REFRESH_INTERVAL = 1000;
+const STATUS_CONFIG = {
+  pending: { label: 'Ожидает', className: 'status-pending' },
+  in_progress: { label: 'В работе', className: 'status-in-progress' },
+  done: { label: 'Готово', className: 'status-done' },
+  failed: { label: 'Ошибка', className: 'status-failed' },
+  disabled: { label: 'Отключено', className: 'status-disabled' }
+};
+
+let sourceUrl = '';
+let refreshTimer = null;
 
 init();
 
 async function init() {
-  const sourceUrl = getSourceUrlFromQuery();
+  sourceUrl = getSourceUrlFromQuery();
   if (!sourceUrl) {
     renderEmpty('Не удалось определить страницу для отладки.');
     return;
   }
 
-  const debugData = await getDebugData(sourceUrl);
-  if (!debugData) {
-    renderEmpty('Отладочная информация для этой страницы не найдена.');
-    return;
-  }
-
-  renderDebug(sourceUrl, debugData);
+  await refreshDebug();
+  startAutoRefresh();
 }
 
 function getSourceUrlFromQuery() {
@@ -37,6 +43,31 @@ async function getDebugData(url) {
   });
 }
 
+function startAutoRefresh() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+  }
+  refreshTimer = setInterval(() => {
+    refreshDebug();
+  }, AUTO_REFRESH_INTERVAL);
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local') return;
+    if (!changes[DEBUG_STORAGE_KEY]) return;
+    refreshDebug();
+  });
+}
+
+async function refreshDebug() {
+  const debugData = await getDebugData(sourceUrl);
+  if (!debugData) {
+    renderEmpty('Ожидание отладочных данных...');
+    return;
+  }
+
+  renderDebug(sourceUrl, debugData);
+}
+
 function renderEmpty(message) {
   metaEl.textContent = message;
   contextEl.innerHTML = '';
@@ -47,10 +78,25 @@ function renderDebug(url, data) {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
 
+  const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const contextText = data.context?.trim();
   contextEl.innerHTML = contextText
-    ? `<div class="label">Контекст</div><pre>${escapeHtml(contextText)}</pre>`
-    : `<div class="label">Контекст</div><div class="empty">Контекст не сформирован.</div>`;
+    ? `<div class="label">Контекст</div>
+       <div class="status-row">
+         <div class="status-group">
+           <span class="status-label">Статус</span>
+           ${renderStatusBadge(contextStatus)}
+         </div>
+       </div>
+       <pre>${escapeHtml(contextText)}</pre>`
+    : `<div class="label">Контекст</div>
+       <div class="status-row">
+         <div class="status-group">
+           <span class="status-label">Статус</span>
+           ${renderStatusBadge(contextStatus)}
+         </div>
+       </div>
+       <div class="empty">Контекст не сформирован.</div>`;
 
   const items = Array.isArray(data.items) ? data.items : [];
   if (!items.length) {
@@ -62,16 +108,34 @@ function renderDebug(url, data) {
   items.forEach((item) => {
     const entry = document.createElement('div');
     entry.className = 'entry';
+    const translationStatus = normalizeStatus(item.translationStatus, item.translated);
+    const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
     const proofreadSection = renderProofreadSection(item);
     entry.innerHTML = `
-      <h2>Блок ${item.index || ''}</h2>
+      <div class="entry-header">
+        <h2>Блок ${item.index || ''}</h2>
+        <div class="status-row">
+          <div class="status-group">
+            <span class="status-label">Перевод</span>
+            ${renderStatusBadge(translationStatus)}
+          </div>
+          <div class="status-group">
+            <span class="status-label">Вычитка</span>
+            ${renderStatusBadge(proofreadStatus)}
+          </div>
+        </div>
+      </div>
       <div class="block">
         <div class="label">Оригинал</div>
         <pre>${escapeHtml(item.original || '')}</pre>
       </div>
       <div class="block">
         <div class="label">Перевод</div>
-        <pre>${escapeHtml(item.translated || '')}</pre>
+        ${
+          item.translated
+            ? `<pre>${escapeHtml(item.translated)}</pre>`
+            : `<div class="empty">Перевод ещё не получен.</div>`
+        }
       </div>
       ${proofreadSection}
     `;
@@ -80,19 +144,44 @@ function renderDebug(url, data) {
 }
 
 function renderProofreadSection(item) {
-  if (!item?.proofreadApplied) return '';
-  const replacements = Array.isArray(item.proofread) ? item.proofread : [];
-  const content = replacements.length
-    ? replacements
-        .map((replacement) => `${replacement.from} → ${replacement.to ?? ''}`)
-        .join('\n')
-    : 'Нет правок.';
+  const replacements = Array.isArray(item?.proofread) ? item.proofread : [];
+  const status = normalizeStatus(item?.proofreadStatus, replacements, item?.proofreadApplied);
+  let content = '';
+  if (item?.proofreadApplied) {
+    content = replacements.length
+      ? replacements
+          .map((replacement) => `${replacement.from} → ${replacement.to ?? ''}`)
+          .join('\n')
+      : 'Нет правок.';
+  }
   return `
       <div class="block">
         <div class="label">Вычитка</div>
-        <pre>${escapeHtml(content)}</pre>
+        <div class="status-row">
+          <div class="status-group">
+            <span class="status-label">Статус</span>
+            ${renderStatusBadge(status)}
+          </div>
+        </div>
+        ${
+          item?.proofreadApplied
+            ? `<pre>${escapeHtml(content)}</pre>`
+            : `<div class="empty">Вычитка выключена.</div>`
+        }
       </div>
     `;
+}
+
+function normalizeStatus(status, value, proofreadApplied = true) {
+  if (status && STATUS_CONFIG[status]) return status;
+  if (proofreadApplied === false) return 'disabled';
+  if (value) return 'done';
+  return 'pending';
+}
+
+function renderStatusBadge(status) {
+  const config = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
+  return `<span class="status-badge ${config.className}">${config.label}</span>`;
 }
 
 function escapeHtml(value) {

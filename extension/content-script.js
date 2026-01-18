@@ -13,6 +13,7 @@ let originalSnapshot = [];
 let translationVisible = false;
 let latestContextSummary = '';
 let debugEntries = [];
+let debugState = null;
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
@@ -95,6 +96,7 @@ async function translatePage(settings) {
   originalSnapshot = nodesWithPath.map(({ path, original }) => ({ path, original }));
   activeTranslationEntries = [];
   debugEntries = [];
+  debugState = null;
   latestContextSummary = '';
   await clearTranslationDebugInfo(location.href);
 
@@ -103,6 +105,7 @@ async function translatePage(settings) {
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
   const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
   translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
+  await initializeDebugState(blocks, settings);
 
   if (!blocks.length) {
     reportProgress('Перевод не требуется', 0, 0);
@@ -114,6 +117,7 @@ async function translatePage(settings) {
   reportProgress('Перевод запущен', 0, blocks.length, 0);
 
   if (settings.contextGenerationEnabled) {
+    await updateDebugContextStatus('in_progress');
     reportProgress('Генерация контекста', 0, blocks.length, 0);
     const pageText = buildPageText(nodesWithPath);
     if (pageText) {
@@ -122,9 +126,13 @@ async function translatePage(settings) {
           pageText,
           settings.targetLanguage || 'ru'
         );
+        await updateDebugContext(latestContextSummary, 'done');
       } catch (error) {
         console.warn('Context generation failed, continuing without it.', error);
+        await updateDebugContext(latestContextSummary, 'failed');
       }
+    } else {
+      await updateDebugContext(latestContextSummary, 'done');
     }
   }
 
@@ -176,6 +184,10 @@ async function translatePage(settings) {
         return;
       }
       const block = blocks[currentIndex];
+      await updateDebugEntry(currentIndex + 1, {
+        translationStatus: 'in_progress',
+        proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
+      });
       const preparedTexts = block.map(({ node }) =>
         prepareTextForTranslation(node.nodeValue)
       );
@@ -202,6 +214,7 @@ async function translatePage(settings) {
         let finalTranslations = translatedTexts;
         if (settings.proofreadEnabled) {
           try {
+            await updateDebugEntry(currentIndex + 1, { proofreadStatus: 'in_progress' });
             proofreadReplacements = await requestProofreading(
               translatedTexts,
               settings.targetLanguage || 'ru',
@@ -211,8 +224,16 @@ async function translatePage(settings) {
             if (proofreadReplacements.length) {
               finalTranslations = applyProofreadingReplacements(translatedTexts, proofreadReplacements);
             }
+            await updateDebugEntry(currentIndex + 1, {
+              proofreadStatus: 'done',
+              proofread: proofreadReplacements
+            });
           } catch (error) {
             console.warn('Proofreading failed, keeping original translations.', error);
+            await updateDebugEntry(currentIndex + 1, {
+              proofreadStatus: 'failed',
+              proofread: []
+            });
           }
         }
 
@@ -226,23 +247,19 @@ async function translatePage(settings) {
           blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting);
         });
-        const debugEntry = {
-          index: currentIndex + 1,
-          original: formatBlockText(block.map(({ original }) => original)),
+        await updateDebugEntry(currentIndex + 1, {
           translated: formatBlockText(blockTranslations),
-          proofread: proofreadReplacements,
-          proofreadApplied: Boolean(settings.proofreadEnabled)
-        };
-        debugEntries.push(debugEntry);
-        await saveTranslationDebugInfo(location.href, {
-          context: latestContextSummary,
-          items: debugEntries,
-          updatedAt: Date.now()
+          translationStatus: 'done',
+          proofread: proofreadReplacements
         });
       } catch (error) {
         console.error('Block translation failed', error);
         translationError = error;
         cancelRequested = true;
+        await updateDebugEntry(currentIndex + 1, {
+          translationStatus: 'failed',
+          proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled'
+        });
         releaseSlot();
         reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, activeWorkers);
         return;
@@ -752,6 +769,55 @@ async function clearTranslationDebugInfo(url) {
   await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
 }
 
+async function initializeDebugState(blocks, settings = {}) {
+  const proofreadEnabled = Boolean(settings.proofreadEnabled);
+  debugEntries = blocks.map((block, index) => ({
+    index: index + 1,
+    original: formatBlockText(block.map(({ original }) => original)),
+    translated: '',
+    proofread: [],
+    proofreadApplied: proofreadEnabled,
+    translationStatus: 'pending',
+    proofreadStatus: proofreadEnabled ? 'pending' : 'disabled'
+  }));
+  debugState = {
+    context: '',
+    contextStatus: settings.contextGenerationEnabled ? 'pending' : 'disabled',
+    items: debugEntries,
+    updatedAt: Date.now()
+  };
+  await saveTranslationDebugInfo(location.href, debugState);
+}
+
+async function persistDebugState() {
+  if (!debugState) return;
+  debugState.updatedAt = Date.now();
+  debugState.items = debugEntries;
+  await saveTranslationDebugInfo(location.href, debugState);
+}
+
+async function updateDebugContext(context, status) {
+  if (!debugState) return;
+  debugState.context = typeof context === 'string' ? context : debugState.context || '';
+  if (status) {
+    debugState.contextStatus = status;
+  }
+  await persistDebugState();
+}
+
+async function updateDebugContextStatus(status) {
+  if (!debugState) return;
+  debugState.contextStatus = status;
+  await persistDebugState();
+}
+
+async function updateDebugEntry(index, updates = {}) {
+  const entry = debugEntries.find((item) => item.index === index);
+  if (!entry) return;
+  Object.assign(entry, updates);
+  await persistDebugState();
+}
+
 async function getTranslationsObject() {
   return new Promise((resolve) => {
     chrome.storage.local.get([STORAGE_KEY], (data) => {
@@ -786,6 +852,7 @@ async function cancelTranslation() {
   await clearStoredTranslations(location.href);
   await clearTranslationDebugInfo(location.href);
   activeTranslationEntries = [];
+  debugState = null;
   await setTranslationVisibility(false);
   reportProgress('Перевод отменён', translationProgress.completedBlocks, translationProgress.totalBlocks);
 }
