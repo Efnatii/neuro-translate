@@ -440,14 +440,6 @@ async function proofreadTranslation(
         .filter(Boolean)
         .join(' ')
     },
-    ...(context
-      ? [
-          {
-            role: 'user',
-            content: `Translation context (metadata only; do not quote or restate it): ${context}`
-          }
-        ]
-      : []),
     {
       role: 'user',
       content: [
@@ -455,7 +447,7 @@ async function proofreadTranslation(
         `Review the translated text below and return only the revised segments as a JSON array with exactly ${expectedSegments} items.`,
         `The translated text is split by ${PROOFREAD_SEGMENT_TOKEN}; array index 0 corresponds to segmentIndex 0.`,
         'If a segment needs no corrections, return an empty string in its place.',
-        'Use the context metadata only for disambiguation; do not quote or include it in the output.',
+        context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
         normalizedSourceTexts.length ? combinedSourceText : '',
         'Translated text:',
@@ -685,29 +677,22 @@ async function performTranslationRequest(
         PUNCTUATION_TOKEN_HINT,
         'Determine the most appropriate tone/style based on the provided context.',
         context
-          ? 'Rely on the provided page context for disambiguation only; never introduce new facts. Do not quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.'
+          ? `Rely on the provided page context for disambiguation only; never introduce new facts. Do not quote, paraphrase, or include the context text in the output unless it is required to translate the source segments: ${context}`
           : 'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
-        'Return a JSON array of strings with exactly the same number of items as the input segments, in the same order.',
-        'Never include numbering, commentary, or markdown code fences.'
+        'Respond only with translations in the same order, one per line, without numbering or commentary.'
       ]
         .filter(Boolean)
         .join(' ')
     },
-    ...(context
-      ? [
-          {
-            role: 'user',
-            content: `Page context (metadata only; do not translate or restate it): ${context}`
-          }
-        ]
-      : []),
     {
       role: 'user',
       content: [
         `Translate the following segments into ${targetLanguage}.`,
         'Determine the style automatically based on context.',
-        'Use the context metadata only for disambiguation; do not quote or include it in the output unless it is required to translate the source segments.',
+        context
+          ? `Page context (use it for disambiguation only; do not quote or include it in the output unless it is required to translate the source segments): ${context}`
+          : '',
         'Do not omit or add information; preserve modality, tense, aspect, tone, and level of certainty.',
         'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
         'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
@@ -720,7 +705,6 @@ async function performTranslationRequest(
           ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
           : null,
         `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
-        `Return a JSON array of strings with exactly ${texts.length} items in the same order; use an empty string if a segment is empty.`,
         'Segments to translate:',
         ...tokenizedTexts.map((text) => text)
       ]
