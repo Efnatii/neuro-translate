@@ -32,9 +32,13 @@
     .summary-header {
       display: flex;
       align-items: center;
-      justify-content: flex-start;
+      justify-content: space-between;
       gap: 12px;
       margin-bottom: 6px;
+    }
+    .summary-progress {
+      flex: 1;
+      min-width: 160px;
     }
     .summary-meta {
       font-size: 12px;
@@ -152,11 +156,25 @@
       flex-direction: column;
       gap: 10px;
       margin-bottom: 16px;
+      background: #fff;
+      border-radius: 10px;
+      padding: 12px;
+      border: 1px solid #e2e8f0;
     }
     .ai-tests-header {
       display: flex;
-      justify-content: flex-end;
-      align-items: center;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .ai-tests-title {
+      font-weight: bold;
+      font-size: 15px;
+      color: #1f2937;
+    }
+    .ai-tests-meta {
+      font-size: 12px;
+      color: #6b7280;
     }
     .ai-test-refresh {
       border: 1px solid #cbd5f5;
@@ -167,6 +185,10 @@
       font-size: 12px;
       cursor: pointer;
     }
+    .ai-test-refresh:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
     .ai-test-list {
       display: flex;
       flex-direction: column;
@@ -174,13 +196,20 @@
     }
     .ai-test-row {
       display: flex;
-      flex-direction: column;
-      gap: 2px;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
       padding-bottom: 6px;
       border-bottom: 1px solid #e2e8f0;
     }
     .ai-test-row:last-child {
       border-bottom: none;
+    }
+    .ai-test-main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
     }
     .ai-test-title {
       font-weight: bold;
@@ -191,6 +220,40 @@
       font-size: 12px;
       color: #4b5563;
       margin: 0;
+    }
+    .ai-test-status {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+      font-size: 11px;
+      color: #6b7280;
+      text-align: right;
+      min-width: 140px;
+    }
+    .ai-test-detail {
+      max-width: 180px;
+    }
+    @media (max-width: 700px) {
+      .summary-header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .summary-progress {
+        width: 100%;
+      }
+      .ai-test-row {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .ai-test-status {
+        align-items: flex-start;
+        text-align: left;
+        min-width: auto;
+      }
+      .ai-test-detail {
+        max-width: none;
+      }
     }
   </style>
 </head>

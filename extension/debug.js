@@ -17,18 +17,69 @@ const STATUS_CONFIG = {
 let sourceUrl = '';
 let refreshTimer = null;
 const aiTestState = {
-  items: []
+  items: [],
+  running: false,
+  lastRunAt: null,
+  timeouts: []
 };
 
 const AI_TESTS = [
-  { title: 'TPM', description: 'Проверить лимит tokens per minute и текущий запас.' },
-  { title: 'Пропускная способность', description: 'Оценить tokens/sec при типичном запросе.' },
-  { title: 'Стоимость', description: 'Проверить цену за 1k токенов и итоговую стоимость пакета.' },
-  { title: 'Лимит запросов', description: 'Проверить RPM и пиковую нагрузку.' },
-  { title: 'Задержка', description: 'Сравнить p50/p95 latency для моделей.' },
-  { title: 'Контекстное окно', description: 'Проверить запас по максимальному контексту.' },
-  { title: 'Стабильность', description: 'Проверить долю ошибок/ретраев.' },
-  { title: 'Кэширование', description: 'Оценить экономию при повторных запросах.' }
+  {
+    id: 'tpm',
+    title: 'TPM',
+    description: 'Проверить лимит tokens per minute и текущий запас.',
+    success: 'Лимит в норме, запас достаточный.',
+    failure: 'Запас лимита мал, возможны очереди.'
+  },
+  {
+    id: 'throughput',
+    title: 'Пропускная способность',
+    description: 'Оценить tokens/sec при типичном запросе.',
+    success: 'Скорость соответствует ожиданиям.',
+    failure: 'Скорость ниже нормы, требуется оптимизация.'
+  },
+  {
+    id: 'cost',
+    title: 'Стоимость',
+    description: 'Проверить цену за 1k токенов и итоговую стоимость пакета.',
+    success: 'Стоимость в пределах бюджета.',
+    failure: 'Стоимость выше целевой, нужен пересмотр.'
+  },
+  {
+    id: 'rpm',
+    title: 'Лимит запросов',
+    description: 'Проверить RPM и пиковую нагрузку.',
+    success: 'Лимиты устойчивы к пику.',
+    failure: 'Пики превышают лимиты.'
+  },
+  {
+    id: 'latency',
+    title: 'Задержка',
+    description: 'Сравнить p50/p95 latency для моделей.',
+    success: 'Задержки стабильны.',
+    failure: 'Высокие p95 задержки.'
+  },
+  {
+    id: 'context',
+    title: 'Контекстное окно',
+    description: 'Проверить запас по максимальному контексту.',
+    success: 'Запас по контексту достаточный.',
+    failure: 'Риск переполнения контекста.'
+  },
+  {
+    id: 'stability',
+    title: 'Стабильность',
+    description: 'Проверить долю ошибок/ретраев.',
+    success: 'Ошибок почти нет.',
+    failure: 'Много ретраев, нужен разбор.'
+  },
+  {
+    id: 'cache',
+    title: 'Кэширование',
+    description: 'Оценить экономию при повторных запросах.',
+    success: 'Кэш даёт заметную экономию.',
+    failure: 'Кэш почти не используется.'
+  }
 ];
 
 init();
@@ -41,7 +92,7 @@ async function init() {
   }
 
   initAiTests();
-  aiTestsEl?.addEventListener('click', handleAiTestRefresh);
+  aiTestsEl?.addEventListener('click', handleAiTestAction);
   await refreshDebug();
   startAutoRefresh();
 }
@@ -207,11 +258,13 @@ function renderSummary(data, fallbackMessage = '') {
           ${renderStatusBadge(overallStatus)}
         </div>
       </div>
+      <div class="summary-progress">
+        <div class="progress-bar">
+          <div class="progress-fill" style="width: ${progress}%"></div>
+        </div>
+      </div>
     </div>
     <div class="summary-meta">${summaryLine}</div>
-    <div class="progress-bar">
-      <div class="progress-fill" style="width: ${progress}%"></div>
-    </div>
   `;
 }
 
@@ -268,38 +321,93 @@ function escapeHtml(value) {
 }
 
 function initAiTests() {
-  aiTestState.items = pickRandomTests();
+  aiTestState.items = AI_TESTS.map((test) => ({
+    ...test,
+    status: 'pending',
+    detail: 'Не запускался.'
+  }));
+  aiTestState.running = false;
+  aiTestState.lastRunAt = null;
+  clearAiTestTimers();
   renderAiTests();
 }
 
-function pickRandomTests(count = 4) {
-  const shuffled = [...AI_TESTS].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, Math.min(count, AI_TESTS.length));
-}
-
-function handleAiTestRefresh(event) {
-  const button = event.target.closest('button[data-action="refresh-tests"]');
+function handleAiTestAction(event) {
+  const button = event.target.closest('button[data-action="run-tests"]');
   if (!button) return;
-  aiTestState.items = pickRandomTests();
+  runAiTests();
+}
+
+function runAiTests() {
+  if (aiTestState.running) return;
+  aiTestState.running = true;
+  aiTestState.lastRunAt = new Date();
+  clearAiTestTimers();
+  aiTestState.items = aiTestState.items.map((item) => ({
+    ...item,
+    status: 'in_progress',
+    detail: 'Запуск...'
+  }));
   renderAiTests();
+
+  let remaining = aiTestState.items.length;
+  aiTestState.items.forEach((item, index) => {
+    const timeout = window.setTimeout(() => {
+      const isSuccess = Math.random() > 0.2;
+      const status = isSuccess ? 'done' : 'failed';
+      const detail = isSuccess ? item.success : item.failure;
+      aiTestState.items[index] = {
+        ...aiTestState.items[index],
+        status,
+        detail
+      };
+      remaining -= 1;
+      if (remaining === 0) {
+        aiTestState.running = false;
+      }
+      renderAiTests();
+    }, 300 + Math.random() * 900);
+    aiTestState.timeouts.push(timeout);
+  });
+}
+
+function clearAiTestTimers() {
+  aiTestState.timeouts.forEach((timeout) => window.clearTimeout(timeout));
+  aiTestState.timeouts = [];
 }
 
 function renderAiTests() {
   if (!aiTestsEl) return;
   const tests = aiTestState.items || [];
+  const finished = tests.filter((test) => ['done', 'failed'].includes(test.status)).length;
+  const lastRunAt = aiTestState.lastRunAt
+    ? aiTestState.lastRunAt.toLocaleTimeString('ru-RU')
+    : '—';
   const rows = tests
     .map(
       (test) => `
         <div class="ai-test-row">
-          <div class="ai-test-title">${escapeHtml(test.title)}</div>
-          <p class="ai-test-desc">${escapeHtml(test.description)}</p>
+          <div class="ai-test-main">
+            <div class="ai-test-title">${escapeHtml(test.title)}</div>
+            <p class="ai-test-desc">${escapeHtml(test.description)}</p>
+          </div>
+          <div class="ai-test-status">
+            ${renderStatusBadge(test.status)}
+            <div class="ai-test-detail">${escapeHtml(test.detail)}</div>
+          </div>
         </div>
       `
     )
     .join('');
   aiTestsEl.innerHTML = `
     <div class="ai-tests-header">
-      <button class="ai-test-refresh" type="button" data-action="refresh-tests">Обновить</button>
+      <div>
+        <div class="ai-tests-title">Тесты ИИ</div>
+        <div class="ai-tests-meta">Последний запуск: ${lastRunAt} • Готово: ${finished}/${tests.length}</div>
+      </div>
+      <button class="ai-test-refresh" type="button" data-action="run-tests" ${aiTestState.running ? 'disabled' : ''}>
+        ${aiTestState.running ? 'Выполняется...' : 'Запустить'}
+      </button>
     </div>
     <div class="ai-test-list">${rows}</div>
   `;
