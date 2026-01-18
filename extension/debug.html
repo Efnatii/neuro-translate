@@ -147,6 +147,31 @@
       color: #6b7280;
       margin-bottom: 4px;
     }
+    details.ai-response summary {
+      cursor: pointer;
+      list-style: none;
+      font-weight: bold;
+      font-size: 13px;
+      text-transform: uppercase;
+      color: #6b7280;
+      margin-bottom: 4px;
+    }
+    details.ai-response summary::-webkit-details-marker {
+      display: none;
+    }
+    details.ai-response summary::before {
+      content: '▸';
+      display: inline-block;
+      margin-right: 6px;
+      font-size: 12px;
+      transition: transform 0.2s ease;
+    }
+    details.ai-response[open] summary::before {
+      transform: rotate(90deg);
+    }
+    .details-content {
+      margin-top: 4px;
+    }
     pre {
       white-space: pre-wrap;
       background: #f1f5f9;
