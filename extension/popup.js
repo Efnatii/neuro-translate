@@ -556,11 +556,6 @@ async function clearTranslationStorage(url) {
     delete pageTranslations[url];
     await chrome.storage.local.set({ pageTranslations });
   }
-  const { translationDebugByUrl = {} } = await chrome.storage.local.get({ translationDebugByUrl: {} });
-  if (translationDebugByUrl[url]) {
-    delete translationDebugByUrl[url];
-    await chrome.storage.local.set({ translationDebugByUrl });
-  }
 }
 
 async function handleOpenDebug() {
