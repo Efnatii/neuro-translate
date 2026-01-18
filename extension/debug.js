@@ -184,6 +184,7 @@ function renderSummary(data, fallbackMessage = '') {
     : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
+      <div class="summary-meta">${summaryLine}</div>
       <div class="summary-progress">
         <div class="progress-bar">
           <div class="progress-fill" style="width: ${progress}%"></div>
@@ -196,7 +197,6 @@ function renderSummary(data, fallbackMessage = '') {
         </div>
       </div>
     </div>
-    <div class="summary-meta">${summaryLine}</div>
   `;
 }
 
