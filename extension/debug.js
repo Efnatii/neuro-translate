@@ -4,7 +4,6 @@ const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
-const AUTO_REFRESH_INTERVAL = 1000;
 const STATUS_CONFIG = {
   pending: { label: 'Ожидает', className: 'status-pending' },
   in_progress: { label: 'В работе', className: 'status-in-progress' },
@@ -51,18 +50,19 @@ function startAutoRefresh() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
   }
-  refreshTimer = setInterval(() => {
-    refreshDebug();
-  }, AUTO_REFRESH_INTERVAL);
-
-  if (typeof chrome === 'undefined' || !chrome.storage?.onChanged) {
+  const canListen = typeof chrome !== 'undefined' && chrome.storage?.onChanged;
+  if (canListen) {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local') return;
+      if (!changes[DEBUG_STORAGE_KEY]) return;
+      refreshDebug();
+    });
     return;
   }
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== 'local') return;
-    if (!changes[DEBUG_STORAGE_KEY]) return;
+
+  refreshTimer = setInterval(() => {
     refreshDebug();
-  });
+  }, 1000);
 }
 
 async function refreshDebug() {
