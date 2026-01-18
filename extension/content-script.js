@@ -397,6 +397,7 @@ async function translate(texts, targetLanguage, translationStyle, context, keepP
     context
   });
   await ensureTpmBudget('translation', estimatedTokens);
+  await incrementDebugAiRequestCount();
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -425,6 +426,7 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
     sourceTexts
   });
   await ensureTpmBudget('proofread', estimatedTokens);
+  await incrementDebugAiRequestCount();
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -502,6 +504,7 @@ async function requestTranslationContext(text, targetLanguage) {
     texts: [text]
   });
   await ensureTpmBudget('context', estimatedTokens);
+  await incrementDebugAiRequestCount();
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -1082,6 +1085,7 @@ async function initializeDebugState(blocks, settings = {}) {
     context: '',
     contextStatus: settings.contextGenerationEnabled ? 'pending' : 'disabled',
     items: debugEntries,
+    aiRequestCount: 0,
     updatedAt: Date.now()
   };
   await saveTranslationDebugInfo(location.href, debugState);
@@ -1113,6 +1117,13 @@ async function updateDebugEntry(index, updates = {}) {
   const entry = debugEntries.find((item) => item.index === index);
   if (!entry) return;
   Object.assign(entry, updates);
+  await persistDebugState();
+}
+
+async function incrementDebugAiRequestCount() {
+  if (!debugState) return;
+  const currentCount = Number.isFinite(debugState.aiRequestCount) ? debugState.aiRequestCount : 0;
+  debugState.aiRequestCount = currentCount + 1;
   await persistDebugState();
 }
 
