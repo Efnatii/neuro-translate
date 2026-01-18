@@ -352,13 +352,13 @@ function isInjectableUrl(url) {
 async function sendCancel() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  const delivered = await sendMessageWithAutoInject(tab, { type: 'CANCEL_TRANSLATION' });
-  if (!delivered) {
-    return;
-  }
+  await sendMessageWithAutoInject(tab, { type: 'CANCEL_TRANSLATION' });
   updateTranslationVisibility(false);
   updateTranslationVisibilityStorage(false);
+  await clearTranslationStatus(tab.id);
+  await clearTranslationStorage(tab.url);
   setTemporaryStatus('Перевод для этой страницы отменён.');
+  await chrome.tabs.reload(tab.id);
 }
 
 async function sendTranslateRequest() {
@@ -537,6 +537,30 @@ async function updateTranslationVisibilityStorage(visible) {
   const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
   translationVisibilityByTab[activeTabId] = visible;
   await chrome.storage.local.set({ translationVisibilityByTab });
+}
+
+async function clearTranslationStatus(tabId) {
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
+  delete translationStatusByTab[tabId];
+  await chrome.storage.local.set({ translationStatusByTab });
+  if (activeTabId === tabId) {
+    currentTranslationStatus = null;
+    renderStatus();
+  }
+}
+
+async function clearTranslationStorage(url) {
+  if (!url) return;
+  const { pageTranslations = {} } = await chrome.storage.local.get({ pageTranslations: {} });
+  if (pageTranslations[url]) {
+    delete pageTranslations[url];
+    await chrome.storage.local.set({ pageTranslations });
+  }
+  const { translationDebugByUrl = {} } = await chrome.storage.local.get({ translationDebugByUrl: {} });
+  if (translationDebugByUrl[url]) {
+    delete translationDebugByUrl[url];
+    await chrome.storage.local.set({ translationDebugByUrl });
+  }
 }
 
 async function handleOpenDebug() {
