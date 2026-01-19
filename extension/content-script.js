@@ -62,6 +62,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       });
     return true;
   }
+
+  if (message?.type === 'GET_TRANSLATION_VISIBILITY') {
+    Promise.resolve()
+      .then(async () => {
+        const storedEntries = activeTranslationEntries.length
+          ? []
+          : await getStoredTranslations(location.href);
+        const hasTranslations = Boolean(activeTranslationEntries.length || storedEntries.length);
+        if (typeof sendResponse === 'function') {
+          sendResponse({ visible: translationVisible, hasTranslations });
+        }
+      });
+    return true;
+  }
 });
 
 async function startTranslation() {
