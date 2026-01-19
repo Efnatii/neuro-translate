@@ -117,11 +117,25 @@ async function startTranslation() {
 async function requestSettings() {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: 'GET_SETTINGS', url: location.href }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.error('Failed to reach extension background script.', chrome.runtime.lastError.message);
+        resolve({
+          allowed: false,
+          disallowedReason:
+            'Не удалось связаться с фоном расширения. Перезагрузите вкладку или расширение.'
+        });
+        return;
+      }
+      if (response) {
+        resolve(response);
+        return;
+      }
+      console.warn('Settings response is empty without runtime error.');
       if (!response) {
         resolve({
           allowed: false,
           disallowedReason:
-            'Перевод недоступен: не удалось получить настройки. Проверьте ключ API и перезагрузите страницу.'
+            'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.'
         });
         return;
       }
