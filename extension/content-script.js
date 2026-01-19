@@ -94,8 +94,8 @@ async function startTranslation() {
     return;
   }
 
-  if (translationVisible) {
-    await setTranslationVisibility(false);
+  if (!translationVisible) {
+    await setTranslationVisibility(true);
   }
 
   configureTpmLimiter(settings);
