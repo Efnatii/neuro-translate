@@ -650,7 +650,8 @@ async function performTranslationRequest(
   apiBaseUrl = OPENAI_API_URL,
   restorePunctuation = true,
   strictTargetLanguage = false,
-  allowRefusalRetry = true
+  allowRefusalRetry = true,
+  allowLengthRetry = true
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
 
@@ -825,6 +826,37 @@ async function performTranslationRequest(
     }
   }
 
+  if (allowLengthRetry) {
+    const lengthRetryIndices = translations
+      .map((translation, index) =>
+        shouldRetryTranslationLength(texts[index] || '', translation || '') ? index : null
+      )
+      .filter((value) => Number.isInteger(value));
+
+    if (lengthRetryIndices.length) {
+      const retryTexts = lengthRetryIndices.map((index) => texts[index]);
+      console.warn('Translation length anomaly detected; retrying segments individually.', {
+        segmentIndices: lengthRetryIndices
+      });
+      const retryResults = await translateIndividually(
+        retryTexts,
+        apiKey,
+        targetLanguage,
+        model,
+        context,
+        apiBaseUrl,
+        !restorePunctuation,
+        allowRefusalRetry,
+        false
+      );
+      lengthRetryIndices.forEach((index, retryPosition) => {
+        if (retryResults?.[retryPosition]) {
+          translations[index] = retryResults[retryPosition];
+        }
+      });
+    }
+  }
+
   return {
     translations: texts.map((text, index) => {
       const candidate = translations[index];
@@ -929,7 +961,8 @@ async function translateIndividually(
   context = '',
   apiBaseUrl = OPENAI_API_URL,
   keepPunctuationTokens = false,
-  allowRefusalRetry = true
+  allowRefusalRetry = true,
+  allowLengthRetry = true
 ) {
   const results = [];
   const maxRetryableRetries = 3;
@@ -949,7 +982,8 @@ async function translateIndividually(
           apiBaseUrl,
           !keepPunctuationTokens,
           false,
-          allowRefusalRetry
+          allowRefusalRetry,
+          allowLengthRetry
         );
         results.push(result.translations[0]);
         break;
@@ -1227,6 +1261,23 @@ function shouldRetryRussianTranslation(source = '', translated = '') {
   }
 
   return false;
+}
+
+function shouldRetryTranslationLength(source = '', translated = '') {
+  const sourceTrimmed = (source || '').replace(/\s+/g, '');
+  const translatedTrimmed = (translated || '').replace(/\s+/g, '');
+  const sourceLength = Array.from(sourceTrimmed).length;
+  const translatedLength = Array.from(translatedTrimmed).length;
+
+  if (!sourceLength || !translatedLength) return false;
+  if (sourceLength < 12 && translatedLength < 12) return false;
+
+  const ratio = translatedLength / sourceLength;
+  const diff = Math.abs(translatedLength - sourceLength);
+  const isTooLong = ratio >= 2.4 && diff >= 12;
+  const isTooShort = ratio <= 0.45 && diff >= 12;
+
+  return isTooLong || isTooShort;
 }
 
 function applyPunctuationTokens(text = '') {
