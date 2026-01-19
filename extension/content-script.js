@@ -305,7 +305,9 @@ async function translatePage(settings) {
             return;
           }
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-          node.nodeValue = withOriginalFormatting;
+          if (translationVisible) {
+            node.nodeValue = withOriginalFormatting;
+          }
           blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
@@ -393,7 +395,9 @@ async function translatePage(settings) {
             return;
           }
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-          node.nodeValue = withOriginalFormatting;
+          if (translationVisible) {
+            node.nodeValue = withOriginalFormatting;
+          }
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
 
