@@ -1420,12 +1420,29 @@ async function getTranslationDebugObject() {
 }
 
 function restoreOriginal(entries) {
+  if (!Array.isArray(entries) || !entries.length) return;
+  let restoredCount = 0;
   entries.forEach(({ path, original }) => {
     const node = findNodeByPath(path);
-    if (node && typeof original === 'string') {
-      node.nodeValue = original;
+    if (!node) {
+      console.warn(`Missing node while restoring original.${formatLogDetails({ path })}`);
+      return;
     }
+    if (typeof original !== 'string') {
+      console.warn(`Missing original text while restoring.${formatLogDetails({ path })}`);
+      return;
+    }
+    node.nodeValue = original;
+    restoredCount += 1;
   });
+  if (restoredCount !== entries.length) {
+    console.warn(
+      `Not all originals restored.${formatLogDetails({
+        restoredCount,
+        totalEntries: entries.length
+      })}`
+    );
+  }
 }
 
 async function cancelTranslation() {
@@ -1487,21 +1504,23 @@ async function restoreTranslations() {
 
   const restoredSnapshot = [];
   const updatedEntries = [];
+  let appliedCount = 0;
 
   storedEntries.forEach(({ path, translated, original, originalHash }) => {
     const node = findNodeByPath(path);
-    if (!node) return;
-    const originalValue = typeof original === 'string' ? original : node.nodeValue;
+    const originalValue = typeof original === 'string' ? original : node?.nodeValue;
     const resolvedOriginalHash = getOriginalHash(originalValue, originalHash);
-    if (!shouldApplyTranslation(node, originalValue, resolvedOriginalHash)) {
-      return;
+    if (!node) {
+      console.warn(`Missing node while restoring translation.${formatLogDetails({ path })}`);
+    } else {
+      node.nodeValue = translated;
+      appliedCount += 1;
+      restoredSnapshot.push({
+        path,
+        original: originalValue,
+        originalHash: resolvedOriginalHash
+      });
     }
-    node.nodeValue = translated;
-    restoredSnapshot.push({
-      path,
-      original: originalValue,
-      originalHash: resolvedOriginalHash
-    });
     updatedEntries.push({
       path,
       original: originalValue,
@@ -1510,8 +1529,21 @@ async function restoreTranslations() {
     });
   });
 
-  if (restoredSnapshot.length) {
-    originalSnapshot = restoredSnapshot;
+  if (appliedCount !== storedEntries.length) {
+    console.warn(
+      `Not all translations restored.${formatLogDetails({
+        appliedCount,
+        totalEntries: storedEntries.length
+      })}`
+    );
+  }
+
+  if (updatedEntries.length) {
+    originalSnapshot = updatedEntries.map(({ path, original, originalHash }) => ({
+      path,
+      original,
+      originalHash
+    }));
     activeTranslationEntries = updatedEntries;
   }
 }
