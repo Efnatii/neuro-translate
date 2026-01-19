@@ -1,5 +1,3 @@
-importScripts('storage.js');
-
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
   'gpt-4.1-mini': 200000,
@@ -94,9 +92,8 @@ function buildMissingKeyReason(roleLabel, config, model) {
 }
 
 async function getState() {
-  const stored = await storageGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
-  const safeStored = stored && typeof stored === 'object' ? stored : {};
-  const merged = { ...DEFAULT_STATE, ...safeStored };
+  const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+  const merged = { ...DEFAULT_STATE, ...stored };
   if (!merged.blockLengthLimit && stored.chunkLengthLimit) {
     merged.blockLengthLimit = stored.chunkLengthLimit;
   }
@@ -112,7 +109,7 @@ async function getState() {
 async function saveState(partial) {
   const current = await getState();
   const next = { ...current, ...partial };
-  await storageSet(next);
+  await chrome.storage.local.set(next);
   return next;
 }
 
@@ -599,7 +596,7 @@ async function proofreadTranslation(
 }
 
 async function getModelThroughputInfo(model) {
-  const { modelThroughputById = {} } = await storageGet({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
   return modelThroughputById?.[model] || null;
 }
 
@@ -1155,9 +1152,9 @@ async function runModelThroughputTest(apiKey, model, apiBaseUrl = OPENAI_API_URL
 
 async function saveModelThroughputResult(model, result) {
   if (!model) return;
-  const { modelThroughputById = {} } = await storageGet({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
   modelThroughputById[model] = result;
-  await storageSet({ modelThroughputById });
+  await chrome.storage.local.set({ modelThroughputById });
 }
 
 function parseJsonArrayStrict(content, expectedLength, label = 'response') {
@@ -1491,22 +1488,22 @@ async function handleTranslationProgress(message, sender) {
     message: message.message || '',
     timestamp: Date.now()
   };
-  const { translationStatusByTab = {} } = await storageGet({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
   translationStatusByTab[tabId] = status;
-  await storageSet({ translationStatusByTab });
+  await chrome.storage.local.set({ translationStatusByTab });
 }
 
 async function handleGetTranslationStatus(sendResponse, tabId) {
-  const { translationStatusByTab = {} } = await storageGet({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
   sendResponse(translationStatusByTab[tabId] || null);
 }
 
 async function handleTranslationVisibility(message, sender) {
   const tabId = sender?.tab?.id;
   if (!tabId) return;
-  const { translationVisibilityByTab = {} } = await storageGet({ translationVisibilityByTab: {} });
+  const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
   translationVisibilityByTab[tabId] = Boolean(message.visible);
-  await storageSet({ translationVisibilityByTab });
+  await chrome.storage.local.set({ translationVisibilityByTab });
   chrome.runtime.sendMessage({
     type: 'TRANSLATION_VISIBILITY_CHANGED',
     tabId,
@@ -1517,12 +1514,12 @@ async function handleTranslationVisibility(message, sender) {
 async function handleTranslationCancelled(message, sender) {
   const tabId = message?.tabId ?? sender?.tab?.id;
   if (!tabId) return;
-  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await storageGet({
+  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await chrome.storage.local.get({
     translationStatusByTab: {},
     translationVisibilityByTab: {}
   });
   delete translationStatusByTab[tabId];
   translationVisibilityByTab[tabId] = false;
-  await storageSet({ translationStatusByTab, translationVisibilityByTab });
+  await chrome.storage.local.set({ translationStatusByTab, translationVisibilityByTab });
   chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
 }
