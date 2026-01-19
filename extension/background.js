@@ -428,8 +428,8 @@ async function proofreadTranslation(
       role: 'system',
       content: [
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        'Return corrected segments only as JSON with a top-level "replacements" array.',
-        'segmentIndex is the 0-based index of the segment in the translated text array.',
+        'Return corrected segments only as JSON with a top-level "replacements" array of objects.',
+        'Each replacement object must include "segmentIndex" (0-based index) and "replacementText".',
         'Indexing starts at 0 (the first segment is 0, the second is 1). Do not use 1-based indices.',
         'replacementText is the full corrected segment text to replace the original.',
         'Only include segments that require corrections. If no corrections are needed, return an empty list.',
@@ -462,7 +462,8 @@ async function proofreadTranslation(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Review the translated text below and return only the revised segments as pairs of [segmentIndex, replacementText] in JSON under "replacements".',
+        'Review the translated text below and return only the revised segments as JSON objects under "replacements".',
+        'Each replacement object must include "segmentIndex" (0-based) and "replacementText".',
         'Important: segmentIndex is 0-based (first segment is index 0).',
         'Only include segments that need corrections. If no corrections are needed, return an empty list.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
@@ -497,11 +498,13 @@ async function proofreadTranslation(
                   replacements: {
                     type: 'array',
                     items: {
-                      type: 'array',
-                      minItems: 2,
-                      maxItems: 2,
-                      prefixItems: [{ type: 'integer' }, { type: 'string' }],
-                      items: false
+                      type: 'object',
+                      properties: {
+                        segmentIndex: { type: 'integer' },
+                        replacementText: { type: 'string' }
+                      },
+                      required: ['segmentIndex', 'replacementText'],
+                      additionalProperties: false
                     }
                   }
                 },
