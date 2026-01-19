@@ -379,18 +379,50 @@ async function translatePage(settings) {
       activeProofreadWorkers += 1;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress' });
-        const proofreadResult = await requestProofreading(
-          task.translatedTexts,
-          settings.targetLanguage || 'ru',
-          latestContextSummary,
-          task.originalTexts
+        const proofreadResults = await Promise.all(
+          task.translatedTexts.map(async (text, index) => {
+            const blockId = `${task.key || 'block'}:${task.index}:${index}`;
+            try {
+              return await requestProofreadBlock(
+                blockId,
+                text,
+                settings.targetLanguage || 'ru'
+              );
+            } catch (error) {
+              return {
+                ok: false,
+                newText: text,
+                edits: [],
+                applied: [],
+                failed: [],
+                rawProofread: error?.message || ''
+              };
+            }
+          })
         );
-        const replacements = proofreadResult.replacements;
-        let finalTranslations = applyProofreadingReplacements(task.translatedTexts, replacements);
-        finalTranslations = finalTranslations.map((text, index) =>
-          applyOriginalFormatting(task.originalTexts[index], text)
-        );
-        finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
+
+        const finalTranslations = proofreadResults.map((result, index) => {
+          const fallback = task.translatedTexts[index];
+          const nextText = result?.ok && typeof result.newText === 'string' ? result.newText : fallback;
+          return restorePunctuationTokens(applyOriginalFormatting(task.originalTexts[index], nextText));
+        });
+
+        const proofreadDiffs = [];
+        const proofreadRaw = [];
+        let hasFailures = false;
+
+        proofreadResults.forEach((result, index) => {
+          if (!result?.ok) hasFailures = true;
+          const fromText = task.translatedTexts[index];
+          const toText = result?.ok && typeof result.newText === 'string' ? result.newText : fromText;
+          if (fromText !== toText) {
+            proofreadDiffs.push({ from: fromText, to: toText });
+          }
+          if (result?.rawProofread) {
+            proofreadRaw.push({ segmentIndex: index, raw: result.rawProofread });
+          }
+        });
+
         if (finalTranslations.length !== task.block.length) {
           throw new Error(
             `Proofread length mismatch: expected ${task.block.length}, got ${finalTranslations.length}`
@@ -409,9 +441,9 @@ async function translatePage(settings) {
         });
 
         await updateDebugEntry(task.index + 1, {
-          proofreadStatus: 'done',
-          proofread: replacements,
-          proofreadRaw: proofreadResult.rawProofread || ''
+          proofreadStatus: hasFailures ? 'failed' : 'done',
+          proofread: proofreadDiffs,
+          proofreadRaw: proofreadRaw.length ? JSON.stringify(proofreadRaw, null, 2) : ''
         });
         reportProgress('Вычитка выполняется');
       } catch (error) {
@@ -522,6 +554,38 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
         );
       }),
     'Proofreading'
+  );
+}
+
+async function requestProofreadBlock(blockId, text, language, goals) {
+  const estimatedTokens = estimateTokensForRole('proofread', {
+    texts: [text],
+    context: '',
+    sourceTexts: []
+  });
+  await ensureTpmBudget('proofread', estimatedTokens);
+  await incrementDebugAiRequestCount();
+  return withRateLimitRetry(
+    () =>
+      new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
+          {
+            type: 'PROOFREAD_BLOCK',
+            blockId,
+            text,
+            language,
+            goals
+          },
+          (response) => {
+            if (response?.success) {
+              resolve(response);
+            } else {
+              reject(new Error(response?.error || 'Не удалось выполнить вычитку.'));
+            }
+          }
+        );
+      }),
+    'Proofread block'
   );
 }
 
