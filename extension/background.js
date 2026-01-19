@@ -1,5 +1,3 @@
-importScripts('chrome-api.js');
-
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
   'gpt-4.1-mini': 200000,
@@ -28,8 +26,7 @@ const DEFAULT_STATE = {
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
-  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS,
-  debug: false
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
 
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
@@ -49,11 +46,6 @@ const PROOFREAD_SEGMENT_TOKEN = '⟦SEGMENT_BREAK⟧';
 
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
-
-let debugEnabled = false;
-const logDebug = createDebugLogger('background', () => debugEnabled);
-const storageLocalGet = (keys) => chromeApi.storageGet('local', keys);
-const storageLocalSet = (items) => chromeApi.storageSet('local', items);
 
 function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
   if (apiBaseUrl !== OPENAI_API_URL) return messages;
@@ -100,12 +92,7 @@ function buildMissingKeyReason(roleLabel, config, model) {
 }
 
 async function getState() {
-  let stored = {};
-  try {
-    stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
-  } catch (error) {
-    console.error('Failed to load state from storage.', error);
-  }
+  const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
   const merged = { ...DEFAULT_STATE, ...stored };
   if (!merged.blockLengthLimit && stored.chunkLengthLimit) {
     merged.blockLengthLimit = stored.chunkLengthLimit;
@@ -116,15 +103,13 @@ async function getState() {
   if (!merged.contextModel && merged.model) {
     merged.contextModel = merged.model;
   }
-  debugEnabled = Boolean(merged.debug);
   return merged;
 }
 
 async function saveState(partial) {
   const current = await getState();
   const next = { ...current, ...partial };
-  await storageLocalSet(next);
-  debugEnabled = Boolean(next.debug);
+  await chrome.storage.local.set(next);
   return next;
 }
 
@@ -189,7 +174,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleGetSettings(message, sendResponse) {
   try {
-    logDebug('GET_SETTINGS request received.', { url: message?.url || null });
     const state = await getState();
     const translationConfig = getApiConfigForModel(state.translationModel, state);
     const contextConfig = getApiConfigForModel(state.contextModel, state);
@@ -210,7 +194,7 @@ async function handleGetSettings(message, sendResponse) {
     } else if (state.proofreadEnabled && !hasProofreadKey) {
       disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
     }
-    const settings = {
+    sendResponse({
       allowed:
         hasTranslationKey &&
         (!state.contextGenerationEnabled || hasContextKey) &&
@@ -228,19 +212,13 @@ async function handleGetSettings(message, sendResponse) {
       tpmSafetyBufferTokens:
         Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
           ? state.tpmSafetyBufferTokens
-          : DEFAULT_TPM_SAFETY_BUFFER_TOKENS,
-      debug: Boolean(state.debug),
-      source: 'background'
-    };
-    logDebug('GET_SETTINGS response.', { settings });
-    sendResponse({ ok: true, settings });
+          : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+    });
   } catch (error) {
     console.error('Failed to fetch settings.', error);
-    logDebug('GET_SETTINGS failed.', { error: error?.message || String(error) });
     sendResponse({
-      ok: false,
-      error:
-        error?.message ||
+      allowed: false,
+      disallowedReason:
         'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.'
     });
   }
@@ -618,7 +596,7 @@ async function proofreadTranslation(
 }
 
 async function getModelThroughputInfo(model) {
-  const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
   return modelThroughputById?.[model] || null;
 }
 
@@ -1174,9 +1152,9 @@ async function runModelThroughputTest(apiKey, model, apiBaseUrl = OPENAI_API_URL
 
 async function saveModelThroughputResult(model, result) {
   if (!model) return;
-  const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
   modelThroughputById[model] = result;
-  await storageLocalSet({ modelThroughputById });
+  await chrome.storage.local.set({ modelThroughputById });
 }
 
 function parseJsonArrayStrict(content, expectedLength, label = 'response') {
@@ -1510,22 +1488,22 @@ async function handleTranslationProgress(message, sender) {
     message: message.message || '',
     timestamp: Date.now()
   };
-  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
   translationStatusByTab[tabId] = status;
-  await storageLocalSet({ translationStatusByTab });
+  await chrome.storage.local.set({ translationStatusByTab });
 }
 
 async function handleGetTranslationStatus(sendResponse, tabId) {
-  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
   sendResponse(translationStatusByTab[tabId] || null);
 }
 
 async function handleTranslationVisibility(message, sender) {
   const tabId = sender?.tab?.id;
   if (!tabId) return;
-  const { translationVisibilityByTab = {} } = await storageLocalGet({ translationVisibilityByTab: {} });
+  const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
   translationVisibilityByTab[tabId] = Boolean(message.visible);
-  await storageLocalSet({ translationVisibilityByTab });
+  await chrome.storage.local.set({ translationVisibilityByTab });
   chrome.runtime.sendMessage({
     type: 'TRANSLATION_VISIBILITY_CHANGED',
     tabId,
@@ -1536,12 +1514,12 @@ async function handleTranslationVisibility(message, sender) {
 async function handleTranslationCancelled(message, sender) {
   const tabId = message?.tabId ?? sender?.tab?.id;
   if (!tabId) return;
-  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await storageLocalGet({
+  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await chrome.storage.local.get({
     translationStatusByTab: {},
     translationVisibilityByTab: {}
   });
   delete translationStatusByTab[tabId];
   translationVisibilityByTab[tabId] = false;
-  await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
+  await chrome.storage.local.set({ translationStatusByTab, translationVisibilityByTab });
   chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
 }
