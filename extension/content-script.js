@@ -305,7 +305,9 @@ async function translatePage(settings) {
             return;
           }
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-          node.nodeValue = withOriginalFormatting;
+          if (translationVisible) {
+            node.nodeValue = withOriginalFormatting;
+          }
           blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
@@ -393,7 +395,9 @@ async function translatePage(settings) {
             return;
           }
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-          node.nodeValue = withOriginalFormatting;
+          if (translationVisible) {
+            node.nodeValue = withOriginalFormatting;
+          }
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
 
@@ -446,7 +450,6 @@ async function translatePage(settings) {
 
   reportProgress('Перевод завершён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
   await saveTranslationsToMemory(activeTranslationEntries);
-  await setTranslationVisibility(true);
 }
 
 async function translate(texts, targetLanguage, context, keepPunctuationTokens = false) {
