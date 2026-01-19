@@ -93,7 +93,11 @@ async function startTranslation() {
     settings = await requestSettings();
   }
   if (!settings?.allowed) {
-    reportProgress('Перевод недоступен для этой страницы', translationProgress.completedBlocks, translationProgress.totalBlocks);
+    reportProgress(
+      settings?.disallowedReason || 'Перевод недоступен для этой страницы',
+      translationProgress.completedBlocks,
+      translationProgress.totalBlocks
+    );
     return;
   }
 
