@@ -47,11 +47,6 @@ const PROOFREAD_SEGMENT_TOKEN = '⟦SEGMENT_BREAK⟧';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
 
-function isInjectableUrl(url) {
-  if (!url) return false;
-  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
-}
-
 function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
   if (apiBaseUrl !== OPENAI_API_URL) return messages;
   return messages.map((message) =>
@@ -145,14 +140,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === 'CANCEL_PAGE_TRANSLATION' && sender?.tab?.id) {
-    if (!isInjectableUrl(sender.tab.url)) {
-      return;
-    }
-    chrome.tabs.sendMessage(sender.tab.id, { type: 'CANCEL_TRANSLATION' }, () => {
-      if (chrome.runtime.lastError) {
-        return;
-      }
-    });
+    chrome.tabs.sendMessage(sender.tab.id, { type: 'CANCEL_TRANSLATION' });
   }
 
   if (message?.type === 'TRANSLATION_PROGRESS') {
