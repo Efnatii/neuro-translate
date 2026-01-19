@@ -1,5 +1,3 @@
-importScripts('proofread/edits.js', 'proofread/prompt.js');
-
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
   'gpt-4.1-mini': 200000,
@@ -133,11 +131,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'PROOFREAD_TEXT') {
     handleProofreadText(message, sendResponse);
-    return true;
-  }
-
-  if (message?.type === 'PROOFREAD_BLOCK') {
-    handleProofreadBlock(message, sendResponse);
     return true;
   }
 
@@ -289,34 +282,6 @@ async function handleProofreadText(message, sendResponse) {
   }
 }
 
-async function handleProofreadBlock(message, sendResponse) {
-  try {
-    const state = await getState();
-    const { apiKey, apiBaseUrl, provider } = getApiConfigForModel(state.proofreadModel, state);
-    if (!apiKey) {
-      sendResponse({ success: false, error: 'API key is missing.' });
-      return;
-    }
-    const input = {
-      blockId: message?.blockId || 'block',
-      text: message?.text || '',
-      language: message?.language || message?.targetLanguage || 'ru',
-      goals: Array.isArray(message?.goals) ? message.goals : undefined
-    };
-    const result = await proofreadBlock(
-      input,
-      apiKey,
-      state.proofreadModel,
-      apiBaseUrl,
-      provider
-    );
-    sendResponse({ success: true, ...result });
-  } catch (error) {
-    console.error('Proofreading block failed', error);
-    sendResponse({ success: false, error: error?.message || 'Unknown error' });
-  }
-}
-
 async function handleModelThroughputTest(message, sendResponse) {
   try {
     const state = await getState();
@@ -448,84 +413,6 @@ async function generateTranslationContext(
   }
 
   return typeof content === 'string' ? content.trim() : '';
-}
-
-async function proofreadBlock(
-  input,
-  apiKey,
-  model = DEFAULT_STATE.proofreadModel,
-  apiBaseUrl = OPENAI_API_URL,
-  provider = 'openai'
-) {
-  const prompt = proofreadPrompt.buildProofreadPrompt(input);
-  const messages = applyPromptCaching(prompt, apiBaseUrl);
-  const requestBody = {
-    model,
-    messages
-  };
-
-  if (provider === 'openai') {
-    requestBody.response_format = {
-      type: 'json_schema',
-      json_schema: proofreadPrompt.PROOFREAD_RESPONSE_SCHEMA
-    };
-  }
-
-  const response = await fetch(apiBaseUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestBody)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Proofread block request failed: ${response.status} ${errorText}`);
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('No proofreading result returned.');
-  }
-
-  const parsed = parseProofreadBlockResponse(content);
-  const edits = Array.isArray(parsed.edits) ? parsed.edits.slice(0, 30) : [];
-  const rewriteText =
-    parsed.rewrite && typeof parsed.rewrite.text === 'string' ? parsed.rewrite.text : '';
-
-  const appliedResult = proofreadEdits.applyEdits(input.text, edits);
-  let newText = appliedResult.newText;
-  let ok = appliedResult.ok;
-  let rewriteUsed = false;
-
-  if ((edits.length === 0 || appliedResult.applied.length === 0) && rewriteText) {
-    newText = proofreadEdits.normalizeBlockText(rewriteText);
-    ok = true;
-    rewriteUsed = true;
-  }
-
-  return {
-    ok,
-    newText,
-    edits,
-    applied: appliedResult.applied,
-    failed: appliedResult.failed,
-    rawProofread: content,
-    rewriteUsed
-  };
-}
-
-function parseProofreadBlockResponse(content) {
-  try {
-    const parsed = JSON.parse(content);
-    if (parsed && typeof parsed === 'object') return parsed;
-  } catch (error) {
-    throw new Error('Proofread block response JSON parsing failed.');
-  }
-  throw new Error('Proofread block response is not valid JSON.');
 }
 
 async function proofreadTranslation(
