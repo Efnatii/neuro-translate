@@ -382,6 +382,10 @@ async function handleToggleTranslationVisibility() {
   const currentVisible =
     visibilityInfo && typeof visibilityInfo.visible === 'boolean' ? visibilityInfo.visible : translationVisible;
   const nextVisible = !currentVisible;
+  if (nextVisible && visibilityInfo?.hasTranslations === false) {
+    setTemporaryStatus('Сначала переведите хотя бы один блок.');
+    return;
+  }
   const delivered = await sendMessageWithAutoInject(tab, {
     type: 'SET_TRANSLATION_VISIBILITY',
     visible: nextVisible
@@ -391,9 +395,6 @@ async function handleToggleTranslationVisibility() {
   }
   updateTranslationVisibility(nextVisible);
   updateTranslationVisibilityStorage(nextVisible);
-  if (visibilityInfo && typeof visibilityInfo.hasTranslations === 'boolean') {
-    toggleTranslationButton.disabled = !visibilityInfo.hasTranslations;
-  }
   setTemporaryStatus(nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.');
 }
 
@@ -555,9 +556,6 @@ async function syncTranslationVisibility() {
   if (visibilityInfo && typeof visibilityInfo.visible === 'boolean') {
     updateTranslationVisibility(visibilityInfo.visible);
     updateTranslationVisibilityStorage(visibilityInfo.visible);
-  }
-  if (visibilityInfo && typeof visibilityInfo.hasTranslations === 'boolean') {
-    toggleTranslationButton.disabled = !visibilityInfo.hasTranslations;
   }
 }
 
