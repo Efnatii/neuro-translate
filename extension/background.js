@@ -173,46 +173,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleGetSettings(message, sendResponse) {
-  const state = await getState();
-  const translationConfig = getApiConfigForModel(state.translationModel, state);
-  const contextConfig = getApiConfigForModel(state.contextModel, state);
-  const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
-  const tpmLimitsByRole = {
-    translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
-    context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
-    proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
-  };
-  const hasTranslationKey = Boolean(translationConfig.apiKey);
-  const hasContextKey = Boolean(contextConfig.apiKey);
-  const hasProofreadKey = Boolean(proofreadConfig.apiKey);
-  let disallowedReason = null;
-  if (!hasTranslationKey) {
-    disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
-  } else if (state.contextGenerationEnabled && !hasContextKey) {
-    disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
-  } else if (state.proofreadEnabled && !hasProofreadKey) {
-    disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
+  try {
+    const state = await getState();
+    const translationConfig = getApiConfigForModel(state.translationModel, state);
+    const contextConfig = getApiConfigForModel(state.contextModel, state);
+    const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
+    const tpmLimitsByRole = {
+      translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
+      context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
+      proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
+    };
+    const hasTranslationKey = Boolean(translationConfig.apiKey);
+    const hasContextKey = Boolean(contextConfig.apiKey);
+    const hasProofreadKey = Boolean(proofreadConfig.apiKey);
+    let disallowedReason = null;
+    if (!hasTranslationKey) {
+      disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
+    } else if (state.contextGenerationEnabled && !hasContextKey) {
+      disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
+    } else if (state.proofreadEnabled && !hasProofreadKey) {
+      disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
+    }
+    sendResponse({
+      allowed:
+        hasTranslationKey &&
+        (!state.contextGenerationEnabled || hasContextKey) &&
+        (!state.proofreadEnabled || hasProofreadKey),
+      disallowedReason,
+      apiKey: state.apiKey,
+      translationModel: state.translationModel,
+      contextModel: state.contextModel,
+      proofreadModel: state.proofreadModel,
+      contextGenerationEnabled: state.contextGenerationEnabled,
+      proofreadEnabled: state.proofreadEnabled,
+      blockLengthLimit: state.blockLengthLimit,
+      tpmLimitsByRole,
+      outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
+      tpmSafetyBufferTokens:
+        Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
+          ? state.tpmSafetyBufferTokens
+          : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+    });
+  } catch (error) {
+    console.error('Failed to fetch settings.', error);
+    sendResponse({
+      allowed: false,
+      disallowedReason:
+        'Перевод недоступен: не удалось получить настройки. Проверьте ключ API и перезагрузите страницу.'
+    });
   }
-  sendResponse({
-    allowed:
-      hasTranslationKey &&
-      (!state.contextGenerationEnabled || hasContextKey) &&
-      (!state.proofreadEnabled || hasProofreadKey),
-    disallowedReason,
-    apiKey: state.apiKey,
-    translationModel: state.translationModel,
-    contextModel: state.contextModel,
-    proofreadModel: state.proofreadModel,
-    contextGenerationEnabled: state.contextGenerationEnabled,
-    proofreadEnabled: state.proofreadEnabled,
-    blockLengthLimit: state.blockLengthLimit,
-    tpmLimitsByRole,
-    outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
-    tpmSafetyBufferTokens:
-      Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
-        ? state.tpmSafetyBufferTokens
-        : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
-  });
 }
 
 async function handleTranslateText(message, sendResponse) {
