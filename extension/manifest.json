@@ -15,7 +15,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["chrome-api.js", "content-script.js"],
+      "js": ["content-script.js"],
       "run_at": "document_idle"
     }
   ]
