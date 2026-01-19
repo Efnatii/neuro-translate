@@ -47,6 +47,13 @@ const PROOFREAD_SEGMENT_TOKEN = '⟦SEGMENT_BREAK⟧';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
 
+function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
+  if (apiBaseUrl !== OPENAI_API_URL) return messages;
+  return messages.map((message) =>
+    message.role === 'user' ? { ...message, cache_control: { type: 'ephemeral' } } : message
+  );
+}
+
 function isDeepseekModel(model = '') {
   return model.startsWith('deepseek');
 }
@@ -298,7 +305,7 @@ async function generateTranslationContext(
 ) {
   if (!text?.trim()) return '';
 
-  const prompt = [
+  const prompt = applyPromptCaching([
     {
       role: 'system',
       content: [
@@ -368,7 +375,7 @@ async function generateTranslationContext(
         'If a section is empty, write "not specified".'
       ].join('\n')
     }
-  ];
+  ], apiBaseUrl);
 
   const response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -416,7 +423,7 @@ async function proofreadTranslation(
   let rateLimitRetries = 0;
   let lastRateLimitDelayMs = null;
   let lastError = null;
-  const prompt = [
+  const prompt = applyPromptCaching([
     {
       role: 'system',
       content: [
@@ -467,7 +474,7 @@ async function proofreadTranslation(
         .filter(Boolean)
         .join('\n')
     }
-  ];
+  ], apiBaseUrl);
 
   while (true) {
     try {
@@ -679,7 +686,7 @@ async function performTranslationRequest(
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
 
-  const prompt = [
+  const prompt = applyPromptCaching([
     {
       role: 'system',
       content: [
@@ -697,13 +704,9 @@ async function performTranslationRequest(
           : null,
         PUNCTUATION_TOKEN_HINT,
         'Determine the most appropriate tone/style based on the provided context.',
-        context
-          ? [
-              'Rely on the provided page context for disambiguation only; never introduce new facts.',
-              'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
-              `Page context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
-            ].join(' ')
-          : 'If no context is provided, do not invent context or add assumptions.',
+        'If page context is provided in the user message, use it only for disambiguation; never introduce new facts.',
+        'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
+        'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
         'Respond only with the translated segments in the same order as the input segments.',
         'Do not add commentary.'
@@ -744,7 +747,7 @@ async function performTranslationRequest(
         .filter(Boolean)
         .join('\n')
     }
-  ];
+  ], apiBaseUrl);
 
   const response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -1069,10 +1072,13 @@ async function runModelThroughputTest(apiKey, model, apiBaseUrl = OPENAI_API_URL
       body: JSON.stringify({
         model,
         max_completion_tokens: 24,
-        messages: [
-          { role: 'system', content: 'Reply with the word OK.' },
-          { role: 'user', content: 'OK' }
-        ]
+        messages: applyPromptCaching(
+          [
+            { role: 'system', content: 'Reply with the word OK.' },
+            { role: 'user', content: 'OK' }
+          ],
+          apiBaseUrl
+        )
       }),
       signal: controller.signal
     });
