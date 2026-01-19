@@ -369,6 +369,8 @@ async function sendTranslateRequest() {
   if (!delivered) {
     return;
   }
+  updateTranslationVisibility(false);
+  updateTranslationVisibilityStorage(false);
   setTemporaryStatus('Запускаем перевод страницы...');
 }
 
