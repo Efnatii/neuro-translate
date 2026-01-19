@@ -428,7 +428,7 @@ async function proofreadTranslation(
       role: 'system',
       content: [
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        'Return corrected segments only.',
+        'Return corrected segments only as JSON with a top-level "replacements" array.',
         'segmentIndex is the 0-based index of the segment in the translated text array.',
         'Indexing starts at 0 (the first segment is 0, the second is 1). Do not use 1-based indices.',
         'replacementText is the full corrected segment text to replace the original.',
@@ -462,7 +462,7 @@ async function proofreadTranslation(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Review the translated text below and return only the revised segments as pairs of [segmentIndex, replacementText].',
+        'Review the translated text below and return only the revised segments as pairs of [segmentIndex, replacementText] in JSON under "replacements".',
         'Important: segmentIndex is 0-based (first segment is index 0).',
         'Only include segments that need corrections. If no corrections are needed, return an empty list.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
@@ -492,14 +492,21 @@ async function proofreadTranslation(
             json_schema: {
               name: 'proofread_replacements',
               schema: {
-                type: 'array',
-                items: {
-                  type: 'array',
-                  minItems: 2,
-                  maxItems: 2,
-                  prefixItems: [{ type: 'integer' }, { type: 'string' }],
-                  items: false
-                }
+                type: 'object',
+                properties: {
+                  replacements: {
+                    type: 'array',
+                    items: {
+                      type: 'array',
+                      minItems: 2,
+                      maxItems: 2,
+                      prefixItems: [{ type: 'integer' }, { type: 'string' }],
+                      items: false
+                    }
+                  }
+                },
+                required: ['replacements'],
+                additionalProperties: false
               }
             }
           }
@@ -708,7 +715,7 @@ async function performTranslationRequest(
         'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
         'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
-        'Respond only with the translated segments in the same order as the input segments.',
+        'Respond only with a JSON object containing the translated segments in the same order as the input segments under a "translations" array.',
         'Do not add commentary.'
       ]
         .filter(Boolean)
@@ -738,7 +745,7 @@ async function performTranslationRequest(
           ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
           : null,
         `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
-        `Return only the translated segments with exactly ${tokenizedTexts.length} items, one per segment, in the same order.`,
+        `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items, one per segment, in the same order.`,
         'Segments to translate:',
         '<<<SEGMENTS_START>>>',
         ...tokenizedTexts.map((text) => text),
@@ -763,10 +770,17 @@ async function performTranslationRequest(
         json_schema: {
           name: 'translations',
           schema: {
-            type: 'array',
-            minItems: tokenizedTexts.length,
-            maxItems: tokenizedTexts.length,
-            items: { type: 'string' }
+            type: 'object',
+            properties: {
+              translations: {
+                type: 'array',
+                minItems: tokenizedTexts.length,
+                maxItems: tokenizedTexts.length,
+                items: { type: 'string' }
+              }
+            },
+            required: ['translations'],
+            additionalProperties: false
           }
         }
       }
@@ -802,7 +816,7 @@ async function performTranslationRequest(
     throw new Error('No translation returned');
   }
 
-  const translations = parseJsonArrayFlexible(content, texts.length, 'translation');
+  const translations = parseTranslationsResponse(content, texts.length);
   const refusalIndices = translations
     .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
     .filter((value) => Number.isInteger(value));
@@ -1157,6 +1171,61 @@ function parseJsonArrayFlexible(content, expectedLength, label = 'response') {
   return normalizedArray;
 }
 
+function parseJsonObjectFlexible(content = '', label = 'response') {
+  const normalizeString = (value = '') =>
+    value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
+
+  const normalizedContent = normalizeString(String(content ?? '')).trim();
+  if (!normalizedContent) {
+    throw new Error(`${label} response is empty.`);
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(normalizedContent);
+  } catch (error) {
+    const startIndex = normalizedContent.indexOf('{');
+    const endIndex = normalizedContent.lastIndexOf('}');
+    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+      throw new Error(`${label} response does not contain a JSON object.`);
+    }
+
+    const slice = normalizedContent.slice(startIndex, endIndex + 1);
+    try {
+      parsed = JSON.parse(slice);
+    } catch (innerError) {
+      throw new Error(`${label} response JSON parsing failed.`);
+    }
+  }
+
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new Error(`${label} response is not a JSON object.`);
+  }
+
+  return parsed;
+}
+
+function parseTranslationsResponse(content, expectedLength) {
+  try {
+    const parsed = parseJsonObjectFlexible(content, 'translation');
+    const translations = parsed?.translations;
+    if (!Array.isArray(translations)) {
+      throw new Error('translation response is missing translations array.');
+    }
+    const normalizedArray = translations.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
+    if (expectedLength && normalizedArray.length !== expectedLength) {
+      throw new Error(
+        `translation response length mismatch: expected ${expectedLength}, got ${normalizedArray.length}`
+      );
+    }
+    return normalizedArray;
+  } catch (error) {
+    console.warn('Translation response object parsing failed; falling back to array parsing.', error);
+  }
+
+  return parseJsonArrayFlexible(content, expectedLength, 'translation');
+}
+
 function extractJsonArray(content = '', label = 'response') {
   const normalizeString = (value = '') =>
     value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
@@ -1190,10 +1259,20 @@ function extractJsonArray(content = '', label = 'response') {
 function parseProofreadReplacements(content, expectedSegments) {
   let parsed = null;
   try {
-    parsed = extractJsonArray(content, 'proofread');
+    const parsedObject = parseJsonObjectFlexible(content, 'proofread');
+    if (Array.isArray(parsedObject?.replacements)) {
+      parsed = parsedObject.replacements;
+    } else {
+      throw new Error('proofread response is missing replacements array.');
+    }
   } catch (error) {
-    console.warn('Proofread response parsing failed; returning no replacements.', error);
-    return [];
+    console.warn('Proofread response object parsing failed; attempting array parsing.', error);
+    try {
+      parsed = extractJsonArray(content, 'proofread');
+    } catch (innerError) {
+      console.warn('Proofread response parsing failed; returning no replacements.', innerError);
+      return [];
+    }
   }
 
   const rawItems = [];
