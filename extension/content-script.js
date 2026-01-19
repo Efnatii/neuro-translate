@@ -94,6 +94,10 @@ async function startTranslation() {
     return;
   }
 
+  if (translationVisible) {
+    await setTranslationVisibility(false);
+  }
+
   configureTpmLimiter(settings);
   translationInProgress = true;
   try {
