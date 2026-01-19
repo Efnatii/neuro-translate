@@ -421,13 +421,12 @@ async function proofreadTranslation(
       role: 'system',
       content: [
         'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        'Return a JSON array of JSON arrays, each with exactly two elements: [segmentIndex, replacementText].',
+        'Return corrected segments only.',
         'segmentIndex is the 0-based index of the segment in the translated text array.',
         'Indexing starts at 0 (the first segment is 0, the second is 1). Do not use 1-based indices.',
         'replacementText is the full corrected segment text to replace the original.',
-        'Only include segments that require corrections. If no corrections are needed, return an empty array.',
+        'Only include segments that require corrections. If no corrections are needed, return an empty list.',
         'Never add commentary, explanations, numbering, or extra markup.',
-        'Do not wrap the JSON in markdown code fences.',
         'Prioritize readability and clarity of meaning over strict literalness.',
         'Improve fluency and naturalness so the translation reads like it was written by a native speaker.',
         'Fix grammar, agreement, punctuation, typos, or terminology consistency as needed.',
@@ -447,7 +446,7 @@ async function proofreadTranslation(
           ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
           : 'If no context is provided, do not invent context or add assumptions.',
         PUNCTUATION_TOKEN_HINT,
-        'Return only the JSON array.'
+        'Return only the corrected replacements.'
       ]
         .filter(Boolean)
         .join(' ')
@@ -456,9 +455,9 @@ async function proofreadTranslation(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Review the translated text below and return only the revised segments as a JSON array of [segmentIndex, replacementText] pairs.',
+        'Review the translated text below and return only the revised segments as pairs of [segmentIndex, replacementText].',
         'Important: segmentIndex is 0-based (first segment is index 0).',
-        'Only include segments that need corrections. If no corrections are needed, return an empty array.',
+        'Only include segments that need corrections. If no corrections are needed, return an empty list.',
         context ? `Context (use it as the only disambiguation aid): ${context}` : '',
         normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
         normalizedSourceTexts.length ? combinedSourceText : '',
@@ -480,7 +479,23 @@ async function proofreadTranslation(
         },
         body: JSON.stringify({
           model,
-          messages: prompt
+          messages: prompt,
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'proofread_replacements',
+              schema: {
+                type: 'array',
+                items: {
+                  type: 'array',
+                  minItems: 2,
+                  maxItems: 2,
+                  prefixItems: [{ type: 'integer' }, { type: 'string' }],
+                  items: false
+                }
+              }
+            }
+          }
         })
       });
 
@@ -690,8 +705,8 @@ async function performTranslationRequest(
             ].join(' ')
           : 'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
-        `Respond only with a JSON array of strings containing exactly ${tokenizedTexts.length} items in the same order as the input segments.`,
-        'Do not wrap the JSON in markdown code fences or add commentary.'
+        'Respond only with the translated segments in the same order as the input segments.',
+        'Do not add commentary.'
       ]
         .filter(Boolean)
         .join(' ')
@@ -720,7 +735,7 @@ async function performTranslationRequest(
           ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
           : null,
         `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
-        `Return only a JSON array of strings with exactly ${tokenizedTexts.length} items, one per segment, in the same order.`,
+        `Return only the translated segments with exactly ${tokenizedTexts.length} items, one per segment, in the same order.`,
         'Segments to translate:',
         '<<<SEGMENTS_START>>>',
         ...tokenizedTexts.map((text) => text),
@@ -739,7 +754,19 @@ async function performTranslationRequest(
     },
     body: JSON.stringify({
       model,
-      messages: prompt
+      messages: prompt,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'translations',
+          schema: {
+            type: 'array',
+            minItems: tokenizedTexts.length,
+            maxItems: tokenizedTexts.length,
+            items: { type: 'string' }
+          }
+        }
+      }
     }),
     signal
   });
