@@ -683,7 +683,11 @@ async function performTranslationRequest(
         PUNCTUATION_TOKEN_HINT,
         'Determine the most appropriate tone/style based on the provided context.',
         context
-          ? `Rely on the provided page context for disambiguation only; never introduce new facts. Do not quote, paraphrase, or include the context text in the output unless it is required to translate the source segments: ${context}`
+          ? [
+              'Rely on the provided page context for disambiguation only; never introduce new facts.',
+              'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
+              `Page context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
+            ].join(' ')
           : 'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
         `Respond only with a JSON array of strings containing exactly ${tokenizedTexts.length} items in the same order as the input segments.`,
@@ -698,7 +702,11 @@ async function performTranslationRequest(
         `Translate the following segments into ${targetLanguage}.`,
         'Determine the style automatically based on context.',
         context
-          ? `Page context (use it for disambiguation only; do not quote or include it in the output unless it is required to translate the source segments): ${context}`
+          ? [
+              'Use the page context for disambiguation only.',
+              'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
+              `Page context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
+            ].join('\n')
           : '',
         'Do not omit or add information; preserve modality, tense, aspect, tone, and level of certainty.',
         'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
@@ -714,7 +722,9 @@ async function performTranslationRequest(
         `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
         `Return only a JSON array of strings with exactly ${tokenizedTexts.length} items, one per segment, in the same order.`,
         'Segments to translate:',
-        ...tokenizedTexts.map((text) => text)
+        '<<<SEGMENTS_START>>>',
+        ...tokenizedTexts.map((text) => text),
+        '<<<SEGMENTS_END>>>'
       ]
         .filter(Boolean)
         .join('\n')
