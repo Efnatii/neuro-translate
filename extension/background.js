@@ -1343,4 +1343,9 @@ async function handleTranslationVisibility(message, sender) {
   const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
   translationVisibilityByTab[tabId] = Boolean(message.visible);
   await chrome.storage.local.set({ translationVisibilityByTab });
+  chrome.runtime.sendMessage({
+    type: 'TRANSLATION_VISIBILITY_CHANGED',
+    tabId,
+    visible: Boolean(message.visible)
+  });
 }

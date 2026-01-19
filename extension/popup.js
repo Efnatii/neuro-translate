@@ -84,6 +84,7 @@ async function init() {
   await syncTranslationVisibility();
 
   chrome.storage.onChanged.addListener(handleStorageChange);
+  chrome.runtime.onMessage.addListener(handleRuntimeMessage);
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   deepseekApiKeyInput.addEventListener('input', handleDeepseekApiKeyChange);
@@ -415,6 +416,26 @@ function handleStorageChange(changes) {
     };
     renderThroughputStatuses();
   }
+}
+
+function handleRuntimeMessage(message, sender) {
+  if (!message?.type) {
+    return;
+  }
+  if (message.type === 'UPDATE_TRANSLATION_VISIBILITY') {
+    if (activeTabId && sender?.tab?.id && sender.tab.id !== activeTabId) {
+      return;
+    }
+    renderTranslationVisibility(Boolean(message.visible));
+    return;
+  }
+  if (message.type !== 'TRANSLATION_VISIBILITY_CHANGED') {
+    return;
+  }
+  if (activeTabId && typeof message.tabId === 'number' && message.tabId !== activeTabId) {
+    return;
+  }
+  renderTranslationVisibility(Boolean(message.visible));
 }
 
 function renderStatus() {
