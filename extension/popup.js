@@ -23,6 +23,7 @@ let keySaveTimeout = null;
 let deepseekKeySaveTimeout = null;
 let activeTabId = null;
 let translationVisible = false;
+let canShowTranslation = false;
 let currentTranslationStatus = null;
 let currentThroughputByRole = {
   translation: null,
@@ -78,6 +79,7 @@ async function init() {
   renderProofreadEnabled(state.proofreadEnabled);
   renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
+  updateCanShowTranslation(currentTranslationStatus);
   renderStatus();
   renderThroughputStatuses();
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
@@ -382,7 +384,7 @@ async function handleToggleTranslationVisibility() {
   const currentVisible =
     visibilityInfo && typeof visibilityInfo.visible === 'boolean' ? visibilityInfo.visible : translationVisible;
   const nextVisible = !currentVisible;
-  if (nextVisible && visibilityInfo?.hasTranslations === false) {
+  if (nextVisible && !canShowTranslation && visibilityInfo?.hasTranslations === false) {
     setTemporaryStatus('Сначала переведите хотя бы один блок.');
     return;
   }
@@ -402,6 +404,7 @@ function handleStorageChange(changes) {
   if (changes.translationStatusByTab) {
     const nextStatuses = changes.translationStatusByTab.newValue || {};
     currentTranslationStatus = activeTabId ? nextStatuses[activeTabId] : null;
+    updateCanShowTranslation(currentTranslationStatus);
     renderStatus();
   }
   if (changes.translationVisibilityByTab) {
@@ -472,6 +475,11 @@ function formatTranslationStatus(status) {
     return message;
   }
   return `${message} ${completedBlocks}(+${inProgressBlocks}) из ${totalBlocks}`;
+}
+
+function updateCanShowTranslation(status) {
+  const completedBlocks = status?.completedBlocks ?? status?.completedChunks ?? 0;
+  canShowTranslation = completedBlocks > 0;
 }
 
 function formatThroughputStatus(info) {
@@ -590,6 +598,7 @@ async function clearTranslationStatus(tabId) {
   await chrome.storage.local.set({ translationStatusByTab });
   if (activeTabId === tabId) {
     currentTranslationStatus = null;
+    updateCanShowTranslation(currentTranslationStatus);
     renderStatus();
   }
 }
@@ -630,6 +639,7 @@ async function sendBlockLengthLimitUpdate(blockLengthLimit) {
       timestamp: Date.now()
     };
     currentTranslationStatus = nextStatus;
+    updateCanShowTranslation(currentTranslationStatus);
     renderStatus();
     if (activeTabId) {
       const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
