@@ -1460,6 +1460,16 @@ async function cancelTranslation() {
   translationVisible = false;
   notifyVisibilityChange();
   reportProgress('Перевод отменён', 0, 0, 0);
+  const tabId = await getActiveTabId();
+  chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
+}
+
+function getActiveTabId() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'GET_TAB_ID' }, (response) => {
+      resolve(response?.tabId ?? null);
+    });
+  });
 }
 
 async function setTranslationVisibility(visible) {

@@ -356,13 +356,11 @@ function isInjectableUrl(url) {
 async function sendCancel() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  await sendMessageWithAutoInject(tab, { type: 'CANCEL_TRANSLATION' });
-  updateTranslationVisibility(false);
-  updateTranslationVisibilityStorage(false);
-  await clearTranslationStatus(tab.id);
-  await clearTranslationStorage(tab.url);
-  setTemporaryStatus('Перевод для этой страницы отменён.');
-  await chrome.tabs.reload(tab.id);
+  const delivered = await sendMessageWithAutoInject(tab, { type: 'CANCEL_TRANSLATION' });
+  if (!delivered) {
+    return;
+  }
+  setTemporaryStatus('Отменяем перевод...');
 }
 
 async function sendTranslateRequest() {
@@ -422,8 +420,17 @@ function handleStorageChange(changes) {
   }
 }
 
-function handleRuntimeMessage(message, sender) {
+async function handleRuntimeMessage(message, sender) {
   if (!message?.type) {
+    return;
+  }
+  if (message.type === 'TRANSLATION_CANCELLED') {
+    if (typeof message.tabId === 'number' && activeTabId && message.tabId !== activeTabId) {
+      return;
+    }
+    if (typeof message.tabId === 'number') {
+      await handleTranslationCancelled(message.tabId);
+    }
     return;
   }
   if (message.type === 'UPDATE_TRANSLATION_VISIBILITY') {
@@ -440,6 +447,14 @@ function handleRuntimeMessage(message, sender) {
     return;
   }
   renderTranslationVisibility(Boolean(message.visible));
+}
+
+async function handleTranslationCancelled(tabId) {
+  await clearTranslationStatus(tabId);
+  updateTranslationVisibility(false);
+  await updateTranslationVisibilityStorage(false);
+  setTemporaryStatus('Перевод для этой страницы отменён.');
+  await chrome.tabs.reload(tabId);
 }
 
 function renderStatus() {

@@ -127,12 +127,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'GET_TAB_ID') {
+    sendResponse({ tabId: sender?.tab?.id ?? null });
+    return true;
+  }
+
   if (message?.type === 'CANCEL_PAGE_TRANSLATION' && sender?.tab?.id) {
     chrome.tabs.sendMessage(sender.tab.id, { type: 'CANCEL_TRANSLATION' });
   }
 
   if (message?.type === 'TRANSLATION_PROGRESS') {
     handleTranslationProgress(message, sender);
+  }
+
+  if (message?.type === 'TRANSLATION_CANCELLED') {
+    handleTranslationCancelled(message, sender);
   }
 
   if (message?.type === 'UPDATE_TRANSLATION_VISIBILITY') {
@@ -1348,4 +1357,17 @@ async function handleTranslationVisibility(message, sender) {
     tabId,
     visible: Boolean(message.visible)
   });
+}
+
+async function handleTranslationCancelled(message, sender) {
+  const tabId = message?.tabId ?? sender?.tab?.id;
+  if (!tabId) return;
+  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await chrome.storage.local.get({
+    translationStatusByTab: {},
+    translationVisibilityByTab: {}
+  });
+  delete translationStatusByTab[tabId];
+  translationVisibilityByTab[tabId] = false;
+  await chrome.storage.local.set({ translationStatusByTab, translationVisibilityByTab });
+  chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
 }
