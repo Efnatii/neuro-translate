@@ -35,6 +35,16 @@ let currentContextModelId = null;
 let currentProofreadModelId = null;
 let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
+let debugEnabled = false;
+
+const logDebug = createDebugLogger('popup', () => debugEnabled);
+const storageLocalGet = (keys) => chromeApi.storageGet('local', keys);
+const storageLocalSet = (items) => chromeApi.storageSet('local', items);
+const tabsQuery = (query) => chromeApi.tabsQuery(query);
+const tabsReload = (tabId) => chromeApi.tabsReload(tabId);
+const tabsCreate = (createProperties) => chromeApi.tabsCreate(createProperties);
+const executeScript = (details) => chromeApi.executeScript(details);
+const runtimeSendMessageSafe = (payload) => chromeApi.sendMessageSafe(payload);
 
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.45 },
@@ -62,6 +72,7 @@ async function init() {
   activeTabId = tab?.id || null;
 
   const state = await getState();
+  debugEnabled = Boolean(state.debug);
   apiKeyInput.value = state.apiKey || '';
   deepseekApiKeyInput.value = state.deepseekApiKey || '';
   renderModelOptions(translationModelSelect, state.translationModel);
@@ -107,7 +118,7 @@ function handleApiKeyChange() {
   clearTimeout(keySaveTimeout);
   const apiKey = apiKeyInput.value.trim();
   keySaveTimeout = setTimeout(async () => {
-    await chrome.storage.local.set({ apiKey });
+    await storageLocalSet({ apiKey });
     setTemporaryStatus('API ключ сохранён.');
   }, 300);
 }
@@ -116,16 +127,16 @@ function handleDeepseekApiKeyChange() {
   clearTimeout(deepseekKeySaveTimeout);
   const deepseekApiKey = deepseekApiKeyInput.value.trim();
   deepseekKeySaveTimeout = setTimeout(async () => {
-    await chrome.storage.local.set({ deepseekApiKey });
+    await storageLocalSet({ deepseekApiKey });
     setTemporaryStatus('DeepSeek ключ сохранён.');
   }, 300);
 }
 
 async function handleTranslationModelChange() {
   const translationModel = translationModelSelect.value;
-  await chrome.storage.local.set({ translationModel });
+  await storageLocalSet({ translationModel });
   currentTranslationModelId = translationModel;
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
   currentThroughputByRole.translation = modelThroughputById[translationModel] || null;
   renderStatus();
   renderThroughputStatuses();
@@ -135,9 +146,9 @@ async function handleTranslationModelChange() {
 
 async function handleContextModelChange() {
   const contextModel = contextModelSelect.value;
-  await chrome.storage.local.set({ contextModel });
+  await storageLocalSet({ contextModel });
   currentContextModelId = contextModel;
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
   currentThroughputByRole.context = modelThroughputById[contextModel] || null;
   renderThroughputStatuses();
   setTemporaryStatus('Модель для контекста сохранена.');
@@ -146,9 +157,9 @@ async function handleContextModelChange() {
 
 async function handleProofreadModelChange() {
   const proofreadModel = proofreadModelSelect.value;
-  await chrome.storage.local.set({ proofreadModel });
+  await storageLocalSet({ proofreadModel });
   currentProofreadModelId = proofreadModel;
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
   currentThroughputByRole.proofread = modelThroughputById[proofreadModel] || null;
   renderThroughputStatuses();
   setTemporaryStatus('Модель для вычитки сохранена.');
@@ -157,7 +168,7 @@ async function handleProofreadModelChange() {
 
 async function handleContextGenerationChange() {
   const contextGenerationEnabled = contextGenerationCheckbox.checked;
-  await chrome.storage.local.set({ contextGenerationEnabled });
+  await storageLocalSet({ contextGenerationEnabled });
   setTemporaryStatus(
     contextGenerationEnabled ? 'Генерация контекста включена.' : 'Генерация контекста отключена.'
   );
@@ -165,13 +176,13 @@ async function handleContextGenerationChange() {
 
 async function handleProofreadEnabledChange() {
   const proofreadEnabled = proofreadEnabledCheckbox.checked;
-  await chrome.storage.local.set({ proofreadEnabled });
+  await storageLocalSet({ proofreadEnabled });
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
 async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
-  await chrome.storage.local.set({ blockLengthLimit });
+  await storageLocalSet({ blockLengthLimit });
   renderBlockLengthLimit(blockLengthLimit);
   setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
   await sendBlockLengthLimitUpdate(blockLengthLimit);
@@ -180,43 +191,40 @@ async function handleBlockLengthLimitChange() {
 async function handleBlockLengthLimitCommit() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  await chrome.tabs.reload(tab.id);
+  await tabsReload(tab.id);
 }
 
 async function getState() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(
-      [
-        'apiKey',
-        'model',
-        'deepseekApiKey',
-        'translationModel',
-        'contextModel',
-        'proofreadModel',
-        'contextGenerationEnabled',
-        'proofreadEnabled',
-        'blockLengthLimit',
-        'chunkLengthLimit',
-        'translationStatusByTab',
-        'translationVisibilityByTab',
-        'modelThroughputById'
-      ],
-      (data) => {
-      resolve({
-        apiKey: data.apiKey || '',
-        deepseekApiKey: data.deepseekApiKey || '',
-        translationModel: data.translationModel || data.model,
-        contextModel: data.contextModel || data.model,
-        proofreadModel: data.proofreadModel || data.model,
-        contextGenerationEnabled: data.contextGenerationEnabled,
-        proofreadEnabled: data.proofreadEnabled,
-        blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
-        translationStatusByTab: data.translationStatusByTab || {},
-        translationVisibilityByTab: data.translationVisibilityByTab || {},
-        modelThroughputById: data.modelThroughputById || {}
-      });
-    });
-  });
+  const data = await storageLocalGet([
+    'apiKey',
+    'model',
+    'deepseekApiKey',
+    'translationModel',
+    'contextModel',
+    'proofreadModel',
+    'contextGenerationEnabled',
+    'proofreadEnabled',
+    'blockLengthLimit',
+    'chunkLengthLimit',
+    'translationStatusByTab',
+    'translationVisibilityByTab',
+    'modelThroughputById',
+    'debug'
+  ]);
+  return {
+    apiKey: data.apiKey || '',
+    deepseekApiKey: data.deepseekApiKey || '',
+    translationModel: data.translationModel || data.model,
+    contextModel: data.contextModel || data.model,
+    proofreadModel: data.proofreadModel || data.model,
+    contextGenerationEnabled: data.contextGenerationEnabled,
+    proofreadEnabled: data.proofreadEnabled,
+    blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
+    translationStatusByTab: data.translationStatusByTab || {},
+    translationVisibilityByTab: data.translationVisibilityByTab || {},
+    modelThroughputById: data.modelThroughputById || {},
+    debug: Boolean(data.debug)
+  };
 }
 
 function renderModelOptions(select, selected) {
@@ -257,33 +265,47 @@ function clampBlockLengthLimit(value) {
   return Math.min(Math.max(value, min), max);
 }
 
-function runModelThroughputTest(model, role) {
+async function runModelThroughputTest(model, role) {
   if (!model) return;
   const roleLabel = getRoleLabel(role);
   const statusMessage = roleLabel
     ? `Запускаем тест пропускной способности (${roleLabel})...`
     : 'Запускаем тест пропускной способности...';
   setTemporaryStatus(statusMessage);
-  chrome.runtime.sendMessage({ type: 'RUN_MODEL_THROUGHPUT_TEST', model }, (response) => {
-    if (response?.success) {
-      if (role) {
-        currentThroughputByRole[role] = response.result || null;
-      }
-      renderThroughputStatuses();
-      setTemporaryStatus('Тест пропускной способности завершён.', 2000);
-      return;
-    }
-    const error = response?.error || 'Не удалось выполнить тест';
+  const { result, lastError } = await runtimeSendMessageSafe({ type: 'RUN_MODEL_THROUGHPUT_TEST', model });
+  logDebug('RUN_MODEL_THROUGHPUT_TEST response.', {
+    model,
+    role,
+    response: result,
+    runtimeError: lastError?.message || null
+  });
+  if (lastError) {
+    const error = lastError.message || 'Не удалось выполнить тест';
     if (role) {
       currentThroughputByRole[role] = { success: false, error, timestamp: Date.now() };
     }
     renderThroughputStatuses();
     setTemporaryStatus('Тест пропускной способности не удался.', 3000);
-  });
+    return;
+  }
+  if (result?.success) {
+    if (role) {
+      currentThroughputByRole[role] = result.result || null;
+    }
+    renderThroughputStatuses();
+    setTemporaryStatus('Тест пропускной способности завершён.', 2000);
+    return;
+  }
+  const error = result?.error || 'Не удалось выполнить тест';
+  if (role) {
+    currentThroughputByRole[role] = { success: false, error, timestamp: Date.now() };
+  }
+  renderThroughputStatuses();
+  setTemporaryStatus('Тест пропускной способности не удался.', 3000);
 }
 
 async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await tabsQuery({ active: true, currentWindow: true });
   return tab;
 }
 
@@ -312,9 +334,15 @@ function sendMessageToTab(tabId, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, () => {
       if (chrome.runtime.lastError) {
+        logDebug('tabs.sendMessage failed.', {
+          tabId,
+          messageType: message?.type,
+          runtimeError: chrome.runtime.lastError?.message || null
+        });
         resolve(false);
         return;
       }
+      logDebug('tabs.sendMessage delivered.', { tabId, messageType: message?.type });
       resolve(true);
     });
   });
@@ -324,9 +352,15 @@ function sendMessageToTabWithResponse(tabId, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, (response) => {
       if (chrome.runtime.lastError) {
+        logDebug('tabs.sendMessage response failed.', {
+          tabId,
+          messageType: message?.type,
+          runtimeError: chrome.runtime.lastError?.message || null
+        });
         resolve({ delivered: false, response: null });
         return;
       }
+      logDebug('tabs.sendMessage response received.', { tabId, messageType: message?.type, response });
       resolve({ delivered: true, response });
     });
   });
@@ -337,13 +371,15 @@ async function ensureContentScript(tab) {
     return false;
   }
   try {
-    await chrome.scripting.executeScript({
+    await executeScript({
       target: { tabId: tab.id },
       files: ['content-script.js']
     });
+    logDebug('Content script injected.', { tabId: tab.id });
     return true;
   } catch (error) {
     console.warn('Failed to inject content script', error);
+    logDebug('Content script injection failed.', { tabId: tab.id, error: error?.message || String(error) });
     return false;
   }
 }
@@ -454,7 +490,7 @@ async function handleTranslationCancelled(tabId) {
   updateTranslationVisibility(false);
   await updateTranslationVisibilityStorage(false);
   setTemporaryStatus('Перевод для этой страницы отменён.');
-  await chrome.tabs.reload(tabId);
+  await tabsReload(tabId);
 }
 
 function renderStatus() {
@@ -602,15 +638,15 @@ function updateTranslationVisibility(visible) {
 
 async function updateTranslationVisibilityStorage(visible) {
   if (!activeTabId) return;
-  const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
+  const { translationVisibilityByTab = {} } = await storageLocalGet({ translationVisibilityByTab: {} });
   translationVisibilityByTab[activeTabId] = visible;
-  await chrome.storage.local.set({ translationVisibilityByTab });
+  await storageLocalSet({ translationVisibilityByTab });
 }
 
 async function clearTranslationStatus(tabId) {
-  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
   delete translationStatusByTab[tabId];
-  await chrome.storage.local.set({ translationStatusByTab });
+  await storageLocalSet({ translationStatusByTab });
   if (activeTabId === tabId) {
     currentTranslationStatus = null;
     updateCanShowTranslation(currentTranslationStatus);
@@ -620,10 +656,10 @@ async function clearTranslationStatus(tabId) {
 
 async function clearTranslationStorage(url) {
   if (!url) return;
-  const { pageTranslations = {} } = await chrome.storage.local.get({ pageTranslations: {} });
+  const { pageTranslations = {} } = await storageLocalGet({ pageTranslations: {} });
   if (pageTranslations[url]) {
     delete pageTranslations[url];
-    await chrome.storage.local.set({ pageTranslations });
+    await storageLocalSet({ pageTranslations });
   }
 }
 
@@ -631,11 +667,11 @@ async function handleOpenDebug() {
   const tab = await getActiveTab();
   if (!tab?.url) {
     const fallbackUrl = chrome.runtime.getURL('debug.html');
-    await chrome.tabs.create({ url: fallbackUrl });
+    await tabsCreate({ url: fallbackUrl });
     return;
   }
   const debugUrl = chrome.runtime.getURL(`debug.html?source=${encodeURIComponent(tab.url)}`);
-  await chrome.tabs.create({ url: debugUrl });
+  await tabsCreate({ url: debugUrl });
 }
 
 async function sendBlockLengthLimitUpdate(blockLengthLimit) {
@@ -657,9 +693,9 @@ async function sendBlockLengthLimitUpdate(blockLengthLimit) {
     updateCanShowTranslation(currentTranslationStatus);
     renderStatus();
     if (activeTabId) {
-      const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
+      const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
       translationStatusByTab[activeTabId] = nextStatus;
-      await chrome.storage.local.set({ translationStatusByTab });
+      await storageLocalSet({ translationStatusByTab });
     }
   }
 }

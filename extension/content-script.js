@@ -23,6 +23,43 @@ let tpmSettings = {
   },
   safetyBufferTokens: 100
 };
+let debugEnabled = false;
+
+const logDebug = createDebugLogger('content', () => debugEnabled);
+
+const DEFAULT_TPM_LIMITS_BY_MODEL = {
+  default: 200000,
+  'gpt-4.1-mini': 200000,
+  'gpt-4.1': 300000,
+  'gpt-4o-mini': 200000,
+  'gpt-4o': 300000,
+  'o4-mini': 200000,
+  'deepseek-chat': 200000,
+  'deepseek-reasoner': 100000
+};
+const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
+  translation: 0.6,
+  context: 0.4,
+  proofread: 0.5
+};
+const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
+const DEFAULT_SETTINGS = {
+  apiKey: '',
+  deepseekApiKey: '',
+  translationModel: 'gpt-4.1-mini',
+  contextModel: 'gpt-4.1-mini',
+  proofreadModel: 'gpt-4.1-mini',
+  contextGenerationEnabled: false,
+  proofreadEnabled: false,
+  blockLengthLimit: 1200,
+  tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
+  outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS,
+  debug: false
+};
+
+const storageLocalGet = (keys) => chromeApi.storageGet('local', keys);
+const storageLocalSet = (items) => chromeApi.storageSet('local', items);
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
@@ -115,33 +152,168 @@ async function startTranslation() {
 }
 
 async function requestSettings() {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'GET_SETTINGS', url: location.href }, (response) => {
-      if (chrome.runtime.lastError) {
-        console.error('Failed to reach extension background script.', chrome.runtime.lastError.message);
-        resolve({
-          allowed: false,
-          disallowedReason:
-            'Не удалось связаться с фоном расширения. Перезагрузите вкладку или расширение.'
-        });
-        return;
-      }
-      if (response) {
-        resolve(response);
-        return;
-      }
-      console.warn('Settings response is empty without runtime error.');
-      if (!response) {
-        resolve({
-          allowed: false,
-          disallowedReason:
-            'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.'
-        });
-        return;
-      }
-      resolve(response);
-    });
+  if (!debugEnabled) {
+    try {
+      const { debug } = await storageLocalGet(['debug']);
+      debugEnabled = Boolean(debug);
+    } catch (error) {
+      // ignore storage debug lookup errors
+    }
+  }
+  const payload = { type: 'GET_SETTINGS', url: location.href };
+  const { result, lastError } = await chromeApi.sendMessageSafe(payload);
+  const runtimeError = lastError?.message || null;
+  logDebug('GET_SETTINGS response.', {
+    url: location.href,
+    response: result || null,
+    runtimeError
   });
+
+  if (runtimeError) {
+    console.error('Failed to reach extension background script.', runtimeError);
+  }
+
+  if (result?.ok && result.settings) {
+    debugEnabled = Boolean(result.settings.debug);
+    return result.settings;
+  }
+
+  if (result?.ok === false) {
+    logDebug('GET_SETTINGS returned error payload.', { error: result.error || null });
+  } else if (!result) {
+    console.warn('Settings response is empty without runtime error.');
+  }
+
+  const fallback = await loadSettingsFromStorage(runtimeError || result?.error);
+  debugEnabled = Boolean(fallback.debug);
+  return fallback;
+}
+
+function isDeepseekModel(model = '') {
+  return model.startsWith('deepseek');
+}
+
+function getApiConfigForModel(model, state) {
+  if (isDeepseekModel(model)) {
+    return {
+      apiKey: state.deepseekApiKey,
+      provider: 'deepseek'
+    };
+  }
+
+  return {
+    apiKey: state.apiKey,
+    provider: 'openai'
+  };
+}
+
+function getProviderLabel(provider) {
+  return provider === 'deepseek' ? 'DeepSeek' : 'OpenAI';
+}
+
+function buildMissingKeyReason(roleLabel, config, model) {
+  const providerLabel = getProviderLabel(config.provider);
+  return `Перевод недоступен: укажите ключ ${providerLabel} для модели ${model} (${roleLabel}).`;
+}
+
+function getTpmLimitForModel(model, tpmLimitsByModel) {
+  if (!tpmLimitsByModel || typeof tpmLimitsByModel !== 'object') {
+    return DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  }
+  const fallback = tpmLimitsByModel.default ?? DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  return tpmLimitsByModel[model] ?? fallback;
+}
+
+async function loadSettingsFromStorage(errorMessage) {
+  const keys = [
+    'apiKey',
+    'deepseekApiKey',
+    'translationModel',
+    'contextModel',
+    'proofreadModel',
+    'contextGenerationEnabled',
+    'proofreadEnabled',
+    'blockLengthLimit',
+    'chunkLengthLimit',
+    'model',
+    'tpmLimitsByModel',
+    'outputRatioByRole',
+    'tpmSafetyBufferTokens',
+    'debug'
+  ];
+  let stored = {};
+  try {
+    stored = await storageLocalGet(keys);
+  } catch (error) {
+    logDebug('Storage fallback failed.', { error: error?.message || String(error) });
+    return buildSettingsFromStoredData({}, 'defaults', errorMessage);
+  }
+
+  const hasStoredData = keys.some((key) => stored[key] !== undefined);
+  const source = hasStoredData ? 'storage' : 'defaults';
+  return buildSettingsFromStoredData(stored, source, errorMessage);
+}
+
+function buildSettingsFromStoredData(stored, source, errorMessage) {
+  const merged = { ...DEFAULT_SETTINGS, ...stored };
+  if (!merged.blockLengthLimit && stored.chunkLengthLimit) {
+    merged.blockLengthLimit = stored.chunkLengthLimit;
+  }
+  if (!merged.translationModel && stored.model) {
+    merged.translationModel = stored.model;
+  }
+  if (!merged.contextModel && stored.model) {
+    merged.contextModel = stored.model;
+  }
+
+  const translationConfig = getApiConfigForModel(merged.translationModel, merged);
+  const contextConfig = getApiConfigForModel(merged.contextModel, merged);
+  const proofreadConfig = getApiConfigForModel(merged.proofreadModel, merged);
+  const hasTranslationKey = Boolean(translationConfig.apiKey);
+  const hasContextKey = Boolean(contextConfig.apiKey);
+  const hasProofreadKey = Boolean(proofreadConfig.apiKey);
+  let disallowedReason = null;
+  if (!hasTranslationKey) {
+    disallowedReason = buildMissingKeyReason('перевод', translationConfig, merged.translationModel);
+  } else if (merged.contextGenerationEnabled && !hasContextKey) {
+    disallowedReason = buildMissingKeyReason('контекст', contextConfig, merged.contextModel);
+  } else if (merged.proofreadEnabled && !hasProofreadKey) {
+    disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, merged.proofreadModel);
+  }
+
+  if (!hasTranslationKey && errorMessage) {
+    disallowedReason =
+      'Перевод недоступен: не удалось получить настройки из фона и хранилища. Проверьте расширение.';
+  }
+
+  const tpmLimitsByRole = {
+    translation: getTpmLimitForModel(merged.translationModel, merged.tpmLimitsByModel),
+    context: getTpmLimitForModel(merged.contextModel, merged.tpmLimitsByModel),
+    proofread: getTpmLimitForModel(merged.proofreadModel, merged.tpmLimitsByModel)
+  };
+
+  return {
+    allowed:
+      hasTranslationKey &&
+      (!merged.contextGenerationEnabled || hasContextKey) &&
+      (!merged.proofreadEnabled || hasProofreadKey),
+    disallowedReason,
+    apiKey: merged.apiKey,
+    translationModel: merged.translationModel,
+    contextModel: merged.contextModel,
+    proofreadModel: merged.proofreadModel,
+    contextGenerationEnabled: merged.contextGenerationEnabled,
+    proofreadEnabled: merged.proofreadEnabled,
+    blockLengthLimit: merged.blockLengthLimit,
+    tpmLimitsByRole,
+    outputRatioByRole: merged.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
+    tpmSafetyBufferTokens:
+      Number.isFinite(merged.tpmSafetyBufferTokens) && merged.tpmSafetyBufferTokens >= 0
+        ? merged.tpmSafetyBufferTokens
+        : DEFAULT_TPM_SAFETY_BUFFER_TOKENS,
+    debug: Boolean(merged.debug),
+    source
+  };
 }
 
 async function translatePage(settings) {
@@ -1320,7 +1492,7 @@ async function saveTranslationsToMemory(entries) {
   const filtered = entries.filter(({ translated }) => translated && translated.trim());
   const existing = await getTranslationsObject();
   existing[location.href] = filtered;
-  await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+  await storageLocalSet({ [STORAGE_KEY]: existing });
 }
 
 async function getStoredTranslations(url) {
@@ -1331,20 +1503,20 @@ async function getStoredTranslations(url) {
 async function clearStoredTranslations(url) {
   const existing = await getTranslationsObject();
   delete existing[url];
-  await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+  await storageLocalSet({ [STORAGE_KEY]: existing });
 }
 
 async function saveTranslationDebugInfo(url, data) {
   if (!url) return;
   const existing = await getTranslationDebugObject();
   existing[url] = data;
-  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  await storageLocalSet({ [DEBUG_STORAGE_KEY]: existing });
 }
 
 async function clearTranslationDebugInfo(url) {
   const existing = await getTranslationDebugObject();
   delete existing[url];
-  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  await storageLocalSet({ [DEBUG_STORAGE_KEY]: existing });
 }
 
 async function resetTranslationDebugInfo(url) {
@@ -1361,7 +1533,7 @@ async function resetTranslationDebugInfo(url) {
     aiRequestCount: 0,
     updatedAt: Date.now()
   };
-  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  await storageLocalSet({ [DEBUG_STORAGE_KEY]: existing });
 }
 
 async function initializeDebugState(blocks, settings = {}) {
@@ -1426,19 +1598,13 @@ async function incrementDebugAiRequestCount() {
 }
 
 async function getTranslationsObject() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get([STORAGE_KEY], (data) => {
-      resolve(data?.[STORAGE_KEY] || {});
-    });
-  });
+  const data = await storageLocalGet([STORAGE_KEY]);
+  return data?.[STORAGE_KEY] || {};
 }
 
 async function getTranslationDebugObject() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get([DEBUG_STORAGE_KEY], (data) => {
-      resolve(data?.[DEBUG_STORAGE_KEY] || {});
-    });
-  });
+  const data = await storageLocalGet([DEBUG_STORAGE_KEY]);
+  return data?.[DEBUG_STORAGE_KEY] || {};
 }
 
 function restoreOriginal(entries) {
