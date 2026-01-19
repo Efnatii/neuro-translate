@@ -1424,12 +1424,35 @@ async function setTranslationVisibility(visible) {
   if (translationVisible) {
     await restoreTranslations();
   } else {
-    const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+    let entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+    if (!entriesToRestore.length) {
+      await hydrateStoredTranslations();
+      entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+    }
     if (entriesToRestore.length) {
       restoreOriginal(entriesToRestore);
     }
   }
   notifyVisibilityChange();
+}
+
+async function hydrateStoredTranslations() {
+  if (activeTranslationEntries.length) return;
+  const storedEntries = await getStoredTranslations(location.href);
+  if (!storedEntries.length) return;
+  activeTranslationEntries = storedEntries.map(({ path, translated, original, originalHash }) => ({
+    path,
+    translated,
+    original,
+    originalHash
+  }));
+  if (!originalSnapshot.length) {
+    originalSnapshot = storedEntries.map(({ path, original, originalHash }) => ({
+      path,
+      original,
+      originalHash
+    }));
+  }
 }
 
 async function restoreTranslations() {
