@@ -93,7 +93,11 @@ async function startTranslation() {
     settings = await requestSettings();
   }
   if (!settings?.allowed) {
-    reportProgress('Перевод недоступен для этой страницы', translationProgress.completedBlocks, translationProgress.totalBlocks);
+    reportProgress(
+      settings?.disallowedReason || 'Перевод недоступен для этой страницы',
+      translationProgress.completedBlocks,
+      translationProgress.totalBlocks
+    );
     return;
   }
 
@@ -113,6 +117,14 @@ async function startTranslation() {
 async function requestSettings() {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: 'GET_SETTINGS', url: location.href }, (response) => {
+      if (!response) {
+        resolve({
+          allowed: false,
+          disallowedReason:
+            'Перевод недоступен: не удалось получить настройки. Проверьте ключ API и перезагрузите страницу.'
+        });
+        return;
+      }
       resolve(response);
     });
   });

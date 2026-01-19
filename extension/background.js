@@ -82,6 +82,15 @@ function getTpmLimitForModel(model, tpmLimitsByModel) {
   return tpmLimitsByModel[model] ?? fallback;
 }
 
+function getProviderLabel(provider) {
+  return provider === 'deepseek' ? 'DeepSeek' : 'OpenAI';
+}
+
+function buildMissingKeyReason(roleLabel, config, model) {
+  const providerLabel = getProviderLabel(config.provider);
+  return `Перевод недоступен: укажите ключ ${providerLabel} для модели ${model} (${roleLabel}).`;
+}
+
 async function getState() {
   const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
   const merged = { ...DEFAULT_STATE, ...stored };
@@ -176,11 +185,20 @@ async function handleGetSettings(message, sendResponse) {
   const hasTranslationKey = Boolean(translationConfig.apiKey);
   const hasContextKey = Boolean(contextConfig.apiKey);
   const hasProofreadKey = Boolean(proofreadConfig.apiKey);
+  let disallowedReason = null;
+  if (!hasTranslationKey) {
+    disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
+  } else if (state.contextGenerationEnabled && !hasContextKey) {
+    disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
+  } else if (state.proofreadEnabled && !hasProofreadKey) {
+    disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
+  }
   sendResponse({
     allowed:
       hasTranslationKey &&
       (!state.contextGenerationEnabled || hasContextKey) &&
       (!state.proofreadEnabled || hasProofreadKey),
+    disallowedReason,
     apiKey: state.apiKey,
     translationModel: state.translationModel,
     contextModel: state.contextModel,
