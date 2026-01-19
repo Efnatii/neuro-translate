@@ -219,7 +219,7 @@ async function handleGetSettings(message, sendResponse) {
     sendResponse({
       allowed: false,
       disallowedReason:
-        'Перевод недоступен: не удалось получить настройки. Проверьте ключ API и перезагрузите страницу.'
+        'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.'
     });
   }
 }
