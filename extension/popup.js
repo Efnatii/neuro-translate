@@ -81,6 +81,7 @@ async function init() {
   renderStatus();
   renderThroughputStatuses();
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
+  await syncTranslationVisibility();
 
   chrome.storage.onChanged.addListener(handleStorageChange);
 
@@ -376,7 +377,10 @@ async function sendTranslateRequest() {
 async function handleToggleTranslationVisibility() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  const nextVisible = !translationVisible;
+  const visibilityInfo = await getTranslationVisibilityFromPage(tab);
+  const currentVisible =
+    visibilityInfo && typeof visibilityInfo.visible === 'boolean' ? visibilityInfo.visible : translationVisible;
+  const nextVisible = !currentVisible;
   const delivered = await sendMessageWithAutoInject(tab, {
     type: 'SET_TRANSLATION_VISIBILITY',
     visible: nextVisible
@@ -386,6 +390,9 @@ async function handleToggleTranslationVisibility() {
   }
   updateTranslationVisibility(nextVisible);
   updateTranslationVisibilityStorage(nextVisible);
+  if (visibilityInfo && typeof visibilityInfo.hasTranslations === 'boolean') {
+    toggleTranslationButton.disabled = !visibilityInfo.hasTranslations;
+  }
   setTemporaryStatus(nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.');
 }
 
@@ -518,6 +525,25 @@ function setTemporaryStatus(message, durationMs = 2500) {
 
 function renderTranslationVisibility(visible) {
   updateTranslationVisibility(Boolean(visible));
+}
+
+async function syncTranslationVisibility() {
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  const visibilityInfo = await getTranslationVisibilityFromPage(tab);
+  if (visibilityInfo && typeof visibilityInfo.visible === 'boolean') {
+    updateTranslationVisibility(visibilityInfo.visible);
+    updateTranslationVisibilityStorage(visibilityInfo.visible);
+  }
+  if (visibilityInfo && typeof visibilityInfo.hasTranslations === 'boolean') {
+    toggleTranslationButton.disabled = !visibilityInfo.hasTranslations;
+  }
+}
+
+async function getTranslationVisibilityFromPage(tab) {
+  const response = await sendMessageWithAutoInjectAndResponse(tab, { type: 'GET_TRANSLATION_VISIBILITY' });
+  if (!response) return null;
+  return response;
 }
 
 function updateTranslationVisibility(visible) {
