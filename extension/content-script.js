@@ -480,24 +480,16 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
   await incrementDebugAiRequestCount();
   return withRateLimitRetry(
     () =>
-      new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage(
-          {
-            type: 'TRANSLATE_TEXT',
-            texts,
-            targetLanguage,
-            context,
-            keepPunctuationTokens
-          },
-          (response) => {
-            if (response?.success) {
-              resolve(response);
-            } else {
-              reject(new Error(response?.error || 'Не удалось выполнить перевод.'));
-            }
-          }
-        );
-      }),
+      sendRuntimeMessage(
+        {
+          type: 'TRANSLATE_TEXT',
+          texts,
+          targetLanguage,
+          context,
+          keepPunctuationTokens
+        },
+        'Не удалось выполнить перевод.'
+      ),
     'Translation'
   );
 }
@@ -511,30 +503,41 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
   await ensureTpmBudget('proofread', estimatedTokens);
   await incrementDebugAiRequestCount();
   return withRateLimitRetry(
-    () =>
-      new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage(
-          {
-            type: 'PROOFREAD_TEXT',
-            texts,
-            targetLanguage,
-            context,
-            sourceTexts
-          },
-          (response) => {
-            if (response?.success) {
-              resolve({
-                replacements: normalizeProofreadReplacements(response.replacements),
-                rawProofread: response.rawProofread || ''
-              });
-            } else {
-              reject(new Error(response?.error || 'Не удалось выполнить вычитку.'));
-            }
-          }
-        );
-      }),
+    async () => {
+      const response = await sendRuntimeMessage(
+        {
+          type: 'PROOFREAD_TEXT',
+          texts,
+          targetLanguage,
+          context,
+          sourceTexts
+        },
+        'Не удалось выполнить вычитку.'
+      );
+      return {
+        replacements: normalizeProofreadReplacements(response.replacements),
+        rawProofread: response.rawProofread || ''
+      };
+    },
     'Proofreading'
   );
+}
+
+function sendRuntimeMessage(payload, fallbackError) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(payload, (response) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(new Error(runtimeError.message || fallbackError));
+        return;
+      }
+      if (response?.success) {
+        resolve(response);
+        return;
+      }
+      reject(new Error(response?.error || fallbackError));
+    });
+  });
 }
 
 function parseRateLimitDelayMs(error) {
@@ -720,22 +723,15 @@ async function requestTranslationContext(text, targetLanguage) {
   });
   await ensureTpmBudget('context', estimatedTokens);
   await incrementDebugAiRequestCount();
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
-      {
-        type: 'GENERATE_CONTEXT',
-        text,
-        targetLanguage
-      },
-      (response) => {
-        if (response?.success) {
-          resolve(response.context || '');
-        } else {
-          reject(new Error(response?.error || 'Не удалось сгенерировать контекст.'));
-        }
-      }
-    );
-  });
+  const response = await sendRuntimeMessage(
+    {
+      type: 'GENERATE_CONTEXT',
+      text,
+      targetLanguage
+    },
+    'Не удалось сгенерировать контекст.'
+  );
+  return response.context || '';
 }
 
 function deduplicateTexts(texts) {
