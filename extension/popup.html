@@ -141,6 +141,21 @@
       font-size: 11px;
       color: var(--text-muted);
     }
+    .throughput-details {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .throughput-details > summary {
+      font-size: 11px;
+      color: var(--text-secondary);
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+    }
+    .throughput-details > summary::-webkit-details-marker {
+      display: none;
+    }
     .throughput-item {
       display: flex;
       justify-content: space-between;
@@ -268,20 +283,23 @@
         </div>
         <div class="status-text" id="status">Статус: перевод не выполняется.</div>
       </div>
-      <div class="throughput-list" aria-label="Тесты ИИ">
-        <div class="throughput-item">
-          <span>Перевод</span>
-          <span id="translationThroughput">Тест не запускался</span>
+      <details class="throughput-details">
+        <summary>Пропускная способность</summary>
+        <div class="throughput-list" aria-label="Тесты ИИ">
+          <div class="throughput-item">
+            <span>Перевод</span>
+            <span id="translationThroughput">Тест не запускался</span>
+          </div>
+          <div class="throughput-item">
+            <span>Контекст</span>
+            <span id="contextThroughput">Тест не запускался</span>
+          </div>
+          <div class="throughput-item">
+            <span>Вычитка</span>
+            <span id="proofreadThroughput">Тест не запускался</span>
+          </div>
         </div>
-        <div class="throughput-item">
-          <span>Контекст</span>
-          <span id="contextThroughput">Тест не запускался</span>
-        </div>
-        <div class="throughput-item">
-          <span>Вычитка</span>
-          <span id="proofreadThroughput">Тест не запускался</span>
-        </div>
-      </div>
+      </details>
     </div>
     <div class="section">
       <div class="row">
