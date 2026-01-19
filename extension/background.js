@@ -753,8 +753,7 @@ async function performTranslationRequest(
     throw new Error('No translation returned');
   }
 
-  const parsed = parseJsonArrayStrict(content, texts.length, 'translation');
-  const translations = parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
+  const translations = parseJsonArrayFlexible(content, texts.length, 'translation');
   const refusalIndices = translations
     .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
     .filter((value) => Number.isInteger(value));
@@ -1083,6 +1082,22 @@ function parseJsonArrayStrict(content, expectedLength, label = 'response') {
   }
 
   const normalizedArray = parsed.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
+  if (expectedLength && normalizedArray.length !== expectedLength) {
+    throw new Error(`${label} response length mismatch: expected ${expectedLength}, got ${normalizedArray.length}`);
+  }
+
+  return normalizedArray;
+}
+
+function parseJsonArrayFlexible(content, expectedLength, label = 'response') {
+  try {
+    return parseJsonArrayStrict(content, expectedLength, label);
+  } catch (error) {
+    console.warn(`${label} response strict parsing failed; attempting to extract JSON array.`, error);
+  }
+
+  const extracted = extractJsonArray(content, label);
+  const normalizedArray = extracted.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
   if (expectedLength && normalizedArray.length !== expectedLength) {
     throw new Error(`${label} response length mismatch: expected ${expectedLength}, got ${normalizedArray.length}`);
   }
