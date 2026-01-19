@@ -69,7 +69,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const storedEntries = activeTranslationEntries.length
           ? []
           : await getStoredTranslations(location.href);
-        const hasTranslations = Boolean(activeTranslationEntries.length || storedEntries.length);
+        const hasTranslations = Boolean(
+          translationInProgress ||
+          activeTranslationEntries.length ||
+          storedEntries.length ||
+          originalSnapshot.length
+        );
         if (typeof sendResponse === 'function') {
           sendResponse({ visible: translationVisible, hasTranslations });
         }
