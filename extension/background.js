@@ -78,8 +78,8 @@ function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
   );
 }
 
-function isDeepseekModel(model = '') {
-  return model.startsWith('deepseek');
+function isDeepseekModel(model) {
+  return typeof model === 'string' && model.startsWith('deepseek');
 }
 
 function getApiConfigForModel(model, state) {
@@ -128,6 +128,29 @@ async function getState() {
     if (!merged.contextModel && merged.model) {
       merged.contextModel = merged.model;
     }
+    const normalizeModel = (value, fallback) =>
+      typeof value === 'string' && value.length > 0 ? value : fallback;
+    merged.translationModel = normalizeModel(
+      merged.translationModel,
+      DEFAULT_STATE.translationModel
+    );
+    merged.contextModel = normalizeModel(merged.contextModel, DEFAULT_STATE.contextModel);
+    merged.proofreadModel = normalizeModel(merged.proofreadModel, DEFAULT_STATE.proofreadModel);
+
+    const migration = {};
+    if (stored.translationModel === null) {
+      migration.translationModel = merged.translationModel;
+    }
+    if (stored.contextModel === null) {
+      migration.contextModel = merged.contextModel;
+    }
+    if (stored.proofreadModel === null) {
+      migration.proofreadModel = merged.proofreadModel;
+    }
+    if (Object.keys(migration).length > 0) {
+      await setStorage(migration);
+    }
+
     return merged;
   } catch (error) {
     console.warn('Failed to load storage state.', error);
