@@ -36,30 +36,6 @@ let currentProofreadModelId = null;
 let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
 
-function getStorage(keys) {
-  return new Promise((resolve, reject) => {
-    chrome.storage.local.get(keys, (data) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message || 'Storage access failed'));
-        return;
-      }
-      resolve(data);
-    });
-  });
-}
-
-function setStorage(items) {
-  return new Promise((resolve, reject) => {
-    chrome.storage.local.set(items, () => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message || 'Storage write failed'));
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.45 },
   { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', price: 0.5 },
@@ -131,13 +107,8 @@ function handleApiKeyChange() {
   clearTimeout(keySaveTimeout);
   const apiKey = apiKeyInput.value.trim();
   keySaveTimeout = setTimeout(async () => {
-    try {
-      await setStorage({ apiKey });
-      setTemporaryStatus('API ключ сохранён.');
-    } catch (error) {
-      console.warn('Failed to save API key.', error);
-      setTemporaryStatus('Не удалось сохранить API ключ.');
-    }
+    await chrome.storage.local.set({ apiKey });
+    setTemporaryStatus('API ключ сохранён.');
   }, 300);
 }
 
@@ -145,21 +116,16 @@ function handleDeepseekApiKeyChange() {
   clearTimeout(deepseekKeySaveTimeout);
   const deepseekApiKey = deepseekApiKeyInput.value.trim();
   deepseekKeySaveTimeout = setTimeout(async () => {
-    try {
-      await setStorage({ deepseekApiKey });
-      setTemporaryStatus('DeepSeek ключ сохранён.');
-    } catch (error) {
-      console.warn('Failed to save DeepSeek API key.', error);
-      setTemporaryStatus('Не удалось сохранить DeepSeek ключ.');
-    }
+    await chrome.storage.local.set({ deepseekApiKey });
+    setTemporaryStatus('DeepSeek ключ сохранён.');
   }, 300);
 }
 
 async function handleTranslationModelChange() {
   const translationModel = translationModelSelect.value;
-  await setStorage({ translationModel });
+  await chrome.storage.local.set({ translationModel });
   currentTranslationModelId = translationModel;
-  const { modelThroughputById = {} } = await getStorage({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
   currentThroughputByRole.translation = modelThroughputById[translationModel] || null;
   renderStatus();
   renderThroughputStatuses();
@@ -169,9 +135,9 @@ async function handleTranslationModelChange() {
 
 async function handleContextModelChange() {
   const contextModel = contextModelSelect.value;
-  await setStorage({ contextModel });
+  await chrome.storage.local.set({ contextModel });
   currentContextModelId = contextModel;
-  const { modelThroughputById = {} } = await getStorage({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
   currentThroughputByRole.context = modelThroughputById[contextModel] || null;
   renderThroughputStatuses();
   setTemporaryStatus('Модель для контекста сохранена.');
@@ -180,9 +146,9 @@ async function handleContextModelChange() {
 
 async function handleProofreadModelChange() {
   const proofreadModel = proofreadModelSelect.value;
-  await setStorage({ proofreadModel });
+  await chrome.storage.local.set({ proofreadModel });
   currentProofreadModelId = proofreadModel;
-  const { modelThroughputById = {} } = await getStorage({ modelThroughputById: {} });
+  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
   currentThroughputByRole.proofread = modelThroughputById[proofreadModel] || null;
   renderThroughputStatuses();
   setTemporaryStatus('Модель для вычитки сохранена.');
@@ -191,7 +157,7 @@ async function handleProofreadModelChange() {
 
 async function handleContextGenerationChange() {
   const contextGenerationEnabled = contextGenerationCheckbox.checked;
-  await setStorage({ contextGenerationEnabled });
+  await chrome.storage.local.set({ contextGenerationEnabled });
   setTemporaryStatus(
     contextGenerationEnabled ? 'Генерация контекста включена.' : 'Генерация контекста отключена.'
   );
@@ -199,13 +165,13 @@ async function handleContextGenerationChange() {
 
 async function handleProofreadEnabledChange() {
   const proofreadEnabled = proofreadEnabledCheckbox.checked;
-  await setStorage({ proofreadEnabled });
+  await chrome.storage.local.set({ proofreadEnabled });
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
 async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
-  await setStorage({ blockLengthLimit });
+  await chrome.storage.local.set({ blockLengthLimit });
   renderBlockLengthLimit(blockLengthLimit);
   setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
   await sendBlockLengthLimitUpdate(blockLengthLimit);
@@ -218,51 +184,39 @@ async function handleBlockLengthLimitCommit() {
 }
 
 async function getState() {
-  try {
-    const data = await getStorage([
-      'apiKey',
-      'model',
-      'deepseekApiKey',
-      'translationModel',
-      'contextModel',
-      'proofreadModel',
-      'contextGenerationEnabled',
-      'proofreadEnabled',
-      'blockLengthLimit',
-      'chunkLengthLimit',
-      'translationStatusByTab',
-      'translationVisibilityByTab',
-      'modelThroughputById'
-    ]);
-    return {
-      apiKey: data.apiKey || '',
-      deepseekApiKey: data.deepseekApiKey || '',
-      translationModel: data.translationModel || data.model,
-      contextModel: data.contextModel || data.model,
-      proofreadModel: data.proofreadModel || data.model,
-      contextGenerationEnabled: data.contextGenerationEnabled,
-      proofreadEnabled: data.proofreadEnabled,
-      blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
-      translationStatusByTab: data.translationStatusByTab || {},
-      translationVisibilityByTab: data.translationVisibilityByTab || {},
-      modelThroughputById: data.modelThroughputById || {}
-    };
-  } catch (error) {
-    console.warn('Failed to load popup state.', error);
-    return {
-      apiKey: '',
-      deepseekApiKey: '',
-      translationModel: null,
-      contextModel: null,
-      proofreadModel: null,
-      contextGenerationEnabled: false,
-      proofreadEnabled: false,
-      blockLengthLimit: null,
-      translationStatusByTab: {},
-      translationVisibilityByTab: {},
-      modelThroughputById: {}
-    };
-  }
+  return new Promise((resolve) => {
+    chrome.storage.local.get(
+      [
+        'apiKey',
+        'model',
+        'deepseekApiKey',
+        'translationModel',
+        'contextModel',
+        'proofreadModel',
+        'contextGenerationEnabled',
+        'proofreadEnabled',
+        'blockLengthLimit',
+        'chunkLengthLimit',
+        'translationStatusByTab',
+        'translationVisibilityByTab',
+        'modelThroughputById'
+      ],
+      (data) => {
+      resolve({
+        apiKey: data.apiKey || '',
+        deepseekApiKey: data.deepseekApiKey || '',
+        translationModel: data.translationModel || data.model,
+        contextModel: data.contextModel || data.model,
+        proofreadModel: data.proofreadModel || data.model,
+        contextGenerationEnabled: data.contextGenerationEnabled,
+        proofreadEnabled: data.proofreadEnabled,
+        blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
+        translationStatusByTab: data.translationStatusByTab || {},
+        translationVisibilityByTab: data.translationVisibilityByTab || {},
+        modelThroughputById: data.modelThroughputById || {}
+      });
+    });
+  });
 }
 
 function renderModelOptions(select, selected) {
@@ -648,15 +602,15 @@ function updateTranslationVisibility(visible) {
 
 async function updateTranslationVisibilityStorage(visible) {
   if (!activeTabId) return;
-  const { translationVisibilityByTab = {} } = await getStorage({ translationVisibilityByTab: {} });
+  const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
   translationVisibilityByTab[activeTabId] = visible;
-  await setStorage({ translationVisibilityByTab });
+  await chrome.storage.local.set({ translationVisibilityByTab });
 }
 
 async function clearTranslationStatus(tabId) {
-  const { translationStatusByTab = {} } = await getStorage({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
   delete translationStatusByTab[tabId];
-  await setStorage({ translationStatusByTab });
+  await chrome.storage.local.set({ translationStatusByTab });
   if (activeTabId === tabId) {
     currentTranslationStatus = null;
     updateCanShowTranslation(currentTranslationStatus);
@@ -666,10 +620,10 @@ async function clearTranslationStatus(tabId) {
 
 async function clearTranslationStorage(url) {
   if (!url) return;
-  const { pageTranslations = {} } = await getStorage({ pageTranslations: {} });
+  const { pageTranslations = {} } = await chrome.storage.local.get({ pageTranslations: {} });
   if (pageTranslations[url]) {
     delete pageTranslations[url];
-    await setStorage({ pageTranslations });
+    await chrome.storage.local.set({ pageTranslations });
   }
 }
 
@@ -703,9 +657,9 @@ async function sendBlockLengthLimitUpdate(blockLengthLimit) {
     updateCanShowTranslation(currentTranslationStatus);
     renderStatus();
     if (activeTabId) {
-      const { translationStatusByTab = {} } = await getStorage({ translationStatusByTab: {} });
+      const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
       translationStatusByTab[activeTabId] = nextStatus;
-      await setStorage({ translationStatusByTab });
+      await chrome.storage.local.set({ translationStatusByTab });
     }
   }
 }
