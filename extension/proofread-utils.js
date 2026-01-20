@@ -1,24 +1,17 @@
 (() => {
   const MAX_PROOFREAD_EDITS = 30;
-  const PLACEHOLDER_PATTERN = /⟦[^\]]+⟧/;
-  const ZERO_WIDTH_PATTERN = /[\u200B-\u200D\uFEFF]/;
-  const UNUSUAL_CHAR_LABELS = new Map([
-    ['\u00A0', 'NBSP'],
-    ['\u200B', 'ZWSP'],
-    ['\u200C', 'ZWNJ'],
-    ['\u200D', 'ZWJ'],
-    ['\uFEFF', 'ZWNBSP'],
-    ['\u2013', 'EN DASH'],
-    ['\u2014', 'EM DASH'],
-    ['\u2015', 'HORIZONTAL BAR'],
-    ['\u2212', 'MINUS SIGN'],
-    ['\u2018', 'LEFT SINGLE QUOTE'],
-    ['\u2019', 'RIGHT SINGLE QUOTE'],
-    ['\u201C', 'LEFT DOUBLE QUOTE'],
-    ['\u201D', 'RIGHT DOUBLE QUOTE'],
-    ['\u00AB', 'LEFT ANGLE QUOTE'],
-    ['\u00BB', 'RIGHT ANGLE QUOTE']
-  ]);
+  const PLACEHOLDER_PATTERN = /⟦[^⟧]*⟧/;
+  const ZERO_WIDTH_CHARS = new Set(['\u200B', '\u200C', '\u200D', '\uFEFF']);
+  const WHITESPACE_PATTERN =
+    /[\s\u00A0\u202F\u2009\u200A\u1680\u2000-\u2008\u2028\u2029\u205F\u3000]/;
+
+  function isZeroWidth(char) {
+    return ZERO_WIDTH_CHARS.has(char);
+  }
+
+  function isWhitespace(char) {
+    return WHITESPACE_PATTERN.test(char);
+  }
 
   function detectLineEnding(text = '') {
     if (text.includes('\r\n')) return '\r\n';
@@ -32,13 +25,58 @@
     return { normalized, lineEnding };
   }
 
-  function restoreLineEndings(text = '', lineEnding = '\n') {
-    if (lineEnding === '\n') return text;
-    return text.replace(/\n/g, lineEnding);
+  function normalizeWithSpans(text = '', options = {}) {
+    const useNFKC = options.useNFKC !== false;
+    let norm = '';
+    const spans = [];
+    let index = 0;
+
+    while (index < text.length) {
+      const codePoint = text.codePointAt(index);
+      const char = String.fromCodePoint(codePoint);
+      const charLength = char.length;
+
+      if (isZeroWidth(char)) {
+        index += charLength;
+        continue;
+      }
+
+      if (isWhitespace(char)) {
+        const runStart = index;
+        let runEnd = index + charLength;
+        while (runEnd < text.length) {
+          const nextCodePoint = text.codePointAt(runEnd);
+          const nextChar = String.fromCodePoint(nextCodePoint);
+          const nextLength = nextChar.length;
+          if (isZeroWidth(nextChar)) {
+            runEnd += nextLength;
+            continue;
+          }
+          if (!isWhitespace(nextChar)) break;
+          runEnd += nextLength;
+        }
+        norm += ' ';
+        spans.push({ start: runStart, end: runEnd });
+        index = runEnd;
+        continue;
+      }
+
+      const normalizedChar = useNFKC ? char.normalize('NFKC') : char;
+      if (normalizedChar) {
+        for (let i = 0; i < normalizedChar.length; i += 1) {
+          norm += normalizedChar[i];
+          spans.push({ start: index, end: index + charLength });
+        }
+      }
+
+      index += charLength;
+    }
+
+    return { norm, spans };
   }
 
-  function normalizeForComparison(text = '') {
-    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  function normalizeNeedle(text = '', options = {}) {
+    return normalizeWithSpans(text, options).norm;
   }
 
   function findAllOccurrences(text = '', target = '') {
@@ -54,147 +92,180 @@
     return matches;
   }
 
-  function matchesContext(text, match, before, after) {
+  function countMatchingSuffix(reference = '', snippet = '') {
+    const maxLength = Math.min(reference.length, snippet.length);
+    let count = 0;
+    for (let i = 1; i <= maxLength; i += 1) {
+      if (reference[reference.length - i] !== snippet[snippet.length - i]) break;
+      count += 1;
+    }
+    return count;
+  }
+
+  function countMatchingPrefix(reference = '', snippet = '') {
+    const maxLength = Math.min(reference.length, snippet.length);
+    let count = 0;
+    for (let i = 0; i < maxLength; i += 1) {
+      if (reference[i] !== snippet[i]) break;
+      count += 1;
+    }
+    return count;
+  }
+
+  function scoreCandidate(normText, candidate, before, after) {
+    if (!before && !after) return 0;
+    let score = 0;
     if (before) {
-      if (match.start < before.length) return false;
-      const snippet = text.slice(match.start - before.length, match.start);
-      if (snippet !== before) return false;
+      const leftStart = Math.max(0, candidate.start - before.length);
+      const leftSnippet = normText.slice(leftStart, candidate.start);
+      score += countMatchingSuffix(before, leftSnippet);
     }
     if (after) {
-      if (match.end + after.length > text.length) return false;
-      const snippet = text.slice(match.end, match.end + after.length);
-      if (snippet !== after) return false;
+      const rightSnippet = normText.slice(candidate.end, candidate.end + after.length);
+      score += countMatchingPrefix(after, rightSnippet);
     }
-    return true;
+    return score;
   }
 
-  function findCandidates(text, edit) {
-    const target = edit?.target || '';
-    const occurrences = findAllOccurrences(text, target);
-    const before = typeof edit.before === 'string' && edit.before ? edit.before : null;
-    const after = typeof edit.after === 'string' && edit.after ? edit.after : null;
-    if (!before && !after) {
-      return occurrences;
-    }
-    return occurrences.filter((match) => matchesContext(text, match, before, after));
+  function filterByScore(candidates, before, after) {
+    if (!before && !after) return candidates;
+    const total = (before?.length || 0) + (after?.length || 0);
+    const minScore = Math.max(1, Math.floor(total * 0.25));
+    return candidates.filter((candidate) => candidate.score >= minScore);
   }
 
-  function hasContext(edit) {
-    return Boolean(
-      (typeof edit.before === 'string' && edit.before) || (typeof edit.after === 'string' && edit.after)
-    );
-  }
+  function findCandidates(text, edit, options = {}) {
+    const target = typeof edit?.target === 'string' ? edit.target : '';
+    if (!target) return [];
+    const normalizedText = options.normalizedText ?? normalizeWithSpans(text).norm;
+    const normalizedTarget = normalizeNeedle(target);
+    if (!normalizedTarget) return [];
 
-  function validateEditShape(edit) {
-    if (!edit || typeof edit !== 'object') {
-      return { valid: false, reason: 'invalid_edit' };
-    }
-    const op = edit.op;
-    const validOps = new Set(['replace', 'insert_before', 'insert_after', 'delete']);
-    if (!validOps.has(op)) {
-      return { valid: false, reason: 'invalid_op' };
-    }
-    if (typeof edit.target !== 'string' || !edit.target) {
-      return { valid: false, reason: 'missing_target' };
-    }
-    if (op === 'replace' || op === 'insert_before' || op === 'insert_after') {
-      if (typeof edit.replacement !== 'string') {
-        return { valid: false, reason: 'missing_replacement' };
-      }
-    }
-    return { valid: true };
+    const before =
+      typeof edit?.before === 'string' && edit.before ? normalizeNeedle(edit.before) : null;
+    const after = typeof edit?.after === 'string' && edit.after ? normalizeNeedle(edit.after) : null;
+
+    const occurrences = findAllOccurrences(normalizedText, normalizedTarget);
+    const scored = occurrences.map((candidate) => ({
+      ...candidate,
+      score: scoreCandidate(normalizedText, candidate, before, after)
+    }));
+
+    return filterByScore(scored, before, after);
   }
 
   function hasPlaceholder(text) {
     return PLACEHOLDER_PATTERN.test(text);
   }
 
-  function isNoOp(edit) {
-    if (typeof edit.replacement !== 'string') return false;
-    const normalizedTarget = normalizeForComparison(edit.target);
-    const normalizedReplacement = normalizeForComparison(edit.replacement);
-    return normalizedTarget === normalizedReplacement;
-  }
-
-  function buildEditSpan(edit, match, index) {
-    const op = edit.op;
-    let start = match.start;
-    let end = match.end;
-    let replacement = edit.replacement;
-    if (op === 'insert_before') {
-      start = match.start;
-      end = match.start;
-    }
-    if (op === 'insert_after') {
-      start = match.end;
-      end = match.end;
-    }
-    if (op === 'delete') {
-      replacement = '';
-    }
-    return {
-      edit,
-      start,
-      end,
-      replacement: replacement ?? '',
-      index
-    };
-  }
-
-  function buildFailed(edit, reason, detail) {
-    return detail ? { edit, reason, detail } : { edit, reason };
-  }
-
-  function resolveOccurrence(edit, candidates) {
-    if (!candidates.length) return null;
-    if (candidates.length === 1) return candidates[0];
-    if (!Number.isInteger(edit.occurrence)) return null;
-    const occurrence = edit.occurrence;
-    if (occurrence < 1 || occurrence > candidates.length) return null;
-    return candidates[occurrence - 1];
-  }
-
-  function collectEditSpans(edits, text) {
-    const spans = [];
+  function validateEdits(text, edits) {
+    const validEdits = [];
+    const skipped = [];
     const failed = [];
+    const normalizedText = normalizeWithSpans(text).norm;
+    const fallbackReasons = new Set(['model_violation', 'ambiguous', 'not_found', 'overlap']);
+
     if (!Array.isArray(edits) || !edits.length) {
-      return { spans, failed };
+      return { validEdits, skipped, failed, fallbackReasons };
     }
 
-    edits.forEach((edit, index) => {
-      const shapeCheck = validateEditShape(edit);
-      if (!shapeCheck.valid) {
-        failed.push(buildFailed(edit, shapeCheck.reason));
+    edits.forEach((edit) => {
+      if (!edit || typeof edit !== 'object') {
+        failed.push({ edit, reason: 'invalid_edit' });
         return;
       }
-      if (hasPlaceholder(edit.target)) {
-        failed.push(buildFailed(edit, 'model_violation', 'placeholder_target'));
+      const op = edit.op;
+      const validOps = new Set(['replace', 'insert_before', 'insert_after', 'delete']);
+      if (!validOps.has(op)) {
+        failed.push({ edit, reason: 'invalid_op' });
         return;
       }
-      if (isNoOp(edit)) {
-        failed.push(buildFailed(edit, 'no_op'));
+
+      const target = typeof edit.target === 'string' ? edit.target : '';
+      const replacement = typeof edit.replacement === 'string' ? edit.replacement : null;
+      const before = typeof edit.before === 'string' ? edit.before : '';
+      const after = typeof edit.after === 'string' ? edit.after : '';
+
+      if (!target) {
+        failed.push({ edit, reason: 'model_violation', detail: 'missing_target' });
         return;
       }
-      if (!text.includes(edit.target)) {
-        failed.push(buildFailed(edit, 'model_violation', 'target_not_found'));
+
+      if ([target, before, after, replacement].some((value) => typeof value === 'string' && hasPlaceholder(value))) {
+        failed.push({ edit, reason: 'model_violation', detail: 'placeholder' });
         return;
       }
-      const candidates = findCandidates(text, edit);
-      if (candidates.length > 1 && !hasContext(edit)) {
-        failed.push(buildFailed(edit, 'model_violation', 'missing_context'));
+
+      if (op === 'replace' && typeof replacement !== 'string') {
+        failed.push({ edit, reason: 'model_violation', detail: 'missing_replacement' });
         return;
       }
-      const match = resolveOccurrence(edit, candidates);
-      if (!match) {
-        failed.push(
-          buildFailed(edit, candidates.length ? 'ambiguous' : 'target_not_found')
-        );
+      if ((op === 'insert_before' || op === 'insert_after') && typeof replacement !== 'string') {
+        failed.push({ edit, reason: 'model_violation', detail: 'missing_replacement' });
         return;
       }
-      spans.push(buildEditSpan(edit, match, index));
+
+      if (op === 'replace' && typeof replacement === 'string') {
+        const normalizedTarget = normalizeNeedle(target);
+        const normalizedReplacement = normalizeNeedle(replacement);
+        if (normalizedTarget === normalizedReplacement) {
+          skipped.push({ edit, reason: 'no_op' });
+          return;
+        }
+      }
+
+      const normalizedTarget = normalizeNeedle(target);
+      if (!normalizedTarget) {
+        failed.push({ edit, reason: 'model_violation', detail: 'empty_target' });
+        return;
+      }
+
+      const candidates = findCandidates(text, edit, { normalizedText });
+      if (!candidates.length) {
+        failed.push({ edit, reason: 'not_found' });
+        return;
+      }
+
+      let chosen = null;
+      if (Number.isInteger(edit.occurrence)) {
+        const occurrence = edit.occurrence;
+        if (occurrence < 1 || occurrence > candidates.length) {
+          failed.push({ edit, reason: 'invalid_occurrence' });
+          return;
+        }
+        chosen = candidates[occurrence - 1];
+      } else if (candidates.length === 1) {
+        chosen = candidates[0];
+      } else {
+        failed.push({ edit, reason: 'ambiguous' });
+        return;
+      }
+
+      validEdits.push({
+        edit,
+        startNorm: chosen.start,
+        endNorm: chosen.end,
+        score: chosen.score
+      });
     });
 
-    return { spans, failed };
+    return { validEdits, skipped, failed, fallbackReasons };
+  }
+
+  function resolveOriginalRange(spans, startNorm, endNorm, textLength) {
+    if (startNorm < 0 || startNorm > spans.length) {
+      return { start: 0, end: 0 };
+    }
+    if (startNorm === endNorm) {
+      const span = spans[startNorm] || spans[startNorm - 1];
+      const pos = span ? span.end : textLength;
+      return { start: pos, end: pos };
+    }
+    const startSpan = spans[startNorm];
+    const endSpan = spans[endNorm - 1];
+    const start = startSpan ? startSpan.start : textLength;
+    const end = endSpan ? endSpan.end : textLength;
+    return { start, end };
   }
 
   function spansOverlap(a, b) {
@@ -215,51 +286,109 @@
   function rejectOverlaps(spans) {
     const accepted = [];
     const rejected = [];
-    const sorted = [...spans].sort((a, b) => a.index - b.index);
+    const sorted = [...spans].sort((a, b) => {
+      if (a.start !== b.start) return a.start - b.start;
+      return a.end - b.end;
+    });
+
     sorted.forEach((candidate) => {
-      const hasOverlap = accepted.some((existing) => spansOverlap(existing, candidate));
-      if (hasOverlap) {
-        rejected.push(buildFailed(candidate.edit, 'overlap'));
+      const overlapping = accepted.filter((existing) => spansOverlap(existing, candidate));
+      if (!overlapping.length) {
+        accepted.push(candidate);
         return;
       }
-      accepted.push(candidate);
+
+      const highestScore = Math.max(...overlapping.map((item) => item.score ?? 0));
+      const candidateScore = candidate.score ?? 0;
+      if (candidateScore > highestScore) {
+        overlapping.forEach((item) => {
+          rejected.push({ edit: item.edit, reason: 'overlap' });
+          const index = accepted.indexOf(item);
+          if (index >= 0) accepted.splice(index, 1);
+        });
+        accepted.push(candidate);
+      } else {
+        rejected.push({ edit: candidate.edit, reason: 'overlap' });
+      }
     });
+
     return { accepted, rejected };
   }
 
-  function shouldFallback(failed) {
-    return failed.some((item) => item.reason === 'model_violation' || item.reason === 'ambiguous');
-  }
+  function applyEdits(text, edits, rewriteText = null, modelInputText = null) {
+    const mismatch = assertSameInputApply(modelInputText, text);
+    if (modelInputText != null && !mismatch.ok) {
+      return {
+        ok: false,
+        newText: text,
+        applied: [],
+        failed: [{ reason: 'mismatch', detail: mismatch.detail }],
+        skipped: [],
+        usedRewrite: false,
+        mismatch: true
+      };
+    }
 
-  function validateEditsAgainstText(edits, text) {
-    const { normalized } = normalizeLineEndings(text);
-    const { spans, failed } = collectEditSpans(edits, normalized);
-    const applicable = spans.map((span) => ({
+    const { validEdits, skipped, failed, fallbackReasons } = validateEdits(text, edits);
+    const { spans } = normalizeWithSpans(text);
+    const resolvedEdits = validEdits.map((entry) => {
+      const range = resolveOriginalRange(spans, entry.startNorm, entry.endNorm, text.length);
+      let start = range.start;
+      let end = range.end;
+      let replacement = entry.edit.replacement ?? '';
+      if (entry.edit.op === 'insert_before') {
+        start = range.start;
+        end = range.start;
+      }
+      if (entry.edit.op === 'insert_after') {
+        start = range.end;
+        end = range.end;
+      }
+      if (entry.edit.op === 'delete') {
+        replacement = '';
+      }
+      return {
+        edit: entry.edit,
+        start,
+        end,
+        replacement,
+        score: entry.score ?? 0
+      };
+    });
+
+    const { accepted, rejected } = rejectOverlaps(resolvedEdits);
+    const failedEdits = failed.concat(rejected);
+
+    const sortedForApply = [...accepted].sort((a, b) => {
+      if (b.start !== a.start) return b.start - a.start;
+      return b.end - a.end;
+    });
+
+    let output = text;
+    sortedForApply.forEach((span) => {
+      output = output.slice(0, span.start) + span.replacement + output.slice(span.end);
+    });
+
+    const applied = accepted.map((span) => ({
       edit: span.edit,
       start: span.start,
       end: span.end
     }));
-    return {
-      ok: failed.length === 0,
-      applicable,
-      failed
-    };
-  }
 
-  function applyEdits(text, edits, rewriteText = null) {
-    const { normalized, lineEnding } = normalizeLineEndings(text);
-    const { spans, failed } = collectEditSpans(edits, normalized);
-    const { accepted, rejected } = rejectOverlaps(spans);
-    const failedEdits = failed.concat(rejected);
+    const hasFallbackFailure = failedEdits.some((item) => fallbackReasons.has(item.reason));
+    const needsFallback =
+      hasFallbackFailure || (Array.isArray(edits) && edits.length && applied.length === 0);
 
-    if (failedEdits.length && shouldFallback(failedEdits)) {
+    if (needsFallback) {
       if (typeof rewriteText === 'string' && rewriteText) {
         return {
-          ok: false,
+          ok: true,
           newText: rewriteText,
           applied: [],
           failed: failedEdits,
-          usedRewrite: true
+          skipped,
+          usedRewrite: true,
+          ops: computeDiffOps(text, rewriteText)
         };
       }
       return {
@@ -267,98 +396,131 @@
         newText: text,
         applied: [],
         failed: failedEdits,
+        skipped,
         usedRewrite: false
       };
     }
 
-    const sortedForApply = [...accepted].sort((a, b) => {
-      if (b.start !== a.start) return b.start - a.start;
-      return b.end - a.end;
-    });
-
-    let output = normalized;
-    sortedForApply.forEach((span) => {
-      output = output.slice(0, span.start) + span.replacement + output.slice(span.end);
-    });
-
     return {
       ok: failedEdits.length === 0,
-      newText: restoreLineEndings(output, lineEnding),
-      applied: accepted.map((span) => ({
-        edit: span.edit,
-        start: span.start,
-        end: span.end
-      })),
+      newText: output,
+      applied,
       failed: failedEdits,
+      skipped,
       usedRewrite: false
     };
   }
 
-  function normalizeForLooseMatch(text = '') {
-    return text
-      .replace(/\u00A0/g, ' ')
-      .replace(ZERO_WIDTH_PATTERN, '')
-      .replace(/[\u2013\u2014\u2015\u2212]/g, '-')
-      .replace(/[\u2018\u2019]/g, "'")
-      .replace(/[\u201C\u201D\u00AB\u00BB]/g, '"');
+  function computeDiffOps(original = '', rewritten = '') {
+    if (original === rewritten) return [];
+
+    let prefix = 0;
+    const maxPrefix = Math.min(original.length, rewritten.length);
+    while (prefix < maxPrefix && original[prefix] === rewritten[prefix]) {
+      prefix += 1;
+    }
+
+    let suffix = 0;
+    const maxSuffix = Math.min(original.length - prefix, rewritten.length - prefix);
+    while (
+      suffix < maxSuffix &&
+      original[original.length - 1 - suffix] === rewritten[rewritten.length - 1 - suffix]
+    ) {
+      suffix += 1;
+    }
+
+    const originalMid = original.slice(prefix, original.length - suffix);
+    const rewrittenMid = rewritten.slice(prefix, rewritten.length - suffix);
+
+    if (!originalMid && rewrittenMid) {
+      return [{ op: 'insert', start: prefix, end: prefix, text: rewrittenMid }];
+    }
+    if (originalMid && !rewrittenMid) {
+      return [{ op: 'delete', start: prefix, end: prefix + originalMid.length }];
+    }
+    return [
+      {
+        op: 'replace',
+        start: prefix,
+        end: prefix + originalMid.length,
+        text: rewrittenMid
+      }
+    ];
   }
 
-  function buildNormalizationMap(text = '') {
-    let normalized = '';
-    const indexMap = [];
+  function debugString(text = '') {
+    const suspicious = [];
     for (let i = 0; i < text.length; i += 1) {
       const char = text[i];
-      const normalizedChar = normalizeForLooseMatch(char);
-      if (!normalizedChar) {
-        continue;
-      }
-      normalized += normalizedChar;
-      for (let j = 0; j < normalizedChar.length; j += 1) {
-        indexMap.push(i);
+      const code = char.codePointAt(0);
+      if (
+        char === '\u00A0' ||
+        char === '\u202F' ||
+        char === '\u200B' ||
+        char === '\u200D' ||
+        char === '\uFEFF' ||
+        char === '\t' ||
+        char === '\n' ||
+        char === '\r'
+      ) {
+        suspicious.push({
+          index: i,
+          char,
+          code: `U+${code.toString(16).toUpperCase().padStart(4, '0')}`
+        });
       }
     }
-    return { normalized, indexMap };
+    const stringified = JSON.stringify(text);
+    console.log(stringified);
+    console.log(suspicious);
+    return { stringified, suspicious };
   }
 
-  function formatCodePoints(text = '') {
-    return Array.from(text).map((char) => {
-      const codePoint = char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
-      const label = UNUSUAL_CHAR_LABELS.get(char) || '';
-      return `${char} U+${codePoint}${label ? ` (${label})` : ''}`;
-    });
+  function debugMismatch(modelInputText = '', applyText = '', limit = 40) {
+    if (modelInputText === applyText) return { mismatch: false };
+    const max = Math.min(modelInputText.length, applyText.length, limit);
+    const diffs = [];
+    for (let i = 0; i < max; i += 1) {
+      if (modelInputText[i] !== applyText[i]) {
+        diffs.push({
+          index: i,
+          modelChar: modelInputText[i],
+          applyChar: applyText[i],
+          modelCode: `U+${modelInputText.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')}`,
+          applyCode: `U+${applyText.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')}`
+        });
+        if (diffs.length >= limit) break;
+      }
+    }
+    console.warn('Mismatch between modelInputText and applyText', diffs);
+    return { mismatch: true, diffs };
   }
 
-  function debugTargetNotFound(text, target, options = {}) {
-    const contextRadius = Number.isInteger(options.contextRadius) ? options.contextRadius : 20;
-    const maxMatches = Number.isInteger(options.maxMatches) ? options.maxMatches : 5;
-    const { normalized, indexMap } = buildNormalizationMap(text);
-    const normalizedTarget = normalizeForLooseMatch(target);
-    if (!normalizedTarget) {
-      return [];
+  function assertSameInputApply(modelInputText, applyText) {
+    // НЕЛЬЗЯ отправлять модели склеенный блок и применять патчи к runs/leaf-ндам. Выберите один слой и придерживайтесь.
+    if (modelInputText == null || applyText == null) {
+      return { ok: true };
     }
-    const matches = [];
-    let startIndex = 0;
-    while (startIndex <= normalized.length) {
-      const index = normalized.indexOf(normalizedTarget, startIndex);
-      if (index === -1) break;
-      matches.push(index);
-      if (matches.length >= maxMatches) break;
-      startIndex = index + Math.max(1, normalizedTarget.length);
+    if (modelInputText === applyText) {
+      return { ok: true };
     }
+    const details = debugMismatch(modelInputText, applyText);
+    return { ok: false, detail: details };
+  }
 
-    return matches.map((matchIndex) => {
-      const originalStart = indexMap[matchIndex] ?? 0;
-      const originalEndIndex = indexMap[Math.min(matchIndex + normalizedTarget.length - 1, indexMap.length - 1)];
-      const originalEnd = Number.isInteger(originalEndIndex) ? originalEndIndex + 1 : originalStart + 1;
-      const contextStart = Math.max(0, originalStart - contextRadius);
-      const contextEnd = Math.min(text.length, originalEnd + contextRadius);
-      const context = text.slice(contextStart, contextEnd);
-      return {
-        context,
-        contextRange: [contextStart, contextEnd],
-        codePoints: formatCodePoints(context)
-      };
-    });
+  function validateEditsAgainstText(edits, text) {
+    const { validEdits, skipped, failed } = validateEdits(text, edits);
+    const applicable = validEdits.map((entry) => ({
+      edit: entry.edit,
+      start: entry.startNorm,
+      end: entry.endNorm
+    }));
+    return {
+      ok: failed.length === 0,
+      applicable,
+      failed,
+      skipped
+    };
   }
 
   function buildProofreadPrompt(input) {
@@ -378,7 +540,7 @@
           'Keep formatting, whitespace, Markdown, and punctuation tokens unchanged except for local fixes.',
           'Avoid over-editing; keep meaning identical.',
           `Limit to at most ${MAX_PROOFREAD_EDITS} edits per block.`,
-          'If edits are unsafe or ambiguous, return rewrite.text instead.',
+          'If edits are unsafe or ambiguous, return rewrite_text instead.',
           'Never include any extra commentary outside the JSON object.'
         ].join(' ')
       },
@@ -400,11 +562,16 @@
   const api = {
     MAX_PROOFREAD_EDITS,
     applyEdits,
+    assertSameInputApply,
     buildProofreadPrompt,
-    debugTargetNotFound,
+    computeDiffOps,
+    debugMismatch,
+    debugString,
     findCandidates,
     normalizeLineEndings,
-    restoreLineEndings,
+    normalizeNeedle,
+    normalizeWithSpans,
+    validateEdits,
     validateEditsAgainstText
   };
 

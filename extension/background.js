@@ -63,18 +63,11 @@ const PROOFREAD_RESPONSE_SCHEMA = {
           after: { type: 'string' },
           rationale: { type: 'string' }
         },
-        required: ['op', 'target', 'occurrence'],
+        required: ['op', 'target'],
         additionalProperties: false
       }
     },
-    rewrite: {
-      type: 'object',
-      properties: {
-        text: { type: 'string' }
-      },
-      required: ['text'],
-      additionalProperties: false
-    }
+    rewrite_text: { type: 'string' }
   },
   required: ['edits'],
   additionalProperties: false
@@ -533,10 +526,9 @@ async function proofreadTranslation(blocks, apiKey, model = DEFAULT_STATE.proofr
 
         const parsed = parseJsonObjectFlexible(content, 'proofread');
         const edits = Array.isArray(parsed?.edits) ? parsed.edits : [];
-        const rewrite =
-          parsed?.rewrite && typeof parsed.rewrite?.text === 'string' ? { text: parsed.rewrite.text } : null;
+        const rewriteText = typeof parsed?.rewrite_text === 'string' ? parsed.rewrite_text : null;
 
-        results.push({ blockId: block.blockId, edits, rewrite });
+        results.push({ blockId: block.blockId, edits, rewriteText });
         rawProofread.push({ blockId: block.blockId, raw: content });
         break;
       } catch (error) {
