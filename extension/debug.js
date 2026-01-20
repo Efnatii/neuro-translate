@@ -14,6 +14,7 @@ const STATUS_CONFIG = {
 
 let sourceUrl = '';
 let refreshTimer = null;
+const proofreadUiState = new Map();
 
 init();
 
@@ -40,15 +41,38 @@ async function init() {
     entriesEl.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
-      const button = target.closest('[data-action="set-proofread-view"]');
-      if (!button) return;
-      const view = button.getAttribute('data-view');
-      const container = button.closest('.proofread-block');
-      if (!view || !container) return;
-      container.setAttribute('data-proofread-view', view);
-      container.querySelectorAll('[data-action="set-proofread-view"]').forEach((node) => {
-        node.classList.toggle('is-active', node.getAttribute('data-view') === view);
-      });
+      const viewButton = target.closest('[data-action="set-proofread-view"]');
+      if (viewButton) {
+        event.preventDefault();
+        event.stopPropagation();
+        const view = viewButton.getAttribute('data-view');
+        const container = viewButton.closest('.proofread-block');
+        if (!view || !container) return;
+        const entryKey = container.getAttribute('data-proofread-id') || '';
+        const state = proofreadUiState.get(entryKey) || {};
+        proofreadUiState.set(entryKey, { ...state, view });
+        container.setAttribute('data-proofread-view', view);
+        container.querySelectorAll('[data-action="set-proofread-view"]').forEach((node) => {
+          node.classList.toggle('is-active', node.getAttribute('data-view') === view);
+        });
+        return;
+      }
+
+      const expandButton = target.closest('[data-action="toggle-proofread-expand"]');
+      if (expandButton) {
+        event.preventDefault();
+        const container = expandButton.closest('.proofread-block');
+        if (!container) return;
+        const entryKey = container.getAttribute('data-proofread-id') || '';
+        const isExpanded = container.classList.toggle('is-expanded');
+        const state = proofreadUiState.get(entryKey) || {};
+        proofreadUiState.set(entryKey, { ...state, expanded: isExpanded });
+        container.querySelectorAll('.proofread-expand').forEach((button) => {
+          button.setAttribute('aria-expanded', String(isExpanded));
+          button.textContent = isExpanded ? 'Свернуть' : 'Развернуть';
+        });
+        return;
+      }
     });
   }
 
@@ -186,12 +210,13 @@ function renderDebug(url, data) {
   }
 
   entriesEl.innerHTML = '';
-  items.forEach((item) => {
+  items.forEach((item, index) => {
     const entry = document.createElement('div');
     entry.className = 'entry';
     const translationStatus = normalizeStatus(item.translationStatus, item.translated);
     const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
-    const proofreadSection = renderProofreadSection(item);
+    const entryKey = getProofreadEntryKey(item, index);
+    const proofreadSection = renderProofreadSection(item, entryKey);
     entry.innerHTML = `
       <div class="entry-header">
         <h2>Блок ${item.index || ''}</h2>
@@ -283,7 +308,7 @@ function getOverallStatus({ completed, inProgress, failed, total, contextStatus 
   return 'pending';
 }
 
-function renderProofreadSection(item) {
+function renderProofreadSection(item, entryKey) {
   if (item?.proofreadApplied === false) {
     return `
       <div class="block">
@@ -308,26 +333,51 @@ function renderProofreadSection(item) {
     ? renderProofreadSideBySideView(comparisons)
     : '<div class="empty">Нет правок.</div>';
   const finalView = hasComparisons ? renderProofreadFinalView(comparisons) : '<div class="empty">Нет правок.</div>';
+  const defaultView = hasComparisons ? 'diff' : 'final';
+  const state = getProofreadState(entryKey, defaultView);
+  const statusLabel = getProofreadStatusLabel(item);
+  const statusClass = getProofreadStatusClass(item);
+  const latency = getProofreadLatency(item);
+  const changes = getProofreadChangesSummary(comparisons);
+  const isExpanded = Boolean(state.expanded);
+  const showView = state.view || defaultView;
 
   return `
-      <div class="block proofread-block" data-proofread-view="diff">
+      <div class="block proofread-block${isExpanded ? ' is-expanded' : ''}" data-proofread-id="${escapeHtml(entryKey)}" data-proofread-view="${escapeHtml(showView)}">
         <div class="proofread-header">
-          <div class="label">Вычитка</div>
-          <div class="proofread-toggle">
-            <button class="toggle-button is-active" type="button" data-action="set-proofread-view" data-view="diff">
-              Diff
-            </button>
-            <button class="toggle-button" type="button" data-action="set-proofread-view" data-view="side">
-              Два текста рядом
-            </button>
-            <button class="toggle-button" type="button" data-action="set-proofread-view" data-view="final">
-              Только итог
+          <div class="proofread-title">
+            <span class="label">Вычитка</span>
+            <span class="proofread-status ${escapeHtml(statusClass)}">${escapeHtml(statusLabel)}</span>
+            <span class="proofread-metric">${escapeHtml(latency)}</span>
+            <span class="proofread-metric">${escapeHtml(changes)}</span>
+          </div>
+          <div class="proofread-controls">
+            <div class="proofread-toggle">
+              <button class="toggle-button${showView === 'diff' ? ' is-active' : ''}" type="button" data-action="set-proofread-view" data-view="diff">
+                Diff
+              </button>
+              <button class="toggle-button${showView === 'side' ? ' is-active' : ''}" type="button" data-action="set-proofread-view" data-view="side">
+                Side-by-side
+              </button>
+              <button class="toggle-button${showView === 'final' ? ' is-active' : ''}" type="button" data-action="set-proofread-view" data-view="final">
+                Final
+              </button>
+            </div>
+            <button class="proofread-expand" type="button" data-action="toggle-proofread-expand" aria-expanded="${isExpanded}">
+              ${isExpanded ? 'Свернуть' : 'Развернуть'}
             </button>
           </div>
         </div>
-        <div class="proofread-view proofread-view--diff">${diffView}</div>
-        <div class="proofread-view proofread-view--side">${sideBySideView}</div>
-        <div class="proofread-view proofread-view--final">${finalView}</div>
+        <div class="proofread-body">
+          <div class="proofread-view proofread-view--diff">${diffView}</div>
+          <div class="proofread-view proofread-view--side">${sideBySideView}</div>
+          <div class="proofread-view proofread-view--final">${finalView}</div>
+          <div class="proofread-preview-overlay">
+            <button class="proofread-preview-button" type="button" data-action="toggle-proofread-expand">
+              Показать полностью
+            </button>
+          </div>
+        </div>
       </div>
       <div class="block">
         <details class="ai-response">
@@ -618,6 +668,54 @@ function renderDiffHtml(before = '', after = '') {
       return escaped;
     })
     .join('');
+}
+
+function getProofreadEntryKey(item, index) {
+  if (item?.id) return String(item.id);
+  if (item?.index != null) return String(item.index);
+  return `entry-${index}`;
+}
+
+function getProofreadState(entryKey, defaultView) {
+  const existing = proofreadUiState.get(entryKey);
+  if (existing) {
+    return { view: existing.view || defaultView, expanded: Boolean(existing.expanded) };
+  }
+  const next = { view: defaultView, expanded: false };
+  proofreadUiState.set(entryKey, next);
+  return next;
+}
+
+function getProofreadStatusLabel(item) {
+  if (item?.proofreadApplied === false) return 'Skipped';
+  const status = normalizeStatus(item?.proofreadStatus, item?.proofread, true);
+  if (status === 'failed') return 'Error';
+  return 'Applied';
+}
+
+function getProofreadStatusClass(item) {
+  if (item?.proofreadApplied === false) return 'proofread-status--skipped';
+  const status = normalizeStatus(item?.proofreadStatus, item?.proofread, true);
+  if (status === 'failed') return 'proofread-status--error';
+  return 'proofread-status--applied';
+}
+
+function getProofreadLatency(item) {
+  const debug = Array.isArray(item?.proofreadDebug) ? item.proofreadDebug : [];
+  const latency = debug.find((entry) => Number.isFinite(entry?.latencyMs))?.latencyMs;
+  if (Number.isFinite(latency)) {
+    return `${Math.round(latency)} ms`;
+  }
+  return '— ms';
+}
+
+function getProofreadChangesSummary(comparisons) {
+  const totalBefore = comparisons.reduce((sum, comparison) => sum + (comparison.before || '').length, 0);
+  const totalAfter = comparisons.reduce((sum, comparison) => sum + (comparison.after || '').length, 0);
+  const delta = totalAfter - totalBefore;
+  const deltaLabel = delta === 0 ? 'Δ 0' : `Δ ${delta > 0 ? '+' : ''}${delta}`;
+  const changes = comparisons.length;
+  return changes ? `${deltaLabel} • ${changes} сегм.` : `${deltaLabel}`;
 }
 
 function renderProofreadDiffView(comparisons) {
