@@ -287,87 +287,43 @@ async function getActiveTab() {
   return tab;
 }
 
-async function sendMessageWithAutoInject(tab, message) {
-  const delivered = await sendMessageToTab(tab.id, message);
-  if (delivered) return true;
-
-  const injected = await ensureContentScript(tab);
-  if (!injected) return false;
-
-  return sendMessageToTab(tab.id, message);
-}
-
-async function sendMessageWithAutoInjectAndResponse(tab, message) {
-  const initial = await sendMessageToTabWithResponse(tab.id, message);
-  if (initial.delivered) return initial.response;
-
-  const injected = await ensureContentScript(tab);
-  if (!injected) return null;
-
-  const retry = await sendMessageToTabWithResponse(tab.id, message);
-  return retry.response;
-}
-
-function sendMessageToTab(tabId, message) {
-  return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, message, () => {
-      if (chrome.runtime.lastError) {
-        resolve(false);
-        return;
-      }
-      resolve(true);
-    });
-  });
-}
-
-function sendMessageToTabWithResponse(tabId, message) {
-  return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, message, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve({ delivered: false, response: null });
-        return;
-      }
-      resolve({ delivered: true, response });
-    });
-  });
-}
-
-async function ensureContentScript(tab) {
-  if (!tab?.id || !isInjectableUrl(tab?.url)) {
-    return false;
-  }
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content-script.js']
-    });
-    return true;
-  } catch (error) {
-    console.warn('Failed to inject content script', error);
-    return false;
+function getMessageFailureStatus(result) {
+  if (!result || result.ok) return '';
+  switch (result.reason) {
+    case 'unsupported-url':
+      return 'Перевод недоступен на этой странице.';
+    case 'tab-not-ready':
+      return 'Страница ещё загружается. Попробуйте снова через пару секунд.';
+    case 'content-script-unavailable':
+      return 'Не удалось подключиться к странице. Перезагрузите вкладку.';
+    case 'inject-failed':
+      return 'Не удалось подключиться к странице. Проверьте права расширения.';
+    default:
+      return 'Не удалось связаться со страницей.';
   }
 }
 
-function isInjectableUrl(url) {
-  if (!url) return false;
-  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
+async function sendMessageToActiveTabSafe(message, options = {}) {
+  const tab = await getActiveTab();
+  if (!tab?.id) {
+    return { ok: false, reason: 'tab-not-found' };
+  }
+  return sendMessageToTabSafe(tab, message, options);
 }
 
 async function sendCancel() {
-  const tab = await getActiveTab();
-  if (!tab?.id) return;
-  const delivered = await sendMessageWithAutoInject(tab, { type: 'CANCEL_TRANSLATION' });
-  if (!delivered) {
+  const result = await sendMessageToActiveTabSafe({ type: 'CANCEL_TRANSLATION' });
+  if (!result.ok) {
+    setTemporaryStatus(getMessageFailureStatus(result));
     return;
   }
   setTemporaryStatus('Отменяем перевод...');
 }
 
 async function sendTranslateRequest() {
-  const tab = await getActiveTab();
-  if (!tab?.id) return;
-  const delivered = await sendMessageWithAutoInject(tab, { type: 'START_TRANSLATION' });
-  if (!delivered) {
+  const result = await sendMessageToActiveTabSafe({ type: 'START_TRANSLATION' });
+  if (!result.ok) {
+    setTemporaryStatus(getMessageFailureStatus(result));
     return;
   }
   updateTranslationVisibility(true);
@@ -386,11 +342,12 @@ async function handleToggleTranslationVisibility() {
     setTemporaryStatus('Сначала переведите хотя бы один блок.');
     return;
   }
-  const delivered = await sendMessageWithAutoInject(tab, {
+  const result = await sendMessageToTabSafe(tab, {
     type: 'SET_TRANSLATION_VISIBILITY',
     visible: nextVisible
   });
-  if (!delivered) {
+  if (!result.ok) {
+    setTemporaryStatus(getMessageFailureStatus(result));
     return;
   }
   updateTranslationVisibility(nextVisible);
@@ -583,9 +540,11 @@ async function syncTranslationVisibility() {
 }
 
 async function getTranslationVisibilityFromPage(tab) {
-  const response = await sendMessageWithAutoInjectAndResponse(tab, { type: 'GET_TRANSLATION_VISIBILITY' });
-  if (!response) return null;
-  return response;
+  const result = await sendMessageToTabSafe(tab, { type: 'GET_TRANSLATION_VISIBILITY' }, { expectResponse: true });
+  if (!result.ok) {
+    return null;
+  }
+  return result.response;
 }
 
 function updateTranslationVisibility(visible) {
@@ -641,10 +600,15 @@ async function handleOpenDebug() {
 async function sendBlockLengthLimitUpdate(blockLengthLimit) {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  const response = await sendMessageWithAutoInjectAndResponse(tab, {
+  const result = await sendMessageToTabSafe(tab, {
     type: 'RECALCULATE_BLOCKS',
     blockLengthLimit
-  });
+  }, { expectResponse: true });
+  if (!result.ok) {
+    setTemporaryStatus(getMessageFailureStatus(result));
+    return;
+  }
+  const response = result.response;
   if (response?.updated && typeof response.totalBlocks === 'number') {
     const nextStatus = {
       completedBlocks: 0,
