@@ -413,6 +413,7 @@ async function translatePage(settings) {
         const proofreadResult = await requestProofreading(proofreadBlocks);
         const results = Array.isArray(proofreadResult.results) ? proofreadResult.results : [];
         const resultById = new Map(results.map((result) => [result.blockId, result]));
+        const modelInputById = new Map(proofreadBlocks.map((block) => [block.blockId, block.text]));
         const proofreadSummary = [];
         let finalTranslations = task.translatedTexts.map((text, index) => {
           const blockId = String(task.block[index]?.path ?? `${task.index}-${index}`);
@@ -421,7 +422,8 @@ async function translatePage(settings) {
             return text;
           }
           const edits = Array.isArray(result.edits) ? result.edits : [];
-          const application = ProofreadUtils.applyEdits(text, edits, result?.rewrite?.text);
+          const modelInputText = modelInputById.get(blockId) ?? text;
+          const application = ProofreadUtils.applyEdits(text, edits, result?.rewriteText, modelInputText);
           const nextText = application.newText;
           const usedRewrite = application.usedRewrite;
           proofreadSummary.push({
