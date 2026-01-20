@@ -23,7 +23,7 @@ describe('ProofreadUtils.applyEdits', () => {
     const result = ProofreadUtils.applyEdits(text, edits);
 
     expect(result.newText).toBe(text);
-    expect(result.failed[0]?.reason).toBe('model_violation');
+    expect(result.failed[0]?.reason).toBe('ambiguous');
   });
 
   it('rejects overlapping edits', () => {
@@ -35,7 +35,7 @@ describe('ProofreadUtils.applyEdits', () => {
 
     const result = ProofreadUtils.applyEdits(text, edits);
 
-    expect(result.newText).toBe('aXXXef');
+    expect(result.newText).toBe(text);
     expect(result.failed.some((item: { reason: string }) => item.reason === 'overlap')).toBe(true);
   });
 
@@ -46,7 +46,8 @@ describe('ProofreadUtils.applyEdits', () => {
     const result = ProofreadUtils.applyEdits(text, edits);
 
     expect(result.newText).toBe(text);
-    expect(result.failed[0]?.reason).toBe('no_op');
+    expect(result.failed).toHaveLength(0);
+    expect(result.skipped[0]?.reason).toBe('no_op');
   });
 
   it('falls back to rewrite text on model violation', () => {
@@ -66,6 +67,46 @@ describe('ProofreadUtils.applyEdits', () => {
     const result = ProofreadUtils.applyEdits(text, edits);
 
     expect(result.newText).toBe('Hello World');
+    expect(result.failed).toHaveLength(0);
+  });
+
+  it('matches targets split across runs with optional whitespace', () => {
+    const runs = ['Скачать', '.html'];
+    const edits = [{ op: 'replace', target: 'Скачать .html', replacement: 'Скачать .html-файл' }];
+
+    const result = ProofreadUtils.applyEdits(runs, edits);
+
+    expect(result.newText).toBe('Скачать .html-файл');
+    expect(result.failed).toHaveLength(0);
+  });
+
+  it('matches targets with NBSP using whitespace-optional search', () => {
+    const text = `Жанры\u00A0`;
+    const edits = [{ op: 'replace', target: 'Жанры', replacement: 'Жанры:' }];
+
+    const result = ProofreadUtils.applyEdits(text, edits);
+
+    expect(result.newText).toBe(`Жанры:\u00A0`);
+    expect(result.failed).toHaveLength(0);
+  });
+
+  it('matches targets with ZWSP using whitespace-optional search', () => {
+    const text = `Пи\u200Bпп`;
+    const edits = [{ op: 'replace', target: 'Пипп', replacement: 'Пипп!' }];
+
+    const result = ProofreadUtils.applyEdits(text, edits);
+
+    expect(result.newText).toBe('Пипп!');
+    expect(result.failed).toHaveLength(0);
+  });
+
+  it('treats occurrence 0 as first match', () => {
+    const text = 'foo bar';
+    const edits = [{ op: 'replace', target: 'foo', replacement: 'baz', occurrence: 0 }];
+
+    const result = ProofreadUtils.applyEdits(text, edits);
+
+    expect(result.newText).toBe('baz bar');
     expect(result.failed).toHaveLength(0);
   });
 });

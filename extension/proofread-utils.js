@@ -80,6 +80,32 @@
     return normalizeWithSpans(text, options).norm;
   }
 
+  function stripAllWhitespaceWithSpans(input = '') {
+    let text = '';
+    const map = [];
+    let index = 0;
+
+    // Build a whitespace-free string while keeping a map back to original indices.
+    while (index < input.length) {
+      const codePoint = input.codePointAt(index);
+      const char = String.fromCodePoint(codePoint);
+      const charLength = char.length;
+
+      if (isWhitespace(char) || isZeroWidth(char)) {
+        index += charLength;
+        continue;
+      }
+
+      text += char;
+      for (let i = 0; i < char.length; i += 1) {
+        map.push(index);
+      }
+      index += charLength;
+    }
+
+    return { text, map };
+  }
+
   function casefoldWithSpans(text = '', locale = 'ru') {
     let folded = '';
     const spans = [];
@@ -102,6 +128,14 @@
     }
 
     return { folded, spans };
+  }
+
+  function casefoldAndStripWithMap(text = '', locale = 'ru') {
+    const stripped = stripAllWhitespaceWithSpans(text);
+    if (!stripped.text) return { text: '', map: [] };
+    const folded = casefoldWithSpans(stripped.text, locale);
+    const map = folded.spans.map((span) => stripped.map[span.start]);
+    return { text: folded.folded, map };
   }
 
   function joinRuns(runs = []) {
@@ -189,6 +223,25 @@
     return { start, end };
   }
 
+  function resolveStrippedRange(originalText, map, startStripped, endStripped) {
+    const textLength = originalText.length;
+    if (startStripped < 0 || startStripped > map.length) {
+      return { start: 0, end: 0 };
+    }
+    if (startStripped === endStripped) {
+      const pos = map[startStripped] ?? textLength;
+      return { start: pos, end: pos };
+    }
+    const startIndex = map[startStripped] ?? textLength;
+    const endIndexStart = map[endStripped - 1];
+    if (endIndexStart == null) {
+      return { start: startIndex, end: textLength };
+    }
+    const codePoint = originalText.codePointAt(endIndexStart);
+    const charLength = codePoint ? String.fromCodePoint(codePoint).length : 1;
+    return { start: startIndex, end: endIndexStart + charLength };
+  }
+
   function findExactCandidates(text, target, before, after) {
     const occurrences = findAllOccurrences(text, target);
     const scored = occurrences.map((candidate) => ({
@@ -225,6 +278,34 @@
     });
   }
 
+  function findWhitespaceOptionalCandidates(text, target, before, after) {
+    const strippedText = stripAllWhitespaceWithSpans(text);
+    const strippedTarget = stripAllWhitespaceWithSpans(target).text;
+    if (!strippedTarget) return [];
+    const strippedBefore = typeof before === 'string' && before
+      ? stripAllWhitespaceWithSpans(before).text
+      : null;
+    const strippedAfter = typeof after === 'string' && after
+      ? stripAllWhitespaceWithSpans(after).text
+      : null;
+
+    const occurrences = findAllOccurrences(strippedText.text, strippedTarget);
+    const scored = occurrences.map((candidate) => ({
+      ...candidate,
+      score: scoreCandidate(strippedText.text, candidate, strippedBefore, strippedAfter)
+    }));
+    const filtered = filterByScore(scored, strippedBefore, strippedAfter);
+    return filtered.map((candidate) => {
+      const range = resolveStrippedRange(
+        text,
+        strippedText.map,
+        candidate.start,
+        candidate.end
+      );
+      return { ...candidate, start: range.start, end: range.end, matchType: 'whitespace_optional' };
+    });
+  }
+
   function findCasefoldCandidates(text, target, before, after) {
     const foldedText = casefoldWithSpans(text);
     const foldedTarget = target.toLocaleLowerCase('ru');
@@ -249,6 +330,39 @@
     });
   }
 
+  function findCasefoldWhitespaceOptionalCandidates(text, target, before, after) {
+    const strippedText = casefoldAndStripWithMap(text);
+    const strippedTarget = casefoldAndStripWithMap(target).text;
+    if (!strippedTarget) return [];
+    const strippedBefore = typeof before === 'string' && before
+      ? casefoldAndStripWithMap(before).text
+      : null;
+    const strippedAfter = typeof after === 'string' && after
+      ? casefoldAndStripWithMap(after).text
+      : null;
+
+    const occurrences = findAllOccurrences(strippedText.text, strippedTarget);
+    const scored = occurrences.map((candidate) => ({
+      ...candidate,
+      score: scoreCandidate(strippedText.text, candidate, strippedBefore, strippedAfter)
+    }));
+    const filtered = filterByScore(scored, strippedBefore, strippedAfter);
+    return filtered.map((candidate) => {
+      const range = resolveStrippedRange(
+        text,
+        strippedText.map,
+        candidate.start,
+        candidate.end
+      );
+      return {
+        ...candidate,
+        start: range.start,
+        end: range.end,
+        matchType: 'casefold_whitespace_optional'
+      };
+    });
+  }
+
   function findCandidates(text, edit) {
     const target = typeof edit?.target === 'string' ? edit.target : '';
     if (!target) return [];
@@ -261,7 +375,13 @@
     const normalized = findNormalizedWhitespaceCandidates(text, target, before, after);
     if (normalized.length) return normalized;
 
-    return findCasefoldCandidates(text, target, before, after);
+    const whitespaceOptional = findWhitespaceOptionalCandidates(text, target, before, after);
+    if (whitespaceOptional.length) return whitespaceOptional;
+
+    const casefold = findCasefoldCandidates(text, target, before, after);
+    if (casefold.length) return casefold;
+
+    return findCasefoldWhitespaceOptionalCandidates(text, target, before, after);
   }
 
   function collectSuspicious(text = '') {
@@ -390,8 +510,15 @@
 
       const target = typeof edit.target === 'string' ? edit.target : '';
       const replacement = typeof edit.replacement === 'string' ? edit.replacement : null;
-      const before = typeof edit.before === 'string' ? edit.before : '';
-      const after = typeof edit.after === 'string' ? edit.after : '';
+      let before = typeof edit.before === 'string' ? edit.before : '';
+      let after = typeof edit.after === 'string' ? edit.after : '';
+
+      if (before && before === target) {
+        before = '';
+      }
+      if (after && replacement != null && after === replacement) {
+        after = '';
+      }
 
       if (!target) {
         failed.push({
@@ -442,7 +569,7 @@
         return;
       }
 
-      const candidates = findCandidates(text, edit);
+      const candidates = findCandidates(text, { ...edit, before, after });
       if (!candidates.length) {
         failed.push({
           edit,
@@ -453,9 +580,15 @@
       }
 
       let chosen = null;
-      if (Number.isInteger(edit.occurrence)) {
-        const occurrence = edit.occurrence;
-        if (occurrence < 1 || occurrence > candidates.length) {
+      let occurrence = Number.isInteger(edit.occurrence) ? edit.occurrence : 1;
+      if (occurrence <= 0) {
+        occurrence = 1;
+      }
+
+      if (occurrence > candidates.length) {
+        if (candidates.length === 1) {
+          chosen = candidates[0];
+        } else {
           failed.push({
             edit,
             reason: 'invalid_occurrence',
@@ -463,9 +596,10 @@
           });
           return;
         }
-        chosen = candidates[occurrence - 1];
       } else if (candidates.length === 1) {
         chosen = candidates[0];
+      } else if (Number.isInteger(edit.occurrence)) {
+        chosen = candidates[occurrence - 1];
       } else if (before || after) {
         failed.push({
           edit,
@@ -699,7 +833,11 @@
 
     const hasFallbackFailure = failedEdits.some((item) => fallbackReasons.has(item.reason));
     const needsFallback =
-      hasFallbackFailure || (Array.isArray(edits) && edits.length && applied.length === 0);
+      hasFallbackFailure ||
+      (Array.isArray(edits) &&
+        edits.length &&
+        applied.length === 0 &&
+        failedEdits.length > 0);
 
     if (needsFallback) {
       if (typeof rewriteText === 'string' && rewriteText) {
@@ -806,6 +944,32 @@
     return { stringified, suspicious };
   }
 
+  function debugTargetNotFound(text = '', target = '') {
+    const codePointNames = new Map([
+      ['\u00A0', 'NBSP'],
+      ['\u202F', 'NARROW NBSP'],
+      ['\u2009', 'THIN SPACE'],
+      ['\u200B', 'ZWSP'],
+      ['\uFEFF', 'BOM'],
+      ['\u00AB', 'LEFT ANGLE QUOTE'],
+      ['\u00BB', 'RIGHT ANGLE QUOTE']
+    ]);
+    const combined = `${text}${target}`;
+    const codePoints = [];
+    const seen = new Set();
+    for (let i = 0; i < combined.length; i += 1) {
+      const char = combined[i];
+      const name = codePointNames.get(char);
+      if (!name && !isWhitespace(char) && !isZeroWidth(char)) continue;
+      const code = `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
+      const entry = name ? `${name} ${code}` : code;
+      if (seen.has(entry)) continue;
+      seen.add(entry);
+      codePoints.push(entry);
+    }
+    return [{ text: JSON.stringify(text), target: JSON.stringify(target), codePoints }];
+  }
+
   function debugMismatch(modelInputText = '', applyText = '', limit = 40) {
     if (modelInputText === applyText) return { mismatch: false };
     const max = Math.min(modelInputText.length, applyText.length, limit);
@@ -896,6 +1060,7 @@
     buildProofreadPrompt,
     computeDiffOps,
     debugMismatch,
+    debugTargetNotFound,
     debugString,
     detokenizeEdits,
     findCandidates,
