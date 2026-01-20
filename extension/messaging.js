@@ -6,6 +6,12 @@ function isSupportedTabUrl(url) {
   return normalized.startsWith('http://') || normalized.startsWith('https://') || normalized.startsWith('file://');
 }
 
+function isInjectableTabUrl(url) {
+  if (!url) return false;
+  const normalized = url.toLowerCase();
+  return normalized.startsWith('http://') || normalized.startsWith('https://');
+}
+
 function getTabById(tabId) {
   return new Promise((resolve) => {
     if (!tabId) {
@@ -91,6 +97,52 @@ async function ensureContentScriptInjected(tabId) {
   }
 }
 
+function requestContentScriptInjection(tabId) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'ENSURE_CONTENT_SCRIPT', tabId }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, reason: chrome.runtime.lastError.message });
+        return;
+      }
+      if (!response?.ok) {
+        resolve({ ok: false, reason: response?.reason || 'inject-failed' });
+        return;
+      }
+      resolve({ ok: true });
+    });
+  });
+}
+
+async function ensureConnected(tabId, options = {}) {
+  const pingTimeoutMs = options.pingTimeoutMs ?? 700;
+  const retryCount = Number.isFinite(options.retryCount) ? options.retryCount : 2;
+  const retryDelayMs = options.retryDelayMs ?? 200;
+  const useBackgroundInjection = options.useBackgroundInjection ?? true;
+
+  let pingResult = await pingContentScript(tabId, pingTimeoutMs);
+  if (pingResult.ok) {
+    return { ok: true };
+  }
+
+  for (let attempt = 0; attempt < retryCount; attempt += 1) {
+    const injected = useBackgroundInjection
+      ? await requestContentScriptInjection(tabId)
+      : await ensureContentScriptInjected(tabId);
+    if (!injected.ok) {
+      return { ok: false, reason: injected.reason || 'inject-failed' };
+    }
+    if (retryDelayMs) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
+    pingResult = await pingContentScript(tabId, pingTimeoutMs + 200);
+    if (pingResult.ok) {
+      return { ok: true };
+    }
+  }
+
+  return { ok: false, reason: 'content-script-unavailable' };
+}
+
 function sendMessageToTab(tabId, message, expectResponse = false) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, (response) => {
@@ -127,15 +179,15 @@ async function sendMessageToTabSafe(tab, message, options = {}) {
     }
   }
 
-  const pingResult = await pingContentScript(tabId, options.pingTimeoutMs ?? 700);
-  if (!pingResult.ok) {
-    const injected = await ensureContentScriptInjected(tabId);
-    if (!injected.ok) {
-      return { ok: false, reason: injected.reason || 'inject-failed' };
-    }
-    const pingRetry = await pingContentScript(tabId, options.pingTimeoutMs ?? 900);
-    if (!pingRetry.ok) {
-      return { ok: false, reason: 'content-script-unavailable' };
+  if (!options.skipEnsureConnection) {
+    const connectionResult = await ensureConnected(tabId, {
+      pingTimeoutMs: options.pingTimeoutMs ?? 700,
+      retryCount: options.retryCount,
+      retryDelayMs: options.retryDelayMs,
+      useBackgroundInjection: options.useBackgroundInjection
+    });
+    if (!connectionResult.ok) {
+      return { ok: false, reason: connectionResult.reason || 'content-script-unavailable' };
     }
   }
 

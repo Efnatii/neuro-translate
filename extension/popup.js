@@ -173,7 +173,6 @@ async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
   await chrome.storage.local.set({ blockLengthLimit });
   renderBlockLengthLimit(blockLengthLimit);
-  setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
   await sendBlockLengthLimitUpdate(blockLengthLimit);
 }
 
@@ -311,8 +310,36 @@ async function sendMessageToActiveTabSafe(message, options = {}) {
   return sendMessageToTabSafe(tab, message, options);
 }
 
+async function ensureActiveTabConnection() {
+  const tab = await getActiveTab();
+  if (!tab?.id) {
+    return { ok: false, reason: 'tab-not-found' };
+  }
+  if (!isSupportedTabUrl(tab.url)) {
+    return { ok: false, reason: 'unsupported-url' };
+  }
+  setTemporaryStatus('Подключение...', 0);
+  const connected = await ensureConnected(tab.id, {
+    pingTimeoutMs: 700,
+    retryCount: 2,
+    retryDelayMs: 250,
+    useBackgroundInjection: true
+  });
+  if (!connected.ok) {
+    return { ok: false, reason: connected.reason || 'content-script-unavailable' };
+  }
+  return { ok: true, tab };
+}
+
 async function sendCancel() {
-  const result = await sendMessageToActiveTabSafe({ type: 'CANCEL_TRANSLATION' });
+  const connection = await ensureActiveTabConnection();
+  if (!connection.ok) {
+    setTemporaryStatus(getMessageFailureStatus(connection));
+    return;
+  }
+  const result = await sendMessageToTabSafe(connection.tab, { type: 'CANCEL_TRANSLATION' }, {
+    skipEnsureConnection: true
+  });
   if (!result.ok) {
     setTemporaryStatus(getMessageFailureStatus(result));
     return;
@@ -321,7 +348,14 @@ async function sendCancel() {
 }
 
 async function sendTranslateRequest() {
-  const result = await sendMessageToActiveTabSafe({ type: 'START_TRANSLATION' });
+  const connection = await ensureActiveTabConnection();
+  if (!connection.ok) {
+    setTemporaryStatus(getMessageFailureStatus(connection));
+    return;
+  }
+  const result = await sendMessageToTabSafe(connection.tab, { type: 'START_TRANSLATION' }, {
+    skipEnsureConnection: true
+  });
   if (!result.ok) {
     setTemporaryStatus(getMessageFailureStatus(result));
     return;
@@ -332,8 +366,12 @@ async function sendTranslateRequest() {
 }
 
 async function handleToggleTranslationVisibility() {
-  const tab = await getActiveTab();
-  if (!tab?.id) return;
+  const connection = await ensureActiveTabConnection();
+  if (!connection.ok) {
+    setTemporaryStatus(getMessageFailureStatus(connection));
+    return;
+  }
+  const tab = connection.tab;
   const visibilityInfo = await getTranslationVisibilityFromPage(tab);
   const currentVisible =
     visibilityInfo && typeof visibilityInfo.visible === 'boolean' ? visibilityInfo.visible : translationVisible;
@@ -345,7 +383,7 @@ async function handleToggleTranslationVisibility() {
   const result = await sendMessageToTabSafe(tab, {
     type: 'SET_TRANSLATION_VISIBILITY',
     visible: nextVisible
-  });
+  }, { skipEnsureConnection: true });
   if (!result.ok) {
     setTemporaryStatus(getMessageFailureStatus(result));
     return;
@@ -598,16 +636,20 @@ async function handleOpenDebug() {
 }
 
 async function sendBlockLengthLimitUpdate(blockLengthLimit) {
-  const tab = await getActiveTab();
-  if (!tab?.id) return;
-  const result = await sendMessageToTabSafe(tab, {
+  const connection = await ensureActiveTabConnection();
+  if (!connection.ok) {
+    setTemporaryStatus(getMessageFailureStatus(connection));
+    return;
+  }
+  const result = await sendMessageToTabSafe(connection.tab, {
     type: 'RECALCULATE_BLOCKS',
     blockLengthLimit
-  }, { expectResponse: true });
+  }, { expectResponse: true, skipEnsureConnection: true });
   if (!result.ok) {
     setTemporaryStatus(getMessageFailureStatus(result));
     return;
   }
+  setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
   const response = result.response;
   if (response?.updated && typeof response.totalBlocks === 'number') {
     const nextStatus = {

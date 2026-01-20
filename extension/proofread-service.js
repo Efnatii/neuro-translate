@@ -16,7 +16,8 @@ function buildProofreadPrompt(input, strict = false) {
       content: [
         'You are an expert translation proofreader and editor.',
         'Your job is to improve the translated text for clarity, fluency, and readability while preserving the original meaning.',
-        'You may rewrite freely for naturalness, but do not add, omit, or distort information.',
+        'Fix typos, punctuation, grammar, and awkward phrasing. Do not add, omit, or distort information.',
+        'Do not add new sentences, do not reorder content, and do not change the structure of the text.',
         'Preserve modality, tense, aspect, tone, and level of certainty.',
         'Keep numbers, units, currencies, dates, and formatting intact unless they are clearly incorrect.',
         'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
@@ -28,11 +29,11 @@ function buildProofreadPrompt(input, strict = false) {
         'Return a JSON object with an "items" array.',
         'Each item must include the original "id" and the corrected "text" string.',
         'Do not add, remove, or reorder items. Keep ids unchanged.',
-        'If a segment does not need edits, return an empty string for its text.',
+        'If a segment does not need edits, return the original text unchanged.',
         strict
           ? 'Strict mode: return every input id exactly once in the output items array.'
           : '',
-        'Do not add commentary.'
+        'Return only JSON, without commentary.'
       ]
         .filter(Boolean)
         .join(' ')
@@ -78,11 +79,11 @@ async function proofreadTranslation(
     return { translations: [], rawProofread: '' };
   }
 
-  const normalizedSegments = segments.map((segment) => (typeof segment === 'string' ? segment : String(segment ?? '')));
-  const items = normalizedSegments.map((text, index) => ({ id: String(index), text }));
+  const { items, originalById } = normalizeProofreadSegments(segments);
   const chunks = chunkProofreadItems(items);
   const revisionsById = new Map();
   const rawProofreadParts = [];
+  const debugPayloads = [];
 
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
@@ -95,6 +96,9 @@ async function proofreadTranslation(
       false
     );
     rawProofreadParts.push(result.rawProofread);
+    if (Array.isArray(result.debug)) {
+      debugPayloads.push(...result.debug);
+    }
     let quality = evaluateProofreadResult(chunk, result.itemsById, result.parseError);
     logProofreadChunk('proofread', index, chunks.length, chunk.length, quality, result.parseError);
     if (quality.isPoor) {
@@ -112,6 +116,9 @@ async function proofreadTranslation(
         true
       );
       rawProofreadParts.push(result.rawProofread);
+      if (Array.isArray(result.debug)) {
+        debugPayloads.push(...result.debug);
+      }
       quality = evaluateProofreadResult(chunk, result.itemsById, result.parseError);
       logProofreadChunk('proofread-retry', index, chunks.length, chunk.length, quality, result.parseError);
     }
@@ -132,11 +139,16 @@ async function proofreadTranslation(
           true
         );
         rawProofreadParts.push(singleResult.rawProofread);
+        if (Array.isArray(singleResult.debug)) {
+          debugPayloads.push(...singleResult.debug);
+        }
         const singleQuality = evaluateProofreadResult([item], singleResult.itemsById, singleResult.parseError);
         logProofreadChunk('proofread-single', index, chunks.length, 1, singleQuality, singleResult.parseError);
         const revision = singleResult.itemsById.get(item.id);
         if (revision !== undefined) {
           revisionsById.set(item.id, revision);
+        } else if (originalById.has(item.id)) {
+          revisionsById.set(item.id, originalById.get(item.id));
         }
       }
       continue;
@@ -145,17 +157,33 @@ async function proofreadTranslation(
     for (const item of chunk) {
       if (result.itemsById.has(item.id)) {
         revisionsById.set(item.id, result.itemsById.get(item.id));
+      } else if (originalById.has(item.id)) {
+        revisionsById.set(item.id, originalById.get(item.id));
       }
     }
   }
 
-  const translations = normalizedSegments.map((_, index) => {
-    const revision = revisionsById.get(String(index));
-    return typeof revision === 'string' ? revision : '';
+  const translations = items.map((item) => {
+    const revision = revisionsById.get(String(item.id));
+    if (typeof revision === 'string') {
+      return revision;
+    }
+    return originalById.get(String(item.id)) || '';
   });
 
+  const repairedTranslations = await repairProofreadSegments(
+    items,
+    translations,
+    originalById,
+    apiKey,
+    model,
+    apiBaseUrl,
+    language,
+    debugPayloads
+  );
+
   const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
-  return { translations, rawProofread };
+  return { translations: repairedTranslations, rawProofread, debug: debugPayloads };
 }
 
 function parseJsonObjectFlexible(content = '', label = 'response') {
@@ -232,6 +260,125 @@ function normalizeProofreadItems(items) {
     .filter(Boolean);
 }
 
+function normalizeProofreadSegments(segments) {
+  if (!Array.isArray(segments)) return { items: [], originalById: new Map() };
+  const items = [];
+  const originalById = new Map();
+  segments.forEach((segment, index) => {
+    if (segment && typeof segment === 'object') {
+      const id = segment.id ?? String(index);
+      const text = typeof segment.text === 'string' ? segment.text : String(segment.text ?? '');
+      items.push({ id: String(id), text });
+      originalById.set(String(id), text);
+      return;
+    }
+    const text = typeof segment === 'string' ? segment : String(segment ?? '');
+    const id = String(index);
+    items.push({ id, text });
+    originalById.set(id, text);
+  });
+  return { items, originalById };
+}
+
+function countMatches(value = '', regex) {
+  if (!value) return 0;
+  const matches = value.match(regex);
+  return matches ? matches.length : 0;
+}
+
+function normalizeTextForComparison(value = '') {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getLanguageScript(language = '') {
+  const normalized = language.toLowerCase();
+  if (
+    normalized.startsWith('ru') ||
+    normalized.startsWith('uk') ||
+    normalized.startsWith('bg') ||
+    normalized.startsWith('sr') ||
+    normalized.startsWith('mk')
+  ) {
+    return 'cyrillic';
+  }
+  if (normalized.startsWith('ar')) return 'arabic';
+  if (normalized.startsWith('he')) return 'hebrew';
+  if (normalized.startsWith('hi')) return 'devanagari';
+  if (normalized.startsWith('ja')) return 'japanese';
+  if (normalized.startsWith('ko')) return 'hangul';
+  if (normalized.startsWith('zh')) return 'han';
+  return 'latin';
+}
+
+function countLettersByScript(text = '', script) {
+  if (!text) return 0;
+  switch (script) {
+    case 'cyrillic':
+      return countMatches(text, /[\p{Script=Cyrillic}]/gu);
+    case 'arabic':
+      return countMatches(text, /[\p{Script=Arabic}]/gu);
+    case 'hebrew':
+      return countMatches(text, /[\p{Script=Hebrew}]/gu);
+    case 'devanagari':
+      return countMatches(text, /[\p{Script=Devanagari}]/gu);
+    case 'japanese':
+      return countMatches(text, /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/gu);
+    case 'hangul':
+      return countMatches(text, /[\p{Script=Hangul}]/gu);
+    case 'han':
+      return countMatches(text, /[\p{Script=Han}]/gu);
+    case 'latin':
+    default:
+      return countMatches(text, /[\p{Script=Latin}]/gu);
+  }
+}
+
+function detectDominantScript(text = '') {
+  const scripts = ['cyrillic', 'latin', 'arabic', 'hebrew', 'devanagari', 'japanese', 'hangul', 'han'];
+  let best = null;
+  let bestCount = 0;
+  scripts.forEach((script) => {
+    const count = countLettersByScript(text, script);
+    if (count > bestCount) {
+      bestCount = count;
+      best = script;
+    }
+  });
+  return bestCount > 0 ? best : null;
+}
+
+function needsLanguageRepair(source = '', translated = '', targetLanguage = '') {
+  const sourceNormalized = normalizeTextForComparison(source);
+  const translatedNormalized = normalizeTextForComparison(translated);
+  if (!translatedNormalized) return false;
+  const totalLetters = countMatches(translated, /[\p{L}]/gu);
+  if (!totalLetters || totalLetters < 6) return false;
+  const targetScript = getLanguageScript(targetLanguage);
+  const targetLetters = countLettersByScript(translated, targetScript);
+  const targetRatio = totalLetters ? targetLetters / totalLetters : 0;
+  const sourceScript = detectDominantScript(source);
+  if (
+    sourceNormalized &&
+    sourceNormalized === translatedNormalized &&
+    sourceScript &&
+    sourceScript !== targetScript &&
+    totalLetters >= 6
+  ) {
+    return true;
+  }
+  if (sourceScript && sourceScript !== targetScript) {
+    const sourceLetters = countLettersByScript(translated, sourceScript);
+    if (sourceLetters / totalLetters >= 0.35 && totalLetters >= 10) {
+      return true;
+    }
+  }
+  return targetRatio < 0.35 && totalLetters >= 12;
+}
+
 function evaluateProofreadResult(expectedItems, itemsById, parseError) {
   const expectedIds = expectedItems.map((item) => String(item.id));
   const missingIds = expectedIds.filter((id) => !itemsById.has(id));
@@ -273,44 +420,53 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     ),
     apiBaseUrl
   );
+  const inputChars =
+    items.reduce((sum, item) => sum + (item?.text?.length || 0), 0) +
+    (metadata?.context?.length || 0) +
+    (metadata?.sourceBlock?.length || 0) +
+    (metadata?.translatedBlock?.length || 0);
+  const maxTokens = Math.min(2000, Math.max(256, Math.ceil(inputChars / 4) + 120));
 
+  const requestPayload = {
+    model,
+    messages: prompt,
+    max_tokens: maxTokens,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: PROOFREAD_SCHEMA_NAME,
+        schema: {
+          type: 'object',
+          properties: {
+            items: {
+              type: 'array',
+              minItems: items.length,
+              maxItems: items.length,
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  text: { type: 'string' }
+                },
+                required: ['id', 'text'],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ['items'],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+  const startedAt = Date.now();
   const response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify({
-      model,
-      messages: prompt,
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: PROOFREAD_SCHEMA_NAME,
-          schema: {
-            type: 'object',
-            properties: {
-              items: {
-                type: 'array',
-                minItems: items.length,
-                maxItems: items.length,
-                items: {
-                  type: 'object',
-                  properties: {
-                    id: { type: 'string' },
-                    text: { type: 'string' }
-                  },
-                  required: ['id', 'text'],
-                  additionalProperties: false
-                }
-              }
-            },
-            required: ['items'],
-            additionalProperties: false
-          }
-        }
-      }
-    })
+    body: JSON.stringify(requestPayload)
   });
 
   if (!response.ok) {
@@ -334,8 +490,24 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content;
   if (!content) {
-    return { itemsById: new Map(), rawProofread: '', parseError: 'no-content' };
+    return { itemsById: new Map(), rawProofread: '', parseError: 'no-content', debug: [] };
   }
+  const latencyMs = Date.now() - startedAt;
+  const usage = normalizeUsage(data?.usage);
+  const costUsd = calculateUsageCost(usage, model);
+  const debugPayload = {
+    phase: 'PROOFREAD',
+    model,
+    latencyMs,
+    usage,
+    costUsd,
+    inputChars,
+    outputChars: content?.length || 0,
+    request: requestPayload,
+    response: content,
+    parseIssues: []
+  };
+  const debugPayloads = [debugPayload];
 
   let parsed = null;
   let parseError = null;
@@ -343,6 +515,26 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     parsed = parseJsonObjectFlexible(content, 'proofread');
   } catch (error) {
     parseError = error?.message || 'parse-error';
+    debugPayload.parseIssues.push(parseError);
+  }
+
+  let rawProofread = content;
+  if (parseError) {
+    const repaired = await requestProofreadFormatRepair(
+      content,
+      items,
+      apiKey,
+      model,
+      apiBaseUrl
+    );
+    rawProofread = repaired.rawProofread;
+    if (Array.isArray(repaired.debug)) {
+      debugPayloads.push(...repaired.debug);
+    }
+    if (repaired.parsed) {
+      parsed = repaired.parsed;
+      parseError = repaired.parseError || null;
+    }
   }
 
   const normalizedItems = normalizeProofreadItems(parsed?.items);
@@ -351,5 +543,241 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     itemsById.set(item.id, item.text);
   });
 
-  return { itemsById, rawProofread: content, parseError };
+  return { itemsById, rawProofread, parseError, debug: debugPayloads };
+}
+
+async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, apiBaseUrl) {
+  const prompt = applyPromptCaching([
+    {
+      role: 'system',
+      content: [
+        'You are a formatter.',
+        'Convert the provided text into valid JSON that matches the required schema.',
+        'Do not change meaning or wording.',
+        'Return only JSON.'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: [
+        `Return JSON with an "items" array of ${items.length} objects.`,
+        'Each object must contain "id" and "text". Keep ids unchanged.',
+        'Schema example: {"items":[{"id":"0","text":"..."}]}',
+        'Original response:',
+        rawResponse
+      ].join('\n')
+    }
+  ], apiBaseUrl);
+
+  const requestPayload = {
+    model,
+    messages: prompt,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: `${PROOFREAD_SCHEMA_NAME}_repair`,
+        schema: {
+          type: 'object',
+          properties: {
+            items: {
+              type: 'array',
+              minItems: items.length,
+              maxItems: items.length,
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  text: { type: 'string' }
+                },
+                required: ['id', 'text'],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ['items'],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+  const startedAt = Date.now();
+  const response = await fetch(apiBaseUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(requestPayload)
+  });
+
+  if (!response.ok) {
+    return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
+  }
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content || '';
+  const latencyMs = Date.now() - startedAt;
+  const usage = normalizeUsage(data?.usage);
+  const costUsd = calculateUsageCost(usage, model);
+  const debugPayload = {
+    phase: 'PROOFREAD_FORMAT_REPAIR',
+    model,
+    latencyMs,
+    usage,
+    costUsd,
+    inputChars: rawResponse?.length || 0,
+    outputChars: content?.length || 0,
+    request: requestPayload,
+    response: content,
+    parseIssues: []
+  };
+
+  let parsed = null;
+  let parseError = null;
+  try {
+    parsed = parseJsonObjectFlexible(content, 'proofread-format-repair');
+  } catch (error) {
+    parseError = error?.message || 'parse-error';
+    debugPayload.parseIssues.push(parseError);
+  }
+
+  return {
+    parsed,
+    rawProofread: [rawResponse, content].filter(Boolean).join('\n\n---\n\n'),
+    parseError,
+    debug: [debugPayload]
+  };
+}
+
+async function repairProofreadSegments(
+  items,
+  translations,
+  originalById,
+  apiKey,
+  model,
+  apiBaseUrl,
+  language,
+  debugPayloads
+) {
+  const repairItems = [];
+  const repairIndices = [];
+  translations.forEach((text, index) => {
+    const item = items[index];
+    const original = originalById.get(String(item?.id)) || '';
+    if (needsLanguageRepair(original, text, language)) {
+      repairItems.push({ id: String(item.id), source: original, draft: text });
+      repairIndices.push(index);
+    }
+  });
+
+  if (!repairItems.length) {
+    return translations;
+  }
+
+  const prompt = applyPromptCaching([
+    {
+      role: 'system',
+      content: [
+        'You are a translation proofreader.',
+        'Fix the draft so the result is fully in the target language, without any source-language fragments.',
+        'Do not change meaning. Preserve placeholders, markup, code, numbers, units, and punctuation tokens.',
+        PUNCTUATION_TOKEN_HINT,
+        'Return only JSON.'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: [
+        language ? `Target language: ${language}` : '',
+        'Return JSON with an "items" array of {id, text}.',
+        'Use the same ids as input and keep the order.',
+        'Items (JSON array of {id, source, draft}):',
+        JSON.stringify(repairItems)
+      ]
+        .filter(Boolean)
+        .join('\n')
+    }
+  ], apiBaseUrl);
+
+  const requestPayload = {
+    model,
+    messages: prompt,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: `${PROOFREAD_SCHEMA_NAME}_language_repair`,
+        schema: {
+          type: 'object',
+          properties: {
+            items: {
+              type: 'array',
+              minItems: repairItems.length,
+              maxItems: repairItems.length,
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  text: { type: 'string' }
+                },
+                required: ['id', 'text'],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ['items'],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(requestPayload)
+    });
+    if (!response.ok) {
+      return translations;
+    }
+    const data = await response.json();
+    const content = data?.choices?.[0]?.message?.content || '';
+    const latencyMs = Date.now() - startedAt;
+    const usage = normalizeUsage(data?.usage);
+    const costUsd = calculateUsageCost(usage, model);
+    const debugPayload = {
+      phase: 'PROOFREAD_REPAIR',
+      model,
+      latencyMs,
+      usage,
+      costUsd,
+      inputChars: repairItems.reduce((sum, item) => sum + (item?.draft?.length || 0), 0),
+      outputChars: content?.length || 0,
+      request: requestPayload,
+      response: content,
+      parseIssues: []
+    };
+    if (Array.isArray(debugPayloads)) {
+      debugPayloads.push(debugPayload);
+    }
+    const parsed = parseJsonObjectFlexible(content, 'proofread-repair');
+    const normalizedItems = normalizeProofreadItems(parsed?.items);
+    const itemsById = new Map();
+    normalizedItems.forEach((item) => {
+      itemsById.set(item.id, item.text);
+    });
+    repairIndices.forEach((index) => {
+      const id = String(items[index]?.id);
+      const candidate = itemsById.get(id);
+      if (typeof candidate === 'string' && candidate.trim()) {
+        translations[index] = candidate;
+      }
+    });
+  } catch (error) {
+    console.warn('Proofread language repair failed; keeping original revisions.', error);
+  }
+
+  return translations;
 }

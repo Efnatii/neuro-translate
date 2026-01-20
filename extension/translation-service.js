@@ -49,6 +49,7 @@ async function translateTexts(
   let lastError = null;
   let lastRetryDelayMs = null;
   let lastRawTranslation = '';
+  const debugPayloads = [];
   const throughputInfo = await getModelThroughputInfo(model);
   const timeoutMs = calculateTranslationTimeoutMs(texts, throughputInfo);
 
@@ -68,11 +69,21 @@ async function translateTexts(
         !keepPunctuationTokens
       );
       lastRawTranslation = result.rawTranslation;
-      return result;
+      if (Array.isArray(result?.debug)) {
+        debugPayloads.push(...result.debug);
+      }
+      return {
+        translations: result.translations,
+        rawTranslation: result.rawTranslation,
+        debug: debugPayloads
+      };
     } catch (error) {
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
       if (error?.rawTranslation) {
         lastRawTranslation = error.rawTranslation;
+      }
+      if (error?.debugPayload) {
+        debugPayloads.push(error.debugPayload);
       }
 
       const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
@@ -104,9 +115,10 @@ async function translateTexts(
           model,
           context,
           apiBaseUrl,
-          keepPunctuationTokens
+          keepPunctuationTokens,
+          debugPayloads
         );
-        return { translations, rawTranslation: lastRawTranslation };
+        return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
       }
 
       if (isRateLimit) {
@@ -135,19 +147,21 @@ async function performTranslationRequest(
   allowLengthRetry = true
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
+  const inputChars = tokenizedTexts.reduce((sum, text) => sum + (text?.length || 0), 0) + (context?.length || 0);
 
   const prompt = applyPromptCaching([
     {
       role: 'system',
       content: [
-        'You are a fluent Russian translator.',
-        `Translate every element of the provided "texts" list into ${targetLanguage} with natural, idiomatic phrasing that preserves meaning and readability.`,
+        'You are a professional translator.',
+        'Translate every element of the provided "texts" list into the target language with natural, idiomatic phrasing that preserves meaning and readability.',
         'Never omit, add, or generalize information. Preserve modality, tense, aspect, tone, and level of certainty.',
         'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
         'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
         'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
         'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
         'Do not leave any source text untranslated. Do not copy the source text verbatim except for placeholders, markup, punctuation tokens, or text that is already in the target language.',
+        'The final output must be entirely in the target language with no source-language fragments.',
         'Ensure terminology consistency within the same request.',
         strictTargetLanguage
           ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
@@ -159,7 +173,8 @@ async function performTranslationRequest(
         'If no context is provided, do not invent context or add assumptions.',
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
         'Respond only with a JSON object containing the translated segments in the same order as the input segments under a "translations" array.',
-        'Do not add commentary.'
+        'Do not add commentary.',
+        `Target language: ${targetLanguage}.`
       ]
         .filter(Boolean)
         .join(' ')
@@ -182,6 +197,7 @@ async function performTranslationRequest(
         'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
         'Translate names/titles/terms; if unsure, transliterate rather than leaving them untranslated, except for established brands.',
         'Do not leave any source text untranslated. Do not copy segments verbatim except for placeholders, markup, punctuation tokens, or text already in the target language.',
+        `Ensure the output is entirely in ${targetLanguage} with no source-language fragments.`,
         'Never include page context text in the translations unless it is explicitly part of the source segments.',
         'Keep terminology consistent within a single request.',
         strictTargetLanguage
@@ -199,35 +215,37 @@ async function performTranslationRequest(
     }
   ], apiBaseUrl);
 
+  const requestPayload = {
+    model,
+    messages: prompt,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'translations',
+        schema: {
+          type: 'object',
+          properties: {
+            translations: {
+              type: 'array',
+              minItems: tokenizedTexts.length,
+              maxItems: tokenizedTexts.length,
+              items: { type: 'string' }
+            }
+          },
+          required: ['translations'],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+  const startedAt = Date.now();
   const response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify({
-      model,
-      messages: prompt,
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: 'translations',
-          schema: {
-            type: 'object',
-            properties: {
-              translations: {
-                type: 'array',
-                minItems: tokenizedTexts.length,
-                maxItems: tokenizedTexts.length,
-                items: { type: 'string' }
-              }
-            },
-            required: ['translations'],
-            additionalProperties: false
-          }
-        }
-      }
-    }),
+    body: JSON.stringify(requestPayload),
     signal
   });
 
@@ -258,11 +276,31 @@ async function performTranslationRequest(
   if (!content) {
     throw new Error('No translation returned');
   }
+  const latencyMs = Date.now() - startedAt;
+  const usage = normalizeUsage(data?.usage);
+  const costUsd = calculateUsageCost(usage, model);
+  const debugPayload = {
+    phase: 'TRANSLATE',
+    model,
+    latencyMs,
+    usage,
+    costUsd,
+    inputChars,
+    outputChars: content?.length || 0,
+    request: requestPayload,
+    response: content,
+    parseIssues: []
+  };
+  const debugPayloads = [debugPayload];
 
   let translations;
   try {
     translations = parseTranslationsResponse(content, texts.length);
   } catch (error) {
+    if (error && typeof error === 'object') {
+      debugPayload.parseIssues.push(error?.message || 'parse-error');
+      error.debugPayload = debugPayload;
+    }
     if (error && typeof error === 'object') {
       error.rawTranslation = content;
     }
@@ -289,7 +327,9 @@ async function performTranslationRequest(
       context,
       apiBaseUrl,
       !restorePunctuation,
-      false
+      false,
+      true,
+      debugPayloads
     );
 
     refusalIndices.forEach((index, retryPosition) => {
@@ -330,6 +370,9 @@ async function performTranslationRequest(
         allowRefusalRetry
       );
       const retryTranslations = retryResults?.translations || [];
+      if (Array.isArray(retryResults?.debug)) {
+        debugPayloads.push(...retryResults.debug);
+      }
 
       retryIndices.forEach((index, retryPosition) => {
         if (retryTranslations?.[retryPosition]) {
@@ -360,7 +403,8 @@ async function performTranslationRequest(
         apiBaseUrl,
         !restorePunctuation,
         allowRefusalRetry,
-        false
+        false,
+        debugPayloads
       );
       lengthRetryIndices.forEach((index, retryPosition) => {
         if (retryResults?.[retryPosition]) {
@@ -370,6 +414,17 @@ async function performTranslationRequest(
     }
   }
 
+  translations = await repairTranslationsForLanguage(
+    texts,
+    translations,
+    apiKey,
+    targetLanguage,
+    model,
+    context,
+    apiBaseUrl,
+    debugPayloads
+  );
+
   return {
     translations: texts.map((text, index) => {
       const candidate = translations[index];
@@ -378,8 +433,184 @@ async function performTranslationRequest(
       }
       return text;
     }),
-    rawTranslation: content
+    rawTranslation: content,
+    debug: debugPayloads
   };
+}
+
+async function performTranslationRepairRequest(
+  items,
+  apiKey,
+  targetLanguage,
+  model,
+  signal,
+  context = '',
+  apiBaseUrl = OPENAI_API_URL
+) {
+  const normalizedItems = items.map((item) => ({
+    id: item.id,
+    source: applyPunctuationTokens(item.source || ''),
+    draft: applyPunctuationTokens(item.draft || '')
+  }));
+  const prompt = applyPromptCaching([
+    {
+      role: 'system',
+      content: [
+        'You are a professional translator.',
+        'You receive source text and a draft translation that may contain untranslated fragments.',
+        'Fix the draft so the output is fully in the target language with no source-language fragments.',
+        'Preserve meaning, formatting, punctuation tokens, placeholders, markup, code, numbers, units, and links.',
+        'Do not add or remove information. Do not add commentary.',
+        `Target language: ${targetLanguage}.`,
+        PUNCTUATION_TOKEN_HINT
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: [
+        `Repair the following translations into ${targetLanguage}.`,
+        context
+          ? [
+              'Use the page context only for disambiguation.',
+              'Do not translate or include the context in the output.',
+              `Context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
+            ].join('\n')
+          : '',
+        'Return only JSON with a "translations" array matching the input order.',
+        'Items: (JSON array of {id, source, draft})',
+        JSON.stringify(normalizedItems)
+      ]
+        .filter(Boolean)
+        .join('\n')
+    }
+  ], apiBaseUrl);
+
+  const requestPayload = {
+    model,
+    messages: prompt,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'translations_repair',
+        schema: {
+          type: 'object',
+          properties: {
+            translations: {
+              type: 'array',
+              minItems: normalizedItems.length,
+              maxItems: normalizedItems.length,
+              items: { type: 'string' }
+            }
+          },
+          required: ['translations'],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+  const startedAt = Date.now();
+  const response = await fetch(apiBaseUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(requestPayload),
+    signal
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const error = new Error(`Repair request failed: ${response.status} ${errorText}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('No repair translation returned');
+  }
+  const latencyMs = Date.now() - startedAt;
+  const usage = normalizeUsage(data?.usage);
+  const costUsd = calculateUsageCost(usage, model);
+  const debugPayload = {
+    phase: 'TRANSLATE_REPAIR',
+    model,
+    latencyMs,
+    usage,
+    costUsd,
+    inputChars: normalizedItems.reduce(
+      (sum, item) => sum + (item.source?.length || 0) + (item.draft?.length || 0),
+      0
+    ),
+    outputChars: content?.length || 0,
+    request: requestPayload,
+    response: content,
+    parseIssues: []
+  };
+
+  let translations = null;
+  try {
+    translations = parseTranslationsResponse(content, normalizedItems.length);
+  } catch (error) {
+    debugPayload.parseIssues.push(error?.message || 'parse-error');
+    throw error;
+  }
+
+  return {
+    translations: translations.map((text) => restorePunctuationTokens(text)),
+    rawTranslation: content,
+    debug: debugPayload
+  };
+}
+
+async function repairTranslationsForLanguage(
+  texts,
+  translations,
+  apiKey,
+  targetLanguage,
+  model,
+  context,
+  apiBaseUrl,
+  debugPayloads
+) {
+  const repairItems = [];
+  const repairIndices = [];
+  translations.forEach((translated, index) => {
+    if (needsLanguageRepair(texts[index] || '', translated || '', targetLanguage)) {
+      repairIndices.push(index);
+      repairItems.push({ id: String(index), source: texts[index], draft: translated });
+    }
+  });
+  if (!repairItems.length) {
+    return translations;
+  }
+
+  try {
+    const repairResult = await performTranslationRepairRequest(
+      repairItems,
+      apiKey,
+      targetLanguage,
+      model,
+      undefined,
+      context,
+      apiBaseUrl
+    );
+    if (repairResult?.debug && Array.isArray(debugPayloads)) {
+      debugPayloads.push(repairResult.debug);
+    }
+    repairIndices.forEach((index, position) => {
+      const candidate = repairResult.translations?.[position];
+      if (typeof candidate === 'string' && candidate.trim()) {
+        translations[index] = candidate;
+      }
+    });
+  } catch (error) {
+    console.warn('Translation repair failed; keeping original translations.', error);
+  }
+
+  return translations;
 }
 
 async function translateIndividually(
@@ -391,7 +622,8 @@ async function translateIndividually(
   apiBaseUrl = OPENAI_API_URL,
   keepPunctuationTokens = false,
   allowRefusalRetry = true,
-  allowLengthRetry = true
+  allowLengthRetry = true,
+  debugPayloads = null
 ) {
   const results = [];
   const maxRetryableRetries = 3;
@@ -414,6 +646,9 @@ async function translateIndividually(
           allowRefusalRetry,
           allowLengthRetry
         );
+        if (Array.isArray(result?.debug) && Array.isArray(debugPayloads)) {
+          debugPayloads.push(...result.debug);
+        }
         results.push(result.translations[0]);
         break;
       } catch (error) {
@@ -571,6 +806,91 @@ function countMatches(value = '', regex) {
   if (!value) return 0;
   const matches = value.match(regex);
   return matches ? matches.length : 0;
+}
+
+function getLanguageScript(language = '') {
+  const normalized = language.toLowerCase();
+  if (
+    normalized.startsWith('ru') ||
+    normalized.startsWith('uk') ||
+    normalized.startsWith('bg') ||
+    normalized.startsWith('sr') ||
+    normalized.startsWith('mk')
+  ) {
+    return 'cyrillic';
+  }
+  if (normalized.startsWith('ar')) return 'arabic';
+  if (normalized.startsWith('he')) return 'hebrew';
+  if (normalized.startsWith('hi')) return 'devanagari';
+  if (normalized.startsWith('ja')) return 'japanese';
+  if (normalized.startsWith('ko')) return 'hangul';
+  if (normalized.startsWith('zh')) return 'han';
+  return 'latin';
+}
+
+function countLettersByScript(text = '', script) {
+  if (!text) return 0;
+  switch (script) {
+    case 'cyrillic':
+      return countMatches(text, /[\p{Script=Cyrillic}]/gu);
+    case 'arabic':
+      return countMatches(text, /[\p{Script=Arabic}]/gu);
+    case 'hebrew':
+      return countMatches(text, /[\p{Script=Hebrew}]/gu);
+    case 'devanagari':
+      return countMatches(text, /[\p{Script=Devanagari}]/gu);
+    case 'japanese':
+      return countMatches(text, /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/gu);
+    case 'hangul':
+      return countMatches(text, /[\p{Script=Hangul}]/gu);
+    case 'han':
+      return countMatches(text, /[\p{Script=Han}]/gu);
+    case 'latin':
+    default:
+      return countMatches(text, /[\p{Script=Latin}]/gu);
+  }
+}
+
+function detectDominantScript(text = '') {
+  const scripts = ['cyrillic', 'latin', 'arabic', 'hebrew', 'devanagari', 'japanese', 'hangul', 'han'];
+  let best = null;
+  let bestCount = 0;
+  scripts.forEach((script) => {
+    const count = countLettersByScript(text, script);
+    if (count > bestCount) {
+      bestCount = count;
+      best = script;
+    }
+  });
+  return bestCount > 0 ? best : null;
+}
+
+function needsLanguageRepair(source = '', translated = '', targetLanguage = '') {
+  const sourceNormalized = normalizeTextForComparison(source);
+  const translatedNormalized = normalizeTextForComparison(translated);
+  if (!translatedNormalized) return false;
+  const totalLetters = countMatches(translated, /[\p{L}]/gu);
+  if (!totalLetters || totalLetters < 6) return false;
+  const targetScript = getLanguageScript(targetLanguage);
+  const targetLetters = countLettersByScript(translated, targetScript);
+  const targetRatio = totalLetters ? targetLetters / totalLetters : 0;
+  const sourceScript = detectDominantScript(source);
+  if (
+    sourceNormalized &&
+    sourceNormalized === translatedNormalized &&
+    sourceScript &&
+    sourceScript !== targetScript &&
+    totalLetters >= 6
+  ) {
+    return true;
+  }
+  if (sourceScript && sourceScript !== targetScript) {
+    const sourceLetters = countLettersByScript(translated, sourceScript);
+    if (sourceLetters / totalLetters >= 0.35 && totalLetters >= 10) {
+      return true;
+    }
+  }
+  return targetRatio < 0.35 && totalLetters >= 12;
 }
 
 function normalizeTextForComparison(value = '') {

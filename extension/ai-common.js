@@ -2,6 +2,24 @@ const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
+const MODEL_PRICE_PER_M_TOKEN = {
+  'gpt-5-nano': 0.45,
+  'gpt-4.1-nano': 0.5,
+  'gpt-4o-mini': 0.75,
+  'gpt-4.1-mini': 2,
+  'deepseek-chat': 0.7,
+  'deepseek-reasoner': 0.7,
+  'gpt-5-mini': 2.25,
+  'gpt-4.1': 10,
+  'gpt-5.1': 11.25,
+  'gpt-5': 11.25,
+  'gpt-5.1-chat-latest': 11.25,
+  'gpt-5-chat-latest': 11.25,
+  'gpt-4o': 12.5,
+  'gpt-5.2': 15.75,
+  'gpt-5.2-chat-latest': 15.75,
+  'gpt-4o-2024-05-13': 20
+};
 
 function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
   if (apiBaseUrl !== OPENAI_API_URL) return messages;
@@ -92,4 +110,24 @@ function calculateRetryDelayMs(attempt, retryAfterMs) {
 
 function sleep(durationMs) {
   return new Promise(resolve => setTimeout(resolve, durationMs));
+}
+
+function normalizeUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens);
+  const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? usage.completionTokens);
+  const totalTokens = Number(usage.total_tokens ?? usage.totalTokens);
+  return {
+    prompt_tokens: Number.isFinite(promptTokens) ? promptTokens : null,
+    completion_tokens: Number.isFinite(completionTokens) ? completionTokens : null,
+    total_tokens: Number.isFinite(totalTokens) ? totalTokens : null
+  };
+}
+
+function calculateUsageCost(usage, model) {
+  const normalized = normalizeUsage(usage);
+  if (!normalized?.total_tokens) return null;
+  const pricePerM = MODEL_PRICE_PER_M_TOKEN?.[model];
+  if (!Number.isFinite(pricePerM)) return null;
+  return (normalized.total_tokens / 1_000_000) * pricePerM;
 }
