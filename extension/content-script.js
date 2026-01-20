@@ -34,7 +34,6 @@ const PUNCTUATION_TOKENS = new Map([
   ['”', '⟦PUNC_RDQUOTE⟧'],
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
-const PROOFREAD_SEGMENT_TOKEN = '⟦SEGMENT_BREAK⟧';
 
 restoreFromMemory();
 
@@ -405,14 +404,39 @@ async function translatePage(settings) {
       activeProofreadWorkers += 1;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress' });
-        const proofreadResult = await requestProofreading(
-          task.translatedTexts,
-          settings.targetLanguage || 'ru',
-          latestContextSummary,
-          task.originalTexts
-        );
-        const replacements = proofreadResult.replacements;
-        let finalTranslations = applyProofreadingReplacements(task.translatedTexts, replacements);
+        const proofreadBlocks = task.translatedTexts.map((text, index) => ({
+          blockId: String(task.block[index]?.path ?? `${task.index}-${index}`),
+          text,
+          language: settings.targetLanguage || 'ru',
+          goals: latestContextSummary ? [`Контекст перевода: ${latestContextSummary}`] : []
+        }));
+        const proofreadResult = await requestProofreading(proofreadBlocks);
+        const results = Array.isArray(proofreadResult.results) ? proofreadResult.results : [];
+        const resultById = new Map(results.map((result) => [result.blockId, result]));
+        const proofreadSummary = [];
+        let finalTranslations = task.translatedTexts.map((text, index) => {
+          const blockId = String(task.block[index]?.path ?? `${task.index}-${index}`);
+          const result = resultById.get(blockId);
+          if (!result) {
+            return text;
+          }
+          const edits = Array.isArray(result.edits) ? result.edits : [];
+          const application = ProofreadUtils.applyEdits(text, edits);
+          let nextText = application.newText;
+          let usedRewrite = false;
+          if ((!edits.length || application.applied.length === 0) && result?.rewrite?.text) {
+            nextText = result.rewrite.text;
+            usedRewrite = true;
+          }
+          proofreadSummary.push({
+            blockId,
+            edits,
+            applied: application.applied,
+            failed: application.failed,
+            usedRewrite
+          });
+          return nextText;
+        });
         finalTranslations = finalTranslations.map((text, index) =>
           applyOriginalFormatting(task.originalTexts[index], text)
         );
@@ -434,10 +458,15 @@ async function translatePage(settings) {
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
 
+        const rawProofreadPayload = proofreadResult.rawProofread || '';
+        const rawProofread =
+          typeof rawProofreadPayload === 'string'
+            ? rawProofreadPayload
+            : JSON.stringify(rawProofreadPayload, null, 2);
         await updateDebugEntry(task.index + 1, {
           proofreadStatus: 'done',
-          proofread: replacements,
-          proofreadRaw: proofreadResult.rawProofread || ''
+          proofread: proofreadSummary,
+          proofreadRaw: rawProofread
         });
         reportProgress('Вычитка выполняется');
       } catch (error) {
@@ -508,11 +537,10 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
   );
 }
 
-async function requestProofreading(texts, targetLanguage, context, sourceTexts) {
+async function requestProofreading(blocks) {
+  const texts = Array.isArray(blocks) ? blocks.map((block) => block?.text || '') : [];
   const estimatedTokens = estimateTokensForRole('proofread', {
-    texts,
-    context,
-    sourceTexts
+    texts
   });
   await ensureTpmBudget('proofread', estimatedTokens);
   await incrementDebugAiRequestCount();
@@ -521,15 +549,12 @@ async function requestProofreading(texts, targetLanguage, context, sourceTexts) 
       const response = await sendRuntimeMessage(
         {
           type: 'PROOFREAD_TEXT',
-          texts,
-          targetLanguage,
-          context,
-          sourceTexts
+          blocks
         },
         'Не удалось выполнить вычитку.'
       );
       return {
-        replacements: normalizeProofreadReplacements(response.replacements),
+        results: Array.isArray(response.results) ? response.results : [],
         rawProofread: response.rawProofread || ''
       };
     },
@@ -581,30 +606,6 @@ async function withRateLimitRetry(requestFn, label) {
   }
 }
 
-function normalizeProofreadReplacements(replacements) {
-  if (!Array.isArray(replacements)) {
-    return [];
-  }
-
-  return replacements
-    .map((item) => {
-      if (!item || typeof item !== 'object') return null;
-      const segmentIndex = Number(item.segmentIndex);
-      if (!Number.isInteger(segmentIndex)) return null;
-      const revisedText = typeof item.revisedText === 'string' ? item.revisedText : '';
-      return { segmentIndex, revisedText };
-    })
-    .filter(Boolean);
-}
-
-function normalizeSegmentForComparison(value = '') {
-  return value
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/[^\p{L}\p{N}\s]/gu, '')
-    .trim();
-}
-
 function formatLogDetails(details) {
   if (details === null || details === undefined) return '';
   try {
@@ -613,109 +614,6 @@ function formatLogDetails(details) {
   } catch (error) {
     return ` ${String(details)}`;
   }
-}
-
-function hasMeaningfulOverlap(originalText, revisedText) {
-  const normalizedOriginal = normalizeSegmentForComparison(originalText);
-  const normalizedRevised = normalizeSegmentForComparison(revisedText);
-  if (!normalizedOriginal || !normalizedRevised) return false;
-  const minLength = Math.min(normalizedOriginal.length, normalizedRevised.length);
-  if (minLength < 8) return false;
-  return (
-    normalizedOriginal.includes(normalizedRevised) || normalizedRevised.includes(normalizedOriginal)
-  );
-}
-
-function isSuspiciousLengthChange(originalText, revisedText) {
-  const originalLength = originalText.length;
-  const revisedLength = revisedText.length;
-  const hasOverlap = hasMeaningfulOverlap(originalText, revisedText);
-
-  if (originalLength === 0) {
-    return revisedLength > 200;
-  }
-
-  const ratio = revisedLength / originalLength;
-  if (originalLength >= 20) {
-    const minRatio = hasOverlap ? 0.2 : 0.3;
-    const maxRatio = hasOverlap ? 5 : 4;
-    return ratio < minRatio || ratio > maxRatio;
-  }
-
-  const maxIncrease = originalLength < 8 ? 120 : 160;
-  const allowedIncrease = hasOverlap ? maxIncrease + 60 : maxIncrease;
-  return revisedLength - originalLength > allowedIncrease;
-}
-
-function isSimilarToNeighbor(revisedText, neighborText) {
-  if (!neighborText) return false;
-  const normalizedRevised = normalizeSegmentForComparison(revisedText);
-  const normalizedNeighbor = normalizeSegmentForComparison(neighborText);
-  if (!normalizedRevised || !normalizedNeighbor) return false;
-  if (normalizedRevised === normalizedNeighbor) return true;
-  if (
-    normalizedRevised.length >= 20 &&
-    (normalizedRevised.includes(normalizedNeighbor) || normalizedNeighbor.includes(normalizedRevised))
-  ) {
-    const minLength = Math.min(normalizedRevised.length, normalizedNeighbor.length);
-    const maxLength = Math.max(normalizedRevised.length, normalizedNeighbor.length);
-    return minLength / maxLength > 0.8;
-  }
-  return false;
-}
-
-function applyProofreadingReplacements(texts, replacements) {
-  const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
-  const combinedText = texts.join(segmentDelimiter);
-  const segments = combinedText.split(segmentDelimiter);
-
-  replacements.forEach((replacement) => {
-    if (!replacement) return;
-    const segmentIndex = Number(replacement.segmentIndex);
-    if (!Number.isInteger(segmentIndex)) return;
-    if (segmentIndex < 0 || segmentIndex >= segments.length) {
-      console.warn(
-        `Proofread segment index out of range, skipping.${formatLogDetails({
-          segmentIndex,
-          segmentCount: segments.length
-        })}`
-      );
-      return;
-    }
-    const revisedText = typeof replacement.revisedText === 'string' ? replacement.revisedText : '';
-    const originalText = segments[segmentIndex] ?? '';
-    if (revisedText.includes(PROOFREAD_SEGMENT_TOKEN)) {
-      console.warn(
-        `Proofread segment contains segment token, skipping.${formatLogDetails({ segmentIndex })}`
-      );
-      return;
-    }
-    if (isSuspiciousLengthChange(originalText, revisedText)) {
-      console.warn(
-        `Proofread segment length looks suspicious, skipping.${formatLogDetails({
-          segmentIndex,
-          originalLength: originalText.length,
-          revisedLength: revisedText.length
-        })}`
-      );
-      return;
-    }
-    const previousSegment = segments[segmentIndex - 1];
-    const nextSegment = segments[segmentIndex + 1];
-    const resemblesNeighbor =
-      isSimilarToNeighbor(revisedText, previousSegment) || isSimilarToNeighbor(revisedText, nextSegment);
-    const originalResemblesNeighbor =
-      isSimilarToNeighbor(originalText, previousSegment) || isSimilarToNeighbor(originalText, nextSegment);
-    if (resemblesNeighbor && !originalResemblesNeighbor) {
-      console.warn(
-        `Proofread segment resembles a neighbor, skipping.${formatLogDetails({ segmentIndex })}`
-      );
-      return;
-    }
-    segments[segmentIndex] = revisedText;
-  });
-
-  return segments;
 }
 
 function escapeRegex(value = '') {

@@ -310,6 +310,42 @@ function renderProofreadSection(item) {
 
 function formatProofreadReplacement(replacement, index, item) {
   if (!replacement || typeof replacement !== 'object') return '';
+  if (
+    Array.isArray(replacement.edits) ||
+    Array.isArray(replacement.applied) ||
+    Array.isArray(replacement.failed)
+  ) {
+    const blockId = replacement.blockId ?? `#${index + 1}`;
+    const applied = Array.isArray(replacement.applied)
+      ? replacement.applied
+          .map((entry) => formatProofreadEdit(entry?.edit || entry))
+          .filter(Boolean)
+      : [];
+    const failed = Array.isArray(replacement.failed)
+      ? replacement.failed
+          .map((entry) => {
+            const formatted = formatProofreadEdit(entry?.edit || entry);
+            if (!formatted) return '';
+            const reason = entry?.reason ? ` (failed: ${entry.reason})` : ' (failed)';
+            return `${formatted}${reason}`;
+          })
+          .filter(Boolean)
+      : [];
+    const lines = [`Block ${blockId}:`];
+    if (applied.length) {
+      lines.push(`  Applied: ${applied.join('; ')}`);
+    }
+    if (failed.length) {
+      lines.push(`  Failed: ${failed.join('; ')}`);
+    }
+    if (!applied.length && !failed.length) {
+      lines.push('  Нет правок.');
+    }
+    if (replacement.usedRewrite) {
+      lines.push('  Использован полный rewrite.');
+    }
+    return lines.join('\n');
+  }
   const hasFromTo = 'from' in replacement || 'to' in replacement;
   if (hasFromTo) {
     const fromText = typeof replacement.from === 'string' ? replacement.from : '';
@@ -328,6 +364,26 @@ function formatProofreadReplacement(replacement, index, item) {
   }
 
   return '';
+}
+
+function formatProofreadEdit(edit) {
+  if (!edit || typeof edit !== 'object') return '';
+  const target = typeof edit.target === 'string' ? edit.target : '';
+  const replacement = typeof edit.replacement === 'string' ? edit.replacement : '';
+  const occurrence =
+    Number.isInteger(edit.occurrence) && edit.occurrence > 1 ? ` (#${edit.occurrence})` : '';
+  switch (edit.op) {
+    case 'replace':
+      return target || replacement ? `${target} -> ${replacement}${occurrence}` : '';
+    case 'delete':
+      return target ? `delete ${target}${occurrence}` : '';
+    case 'insert_before':
+      return target || replacement ? `insert_before ${target}: ${replacement}${occurrence}` : '';
+    case 'insert_after':
+      return target || replacement ? `insert_after ${target}: ${replacement}${occurrence}` : '';
+    default:
+      return '';
+  }
 }
 
 function resolveProofreadSourceText(item, segmentIndex) {

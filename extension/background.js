@@ -1,3 +1,5 @@
+importScripts('proofread-utils.js');
+
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
   'gpt-4.1-mini': 200000,
@@ -42,10 +44,41 @@ const PUNCTUATION_TOKENS = new Map([
   ['”', '⟦PUNC_RDQUOTE⟧'],
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
-const PROOFREAD_SEGMENT_TOKEN = '⟦SEGMENT_BREAK⟧';
-
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
+const PROOFREAD_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    edits: {
+      type: 'array',
+      maxItems: ProofreadUtils.MAX_PROOFREAD_EDITS,
+      items: {
+        type: 'object',
+        properties: {
+          op: { type: 'string', enum: ['replace', 'insert_before', 'insert_after', 'delete'] },
+          target: { type: 'string' },
+          replacement: { type: 'string' },
+          occurrence: { type: 'integer', minimum: 1 },
+          before: { type: 'string' },
+          after: { type: 'string' },
+          rationale: { type: 'string' }
+        },
+        required: ['op', 'target', 'occurrence'],
+        additionalProperties: false
+      }
+    },
+    rewrite: {
+      type: 'object',
+      properties: {
+        text: { type: 'string' }
+      },
+      required: ['text'],
+      additionalProperties: false
+    }
+  },
+  required: ['edits'],
+  additionalProperties: false
+};
 
 function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
   if (apiBaseUrl !== OPENAI_API_URL) return messages;
@@ -281,16 +314,13 @@ async function handleProofreadText(message, sendResponse) {
       return;
     }
 
-    const { replacements, rawProofread } = await proofreadTranslation(
-      message.texts,
+    const { results, rawProofread } = await proofreadTranslation(
+      message.blocks,
       apiKey,
-      message.targetLanguage,
       state.proofreadModel,
-      apiBaseUrl,
-      message.context,
-      message.sourceTexts
+      apiBaseUrl
     );
-    sendResponse({ success: true, replacements, rawProofread });
+    sendResponse({ success: true, results, rawProofread });
   } catch (error) {
     console.error('Proofreading failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
@@ -430,169 +460,114 @@ async function generateTranslationContext(
   return typeof content === 'string' ? content.trim() : '';
 }
 
-async function proofreadTranslation(
-  texts,
-  apiKey,
-  targetLanguage = 'ru',
-  model = DEFAULT_STATE.proofreadModel,
-  apiBaseUrl = OPENAI_API_URL,
-  context = '',
-  sourceTexts = []
-) {
-  if (!Array.isArray(texts) || !texts.length) return { replacements: [], rawProofread: '' };
+async function proofreadTranslation(blocks, apiKey, model = DEFAULT_STATE.proofreadModel, apiBaseUrl = OPENAI_API_URL) {
+  if (!Array.isArray(blocks) || !blocks.length) return { results: [], rawProofread: [] };
 
-  const expectedSegments = texts.length;
-  const normalizedSourceTexts = Array.isArray(sourceTexts) ? sourceTexts : [];
-  const segmentDelimiter = `\n${PROOFREAD_SEGMENT_TOKEN}\n`;
-  const combinedSourceText = normalizedSourceTexts.join(segmentDelimiter);
-  const combinedTranslatedText = texts.join(segmentDelimiter);
-  const maxRateLimitRetries = 3;
-  let rateLimitRetries = 0;
-  let lastRateLimitDelayMs = null;
-  let lastError = null;
-  const prompt = applyPromptCaching([
-    {
-      role: 'system',
-      content: [
-        'You are a flexible proofreading engine focused on readability and clear meaning in translated text.',
-        'Return corrected segments only as JSON with a top-level "replacements" array of objects.',
-        'Each replacement object must include "segmentIndex" (0-based index) and "replacementText".',
-        'Indexing starts at 0 (the first segment is 0, the second is 1). Do not use 1-based indices.',
-        'replacementText is the full corrected segment text to replace the original.',
-        'Only include segments that require corrections. If no corrections are needed, return an empty list.',
-        'Never add commentary, explanations, numbering, or extra markup.',
-        'Prioritize readability and clarity of meaning over strict literalness.',
-        'Improve fluency and naturalness so the translation reads like it was written by a native speaker.',
-        'Fix grammar, agreement, punctuation, typos, or terminology consistency as needed.',
-        'You may add or adjust punctuation marks for naturalness, but do not modify punctuation tokens.',
-        'You may rephrase more freely to improve readability and to раскрыть смысл яснее, but never change meaning or add/remove information.',
-        'Avoid over-editing when the text is already clear and natural.',
-        'Do not reorder sentences unless it is required for readability or naturalness in the target language.',
-        'Never move text between segments; keep every edit entirely within its original segment.',
-        'Do not merge or split segments; each segment must stay as a single unit.',
-        'Preserve the relative order of sentences within each segment.',
-        'Never introduce, duplicate, or delete punctuation tokens like ⟦PUNC_DQUOTE⟧.',
-        'If a punctuation token appears in the translated text, keep it unchanged and in the same position.',
-        'If a segment separator token appears in the translated text, keep it unchanged and in the same position.',
-        'Do not include the segment separator in any line.',
-        'Use the source text only to verify correctness and preserve meaning.',
-        context
-          ? 'Rely on the provided translation context to maintain terminology consistency and resolve ambiguity.'
-          : 'If no context is provided, do not invent context or add assumptions.',
-        PUNCTUATION_TOKEN_HINT,
-        'Return only the corrected replacements.'
-      ]
-        .filter(Boolean)
-        .join(' ')
-    },
-    {
-      role: 'user',
-      content: [
-        `Target language: ${targetLanguage}.`,
-        'Review the translated text below and return only the revised segments as JSON objects under "replacements".',
-        'Each replacement object must include "segmentIndex" (0-based) and "replacementText".',
-        'Important: segmentIndex is 0-based (first segment is index 0).',
-        'Only include segments that need corrections. If no corrections are needed, return an empty list.',
-        context ? `Context (use it as the only disambiguation aid): ${context}` : '',
-        normalizedSourceTexts.length ? `Source text (segments separated by ${PROOFREAD_SEGMENT_TOKEN}):` : '',
-        normalizedSourceTexts.length ? combinedSourceText : '',
-        'Translated text:',
-        combinedTranslatedText
-      ]
-        .filter(Boolean)
-        .join('\n')
+  const normalizedBlocks = blocks.map((block, index) => {
+    const blockId = block?.blockId ?? String(index);
+    const language = block?.language ?? '';
+    const goals = Array.isArray(block?.goals) ? block.goals : [];
+    const text = typeof block?.text === 'string' ? block.text : '';
+    const { normalized } = ProofreadUtils.normalizeLineEndings(text);
+    return { blockId, text: normalized, language, goals };
+  });
+
+  const results = [];
+  const rawProofread = [];
+
+  for (const block of normalizedBlocks) {
+    const prompt = applyPromptCaching(ProofreadUtils.buildProofreadPrompt(block), apiBaseUrl);
+    if (prompt?.[0]?.content) {
+      prompt[0].content = `${prompt[0].content} ${PUNCTUATION_TOKEN_HINT}`;
     }
-  ], apiBaseUrl);
 
-  while (true) {
-    try {
-      const response = await fetch(apiBaseUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model,
-          messages: prompt,
-          response_format: {
-            type: 'json_schema',
-            json_schema: {
-              name: 'proofread_replacements',
-              schema: {
-                type: 'object',
-                properties: {
-                  replacements: {
-                    type: 'array',
-                    items: {
-                      type: 'object',
-                      properties: {
-                        segmentIndex: { type: 'integer' },
-                        replacementText: { type: 'string' }
-                      },
-                      required: ['segmentIndex', 'replacementText'],
-                      additionalProperties: false
-                    }
-                  }
-                },
-                required: ['replacements'],
-                additionalProperties: false
+    const maxRateLimitRetries = 3;
+    let rateLimitRetries = 0;
+    let lastRateLimitDelayMs = null;
+    let lastError = null;
+
+    while (true) {
+      try {
+        const response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model,
+            messages: prompt,
+            response_format: {
+              type: 'json_schema',
+              json_schema: {
+                name: 'proofread_edits',
+                schema: PROOFREAD_RESPONSE_SCHEMA
               }
             }
+          })
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          let errorPayload = null;
+          try {
+            errorPayload = JSON.parse(errorText);
+          } catch (parseError) {
+            errorPayload = null;
           }
-        })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        let errorPayload = null;
-        try {
-          errorPayload = JSON.parse(errorText);
-        } catch (parseError) {
-          errorPayload = null;
+          const retryAfterMs = parseRetryAfterMs(response, errorPayload);
+          const errorMessage =
+            errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
+          const error = new Error(`Proofread request failed: ${response.status} ${errorMessage}`);
+          error.status = response.status;
+          error.retryAfterMs = retryAfterMs;
+          error.isRateLimit = response.status === 429 || response.status === 503;
+          throw error;
         }
-        const retryAfterMs = parseRetryAfterMs(response, errorPayload);
-        const errorMessage =
-          errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
-        const error = new Error(`Proofread request failed: ${response.status} ${errorMessage}`);
-        error.status = response.status;
-        error.retryAfterMs = retryAfterMs;
-        error.isRateLimit = response.status === 429 || response.status === 503;
-        throw error;
+
+        const data = await response.json();
+        const content = data?.choices?.[0]?.message?.content;
+        if (!content) {
+          throw new Error('No proofreading result returned');
+        }
+
+        const parsed = parseJsonObjectFlexible(content, 'proofread');
+        const edits = Array.isArray(parsed?.edits) ? parsed.edits : [];
+        const rewrite =
+          parsed?.rewrite && typeof parsed.rewrite?.text === 'string' ? { text: parsed.rewrite.text } : null;
+
+        results.push({ blockId: block.blockId, edits, rewrite });
+        rawProofread.push({ blockId: block.blockId, raw: content });
+        break;
+      } catch (error) {
+        lastError = error;
+        const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
+        if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
+          rateLimitRetries += 1;
+          const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
+          lastRateLimitDelayMs = retryDelayMs;
+          console.warn(`Proofreading rate-limited, retrying after ${retryDelayMs}ms...`);
+          await sleep(retryDelayMs);
+          continue;
+        }
+
+        if (isRateLimit) {
+          const waitSeconds = Math.max(
+            1,
+            Math.ceil((lastRateLimitDelayMs || error?.retryAfterMs || 30000) / 1000)
+          );
+          const waitMs = waitSeconds * 1000;
+          console.warn(`Proofreading rate limit reached—waiting ${waitSeconds}s before retrying.`);
+          await sleep(waitMs);
+          continue;
+        }
+
+        throw lastError;
       }
-
-      const data = await response.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) {
-        throw new Error('No proofreading result returned');
-      }
-
-      const replacements = parseProofreadReplacements(content, texts.length);
-
-      return { replacements, rawProofread: content };
-    } catch (error) {
-      lastError = error;
-      const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
-      if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
-        rateLimitRetries += 1;
-        const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
-        lastRateLimitDelayMs = retryDelayMs;
-        console.warn(`Proofreading rate-limited, retrying after ${retryDelayMs}ms...`);
-        await sleep(retryDelayMs);
-        continue;
-      }
-
-      if (isRateLimit) {
-        const waitSeconds = Math.max(1, Math.ceil((lastRateLimitDelayMs || error?.retryAfterMs || 30000) / 1000));
-        const waitMs = waitSeconds * 1000;
-        console.warn(`Proofreading rate limit reached—waiting ${waitSeconds}s before retrying.`);
-        await sleep(waitMs);
-        continue;
-      }
-
-      throw lastError;
     }
   }
+
+  return { results, rawProofread };
 }
 
 async function getModelThroughputInfo(model) {
@@ -1284,88 +1259,6 @@ function extractJsonArray(content = '', label = 'response') {
   }
 
   return parsed;
-}
-
-function parseProofreadReplacements(content, expectedSegments) {
-  let parsed = null;
-  try {
-    const parsedObject = parseJsonObjectFlexible(content, 'proofread');
-    if (Array.isArray(parsedObject?.replacements)) {
-      parsed = parsedObject.replacements;
-    } else {
-      throw new Error('proofread response is missing replacements array.');
-    }
-  } catch (error) {
-    console.warn('Proofread response object parsing failed; attempting array parsing.', error);
-    try {
-      parsed = extractJsonArray(content, 'proofread');
-    } catch (innerError) {
-      console.warn('Proofread response parsing failed; returning no replacements.', innerError);
-      return [];
-    }
-  }
-
-  const rawItems = [];
-  for (const item of parsed) {
-    let segmentIndexRaw = null;
-    let replacementRaw = null;
-
-    if (Array.isArray(item) && item.length >= 2) {
-      [segmentIndexRaw, replacementRaw] = item;
-    } else if (item && typeof item === 'object') {
-      segmentIndexRaw = item.segmentIndex ?? item.index ?? item.segment ?? null;
-      replacementRaw =
-        item.replacementText ?? item.revisedText ?? item.text ?? item.value ?? item.replacement ?? null;
-    } else {
-      console.warn('Skipping invalid proofread item.', item);
-      continue;
-    }
-
-    const segmentIndex = Number(segmentIndexRaw);
-    if (!Number.isInteger(segmentIndex)) {
-      console.warn('Skipping proofread item with invalid segment index.', item);
-      continue;
-    }
-    rawItems.push({ segmentIndex, replacementRaw, item });
-  }
-
-  if (!rawItems.length) {
-    return [];
-  }
-
-  const hasZeroIndex = rawItems.some((entry) => entry.segmentIndex === 0);
-  const allPositive = rawItems.every((entry) => entry.segmentIndex > 0);
-  const minIndex = Math.min(...rawItems.map((entry) => entry.segmentIndex));
-  const maxIndex = Math.max(...rawItems.map((entry) => entry.segmentIndex));
-  const looksOneBased =
-    !hasZeroIndex &&
-    allPositive &&
-    minIndex >= 1 &&
-    maxIndex <= expectedSegments &&
-    expectedSegments > 0;
-  const indexOffset = looksOneBased ? -1 : 0;
-  if (indexOffset) {
-    console.warn('Detected 1-based proofread indices; converting to 0-based indices.');
-  }
-
-  const replacements = [];
-  for (const entry of rawItems) {
-    const segmentIndex = entry.segmentIndex + indexOffset;
-    if (segmentIndex < 0 || segmentIndex >= expectedSegments) {
-      console.warn('Skipping proofread item with invalid segment index.', entry.item);
-      continue;
-    }
-    const revisedText =
-      typeof entry.replacementRaw === 'string'
-        ? entry.replacementRaw
-        : String(entry.replacementRaw ?? '');
-    if (!revisedText) {
-      continue;
-    }
-    replacements.push({ segmentIndex, revisedText });
-  }
-
-  return replacements;
 }
 
 function countMatches(value = '', regex) {
