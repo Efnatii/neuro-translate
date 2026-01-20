@@ -421,13 +421,9 @@ async function translatePage(settings) {
             return text;
           }
           const edits = Array.isArray(result.edits) ? result.edits : [];
-          const application = ProofreadUtils.applyEdits(text, edits);
-          let nextText = application.newText;
-          let usedRewrite = false;
-          if ((!edits.length || application.applied.length === 0) && result?.rewrite?.text) {
-            nextText = result.rewrite.text;
-            usedRewrite = true;
-          }
+          const application = ProofreadUtils.applyEdits(text, edits, result?.rewrite?.text);
+          const nextText = application.newText;
+          const usedRewrite = application.usedRewrite;
           proofreadSummary.push({
             blockId,
             edits,

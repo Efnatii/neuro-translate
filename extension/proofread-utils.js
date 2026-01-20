@@ -1,5 +1,24 @@
 (() => {
   const MAX_PROOFREAD_EDITS = 30;
+  const PLACEHOLDER_PATTERN = /⟦[^\]]+⟧/;
+  const ZERO_WIDTH_PATTERN = /[\u200B-\u200D\uFEFF]/;
+  const UNUSUAL_CHAR_LABELS = new Map([
+    ['\u00A0', 'NBSP'],
+    ['\u200B', 'ZWSP'],
+    ['\u200C', 'ZWNJ'],
+    ['\u200D', 'ZWJ'],
+    ['\uFEFF', 'ZWNBSP'],
+    ['\u2013', 'EN DASH'],
+    ['\u2014', 'EM DASH'],
+    ['\u2015', 'HORIZONTAL BAR'],
+    ['\u2212', 'MINUS SIGN'],
+    ['\u2018', 'LEFT SINGLE QUOTE'],
+    ['\u2019', 'RIGHT SINGLE QUOTE'],
+    ['\u201C', 'LEFT DOUBLE QUOTE'],
+    ['\u201D', 'RIGHT DOUBLE QUOTE'],
+    ['\u00AB', 'LEFT ANGLE QUOTE'],
+    ['\u00BB', 'RIGHT ANGLE QUOTE']
+  ]);
 
   function detectLineEnding(text = '') {
     if (text.includes('\r\n')) return '\r\n';
@@ -16,6 +35,10 @@
   function restoreLineEndings(text = '', lineEnding = '\n') {
     if (lineEnding === '\n') return text;
     return text.replace(/\n/g, lineEnding);
+  }
+
+  function normalizeForComparison(text = '') {
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   }
 
   function findAllOccurrences(text = '', target = '') {
@@ -56,12 +79,10 @@
     return occurrences.filter((match) => matchesContext(text, match, before, after));
   }
 
-  function resolveOccurrence(edit, candidates) {
-    if (!candidates.length) return null;
-    if (candidates.length === 1) return candidates[0];
-    const occurrence = Number.isInteger(edit.occurrence) ? edit.occurrence : 1;
-    if (occurrence < 1 || occurrence > candidates.length) return null;
-    return candidates[occurrence - 1];
+  function hasContext(edit) {
+    return Boolean(
+      (typeof edit.before === 'string' && edit.before) || (typeof edit.after === 'string' && edit.after)
+    );
   }
 
   function validateEditShape(edit) {
@@ -76,9 +97,6 @@
     if (typeof edit.target !== 'string' || !edit.target) {
       return { valid: false, reason: 'missing_target' };
     }
-    if (!Number.isInteger(edit.occurrence) || edit.occurrence < 1) {
-      return { valid: false, reason: 'invalid_occurrence' };
-    }
     if (op === 'replace' || op === 'insert_before' || op === 'insert_after') {
       if (typeof edit.replacement !== 'string') {
         return { valid: false, reason: 'missing_replacement' };
@@ -87,16 +105,18 @@
     return { valid: true };
   }
 
-  function computeConfidence(edit, candidatesCount) {
-    let score = 0;
-    if (edit.before) score += 2;
-    if (edit.after) score += 2;
-    if (Number.isInteger(edit.occurrence)) score += 1;
-    if (candidatesCount === 1) score += 2;
-    return score;
+  function hasPlaceholder(text) {
+    return PLACEHOLDER_PATTERN.test(text);
   }
 
-  function buildEditSpan(edit, match, index, candidatesCount) {
+  function isNoOp(edit) {
+    if (typeof edit.replacement !== 'string') return false;
+    const normalizedTarget = normalizeForComparison(edit.target);
+    const normalizedReplacement = normalizeForComparison(edit.replacement);
+    return normalizedTarget === normalizedReplacement;
+  }
+
+  function buildEditSpan(edit, match, index) {
     const op = edit.op;
     let start = match.start;
     let end = match.end;
@@ -117,9 +137,21 @@
       start,
       end,
       replacement: replacement ?? '',
-      index,
-      confidence: computeConfidence(edit, candidatesCount)
+      index
     };
+  }
+
+  function buildFailed(edit, reason, detail) {
+    return detail ? { edit, reason, detail } : { edit, reason };
+  }
+
+  function resolveOccurrence(edit, candidates) {
+    if (!candidates.length) return null;
+    if (candidates.length === 1) return candidates[0];
+    if (!Number.isInteger(edit.occurrence)) return null;
+    const occurrence = edit.occurrence;
+    if (occurrence < 1 || occurrence > candidates.length) return null;
+    return candidates[occurrence - 1];
   }
 
   function collectEditSpans(edits, text) {
@@ -132,19 +164,34 @@
     edits.forEach((edit, index) => {
       const shapeCheck = validateEditShape(edit);
       if (!shapeCheck.valid) {
-        failed.push({ edit, reason: shapeCheck.reason });
+        failed.push(buildFailed(edit, shapeCheck.reason));
+        return;
+      }
+      if (hasPlaceholder(edit.target)) {
+        failed.push(buildFailed(edit, 'model_violation', 'placeholder_target'));
+        return;
+      }
+      if (isNoOp(edit)) {
+        failed.push(buildFailed(edit, 'no_op'));
+        return;
+      }
+      if (!text.includes(edit.target)) {
+        failed.push(buildFailed(edit, 'model_violation', 'target_not_found'));
         return;
       }
       const candidates = findCandidates(text, edit);
-      const match = resolveOccurrence(edit, candidates);
-      if (!match) {
-        failed.push({
-          edit,
-          reason: candidates.length ? 'ambiguous_target' : 'target_not_found'
-        });
+      if (candidates.length > 1 && !hasContext(edit)) {
+        failed.push(buildFailed(edit, 'model_violation', 'missing_context'));
         return;
       }
-      spans.push(buildEditSpan(edit, match, index, candidates.length));
+      const match = resolveOccurrence(edit, candidates);
+      if (!match) {
+        failed.push(
+          buildFailed(edit, candidates.length ? 'ambiguous' : 'target_not_found')
+        );
+        return;
+      }
+      spans.push(buildEditSpan(edit, match, index));
     });
 
     return { spans, failed };
@@ -165,22 +212,23 @@
     return a.start < b.end && b.start < a.end;
   }
 
-  function resolveOverlaps(spans) {
+  function rejectOverlaps(spans) {
     const accepted = [];
     const rejected = [];
-    const sorted = [...spans].sort((a, b) => {
-      if (b.confidence !== a.confidence) return b.confidence - a.confidence;
-      return a.index - b.index;
-    });
+    const sorted = [...spans].sort((a, b) => a.index - b.index);
     sorted.forEach((candidate) => {
       const hasOverlap = accepted.some((existing) => spansOverlap(existing, candidate));
       if (hasOverlap) {
-        rejected.push({ edit: candidate.edit, reason: 'overlap' });
+        rejected.push(buildFailed(candidate.edit, 'overlap'));
         return;
       }
       accepted.push(candidate);
     });
     return { accepted, rejected };
+  }
+
+  function shouldFallback(failed) {
+    return failed.some((item) => item.reason === 'model_violation' || item.reason === 'ambiguous');
   }
 
   function validateEditsAgainstText(edits, text) {
@@ -198,11 +246,30 @@
     };
   }
 
-  function applyEdits(text, edits) {
+  function applyEdits(text, edits, rewriteText = null) {
     const { normalized, lineEnding } = normalizeLineEndings(text);
     const { spans, failed } = collectEditSpans(edits, normalized);
-    const { accepted, rejected } = resolveOverlaps(spans);
+    const { accepted, rejected } = rejectOverlaps(spans);
     const failedEdits = failed.concat(rejected);
+
+    if (failedEdits.length && shouldFallback(failedEdits)) {
+      if (typeof rewriteText === 'string' && rewriteText) {
+        return {
+          ok: false,
+          newText: rewriteText,
+          applied: [],
+          failed: failedEdits,
+          usedRewrite: true
+        };
+      }
+      return {
+        ok: false,
+        newText: text,
+        applied: [],
+        failed: failedEdits,
+        usedRewrite: false
+      };
+    }
 
     const sortedForApply = [...accepted].sort((a, b) => {
       if (b.start !== a.start) return b.start - a.start;
@@ -222,8 +289,76 @@
         start: span.start,
         end: span.end
       })),
-      failed: failedEdits
+      failed: failedEdits,
+      usedRewrite: false
     };
+  }
+
+  function normalizeForLooseMatch(text = '') {
+    return text
+      .replace(/\u00A0/g, ' ')
+      .replace(ZERO_WIDTH_PATTERN, '')
+      .replace(/[\u2013\u2014\u2015\u2212]/g, '-')
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/[\u201C\u201D\u00AB\u00BB]/g, '"');
+  }
+
+  function buildNormalizationMap(text = '') {
+    let normalized = '';
+    const indexMap = [];
+    for (let i = 0; i < text.length; i += 1) {
+      const char = text[i];
+      const normalizedChar = normalizeForLooseMatch(char);
+      if (!normalizedChar) {
+        continue;
+      }
+      normalized += normalizedChar;
+      for (let j = 0; j < normalizedChar.length; j += 1) {
+        indexMap.push(i);
+      }
+    }
+    return { normalized, indexMap };
+  }
+
+  function formatCodePoints(text = '') {
+    return Array.from(text).map((char) => {
+      const codePoint = char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
+      const label = UNUSUAL_CHAR_LABELS.get(char) || '';
+      return `${char} U+${codePoint}${label ? ` (${label})` : ''}`;
+    });
+  }
+
+  function debugTargetNotFound(text, target, options = {}) {
+    const contextRadius = Number.isInteger(options.contextRadius) ? options.contextRadius : 20;
+    const maxMatches = Number.isInteger(options.maxMatches) ? options.maxMatches : 5;
+    const { normalized, indexMap } = buildNormalizationMap(text);
+    const normalizedTarget = normalizeForLooseMatch(target);
+    if (!normalizedTarget) {
+      return [];
+    }
+    const matches = [];
+    let startIndex = 0;
+    while (startIndex <= normalized.length) {
+      const index = normalized.indexOf(normalizedTarget, startIndex);
+      if (index === -1) break;
+      matches.push(index);
+      if (matches.length >= maxMatches) break;
+      startIndex = index + Math.max(1, normalizedTarget.length);
+    }
+
+    return matches.map((matchIndex) => {
+      const originalStart = indexMap[matchIndex] ?? 0;
+      const originalEndIndex = indexMap[Math.min(matchIndex + normalizedTarget.length - 1, indexMap.length - 1)];
+      const originalEnd = Number.isInteger(originalEndIndex) ? originalEndIndex + 1 : originalStart + 1;
+      const contextStart = Math.max(0, originalStart - contextRadius);
+      const contextEnd = Math.min(text.length, originalEnd + contextRadius);
+      const context = text.slice(contextStart, contextEnd);
+      return {
+        context,
+        contextRange: [contextStart, contextEnd],
+        codePoints: formatCodePoints(context)
+      };
+    });
   }
 
   function buildProofreadPrompt(input) {
@@ -239,7 +374,7 @@
           'Return only JSON that matches the provided schema.',
           'Use anchor-based edits only; never return start/end indices.',
           'Each edit must target an exact fragment from the original block.',
-          'If a target appears multiple times, include occurrence and before/after anchors.',
+          'If a target appears multiple times, include before/after anchors.',
           'Keep formatting, whitespace, Markdown, and punctuation tokens unchanged except for local fixes.',
           'Avoid over-editing; keep meaning identical.',
           `Limit to at most ${MAX_PROOFREAD_EDITS} edits per block.`,
@@ -266,6 +401,7 @@
     MAX_PROOFREAD_EDITS,
     applyEdits,
     buildProofreadPrompt,
+    debugTargetNotFound,
     findCandidates,
     normalizeLineEndings,
     restoreLineEndings,
