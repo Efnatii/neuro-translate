@@ -526,7 +526,9 @@ async function proofreadTranslation(blocks, apiKey, model = DEFAULT_STATE.proofr
 
         const parsed = parseJsonObjectFlexible(content, 'proofread');
         const edits = Array.isArray(parsed?.edits) ? parsed.edits : [];
-        const rewriteText = typeof parsed?.rewrite_text === 'string' ? parsed.rewrite_text : null;
+        const parsedRewriteText = typeof parsed?.rewrite_text === 'string' ? parsed.rewrite_text : null;
+        const rewriteText =
+          parsedRewriteText && parsedRewriteText.length > 0 ? parsedRewriteText : block.text;
 
         results.push({ blockId: block.blockId, edits, rewriteText });
         rawProofread.push({ blockId: block.blockId, raw: content });
