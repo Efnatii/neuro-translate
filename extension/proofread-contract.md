@@ -23,18 +23,11 @@
           "after": { "type": "string" },
           "rationale": { "type": "string" }
         },
-        "required": ["op", "target", "occurrence"],
+        "required": ["op", "target"],
         "additionalProperties": false
       }
     },
-    "rewrite": {
-      "type": "object",
-      "properties": {
-        "text": { "type": "string" }
-      },
-      "required": ["text"],
-      "additionalProperties": false
-    }
+    "rewrite_text": { "type": "string" }
   },
   "required": ["edits"],
   "additionalProperties": false
