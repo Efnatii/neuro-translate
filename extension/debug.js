@@ -461,6 +461,18 @@ function formatRawResponse(value) {
   const normalized = stripCodeFences(trimmed);
   try {
     const parsed = JSON.parse(normalized);
+    if (typeof parsed === 'string') {
+      const innerTrimmed = parsed.trim();
+      if (!innerTrimmed) {
+        return { text: '', isJson: false, isEmpty: true };
+      }
+      try {
+        const innerParsed = JSON.parse(innerTrimmed);
+        return { text: JSON.stringify(innerParsed, null, 2), isJson: true, isEmpty: false };
+      } catch (innerError) {
+        return { text: parsed, isJson: false, isEmpty: false };
+      }
+    }
     return { text: JSON.stringify(parsed, null, 2), isJson: true, isEmpty: false };
   } catch (error) {
     return { text: trimmed, isJson: false, isEmpty: false };
