@@ -263,13 +263,17 @@ async function handleProofreadText(message, sendResponse) {
       return;
     }
 
-    const { results, rawProofread } = await proofreadTranslation(
-      message.blocks,
+    const { translations, rawProofread } = await proofreadTranslation(
+      message.segments,
+      message.sourceBlock,
+      message.translatedBlock,
+      message.context,
+      message.language,
       apiKey,
       state.proofreadModel,
       apiBaseUrl
     );
-    sendResponse({ success: true, results, rawProofread });
+    sendResponse({ success: true, translations, rawProofread });
   } catch (error) {
     console.error('Proofreading failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
