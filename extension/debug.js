@@ -206,11 +206,7 @@ function renderDebug(url, data) {
         <details class="ai-response">
           <summary>Ответ ИИ (перевод)</summary>
           <div class="details-content">
-            ${
-              item.translationRaw
-                ? `<pre>${escapeHtml(item.translationRaw)}</pre>`
-                : `<div class="empty">Ответ ИИ ещё не получен.</div>`
-            }
+            ${renderRawResponse(item.translationRaw, 'Ответ ИИ ещё не получен.')}
           </div>
         </details>
       </div>
@@ -297,9 +293,7 @@ function renderProofreadSection(item) {
           <div class="details-content">
             ${
               item?.proofreadApplied
-                ? item.proofreadRaw
-                  ? `<pre>${escapeHtml(item.proofreadRaw)}</pre>`
-                  : `<div class="empty">Ответ ИИ ещё не получен.</div>`
+                ? renderRawResponse(item.proofreadRaw, 'Ответ ИИ ещё не получен.')
                 : `<div class="empty">Вычитка выключена.</div>`
             }
           </div>
@@ -434,6 +428,47 @@ function normalizeStatus(status, value, proofreadApplied = true) {
 function renderStatusBadge(status) {
   const config = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
   return `<span class="status-badge ${config.className}">${config.label}</span>`;
+}
+
+function renderRawResponse(value, emptyMessage) {
+  const { text, isJson, isEmpty } = formatRawResponse(value);
+  if (isEmpty) {
+    return `<div class="empty">${escapeHtml(emptyMessage)}</div>`;
+  }
+  const classes = ['raw-response'];
+  if (isJson) classes.push('raw-json');
+  return `<pre class="${classes.join(' ')}">${escapeHtml(text)}</pre>`;
+}
+
+function formatRawResponse(value) {
+  if (value == null) {
+    return { text: '', isJson: false, isEmpty: true };
+  }
+
+  if (typeof value !== 'string') {
+    try {
+      return { text: JSON.stringify(value, null, 2), isJson: true, isEmpty: false };
+    } catch (error) {
+      return { text: String(value), isJson: false, isEmpty: !String(value).trim() };
+    }
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { text: '', isJson: false, isEmpty: true };
+  }
+
+  const normalized = stripCodeFences(trimmed);
+  try {
+    const parsed = JSON.parse(normalized);
+    return { text: JSON.stringify(parsed, null, 2), isJson: true, isEmpty: false };
+  } catch (error) {
+    return { text: trimmed, isJson: false, isEmpty: false };
+  }
+}
+
+function stripCodeFences(value) {
+  return value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
 }
 
 function escapeHtml(value) {

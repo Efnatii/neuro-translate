@@ -626,6 +626,9 @@ async function translateTexts(
       return result;
     } catch (error) {
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
+      if (error?.rawTranslation) {
+        lastRawTranslation = error.rawTranslation;
+      }
 
       const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
       if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
@@ -813,7 +816,15 @@ async function performTranslationRequest(
     throw new Error('No translation returned');
   }
 
-  const translations = parseTranslationsResponse(content, texts.length);
+  let translations;
+  try {
+    translations = parseTranslationsResponse(content, texts.length);
+  } catch (error) {
+    if (error && typeof error === 'object') {
+      error.rawTranslation = content;
+    }
+    throw error;
+  }
   const refusalIndices = translations
     .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
     .filter((value) => Number.isInteger(value));
