@@ -580,7 +580,6 @@ function sendRuntimeMessage(payload, fallbackError) {
 function parseRateLimitDelayMs(error) {
   const message = error?.message;
   if (!message) return null;
-  if (/rate limit reached/i.test(message)) return null;
   const match = message.match(/retry in\s+(\d+(?:\.\d+)?)\s*seconds/i);
   if (!match) return null;
   const seconds = Number(match[1]);
