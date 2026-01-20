@@ -4,6 +4,7 @@
   const ZERO_WIDTH_CHARS = new Set(['\u200B', '\u200C', '\u200D', '\uFEFF']);
   const WHITESPACE_PATTERN =
     /[\s\u00A0\u202F\u2009\u200A\u1680\u2000-\u2008\u2028\u2029\u205F\u3000]/;
+  const SUSPICIOUS_CHARS = new Set(['\u00A0', '\u202F', '\u200B', '\u200D', '\uFEFF']);
 
   function isZeroWidth(char) {
     return ZERO_WIDTH_CHARS.has(char);
@@ -79,6 +80,40 @@
     return normalizeWithSpans(text, options).norm;
   }
 
+  function casefoldWithSpans(text = '', locale = 'ru') {
+    let folded = '';
+    const spans = [];
+    let index = 0;
+
+    while (index < text.length) {
+      const codePoint = text.codePointAt(index);
+      const char = String.fromCodePoint(codePoint);
+      const charLength = char.length;
+      const foldedChar = char.toLocaleLowerCase(locale);
+
+      if (foldedChar) {
+        for (let i = 0; i < foldedChar.length; i += 1) {
+          folded += foldedChar[i];
+          spans.push({ start: index, end: index + charLength });
+        }
+      }
+
+      index += charLength;
+    }
+
+    return { folded, spans };
+  }
+
+  function joinRuns(runs = []) {
+    const runStarts = [];
+    let text = '';
+    runs.forEach((run) => {
+      runStarts.push(text.length);
+      text += typeof run === 'string' ? run : run?.text ?? '';
+    });
+    return { text, runStarts };
+  }
+
   function findAllOccurrences(text = '', target = '') {
     if (!target) return [];
     const matches = [];
@@ -134,122 +169,8 @@
     return candidates.filter((candidate) => candidate.score >= minScore);
   }
 
-  function findCandidates(text, edit, options = {}) {
-    const target = typeof edit?.target === 'string' ? edit.target : '';
-    if (!target) return [];
-    const normalizedText = options.normalizedText ?? normalizeWithSpans(text).norm;
-    const normalizedTarget = normalizeNeedle(target);
-    if (!normalizedTarget) return [];
-
-    const before =
-      typeof edit?.before === 'string' && edit.before ? normalizeNeedle(edit.before) : null;
-    const after = typeof edit?.after === 'string' && edit.after ? normalizeNeedle(edit.after) : null;
-
-    const occurrences = findAllOccurrences(normalizedText, normalizedTarget);
-    const scored = occurrences.map((candidate) => ({
-      ...candidate,
-      score: scoreCandidate(normalizedText, candidate, before, after)
-    }));
-
-    return filterByScore(scored, before, after);
-  }
-
   function hasPlaceholder(text) {
     return PLACEHOLDER_PATTERN.test(text);
-  }
-
-  function validateEdits(text, edits) {
-    const validEdits = [];
-    const skipped = [];
-    const failed = [];
-    const normalizedText = normalizeWithSpans(text).norm;
-    const fallbackReasons = new Set(['model_violation', 'ambiguous', 'not_found', 'overlap']);
-
-    if (!Array.isArray(edits) || !edits.length) {
-      return { validEdits, skipped, failed, fallbackReasons };
-    }
-
-    edits.forEach((edit) => {
-      if (!edit || typeof edit !== 'object') {
-        failed.push({ edit, reason: 'invalid_edit' });
-        return;
-      }
-      const op = edit.op;
-      const validOps = new Set(['replace', 'insert_before', 'insert_after', 'delete']);
-      if (!validOps.has(op)) {
-        failed.push({ edit, reason: 'invalid_op' });
-        return;
-      }
-
-      const target = typeof edit.target === 'string' ? edit.target : '';
-      const replacement = typeof edit.replacement === 'string' ? edit.replacement : null;
-      const before = typeof edit.before === 'string' ? edit.before : '';
-      const after = typeof edit.after === 'string' ? edit.after : '';
-
-      if (!target) {
-        failed.push({ edit, reason: 'model_violation', detail: 'missing_target' });
-        return;
-      }
-
-      if ([target, before, after, replacement].some((value) => typeof value === 'string' && hasPlaceholder(value))) {
-        failed.push({ edit, reason: 'model_violation', detail: 'placeholder' });
-        return;
-      }
-
-      if (op === 'replace' && typeof replacement !== 'string') {
-        failed.push({ edit, reason: 'model_violation', detail: 'missing_replacement' });
-        return;
-      }
-      if ((op === 'insert_before' || op === 'insert_after') && typeof replacement !== 'string') {
-        failed.push({ edit, reason: 'model_violation', detail: 'missing_replacement' });
-        return;
-      }
-
-      if (op === 'replace' && typeof replacement === 'string') {
-        const normalizedTarget = normalizeNeedle(target);
-        const normalizedReplacement = normalizeNeedle(replacement);
-        if (normalizedTarget === normalizedReplacement) {
-          skipped.push({ edit, reason: 'no_op' });
-          return;
-        }
-      }
-
-      const normalizedTarget = normalizeNeedle(target);
-      if (!normalizedTarget) {
-        failed.push({ edit, reason: 'model_violation', detail: 'empty_target' });
-        return;
-      }
-
-      const candidates = findCandidates(text, edit, { normalizedText });
-      if (!candidates.length) {
-        failed.push({ edit, reason: 'not_found' });
-        return;
-      }
-
-      let chosen = null;
-      if (Number.isInteger(edit.occurrence)) {
-        const occurrence = edit.occurrence;
-        if (occurrence < 1 || occurrence > candidates.length) {
-          failed.push({ edit, reason: 'invalid_occurrence' });
-          return;
-        }
-        chosen = candidates[occurrence - 1];
-      } else if (candidates.length === 1) {
-        chosen = candidates[0];
-      } else {
-        failed.push({ edit, reason: 'ambiguous' });
-        return;
-      }
-
-      validEdits.push({
-        edit,
-        startNorm: chosen.start,
-        endNorm: chosen.end,
-        score: chosen.score
-      });
-    });
-
-    return { validEdits, skipped, failed, fallbackReasons };
   }
 
   function resolveOriginalRange(spans, startNorm, endNorm, textLength) {
@@ -266,6 +187,397 @@
     const start = startSpan ? startSpan.start : textLength;
     const end = endSpan ? endSpan.end : textLength;
     return { start, end };
+  }
+
+  function findExactCandidates(text, target, before, after) {
+    const occurrences = findAllOccurrences(text, target);
+    const scored = occurrences.map((candidate) => ({
+      ...candidate,
+      score: scoreCandidate(text, candidate, before, after),
+      matchType: 'exact'
+    }));
+    return filterByScore(scored, before, after);
+  }
+
+  function findNormalizedWhitespaceCandidates(text, target, before, after) {
+    const normalizedText = normalizeWithSpans(text, { useNFKC: false });
+    const normalizedTarget = normalizeNeedle(target, { useNFKC: false });
+    if (!normalizedTarget) return [];
+    const normalizedBefore =
+      typeof before === 'string' && before ? normalizeNeedle(before, { useNFKC: false }) : null;
+    const normalizedAfter =
+      typeof after === 'string' && after ? normalizeNeedle(after, { useNFKC: false }) : null;
+
+    const occurrences = findAllOccurrences(normalizedText.norm, normalizedTarget);
+    const scored = occurrences.map((candidate) => ({
+      ...candidate,
+      score: scoreCandidate(normalizedText.norm, candidate, normalizedBefore, normalizedAfter)
+    }));
+    const filtered = filterByScore(scored, normalizedBefore, normalizedAfter);
+    return filtered.map((candidate) => {
+      const range = resolveOriginalRange(
+        normalizedText.spans,
+        candidate.start,
+        candidate.end,
+        text.length
+      );
+      return { ...candidate, start: range.start, end: range.end, matchType: 'normalized' };
+    });
+  }
+
+  function findCasefoldCandidates(text, target, before, after) {
+    const foldedText = casefoldWithSpans(text);
+    const foldedTarget = target.toLocaleLowerCase('ru');
+    if (!foldedTarget) return [];
+    const foldedBefore = typeof before === 'string' && before ? before.toLocaleLowerCase('ru') : null;
+    const foldedAfter = typeof after === 'string' && after ? after.toLocaleLowerCase('ru') : null;
+
+    const occurrences = findAllOccurrences(foldedText.folded, foldedTarget);
+    const scored = occurrences.map((candidate) => ({
+      ...candidate,
+      score: scoreCandidate(foldedText.folded, candidate, foldedBefore, foldedAfter)
+    }));
+    const filtered = filterByScore(scored, foldedBefore, foldedAfter);
+    return filtered.map((candidate) => {
+      const range = resolveOriginalRange(
+        foldedText.spans,
+        candidate.start,
+        candidate.end,
+        text.length
+      );
+      return { ...candidate, start: range.start, end: range.end, matchType: 'casefold' };
+    });
+  }
+
+  function findCandidates(text, edit) {
+    const target = typeof edit?.target === 'string' ? edit.target : '';
+    if (!target) return [];
+    const before = typeof edit?.before === 'string' ? edit.before : null;
+    const after = typeof edit?.after === 'string' ? edit.after : null;
+
+    const exact = findExactCandidates(text, target, before, after);
+    if (exact.length) return exact;
+
+    const normalized = findNormalizedWhitespaceCandidates(text, target, before, after);
+    if (normalized.length) return normalized;
+
+    return findCasefoldCandidates(text, target, before, after);
+  }
+
+  function collectSuspicious(text = '') {
+    const suspicious = [];
+    for (let i = 0; i < text.length; i += 1) {
+      const char = text[i];
+      if (!SUSPICIOUS_CHARS.has(char)) continue;
+      const code = char.codePointAt(0);
+      suspicious.push({
+        index: i,
+        char,
+        code: `U+${code.toString(16).toUpperCase().padStart(4, '0')}`
+      });
+    }
+    return suspicious;
+  }
+
+  function findMismatchPositions(text = '', target = '', limit = 10) {
+    const mismatches = [];
+    const max = Math.min(text.length, target.length);
+    for (let i = 0; i < max; i += 1) {
+      if (text[i] !== target[i]) {
+        mismatches.push({
+          index: i,
+          textChar: text[i],
+          targetChar: target[i],
+          textCode: `U+${text.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')}`,
+          targetCode: `U+${target.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')}`
+        });
+        if (mismatches.length >= limit) break;
+      }
+    }
+    return mismatches;
+  }
+
+  function buildFailureSnapshot(joinedText = '', target = '') {
+    return {
+      joinedText: JSON.stringify(joinedText),
+      target: JSON.stringify(target),
+      mismatchPositions: findMismatchPositions(joinedText, target),
+      suspiciousCodepoints: [
+        ...collectSuspicious(joinedText).map((entry) => ({ ...entry, source: 'joinedText' })),
+        ...collectSuspicious(target).map((entry) => ({ ...entry, source: 'target' }))
+      ]
+    };
+  }
+
+  function detokenizeEdits(edits = [], rewriteText = null, joinedText = '') {
+    const sanitized = [];
+    const failed = [];
+
+    if (!Array.isArray(edits)) {
+      return { edits: sanitized, failed };
+    }
+
+    edits.forEach((edit) => {
+      if (!edit || typeof edit !== 'object') {
+        failed.push({
+          edit,
+          reason: 'invalid_edit',
+          debug: buildFailureSnapshot(joinedText, '')
+        });
+        return;
+      }
+      const fields = [
+        edit.target,
+        edit.before,
+        edit.after,
+        edit.replacement
+      ].filter((value) => typeof value === 'string');
+      if (fields.some((value) => hasPlaceholder(value))) {
+        const target = typeof edit.target === 'string' ? edit.target : '';
+        failed.push({
+          edit,
+          reason: 'model_violation',
+          detail: 'placeholder',
+          debug: buildFailureSnapshot(joinedText, target)
+        });
+        return;
+      }
+      sanitized.push(edit);
+    });
+
+    if (typeof rewriteText === 'string' && hasPlaceholder(rewriteText)) {
+      failed.push({
+        reason: 'model_violation',
+        detail: 'placeholder',
+        scope: 'rewrite_text',
+        debug: buildFailureSnapshot(joinedText, rewriteText)
+      });
+    }
+
+    return { edits: sanitized, failed };
+  }
+
+  function validateEdits(text, edits) {
+    const validEdits = [];
+    const skipped = [];
+    const failed = [];
+    const fallbackReasons = new Set(['model_violation', 'ambiguous', 'not_found', 'overlap']);
+
+    if (!Array.isArray(edits) || !edits.length) {
+      return { validEdits, skipped, failed, fallbackReasons };
+    }
+
+    edits.forEach((edit) => {
+      if (!edit || typeof edit !== 'object') {
+        failed.push({
+          edit,
+          reason: 'invalid_edit',
+          debug: buildFailureSnapshot(text, '')
+        });
+        return;
+      }
+      const op = edit.op;
+      const validOps = new Set(['replace', 'insert_before', 'insert_after', 'delete']);
+      if (!validOps.has(op)) {
+        const target = typeof edit?.target === 'string' ? edit.target : '';
+        failed.push({
+          edit,
+          reason: 'invalid_op',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      }
+
+      const target = typeof edit.target === 'string' ? edit.target : '';
+      const replacement = typeof edit.replacement === 'string' ? edit.replacement : null;
+      const before = typeof edit.before === 'string' ? edit.before : '';
+      const after = typeof edit.after === 'string' ? edit.after : '';
+
+      if (!target) {
+        failed.push({
+          edit,
+          reason: 'model_violation',
+          detail: 'missing_target',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      }
+
+      if (op === 'replace' && typeof replacement !== 'string') {
+        failed.push({
+          edit,
+          reason: 'model_violation',
+          detail: 'missing_replacement',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      }
+      if ((op === 'insert_before' || op === 'insert_after') && typeof replacement !== 'string') {
+        failed.push({
+          edit,
+          reason: 'model_violation',
+          detail: 'missing_replacement',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      }
+
+      if (op === 'replace' && typeof replacement === 'string') {
+        const normalizedTarget = normalizeNeedle(target, { useNFKC: false });
+        const normalizedReplacement = normalizeNeedle(replacement, { useNFKC: false });
+        if (normalizedTarget === normalizedReplacement) {
+          skipped.push({ edit, reason: 'no_op' });
+          return;
+        }
+      }
+
+      const normalizedTarget = normalizeNeedle(target, { useNFKC: false });
+      if (!normalizedTarget) {
+        failed.push({
+          edit,
+          reason: 'model_violation',
+          detail: 'empty_target',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      }
+
+      const candidates = findCandidates(text, edit);
+      if (!candidates.length) {
+        failed.push({
+          edit,
+          reason: 'not_found',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      }
+
+      let chosen = null;
+      if (Number.isInteger(edit.occurrence)) {
+        const occurrence = edit.occurrence;
+        if (occurrence < 1 || occurrence > candidates.length) {
+          failed.push({
+            edit,
+            reason: 'invalid_occurrence',
+            debug: buildFailureSnapshot(text, target)
+          });
+          return;
+        }
+        chosen = candidates[occurrence - 1];
+      } else if (candidates.length === 1) {
+        chosen = candidates[0];
+      } else if (before || after) {
+        failed.push({
+          edit,
+          reason: 'ambiguous',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      } else {
+        failed.push({
+          edit,
+          reason: 'ambiguous',
+          debug: buildFailureSnapshot(text, target)
+        });
+        return;
+      }
+
+      validEdits.push({
+        edit,
+        start: chosen.start,
+        end: chosen.end,
+        score: chosen.score
+      });
+    });
+
+    return { validEdits, skipped, failed, fallbackReasons };
+  }
+
+  function cloneRunWithText(run, text) {
+    if (typeof run === 'string') return text;
+    if (run && typeof run === 'object') return { ...run, text };
+    return text;
+  }
+
+  function findRunPosition(position, runStarts, runTexts, isEnd = false) {
+    if (!runStarts.length) return { runIndex: 0, offset: 0 };
+    if (position <= 0) return { runIndex: 0, offset: 0 };
+
+    for (let i = 0; i < runStarts.length; i += 1) {
+      const start = runStarts[i];
+      const end = start + runTexts[i].length;
+      if (isEnd && position === start && i > 0) {
+        return { runIndex: i - 1, offset: runTexts[i - 1].length };
+      }
+      if (position >= start && position <= end) {
+        return { runIndex: i, offset: Math.min(position - start, runTexts[i].length) };
+      }
+    }
+
+    const lastIndex = runStarts.length - 1;
+    return { runIndex: lastIndex, offset: runTexts[lastIndex].length };
+  }
+
+  function applyEditsToRuns(runs, spans, runStarts) {
+    const runTexts = runs.map((run) => (typeof run === 'string' ? run : run?.text ?? ''));
+    const updatedRuns = runs.map((run, index) => cloneRunWithText(run, runTexts[index]));
+
+    spans.forEach((span) => {
+      if (!span) return;
+      const samePoint = span.start === span.end;
+      const startPos = findRunPosition(span.start, runStarts, runTexts, false);
+      const endPos = samePoint
+        ? startPos
+        : findRunPosition(span.end, runStarts, runTexts, true);
+
+      if (startPos.runIndex === endPos.runIndex) {
+        const runIndex = startPos.runIndex;
+        const currentText = typeof updatedRuns[runIndex] === 'string'
+          ? updatedRuns[runIndex]
+          : updatedRuns[runIndex]?.text ?? '';
+        const updatedText =
+          currentText.slice(0, startPos.offset) +
+          span.replacement +
+          currentText.slice(endPos.offset);
+        updatedRuns[runIndex] = cloneRunWithText(updatedRuns[runIndex], updatedText);
+        runTexts[runIndex] = updatedText;
+        return;
+      }
+
+      const startIndex = startPos.runIndex;
+      const endIndex = endPos.runIndex;
+      const startText = typeof updatedRuns[startIndex] === 'string'
+        ? updatedRuns[startIndex]
+        : updatedRuns[startIndex]?.text ?? '';
+      const endText = typeof updatedRuns[endIndex] === 'string'
+        ? updatedRuns[endIndex]
+        : updatedRuns[endIndex]?.text ?? '';
+
+      const updatedStart =
+        startText.slice(0, startPos.offset) + span.replacement;
+      const updatedEnd = endText.slice(endPos.offset);
+
+      updatedRuns[startIndex] = cloneRunWithText(updatedRuns[startIndex], updatedStart);
+      runTexts[startIndex] = updatedStart;
+
+      updatedRuns[endIndex] = cloneRunWithText(updatedRuns[endIndex], updatedEnd);
+      runTexts[endIndex] = updatedEnd;
+
+      for (let i = startIndex + 1; i < endIndex; i += 1) {
+        updatedRuns[i] = cloneRunWithText(updatedRuns[i], '');
+        runTexts[i] = '';
+      }
+    });
+
+    return updatedRuns;
+  }
+
+  function replaceRunsText(runs, text) {
+    if (!Array.isArray(runs)) return [];
+    if (!runs.length) return [text];
+    const updated = runs.map((run) => cloneRunWithText(run, ''));
+    updated[0] = cloneRunWithText(updated[0], text);
+    return updated;
   }
 
   function spansOverlap(a, b) {
@@ -316,11 +628,15 @@
   }
 
   function applyEdits(text, edits, rewriteText = null, modelInputText = null) {
-    const mismatch = assertSameInputApply(modelInputText, text);
+    const usingRuns = Array.isArray(text);
+    const joined = usingRuns ? joinRuns(text) : { text: String(text ?? ''), runStarts: [] };
+    const joinedText = joined.text;
+    const mismatch = assertSameInputApply(modelInputText, joinedText);
     if (modelInputText != null && !mismatch.ok) {
       return {
         ok: false,
-        newText: text,
+        newText: joinedText,
+        newRuns: usingRuns ? text : undefined,
         applied: [],
         failed: [{ reason: 'mismatch', detail: mismatch.detail }],
         skipped: [],
@@ -329,20 +645,19 @@
       };
     }
 
-    const { validEdits, skipped, failed, fallbackReasons } = validateEdits(text, edits);
-    const { spans } = normalizeWithSpans(text);
+    const detokenized = detokenizeEdits(edits, rewriteText, joinedText);
+    const { validEdits, skipped, failed, fallbackReasons } = validateEdits(joinedText, detokenized.edits);
     const resolvedEdits = validEdits.map((entry) => {
-      const range = resolveOriginalRange(spans, entry.startNorm, entry.endNorm, text.length);
-      let start = range.start;
-      let end = range.end;
+      let start = entry.start;
+      let end = entry.end;
       let replacement = entry.edit.replacement ?? '';
       if (entry.edit.op === 'insert_before') {
-        start = range.start;
-        end = range.start;
+        start = entry.start;
+        end = entry.start;
       }
       if (entry.edit.op === 'insert_after') {
-        start = range.end;
-        end = range.end;
+        start = entry.end;
+        end = entry.end;
       }
       if (entry.edit.op === 'delete') {
         replacement = '';
@@ -357,14 +672,21 @@
     });
 
     const { accepted, rejected } = rejectOverlaps(resolvedEdits);
-    const failedEdits = failed.concat(rejected);
+    const rejectedWithDebug = rejected.map((item) => ({
+      ...item,
+      debug: buildFailureSnapshot(
+        joinedText,
+        typeof item.edit?.target === 'string' ? item.edit.target : ''
+      )
+    }));
+    const failedEdits = failed.concat(detokenized.failed, rejectedWithDebug);
 
     const sortedForApply = [...accepted].sort((a, b) => {
       if (b.start !== a.start) return b.start - a.start;
       return b.end - a.end;
     });
 
-    let output = text;
+    let output = joinedText;
     sortedForApply.forEach((span) => {
       output = output.slice(0, span.start) + span.replacement + output.slice(span.end);
     });
@@ -384,16 +706,18 @@
         return {
           ok: true,
           newText: rewriteText,
+          newRuns: usingRuns ? replaceRunsText(text, rewriteText) : undefined,
           applied: [],
           failed: failedEdits,
           skipped,
           usedRewrite: true,
-          ops: computeDiffOps(text, rewriteText)
+          ops: computeDiffOps(joinedText, rewriteText)
         };
       }
       return {
         ok: false,
-        newText: text,
+        newText: joinedText,
+        newRuns: usingRuns ? text : undefined,
         applied: [],
         failed: failedEdits,
         skipped,
@@ -401,9 +725,15 @@
       };
     }
 
+    let newRuns;
+    if (usingRuns) {
+      newRuns = applyEditsToRuns(text, sortedForApply, joined.runStarts);
+    }
+
     return {
       ok: failedEdits.length === 0,
       newText: output,
+      newRuns,
       applied,
       failed: failedEdits,
       skipped,
@@ -497,7 +827,7 @@
   }
 
   function assertSameInputApply(modelInputText, applyText) {
-    // НЕЛЬЗЯ отправлять модели склеенный блок и применять патчи к runs/leaf-ндам. Выберите один слой и придерживайтесь.
+    // Model input должен совпадать с применяемым текстом (joined runs или plain text).
     if (modelInputText == null || applyText == null) {
       return { ok: true };
     }
@@ -512,8 +842,8 @@
     const { validEdits, skipped, failed } = validateEdits(text, edits);
     const applicable = validEdits.map((entry) => ({
       edit: entry.edit,
-      start: entry.startNorm,
-      end: entry.endNorm
+      start: entry.start,
+      end: entry.end
     }));
     return {
       ok: failed.length === 0,
@@ -567,7 +897,9 @@
     computeDiffOps,
     debugMismatch,
     debugString,
+    detokenizeEdits,
     findCandidates,
+    joinRuns,
     normalizeLineEndings,
     normalizeNeedle,
     normalizeWithSpans,
