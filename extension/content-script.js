@@ -26,7 +26,11 @@ let tpmSettings = {
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const CONTEXT_CACHE_KEY = 'contextCacheByPage';
 const RATE_LIMIT_RETRY_ATTEMPTS = 2;
+const SHORT_CONTEXT_MAX_CHARS = 800;
+const TRANSLATION_MAX_TOKENS_PER_REQUEST = 2600;
+const PROOFREAD_SUSPICIOUS_RATIO = 0.35;
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -164,12 +168,22 @@ async function translatePage(settings) {
     settings.contextGenerationEnabled && typeof existingDebugEntry?.context === 'string'
       ? existingDebugEntry.context.trim()
       : '';
+  const tabId = await getActiveTabId();
   const nodesWithPath = textNodes.map((node) => ({
     node,
     path: getNodePath(node),
     original: node.nodeValue,
     originalHash: computeTextHash(node.nodeValue || '')
   }));
+  const contextCacheSignature = buildContextCacheSignature(nodesWithPath);
+  const contextCacheKey =
+    settings.contextGenerationEnabled && tabId
+      ? `${tabId}::${location.href}::${contextCacheSignature}`
+      : '';
+  const cachedContextEntry = settings.contextGenerationEnabled
+    ? await getContextCacheEntry(contextCacheKey)
+    : null;
+  const cachedContext = typeof cachedContextEntry?.context === 'string' ? cachedContextEntry.context.trim() : '';
   originalSnapshot = nodesWithPath.map(({ path, original, originalHash }) => ({
     path,
     original,
@@ -178,7 +192,7 @@ async function translatePage(settings) {
   activeTranslationEntries = [];
   debugEntries = [];
   debugState = null;
-  latestContextSummary = existingContext;
+  latestContextSummary = cachedContext || existingContext;
   await clearTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
@@ -210,6 +224,13 @@ async function translatePage(settings) {
           pageText,
           settings.targetLanguage || 'ru'
         );
+        if (latestContextSummary && contextCacheKey) {
+          await setContextCacheEntry(contextCacheKey, {
+            context: latestContextSummary,
+            signature: contextCacheSignature,
+            updatedAt: Date.now()
+          });
+        }
         await updateDebugContext(latestContextSummary, 'done');
       } catch (error) {
         console.warn('Context generation failed, continuing without it.', error);
@@ -219,6 +240,16 @@ async function translatePage(settings) {
       await updateDebugContext(latestContextSummary, 'done');
     }
   }
+
+  const shortContextSummary = buildShortContext(latestContextSummary);
+  let fullContextUsed = false;
+  const consumeContextForTranslation = () => {
+    if (!fullContextUsed && latestContextSummary) {
+      fullContextUsed = true;
+      return latestContextSummary;
+    }
+    return shortContextSummary;
+  };
 
   const averageBlockLength = blocks.length ? Math.round(textStats.totalLength / blocks.length) : 0;
   const initialConcurrency = selectInitialConcurrency(averageBlockLength, blocks.length);
@@ -319,9 +350,12 @@ async function translatePage(settings) {
         const result = await translate(
           uniqueTexts,
           settings.targetLanguage || 'ru',
-          latestContextSummary,
+          consumeContextForTranslation(),
           keepPunctuationTokens
         );
+        if (!result?.success) {
+          throw new Error(result?.error || 'Не удалось выполнить перевод.');
+        }
         if (result.translations.length !== uniqueTexts.length) {
           throw new Error(
             `Translation length mismatch: expected ${uniqueTexts.length}, got ${result.translations.length}`
@@ -360,17 +394,35 @@ async function translatePage(settings) {
           translated: formatBlockText(blockTranslations),
           translatedSegments: translatedTexts,
           translationStatus: 'done',
-          translationRaw: result.rawTranslation || ''
+          translationRaw: result.rawTranslation || '',
+          translationDebug: result.debug || []
         });
 
         if (settings.proofreadEnabled) {
-          enqueueProofreadTask({
-            block,
-            index: currentIndex,
-            key: queuedItem.key,
-            translatedTexts,
-            originalTexts: block.map(({ original }) => original)
-          });
+          const proofreadSegments = translatedTexts
+            .map((text, index) => ({ id: String(index), text }))
+            .filter((segment) => shouldProofreadSegment(segment.text, settings.targetLanguage || 'ru'));
+          if (!proofreadSegments.length) {
+            await updateDebugEntry(currentIndex + 1, {
+              proofreadStatus: 'done',
+              proofread: [],
+              proofreadComparisons: translatedTexts.map((text, index) => ({
+                segmentIndex: index,
+                before: applyOriginalFormatting(block[index].original, text),
+                after: applyOriginalFormatting(block[index].original, text),
+                changed: false
+              }))
+            });
+          } else {
+            enqueueProofreadTask({
+              block,
+              index: currentIndex,
+              key: queuedItem.key,
+              translatedTexts,
+              originalTexts: block.map(({ original }) => original),
+              proofreadSegments
+            });
+          }
         }
       } catch (error) {
         console.error('Block translation failed', error);
@@ -418,19 +470,29 @@ async function translatePage(settings) {
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress' });
         const proofreadResult = await requestProofreading({
-          segments: task.translatedTexts,
+          segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
           sourceBlock: formatBlockText(task.originalTexts),
           translatedBlock: formatBlockText(task.translatedTexts),
-          context: latestContextSummary || '',
+          context: shortContextSummary || '',
           language: settings.targetLanguage || 'ru'
         });
+        if (!proofreadResult?.success) {
+          throw new Error(proofreadResult?.error || 'Не удалось выполнить вычитку.');
+        }
         const revisedSegments = Array.isArray(proofreadResult.translations)
           ? proofreadResult.translations
           : [];
+        const revisionMap = new Map();
+        (task.proofreadSegments || []).forEach((segment, index) => {
+          const revised = revisedSegments[index];
+          if (typeof revised === 'string') {
+            revisionMap.set(String(segment.id), revised);
+          }
+        });
         const proofreadSummary = [];
         let finalTranslations = task.translatedTexts.map((text, index) => {
-          const revision = revisedSegments[index];
-          if (typeof revision === 'string' && revision.length > 0) {
+          const revision = revisionMap.get(String(index));
+          if (typeof revision === 'string' && revision.trim() && revision.trim() !== text.trim()) {
             proofreadSummary.push({ segmentIndex: index, revisedText: revision });
             return revision;
           }
@@ -465,14 +527,27 @@ async function translatePage(settings) {
         await updateDebugEntry(task.index + 1, {
           proofreadStatus: 'done',
           proofread: proofreadSummary,
-          proofreadRaw: rawProofread
+          proofreadRaw: rawProofread,
+          proofreadDebug: proofreadResult.debug || [],
+          proofreadComparisons: finalTranslations.map((text, index) => ({
+            segmentIndex: index,
+            before: applyOriginalFormatting(task.originalTexts[index], task.translatedTexts[index] || ''),
+            after: text,
+            changed: (task.translatedTexts[index] || '').trim() !== text.trim()
+          }))
         });
         reportProgress('Вычитка выполняется');
       } catch (error) {
         console.warn('Proofreading failed, keeping original translations.', error);
         await updateDebugEntry(task.index + 1, {
           proofreadStatus: 'failed',
-          proofread: []
+          proofread: [],
+          proofreadComparisons: task.translatedTexts.map((text, index) => ({
+            segmentIndex: index,
+            before: applyOriginalFormatting(task.originalTexts[index], text || ''),
+            after: applyOriginalFormatting(task.originalTexts[index], text || ''),
+            changed: false
+          }))
         });
         reportProgress('Вычитка выполняется');
       } finally {
@@ -514,35 +589,81 @@ async function translatePage(settings) {
 }
 
 async function translate(texts, targetLanguage, context, keepPunctuationTokens = false) {
-  const estimatedTokens = estimateTokensForRole('translation', {
-    texts,
-    context
-  });
-  await ensureTpmBudget('translation', estimatedTokens);
-  await incrementDebugAiRequestCount();
-  return withRateLimitRetry(
-    () =>
-      sendRuntimeMessage(
-        {
-          type: 'TRANSLATE_TEXT',
-          texts,
-          targetLanguage,
-          context,
-          keepPunctuationTokens
-        },
-        'Не удалось выполнить перевод.'
-      ),
-    'Translation'
+  const batches = splitTextsByTokenEstimate(
+    Array.isArray(texts) ? texts : [texts],
+    context,
+    TRANSLATION_MAX_TOKENS_PER_REQUEST
   );
+  const translations = [];
+  const rawParts = [];
+  const debugParts = [];
+
+  for (let index = 0; index < batches.length; index += 1) {
+    const batch = batches[index];
+    const batchContext = index === 0 ? context : '';
+    const estimatedTokens = estimateTokensForRole('translation', {
+      texts: batch,
+      context: batchContext
+    });
+    await ensureTpmBudget('translation', estimatedTokens);
+    await incrementDebugAiRequestCount();
+    const batchResult = await withRateLimitRetry(
+      async () => {
+        const response = await sendRuntimeMessage(
+          {
+            type: 'TRANSLATE_TEXT',
+            texts: batch,
+            targetLanguage,
+            context: batchContext,
+            keepPunctuationTokens
+          },
+          'Не удалось выполнить перевод.'
+        );
+        if (!response?.success) {
+          if (response?.isRuntimeError) {
+            return { success: false, error: response.error || 'Не удалось выполнить перевод.' };
+          }
+          throw new Error(response?.error || 'Не удалось выполнить перевод.');
+        }
+        return {
+          success: true,
+          translations: Array.isArray(response.translations) ? response.translations : [],
+          rawTranslation: response.rawTranslation || '',
+          debug: response.debug || []
+        };
+      },
+      'Translation'
+    );
+    if (!batchResult?.success) {
+      return { success: false, error: batchResult?.error || 'Не удалось выполнить перевод.' };
+    }
+    translations.push(...batchResult.translations);
+    if (batchResult.rawTranslation) {
+      rawParts.push(batchResult.rawTranslation);
+    }
+    if (Array.isArray(batchResult.debug)) {
+      debugParts.push(...batchResult.debug);
+    }
+  }
+
+  return {
+    success: true,
+    translations,
+    rawTranslation: rawParts.filter(Boolean).join('\n\n---\n\n'),
+    debug: debugParts
+  };
 }
 
 async function requestProofreading(payload) {
   const segments = Array.isArray(payload?.segments) ? payload.segments : [];
+  const segmentTexts = segments.map((segment) =>
+    typeof segment === 'string' ? segment : segment?.text || ''
+  );
   const sourceBlock = payload?.sourceBlock || '';
   const translatedBlock = payload?.translatedBlock || '';
   const context = payload?.context || '';
   const estimatedTokens = estimateTokensForRole('proofread', {
-    texts: segments,
+    texts: segmentTexts,
     context,
     sourceTexts: [sourceBlock, translatedBlock]
   });
@@ -561,9 +682,17 @@ async function requestProofreading(payload) {
         },
         'Не удалось выполнить вычитку.'
       );
+      if (!response?.success) {
+        if (response?.isRuntimeError) {
+          return { success: false, error: response.error || 'Не удалось выполнить вычитку.' };
+        }
+        throw new Error(response?.error || 'Не удалось выполнить вычитку.');
+      }
       return {
+        success: true,
         translations: Array.isArray(response.translations) ? response.translations : [],
-        rawProofread: response.rawProofread || ''
+        rawProofread: response.rawProofread || '',
+        debug: response.debug || null
       };
     },
     'Proofreading'
@@ -571,18 +700,25 @@ async function requestProofreading(payload) {
 }
 
 function sendRuntimeMessage(payload, fallbackError) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     chrome.runtime.sendMessage(payload, (response) => {
       const runtimeError = chrome.runtime.lastError;
       if (runtimeError) {
-        reject(new Error(runtimeError.message || fallbackError));
+        resolve({
+          success: false,
+          error: runtimeError.message || fallbackError,
+          isRuntimeError: true
+        });
         return;
       }
       if (response?.success) {
         resolve(response);
         return;
       }
-      reject(new Error(response?.error || fallbackError));
+      resolve({
+        success: false,
+        error: response?.error || fallbackError
+      });
     });
   });
 }
@@ -637,6 +773,71 @@ function restorePunctuationTokens(text = '') {
   return output;
 }
 
+function getLanguageScript(language = '') {
+  const normalized = language.toLowerCase();
+  if (normalized.startsWith('ru') || normalized.startsWith('uk') || normalized.startsWith('bg') ||
+      normalized.startsWith('sr') || normalized.startsWith('mk')) {
+    return 'cyrillic';
+  }
+  if (normalized.startsWith('ar')) return 'arabic';
+  if (normalized.startsWith('he')) return 'hebrew';
+  if (normalized.startsWith('hi')) return 'devanagari';
+  if (normalized.startsWith('ja')) return 'japanese';
+  if (normalized.startsWith('ko')) return 'hangul';
+  if (normalized.startsWith('zh')) return 'han';
+  return 'latin';
+}
+
+function countLettersByScript(text = '', script) {
+  if (!text) return 0;
+  switch (script) {
+    case 'cyrillic':
+      return (text.match(/[\p{Script=Cyrillic}]/gu) || []).length;
+    case 'arabic':
+      return (text.match(/[\p{Script=Arabic}]/gu) || []).length;
+    case 'hebrew':
+      return (text.match(/[\p{Script=Hebrew}]/gu) || []).length;
+    case 'devanagari':
+      return (text.match(/[\p{Script=Devanagari}]/gu) || []).length;
+    case 'japanese':
+      return (text.match(/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/gu) || []).length;
+    case 'hangul':
+      return (text.match(/[\p{Script=Hangul}]/gu) || []).length;
+    case 'han':
+      return (text.match(/[\p{Script=Han}]/gu) || []).length;
+    case 'latin':
+    default:
+      return (text.match(/[\p{Script=Latin}]/gu) || []).length;
+  }
+}
+
+function countLetters(text = '') {
+  return (text.match(/[\p{L}]/gu) || []).length;
+}
+
+function hasSuspiciousLanguageMix(text = '', targetLanguage = '') {
+  const totalLetters = countLetters(text);
+  if (!totalLetters) return false;
+  const targetScript = getLanguageScript(targetLanguage);
+  const targetLetters = countLettersByScript(text, targetScript);
+  const ratio = targetLetters / totalLetters;
+  return ratio < 1 - PROOFREAD_SUSPICIOUS_RATIO;
+}
+
+function hasProofreadNoise(text = '') {
+  if (!text) return false;
+  if (/\s{2,}/.test(text)) return true;
+  if (/([!?.,])\1{2,}/.test(text)) return true;
+  if (/[^\S\n]{2,}/.test(text)) return true;
+  if (/[{}<>]{2,}/.test(text)) return true;
+  return false;
+}
+
+function shouldProofreadSegment(text = '', targetLanguage = '') {
+  if (!text) return false;
+  return hasProofreadNoise(text) || hasSuspiciousLanguageMix(text, targetLanguage);
+}
+
 async function requestTranslationContext(text, targetLanguage) {
   const estimatedTokens = estimateTokensForRole('context', {
     texts: [text]
@@ -651,6 +852,12 @@ async function requestTranslationContext(text, targetLanguage) {
     },
     'Не удалось сгенерировать контекст.'
   );
+  if (!response?.success) {
+    if (response?.isRuntimeError) {
+      return '';
+    }
+    throw new Error(response?.error || 'Не удалось сгенерировать контекст.');
+  }
   return response.context || '';
 }
 
@@ -878,6 +1085,32 @@ function estimateTokensForRole(role, { texts = [], context = '', sourceTexts = [
   return inputTokens + estimatedOutput;
 }
 
+function splitTextsByTokenEstimate(texts, context, maxTokens) {
+  const batches = [];
+  let current = [];
+  let currentTokens = 0;
+
+  texts.forEach((text) => {
+    const nextTokens = estimateTokensForRole('translation', {
+      texts: [text],
+      context: current.length ? '' : context
+    });
+    if (current.length && currentTokens + nextTokens > maxTokens) {
+      batches.push(current);
+      current = [];
+      currentTokens = 0;
+    }
+    current.push(text);
+    currentTokens += nextTokens;
+  });
+
+  if (current.length) {
+    batches.push(current);
+  }
+
+  return batches;
+}
+
 async function ensureTpmBudget(role, tokens) {
   if (!tpmLimiter || !Number.isFinite(tokens) || tokens <= 0) {
     return;
@@ -963,8 +1196,69 @@ function buildPageText(nodesWithPath, maxLength) {
   return combined.slice(0, maxLength).trimEnd();
 }
 
+function buildHeadingSignature() {
+  const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+    .map((node) => node.textContent || '')
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return headings;
+}
+
+function buildContextCacheSignature(nodesWithPath) {
+  const headingText = buildHeadingSignature();
+  const pageSample = buildPageText(nodesWithPath, 2000);
+  const signatureSource = [location.href, document.title || '', headingText, pageSample].join('||');
+  return computeTextHash(signatureSource);
+}
+
+async function getContextCacheEntry(key) {
+  if (!key) return null;
+  const store = await new Promise((resolve) => {
+    chrome.storage.local.get([CONTEXT_CACHE_KEY], (data) => {
+      resolve(data?.[CONTEXT_CACHE_KEY] || {});
+    });
+  });
+  return store[key] || null;
+}
+
+async function setContextCacheEntry(key, entry) {
+  if (!key) return;
+  const store = await new Promise((resolve) => {
+    chrome.storage.local.get([CONTEXT_CACHE_KEY], (data) => {
+      resolve(data?.[CONTEXT_CACHE_KEY] || {});
+    });
+  });
+  store[key] = entry;
+  await chrome.storage.local.set({ [CONTEXT_CACHE_KEY]: store });
+}
+
 function formatBlockText(texts) {
   return texts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function buildShortContext(context = '') {
+  if (!context) return '';
+  if (context.length <= SHORT_CONTEXT_MAX_CHARS) return context.trim();
+  const lines = context.split(/\r?\n/);
+  const preferredSections = new Set(['1)', '6)', '8)']);
+  let include = false;
+  const selected = [];
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    const headerMatch = trimmed.match(/^(\d+)\)/);
+    if (headerMatch) {
+      include = preferredSections.has(`${headerMatch[1]})`);
+    }
+    if (include) {
+      selected.push(line);
+    }
+  });
+  const compact = selected.join('\n').trim();
+  if (compact && compact.length <= SHORT_CONTEXT_MAX_CHARS) {
+    return compact;
+  }
+  return context.slice(0, SHORT_CONTEXT_MAX_CHARS).trimEnd();
 }
 
 function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0) {
@@ -1279,8 +1573,11 @@ async function initializeDebugState(blocks, settings = {}) {
     translated: '',
     translatedSegments: [],
     translationRaw: '',
+    translationDebug: [],
     proofread: [],
     proofreadRaw: '',
+    proofreadDebug: [],
+    proofreadComparisons: [],
     proofreadApplied: proofreadEnabled,
     translationStatus: 'pending',
     proofreadStatus: proofreadEnabled ? 'pending' : 'disabled'

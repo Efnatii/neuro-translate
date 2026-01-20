@@ -151,6 +151,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'ENSURE_CONTENT_SCRIPT') {
+    const tabId = Number(message.tabId);
+    if (!Number.isFinite(tabId)) {
+      sendResponse({ ok: false, reason: 'tab-not-found' });
+      return true;
+    }
+    chrome.tabs.get(tabId, async (tab) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, reason: chrome.runtime.lastError.message });
+        return;
+      }
+      if (!tab?.url || !isInjectableTabUrl(tab.url)) {
+        sendResponse({ ok: false, reason: 'unsupported-url' });
+        return;
+      }
+      const injected = await ensureContentScriptInjected(tabId);
+      if (injected.ok) {
+        CONTENT_READY_BY_TAB.set(tabId, Date.now());
+        sendResponse({ ok: true });
+      } else {
+        sendResponse({ ok: false, reason: injected.reason || 'inject-failed' });
+      }
+    });
+    return true;
+  }
+
   if (message?.type === 'TRANSLATION_PROGRESS') {
     handleTranslationProgress(message, sender);
   }
@@ -179,7 +205,7 @@ async function warmUpContentScripts(reason) {
   try {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
-      if (!tab?.id || !isSupportedTabUrl(tab.url)) {
+      if (!tab?.id || !isInjectableTabUrl(tab.url)) {
         continue;
       }
       if (tab.status && tab.status !== 'complete') {
@@ -261,7 +287,7 @@ async function handleTranslateText(message, sendResponse) {
       return;
     }
 
-    const { translations, rawTranslation } = await translateTexts(
+    const { translations, rawTranslation, debug } = await translateTexts(
       message.texts,
       apiKey,
       message.targetLanguage,
@@ -270,7 +296,7 @@ async function handleTranslateText(message, sendResponse) {
       apiBaseUrl,
       message.keepPunctuationTokens
     );
-    sendResponse({ success: true, translations, rawTranslation });
+    sendResponse({ success: true, translations, rawTranslation, debug });
   } catch (error) {
     console.error('Translation failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
@@ -309,7 +335,7 @@ async function handleProofreadText(message, sendResponse) {
       return;
     }
 
-    const { translations, rawProofread } = await proofreadTranslation(
+    const { translations, rawProofread, debug } = await proofreadTranslation(
       message.segments,
       message.sourceBlock,
       message.translatedBlock,
@@ -319,7 +345,7 @@ async function handleProofreadText(message, sendResponse) {
       state.proofreadModel,
       apiBaseUrl
     );
-    sendResponse({ success: true, translations, rawProofread });
+    sendResponse({ success: true, translations, rawProofread, debug });
   } catch (error) {
     console.error('Proofreading failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });

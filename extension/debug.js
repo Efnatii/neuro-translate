@@ -36,6 +36,22 @@ async function init() {
     });
   }
 
+  if (entriesEl) {
+    entriesEl.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const button = target.closest('[data-action="set-proofread-view"]');
+      if (!button) return;
+      const view = button.getAttribute('data-view');
+      const container = button.closest('.proofread-block');
+      if (!view || !container) return;
+      container.setAttribute('data-proofread-view', view);
+      container.querySelectorAll('[data-action="set-proofread-view"]').forEach((node) => {
+        node.classList.toggle('is-active', node.getAttribute('data-view') === view);
+      });
+    });
+  }
+
   await refreshDebug();
   startAutoRefresh();
 }
@@ -206,7 +222,7 @@ function renderDebug(url, data) {
         <details class="ai-response">
           <summary>Ответ ИИ (перевод)</summary>
           <div class="details-content">
-            ${renderRawResponse(item.translationRaw, 'Ответ ИИ ещё не получен.')}
+            ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE')}
           </div>
         </details>
       </div>
@@ -268,134 +284,60 @@ function getOverallStatus({ completed, inProgress, failed, total, contextStatus 
 }
 
 function renderProofreadSection(item) {
-  const replacements = Array.isArray(item?.proofread) ? item.proofread : [];
-  let content = '';
-  if (item?.proofreadApplied) {
-    content = replacements.length
-      ? replacements
-          .map((replacement, index) => formatProofreadReplacement(replacement, index, item))
-          .filter(Boolean)
-          .join('\n')
-      : 'Нет правок.';
-  }
-  return `
+  if (item?.proofreadApplied === false) {
+    return `
       <div class="block">
         <div class="label">Вычитка</div>
-        ${
-          item?.proofreadApplied
-            ? `<pre>${escapeHtml(content)}</pre>`
-            : `<div class="empty">Вычитка выключена.</div>`
-        }
+        <div class="empty">Вычитка выключена.</div>
       </div>
       <div class="block">
         <details class="ai-response">
           <summary>Ответ ИИ (вычитка)</summary>
           <div class="details-content">
-            ${
-              item?.proofreadApplied
-                ? renderRawResponse(item.proofreadRaw, 'Ответ ИИ ещё не получен.')
-                : `<div class="empty">Вычитка выключена.</div>`
-            }
+            <div class="empty">Вычитка выключена.</div>
           </div>
         </details>
       </div>
     `;
-}
-
-function formatProofreadReplacement(replacement, index, item) {
-  if (!replacement || typeof replacement !== 'object') return '';
-  if (
-    Array.isArray(replacement.edits) ||
-    Array.isArray(replacement.applied) ||
-    Array.isArray(replacement.failed)
-  ) {
-    const blockId = replacement.blockId ?? `#${index + 1}`;
-    const applied = Array.isArray(replacement.applied)
-      ? replacement.applied
-          .map((entry) => formatProofreadEdit(entry?.edit || entry))
-          .filter(Boolean)
-      : [];
-    const failed = Array.isArray(replacement.failed)
-      ? replacement.failed
-          .map((entry) => {
-            const formatted = formatProofreadEdit(entry?.edit || entry);
-            if (!formatted) return '';
-            const reason = entry?.reason ? ` (failed: ${entry.reason})` : ' (failed)';
-            return `${formatted}${reason}`;
-          })
-          .filter(Boolean)
-      : [];
-    const lines = [`Block ${blockId}:`];
-    if (applied.length) {
-      lines.push(`  Applied: ${applied.join('; ')}`);
-    }
-    if (failed.length) {
-      lines.push(`  Failed: ${failed.join('; ')}`);
-    }
-    if (!applied.length && !failed.length) {
-      lines.push('  Нет правок.');
-    }
-    if (replacement.usedRewrite) {
-      lines.push('  Использован полный rewrite.');
-    }
-    return lines.join('\n');
-  }
-  const hasFromTo = 'from' in replacement || 'to' in replacement;
-  if (hasFromTo) {
-    const fromText = typeof replacement.from === 'string' ? replacement.from : '';
-    const toText = typeof replacement.to === 'string' ? replacement.to : '';
-    if (!fromText && !toText) return '';
-    return `${fromText} -> ${toText}`;
   }
 
-  if ('revisedText' in replacement) {
-    const revisedText = typeof replacement.revisedText === 'string' ? replacement.revisedText : '';
-    if (!revisedText) return '';
-    const segmentIndex = Number(replacement.segmentIndex);
-    const sourceText = resolveProofreadSourceText(item, segmentIndex);
-    if (!sourceText) return '';
-    return `${sourceText} -> ${revisedText}`;
-  }
+  const comparisons = Array.isArray(item?.proofreadComparisons) ? item.proofreadComparisons : [];
+  const hasComparisons = comparisons.length > 0;
+  const diffView = hasComparisons ? renderProofreadDiffView(comparisons) : '<div class="empty">Нет правок.</div>';
+  const sideBySideView = hasComparisons
+    ? renderProofreadSideBySideView(comparisons)
+    : '<div class="empty">Нет правок.</div>';
+  const finalView = hasComparisons ? renderProofreadFinalView(comparisons) : '<div class="empty">Нет правок.</div>';
 
-  return '';
-}
-
-function formatProofreadEdit(edit) {
-  if (!edit || typeof edit !== 'object') return '';
-  const target = typeof edit.target === 'string' ? edit.target : '';
-  const replacement = typeof edit.replacement === 'string' ? edit.replacement : '';
-  const occurrence =
-    Number.isInteger(edit.occurrence) && edit.occurrence > 1 ? ` (#${edit.occurrence})` : '';
-  switch (edit.op) {
-    case 'replace':
-      return target || replacement ? `${target} -> ${replacement}${occurrence}` : '';
-    case 'delete':
-      return target ? `delete ${target}${occurrence}` : '';
-    case 'insert_before':
-      return target || replacement ? `insert_before ${target}: ${replacement}${occurrence}` : '';
-    case 'insert_after':
-      return target || replacement ? `insert_after ${target}: ${replacement}${occurrence}` : '';
-    default:
-      return '';
-  }
-}
-
-function resolveProofreadSourceText(item, segmentIndex) {
-  const translatedSegments = Array.isArray(item?.translatedSegments) ? item.translatedSegments : [];
-  const originalSegments = Array.isArray(item?.originalSegments) ? item.originalSegments : [];
-  if (Number.isInteger(segmentIndex)) {
-    const translatedSegment = translatedSegments[segmentIndex];
-    if (typeof translatedSegment === 'string' && translatedSegment) return translatedSegment;
-    const originalSegment = originalSegments[segmentIndex];
-    if (typeof originalSegment === 'string' && originalSegment) return originalSegment;
-  }
-  if (!translatedSegments.length && typeof item?.translated === 'string' && item.translated) {
-    return item.translated;
-  }
-  if (!originalSegments.length && typeof item?.original === 'string' && item.original) {
-    return item.original;
-  }
-  return '';
+  return `
+      <div class="block proofread-block" data-proofread-view="diff">
+        <div class="proofread-header">
+          <div class="label">Вычитка</div>
+          <div class="proofread-toggle">
+            <button class="toggle-button is-active" type="button" data-action="set-proofread-view" data-view="diff">
+              Diff
+            </button>
+            <button class="toggle-button" type="button" data-action="set-proofread-view" data-view="side">
+              Два текста рядом
+            </button>
+            <button class="toggle-button" type="button" data-action="set-proofread-view" data-view="final">
+              Только итог
+            </button>
+          </div>
+        </div>
+        <div class="proofread-view proofread-view--diff">${diffView}</div>
+        <div class="proofread-view proofread-view--side">${sideBySideView}</div>
+        <div class="proofread-view proofread-view--final">${finalView}</div>
+      </div>
+      <div class="block">
+        <details class="ai-response">
+          <summary>Ответ ИИ (вычитка)</summary>
+          <div class="details-content">
+            ${renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD')}
+          </div>
+        </details>
+      </div>
+    `;
 }
 
 function getOverallEntryStatus(item) {
@@ -438,6 +380,129 @@ function renderRawResponse(value, emptyMessage) {
   const classes = ['raw-response'];
   if (isJson) classes.push('raw-json');
   return `<pre class="${classes.join(' ')}">${escapeHtml(text)}</pre>`;
+}
+
+function normalizeDebugPayloads(payloads, fallbackRaw, phase) {
+  if (Array.isArray(payloads) && payloads.length) {
+    return payloads;
+  }
+  if (fallbackRaw) {
+    return [
+      {
+        phase,
+        model: '—',
+        latencyMs: null,
+        usage: null,
+        costUsd: null,
+        inputChars: null,
+        outputChars: typeof fallbackRaw === 'string' ? fallbackRaw.length : null,
+        request: null,
+        response: fallbackRaw,
+        parseIssues: []
+      }
+    ];
+  }
+  return [];
+}
+
+function formatUsage(usage) {
+  if (!usage) return '—';
+  const total = usage.total_tokens ?? usage.totalTokens;
+  const prompt = usage.prompt_tokens ?? usage.promptTokens;
+  const completion = usage.completion_tokens ?? usage.completionTokens;
+  if (Number.isFinite(prompt) && Number.isFinite(completion)) {
+    return `${prompt} prompt / ${completion} completion`;
+  }
+  if (Number.isFinite(total)) {
+    return `${total} total`;
+  }
+  return '—';
+}
+
+function formatLatency(latencyMs) {
+  if (!Number.isFinite(latencyMs)) return '—';
+  return `${Math.round(latencyMs)} ms`;
+}
+
+function formatCost(costUsd) {
+  if (!Number.isFinite(costUsd)) return '—';
+  return `$${costUsd.toFixed(4)}`;
+}
+
+function formatCharCount(value) {
+  if (!Number.isFinite(value)) return '—';
+  return `${value} chars`;
+}
+
+function renderDebugPayloads(payloads, fallbackRaw, phase) {
+  const normalized = normalizeDebugPayloads(payloads, fallbackRaw, phase);
+  if (!normalized.length) {
+    return '<div class="empty">Ответ ИИ ещё не получен.</div>';
+  }
+  return normalized
+    .map((payload, index) => renderDebugPayload(payload, index))
+    .join('');
+}
+
+function renderDebugPayload(payload, index) {
+  const phase = payload?.phase || 'UNKNOWN';
+  const model = payload?.model || '—';
+  const usage = formatUsage(payload?.usage);
+  const latency = formatLatency(payload?.latencyMs);
+  const cost = formatCost(payload?.costUsd);
+  const inputChars = formatCharCount(payload?.inputChars);
+  const outputChars = formatCharCount(payload?.outputChars);
+  const requestSection = renderDebugSection('Request (raw)', payload?.request);
+  const responseSection = renderDebugSection('Response (raw)', payload?.response);
+  const parseSection = renderDebugParseSection(payload?.parseIssues);
+  return `
+    <div class="debug-payload">
+      <div class="debug-header">
+        <div class="debug-title">
+          <span class="debug-phase">${escapeHtml(phase)}</span>
+          <span class="debug-model">${escapeHtml(model)}</span>
+        </div>
+        <div class="debug-metrics">
+          <span>Latency: ${escapeHtml(latency)}</span>
+          <span>Tokens: ${escapeHtml(usage)}</span>
+          <span>Cost: ${escapeHtml(cost)}</span>
+        </div>
+      </div>
+      <div class="debug-meta">
+        <span>Input: ${escapeHtml(inputChars)}</span>
+        <span>Output: ${escapeHtml(outputChars)}</span>
+      </div>
+      ${requestSection}
+      ${responseSection}
+      ${parseSection}
+    </div>
+  `;
+}
+
+function renderDebugSection(label, value) {
+  return `
+    <details class="debug-details">
+      <summary>${escapeHtml(label)}</summary>
+      <div class="details-content">
+        ${renderRawResponse(value, 'Нет данных.')}
+      </div>
+    </details>
+  `;
+}
+
+function renderDebugParseSection(parseIssues) {
+  const issues = Array.isArray(parseIssues) ? parseIssues.filter(Boolean) : [];
+  const content = issues.length
+    ? `<pre class="raw-response">${escapeHtml(issues.join('\n'))}</pre>`
+    : `<div class="empty">Ошибок не обнаружено.</div>`;
+  return `
+    <details class="debug-details">
+      <summary>Parse/Validation</summary>
+      <div class="details-content">
+        ${content}
+      </div>
+    </details>
+  `;
 }
 
 function formatRawResponse(value) {
@@ -487,4 +552,112 @@ function escapeHtml(value) {
   const div = document.createElement('div');
   div.textContent = value;
   return div.innerHTML;
+}
+
+function tokenizeForDiff(text = '') {
+  const tokens = text.match(/[\p{L}\p{N}]+|[^\p{L}\p{N}\s]+|\s+/gu);
+  return tokens || [];
+}
+
+function diffTokens(beforeTokens, afterTokens) {
+  const rows = beforeTokens.length + 1;
+  const cols = afterTokens.length + 1;
+  const dp = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+  for (let i = rows - 2; i >= 0; i -= 1) {
+    for (let j = cols - 2; j >= 0; j -= 1) {
+      if (beforeTokens[i] === afterTokens[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  const result = [];
+  let i = 0;
+  let j = 0;
+  while (i < beforeTokens.length && j < afterTokens.length) {
+    if (beforeTokens[i] === afterTokens[j]) {
+      result.push({ type: 'equal', value: beforeTokens[i] });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      result.push({ type: 'delete', value: beforeTokens[i] });
+      i += 1;
+    } else {
+      result.push({ type: 'insert', value: afterTokens[j] });
+      j += 1;
+    }
+  }
+  while (i < beforeTokens.length) {
+    result.push({ type: 'delete', value: beforeTokens[i] });
+    i += 1;
+  }
+  while (j < afterTokens.length) {
+    result.push({ type: 'insert', value: afterTokens[j] });
+    j += 1;
+  }
+
+  return result;
+}
+
+function renderDiffHtml(before = '', after = '') {
+  const beforeTokens = tokenizeForDiff(before);
+  const afterTokens = tokenizeForDiff(after);
+  const diff = diffTokens(beforeTokens, afterTokens);
+  return diff
+    .map((entry) => {
+      const escaped = escapeHtml(entry.value);
+      if (entry.type === 'insert') {
+        return `<span class="diff-insert">${escaped}</span>`;
+      }
+      if (entry.type === 'delete') {
+        return `<span class="diff-delete">${escaped}</span>`;
+      }
+      return escaped;
+    })
+    .join('');
+}
+
+function renderProofreadDiffView(comparisons) {
+  return comparisons
+    .map((comparison) => `
+      <div class="proofread-item">
+        <div class="proofread-item-header">Сегмент ${comparison.segmentIndex + 1}</div>
+        <div class="proofread-diff">${renderDiffHtml(comparison.before || '', comparison.after || '')}</div>
+      </div>
+    `)
+    .join('');
+}
+
+function renderProofreadSideBySideView(comparisons) {
+  return comparisons
+    .map((comparison) => `
+      <div class="proofread-item">
+        <div class="proofread-item-header">Сегмент ${comparison.segmentIndex + 1}</div>
+        <div class="proofread-columns">
+          <div>
+            <div class="proofread-subtitle">До (перевод)</div>
+            <pre>${escapeHtml(comparison.before || '')}</pre>
+          </div>
+          <div>
+            <div class="proofread-subtitle">После (вычитка)</div>
+            <pre>${escapeHtml(comparison.after || '')}</pre>
+          </div>
+        </div>
+      </div>
+    `)
+    .join('');
+}
+
+function renderProofreadFinalView(comparisons) {
+  return comparisons
+    .map((comparison) => `
+      <div class="proofread-item">
+        <div class="proofread-item-header">Сегмент ${comparison.segmentIndex + 1}</div>
+        <pre>${escapeHtml(comparison.after || '')}</pre>
+      </div>
+    `)
+    .join('');
 }
