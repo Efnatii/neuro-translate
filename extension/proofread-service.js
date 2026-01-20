@@ -1,72 +1,56 @@
-const MAX_PROOFREAD_EDITS = 30;
-const PROOFREAD_RESPONSE_SCHEMA = {
-  type: 'object',
-  properties: {
-    edits: {
-      type: 'array',
-      maxItems: MAX_PROOFREAD_EDITS,
-      items: {
-        type: 'object',
-        properties: {
-          op: { type: 'string', enum: ['replace', 'insert_before', 'insert_after', 'delete'] },
-          target: { type: 'string' },
-          replacement: { type: 'string' },
-          occurrence: { type: 'integer', minimum: 1 },
-          before: { type: 'string' },
-          after: { type: 'string' },
-          rationale: { type: 'string' }
-        },
-        required: ['op', 'target'],
-        additionalProperties: false
-      }
-    },
-    rewrite_text: { type: 'string' }
-  },
-  required: ['edits'],
-  additionalProperties: false
-};
-
-function detectLineEnding(text = '') {
-  if (text.includes('\r\n')) return '\r\n';
-  if (text.includes('\r')) return '\r';
-  return '\n';
-}
-
-function normalizeLineEndings(text = '') {
-  const lineEnding = detectLineEnding(text);
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  return { normalized, lineEnding };
-}
+const PROOFREAD_SCHEMA_NAME = 'proofread_translations';
 
 function buildProofreadPrompt(input) {
-  const blockId = input?.blockId ?? '';
-  const text = input?.text ?? '';
+  const segments = Array.isArray(input?.segments) ? input.segments : [];
+  const sourceBlock = input?.sourceBlock ?? '';
+  const translatedBlock = input?.translatedBlock ?? '';
   const language = input?.language ?? '';
-  const goals = Array.isArray(input?.goals) ? input.goals.filter(Boolean) : [];
+  const context = input?.context ?? '';
+
   return [
     {
       role: 'system',
       content: [
-        'You are a precise proofreading engine.',
-        'Return only JSON that matches the provided schema.',
-        'Use anchor-based edits only; never return start/end indices.',
-        'Each edit must target an exact fragment from the original block.',
-        'If a target appears multiple times, include before/after anchors.',
-        'Keep formatting, whitespace, Markdown, and punctuation tokens unchanged except for local fixes.',
-        'Avoid over-editing; keep meaning identical.',
-        `Limit to at most ${MAX_PROOFREAD_EDITS} edits per block.`,
-        'If edits are unsafe or ambiguous, return rewrite_text instead.',
-        'Never include any extra commentary outside the JSON object.'
-      ].join(' ')
+        'You are an expert translation proofreader and editor.',
+        'Your job is to improve the translated text for clarity, fluency, and readability while preserving the original meaning.',
+        'You may rewrite freely for naturalness, but do not add, omit, or distort information.',
+        'Preserve modality, tense, aspect, tone, and level of certainty.',
+        'Keep numbers, units, currencies, dates, and formatting intact unless they are clearly incorrect.',
+        'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
+        'Keep punctuation tokens unchanged and in place.',
+        PUNCTUATION_TOKEN_HINT,
+        'Use the source block only to verify meaning; do not translate it or copy it into the output.',
+        'Use the translated block as context to maintain consistency across segments.',
+        'Never include the context text in the output unless it is already part of the segments.',
+        'Return a JSON object with a "translations" array that matches the input order.',
+        'If a segment does not need edits, return an empty string for that segment.',
+        'Do not add commentary.'
+      ]
+        .filter(Boolean)
+        .join(' ')
     },
     {
       role: 'user',
       content: [
-        `Block ID: ${blockId}`,
-        `Language: ${language}`,
-        goals.length ? `Goals:\n- ${goals.join('\n- ')}` : '',
-        'Block text:',
-        text
+        language ? `Target language: ${language}` : '',
+        context
+          ? [
+              'Use the context only for disambiguation.',
+              'Do not translate, quote, or include the context in the output.',
+              `Context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
+            ].join('\n')
+          : '',
+        sourceBlock
+          ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>`
+          : '',
+        translatedBlock
+          ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`
+          : '',
+        `Return a JSON object with a "translations" array containing exactly ${segments.length} items.`,
+        'Segments to proofread (translated):',
+        '<<<SEGMENTS_START>>>',
+        ...segments.map((segment) => segment ?? ''),
+        '<<<SEGMENTS_END>>>'
       ]
         .filter(Boolean)
         .join('\n')
@@ -74,115 +58,99 @@ function buildProofreadPrompt(input) {
   ];
 }
 
-async function proofreadTranslation(blocks, apiKey, model, apiBaseUrl = OPENAI_API_URL) {
-  if (!Array.isArray(blocks) || !blocks.length) return { results: [], rawProofread: [] };
-
-  const normalizedBlocks = blocks.map((block, index) => {
-    const blockId = block?.blockId ?? String(index);
-    const language = block?.language ?? '';
-    const goals = Array.isArray(block?.goals) ? block.goals : [];
-    const text = typeof block?.text === 'string' ? block.text : '';
-    const { normalized } = normalizeLineEndings(text);
-    return { blockId, text: normalized, language, goals };
-  });
-
-  const results = [];
-  const rawProofread = [];
-
-  for (const block of normalizedBlocks) {
-    const prompt = applyPromptCaching(buildProofreadPrompt(block), apiBaseUrl);
-    if (prompt?.[0]?.content) {
-      prompt[0].content = `${prompt[0].content} ${PUNCTUATION_TOKEN_HINT}`;
-    }
-
-    const maxRateLimitRetries = 3;
-    let rateLimitRetries = 0;
-    let lastRateLimitDelayMs = null;
-    let lastError = null;
-
-    while (true) {
-      try {
-        const response = await fetch(apiBaseUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model,
-            messages: prompt,
-            response_format: {
-              type: 'json_schema',
-              json_schema: {
-                name: 'proofread_edits',
-                schema: PROOFREAD_RESPONSE_SCHEMA
-              }
-            }
-          })
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          let errorPayload = null;
-          try {
-            errorPayload = JSON.parse(errorText);
-          } catch (parseError) {
-            errorPayload = null;
-          }
-          const retryAfterMs = parseRetryAfterMs(response, errorPayload);
-          const errorMessage =
-            errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
-          const error = new Error(`Proofread request failed: ${response.status} ${errorMessage}`);
-          error.status = response.status;
-          error.retryAfterMs = retryAfterMs;
-          error.isRateLimit = response.status === 429 || response.status === 503;
-          throw error;
-        }
-
-        const data = await response.json();
-        const content = data?.choices?.[0]?.message?.content;
-        if (!content) {
-          throw new Error('No proofreading result returned');
-        }
-
-        const parsed = parseJsonObjectFlexible(content, 'proofread');
-        const edits = Array.isArray(parsed?.edits) ? parsed.edits : [];
-        const parsedRewriteText = typeof parsed?.rewrite_text === 'string' ? parsed.rewrite_text : null;
-        const rewriteText =
-          parsedRewriteText && parsedRewriteText.length > 0 ? parsedRewriteText : block.text;
-
-        results.push({ blockId: block.blockId, edits, rewriteText });
-        rawProofread.push({ blockId: block.blockId, raw: content });
-        break;
-      } catch (error) {
-        lastError = error;
-        const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
-        if (isRateLimit && rateLimitRetries < maxRateLimitRetries) {
-          rateLimitRetries += 1;
-          const retryDelayMs = calculateRetryDelayMs(rateLimitRetries, error?.retryAfterMs);
-          lastRateLimitDelayMs = retryDelayMs;
-          console.warn(`Proofreading rate-limited, retrying after ${retryDelayMs}ms...`);
-          await sleep(retryDelayMs);
-          continue;
-        }
-
-        if (isRateLimit) {
-          const waitSeconds = Math.max(
-            1,
-            Math.ceil((lastRateLimitDelayMs || error?.retryAfterMs || 30000) / 1000)
-          );
-          const waitMs = waitSeconds * 1000;
-          console.warn(`Proofreading rate limit reached—waiting ${waitSeconds}s before retrying.`);
-          await sleep(waitMs);
-          continue;
-        }
-
-        throw lastError;
-      }
-    }
+async function proofreadTranslation(
+  segments,
+  sourceBlock,
+  translatedBlock,
+  context,
+  language,
+  apiKey,
+  model,
+  apiBaseUrl = OPENAI_API_URL
+) {
+  if (!Array.isArray(segments) || !segments.length) {
+    return { translations: [], rawProofread: '' };
   }
 
-  return { results, rawProofread };
+  const normalizedSegments = segments.map((segment) => (typeof segment === 'string' ? segment : String(segment ?? '')));
+  const prompt = applyPromptCaching(
+    buildProofreadPrompt({
+      segments: normalizedSegments,
+      sourceBlock,
+      translatedBlock,
+      context,
+      language
+    }),
+    apiBaseUrl
+  );
+
+  const response = await fetch(apiBaseUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model,
+      messages: prompt,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: PROOFREAD_SCHEMA_NAME,
+          schema: {
+            type: 'object',
+            properties: {
+              translations: {
+                type: 'array',
+                minItems: normalizedSegments.length,
+                maxItems: normalizedSegments.length,
+                items: { type: 'string' }
+              }
+            },
+            required: ['translations'],
+            additionalProperties: false
+          }
+        }
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    let errorPayload = null;
+    try {
+      errorPayload = JSON.parse(errorText);
+    } catch (parseError) {
+      errorPayload = null;
+    }
+    const retryAfterMs = parseRetryAfterMs(response, errorPayload);
+    const errorMessage =
+      errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
+    const error = new Error(`Proofread request failed: ${response.status} ${errorMessage}`);
+    error.status = response.status;
+    error.retryAfterMs = retryAfterMs;
+    error.isRateLimit = response.status === 429 || response.status === 503;
+    throw error;
+  }
+
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('No proofreading result returned');
+  }
+
+  const parsed = parseJsonObjectFlexible(content, 'proofread');
+  const translations = Array.isArray(parsed?.translations)
+    ? parsed.translations.map((item) => (typeof item === 'string' ? item : String(item ?? '')))
+    : [];
+
+  if (translations.length !== normalizedSegments.length) {
+    throw new Error(
+      `Proofread response length mismatch: expected ${normalizedSegments.length}, got ${translations.length}`
+    );
+  }
+
+  return { translations, rawProofread: content };
 }
 
 function parseJsonObjectFlexible(content = '', label = 'response') {

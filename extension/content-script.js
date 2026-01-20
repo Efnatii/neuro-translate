@@ -404,34 +404,24 @@ async function translatePage(settings) {
       activeProofreadWorkers += 1;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress' });
-        const proofreadBlocks = task.translatedTexts.map((text, index) => ({
-          blockId: String(task.block[index]?.path ?? `${task.index}-${index}`),
-          text,
-          language: settings.targetLanguage || 'ru',
-          goals: latestContextSummary ? [`Контекст перевода: ${latestContextSummary}`] : []
-        }));
-        const proofreadResult = await requestProofreading(proofreadBlocks);
-        const results = Array.isArray(proofreadResult.results) ? proofreadResult.results : [];
-        const resultById = new Map(results.map((result) => [result.blockId, result]));
+        const proofreadResult = await requestProofreading({
+          segments: task.translatedTexts,
+          sourceBlock: formatBlockText(task.originalTexts),
+          translatedBlock: formatBlockText(task.translatedTexts),
+          context: latestContextSummary || '',
+          language: settings.targetLanguage || 'ru'
+        });
+        const revisedSegments = Array.isArray(proofreadResult.translations)
+          ? proofreadResult.translations
+          : [];
         const proofreadSummary = [];
         let finalTranslations = task.translatedTexts.map((text, index) => {
-          const blockId = String(task.block[index]?.path ?? `${task.index}-${index}`);
-          const result = resultById.get(blockId);
-          if (!result) {
-            return text;
+          const revision = revisedSegments[index];
+          if (typeof revision === 'string' && revision.length > 0) {
+            proofreadSummary.push({ segmentIndex: index, revisedText: revision });
+            return revision;
           }
-          const edits = Array.isArray(result.edits) ? result.edits : [];
-          const rewriteText = typeof result.rewriteText === 'string' ? result.rewriteText : '';
-          const nextText = rewriteText && rewriteText.length > 0 ? rewriteText : text;
-          const usedRewrite = nextText !== text;
-          proofreadSummary.push({
-            blockId,
-            edits,
-            applied: [],
-            failed: [],
-            usedRewrite
-          });
-          return nextText;
+          return text;
         });
         finalTranslations = finalTranslations.map((text, index) =>
           applyOriginalFormatting(task.originalTexts[index], text)
@@ -533,10 +523,15 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
   );
 }
 
-async function requestProofreading(blocks) {
-  const texts = Array.isArray(blocks) ? blocks.map((block) => block?.text || '') : [];
+async function requestProofreading(payload) {
+  const segments = Array.isArray(payload?.segments) ? payload.segments : [];
+  const sourceBlock = payload?.sourceBlock || '';
+  const translatedBlock = payload?.translatedBlock || '';
+  const context = payload?.context || '';
   const estimatedTokens = estimateTokensForRole('proofread', {
-    texts
+    texts: segments,
+    context,
+    sourceTexts: [sourceBlock, translatedBlock]
   });
   await ensureTpmBudget('proofread', estimatedTokens);
   await incrementDebugAiRequestCount();
@@ -545,12 +540,16 @@ async function requestProofreading(blocks) {
       const response = await sendRuntimeMessage(
         {
           type: 'PROOFREAD_TEXT',
-          blocks
+          segments,
+          sourceBlock,
+          translatedBlock,
+          context,
+          language: payload?.language || ''
         },
         'Не удалось выполнить вычитку.'
       );
       return {
-        results: Array.isArray(response.results) ? response.results : [],
+        translations: Array.isArray(response.translations) ? response.translations : [],
         rawProofread: response.rawProofread || ''
       };
     },
