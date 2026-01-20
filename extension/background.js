@@ -1,4 +1,5 @@
 importScripts('ai-common.js');
+importScripts('messaging.js');
 importScripts('translation-service.js');
 importScripts('context-service.js');
 importScripts('proofread-service.js');
@@ -35,6 +36,7 @@ const DEFAULT_STATE = {
 };
 
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
+const CONTENT_READY_BY_TAB = new Map();
 
 function isDeepseekModel(model = '') {
   return model.startsWith('deepseek');
@@ -97,6 +99,11 @@ async function saveState(partial) {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await saveState({});
+  await warmUpContentScripts('installed');
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await warmUpContentScripts('startup');
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -131,7 +138,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === 'CANCEL_PAGE_TRANSLATION' && sender?.tab?.id) {
-    chrome.tabs.sendMessage(sender.tab.id, { type: 'CANCEL_TRANSLATION' });
+    sendMessageToTabSafe(sender.tab, { type: 'CANCEL_TRANSLATION' }).then((result) => {
+      if (!result.ok) {
+        console.warn('Failed to cancel translation via tab message.', result.reason);
+      }
+    });
+  }
+
+  if (message?.type === 'NT_CONTENT_READY' && sender?.tab?.id) {
+    CONTENT_READY_BY_TAB.set(sender.tab.id, Date.now());
+    sendResponse({ ok: true });
+    return true;
   }
 
   if (message?.type === 'TRANSLATION_PROGRESS') {
@@ -153,6 +170,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return false;
 });
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  CONTENT_READY_BY_TAB.delete(tabId);
+});
+
+async function warmUpContentScripts(reason) {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab?.id || !isSupportedTabUrl(tab.url)) {
+        continue;
+      }
+      if (tab.status && tab.status !== 'complete') {
+        continue;
+      }
+      if (CONTENT_READY_BY_TAB.has(tab.id)) {
+        continue;
+      }
+      const injected = await ensureContentScriptInjected(tab.id);
+      if (injected.ok) {
+        CONTENT_READY_BY_TAB.set(tab.id, Date.now());
+      } else {
+        console.debug('Content script warm-up skipped.', { reason, tabId: tab.id, error: injected.reason });
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to warm up content scripts.', error);
+  }
+}
 
 async function handleGetSettings(message, sendResponse) {
   try {

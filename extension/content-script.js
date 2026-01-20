@@ -37,7 +37,20 @@ const PUNCTUATION_TOKENS = new Map([
 
 restoreFromMemory();
 
+try {
+  chrome.runtime.sendMessage({ type: 'NT_CONTENT_READY', url: location.href });
+} catch (error) {
+  console.warn('Failed to notify background about content readiness.', error);
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'NT_PING') {
+    if (typeof sendResponse === 'function') {
+      sendResponse({ ok: true, type: 'NT_PONG', timestamp: Date.now() });
+    }
+    return true;
+  }
+
   if (message?.type === 'CANCEL_TRANSLATION') {
     cancelTranslation();
   }
