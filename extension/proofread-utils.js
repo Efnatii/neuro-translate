@@ -163,10 +163,14 @@
   }
 
   function filterByScore(candidates, before, after) {
-    if (!before && !after) return candidates;
+    const hasMatches = candidates.length > 0;
+    if (!before && !after) return { filtered: candidates, hasMatches };
     const total = (before?.length || 0) + (after?.length || 0);
     const minScore = Math.max(1, Math.floor(total * 0.25));
-    return candidates.filter((candidate) => candidate.score >= minScore);
+    return {
+      filtered: candidates.filter((candidate) => candidate.score >= minScore),
+      hasMatches
+    };
   }
 
   function hasPlaceholder(text) {
@@ -196,7 +200,11 @@
       score: scoreCandidate(text, candidate, before, after),
       matchType: 'exact'
     }));
-    return filterByScore(scored, before, after);
+    const { filtered, hasMatches } = filterByScore(scored, before, after);
+    if (!filtered.length && hasMatches && (before || after)) {
+      return findExactCandidates(text, target, null, null);
+    }
+    return filtered;
   }
 
   function findNormalizedWhitespaceCandidates(text, target, before, after) {
@@ -213,7 +221,10 @@
       ...candidate,
       score: scoreCandidate(normalizedText.norm, candidate, normalizedBefore, normalizedAfter)
     }));
-    const filtered = filterByScore(scored, normalizedBefore, normalizedAfter);
+    const { filtered, hasMatches } = filterByScore(scored, normalizedBefore, normalizedAfter);
+    if (!filtered.length && hasMatches && (before || after)) {
+      return findNormalizedWhitespaceCandidates(text, target, null, null);
+    }
     return filtered.map((candidate) => {
       const range = resolveOriginalRange(
         normalizedText.spans,
@@ -237,7 +248,10 @@
       ...candidate,
       score: scoreCandidate(foldedText.folded, candidate, foldedBefore, foldedAfter)
     }));
-    const filtered = filterByScore(scored, foldedBefore, foldedAfter);
+    const { filtered, hasMatches } = filterByScore(scored, foldedBefore, foldedAfter);
+    if (!filtered.length && hasMatches && (before || after)) {
+      return findCasefoldCandidates(text, target, null, null);
+    }
     return filtered.map((candidate) => {
       const range = resolveOriginalRange(
         foldedText.spans,
@@ -252,8 +266,10 @@
   function findCandidates(text, edit) {
     const target = typeof edit?.target === 'string' ? edit.target : '';
     if (!target) return [];
-    const before = typeof edit?.before === 'string' ? edit.before : null;
-    const after = typeof edit?.after === 'string' ? edit.after : null;
+    const before =
+      typeof edit?.before === 'string' && edit.before ? edit.before : null;
+    const after =
+      typeof edit?.after === 'string' && edit.after ? edit.after : null;
 
     const exact = findExactCandidates(text, target, before, after);
     if (exact.length) return exact;
