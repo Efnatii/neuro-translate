@@ -406,12 +406,7 @@ async function translatePage(settings) {
             await updateDebugEntry(currentIndex + 1, {
               proofreadStatus: 'done',
               proofread: [],
-              proofreadComparisons: translatedTexts.map((text, index) => ({
-                segmentIndex: index,
-                before: applyOriginalFormatting(block[index].original, text),
-                after: applyOriginalFormatting(block[index].original, text),
-                changed: false
-              }))
+              proofreadComparisons: []
             });
           } else {
             enqueueProofreadTask({
@@ -483,11 +478,19 @@ async function translatePage(settings) {
           ? proofreadResult.translations
           : [];
         const revisionMap = new Map();
+        const proofreadWarnings = [];
         (task.proofreadSegments || []).forEach((segment, index) => {
           const revised = revisedSegments[index];
-          if (typeof revised === 'string') {
-            revisionMap.set(String(segment.id), revised);
+          if (typeof revised !== 'string') return;
+          const originalTokens = extractPunctuationTokens(segment.text);
+          const revisedTokens = extractPunctuationTokens(revised);
+          if (!areTokenMultisetsEqual(originalTokens, revisedTokens)) {
+            proofreadWarnings.push(
+              `Segment ${segment.id}: punctuation tokens changed, revision ignored.`
+            );
+            return;
           }
+          revisionMap.set(String(segment.id), revised);
         });
         const proofreadSummary = [];
         let finalTranslations = task.translatedTexts.map((text, index) => {
@@ -524,30 +527,36 @@ async function translatePage(settings) {
           typeof rawProofreadPayload === 'string'
             ? rawProofreadPayload
             : JSON.stringify(rawProofreadPayload, null, 2);
+        const proofreadDebugPayloads = normalizeProofreadDebugPayloads(
+          proofreadResult.debug || [],
+          proofreadWarnings
+        );
+        const proofreadComparisons = buildProofreadComparisons({
+          originalTexts: task.originalTexts,
+          beforeTexts: task.translatedTexts,
+          afterTexts: finalTranslations
+        }).filter((comparison) => comparison.changed);
         await updateDebugEntry(task.index + 1, {
+          translated: formatBlockText(finalTranslations),
+          translatedSegments: finalTranslations,
           proofreadStatus: 'done',
           proofread: proofreadSummary,
           proofreadRaw: rawProofread,
-          proofreadDebug: proofreadResult.debug || [],
-          proofreadComparisons: finalTranslations.map((text, index) => ({
-            segmentIndex: index,
-            before: applyOriginalFormatting(task.originalTexts[index], task.translatedTexts[index] || ''),
-            after: text,
-            changed: (task.translatedTexts[index] || '').trim() !== text.trim()
-          }))
+          proofreadDebug: proofreadDebugPayloads,
+          proofreadComparisons
         });
         reportProgress('Вычитка выполняется');
       } catch (error) {
         console.warn('Proofreading failed, keeping original translations.', error);
+        const proofreadComparisons = buildProofreadComparisons({
+          originalTexts: task.originalTexts,
+          beforeTexts: task.translatedTexts,
+          afterTexts: task.translatedTexts
+        }).filter((comparison) => comparison.changed);
         await updateDebugEntry(task.index + 1, {
           proofreadStatus: 'failed',
           proofread: [],
-          proofreadComparisons: task.translatedTexts.map((text, index) => ({
-            segmentIndex: index,
-            before: applyOriginalFormatting(task.originalTexts[index], text || ''),
-            after: applyOriginalFormatting(task.originalTexts[index], text || ''),
-            changed: false
-          }))
+          proofreadComparisons
         });
         reportProgress('Вычитка выполняется');
       } finally {
@@ -762,6 +771,69 @@ function formatLogDetails(details) {
 
 function escapeRegex(value = '') {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const PUNCTUATION_TOKEN_REGEX = /⟦PUNC_[A-Z0-9_]+⟧/g;
+
+function extractPunctuationTokens(text = '') {
+  if (!text) return [];
+  return text.match(PUNCTUATION_TOKEN_REGEX) || [];
+}
+
+function areTokenMultisetsEqual(leftTokens = [], rightTokens = []) {
+  if (leftTokens.length !== rightTokens.length) return false;
+  const counts = new Map();
+  leftTokens.forEach((token) => counts.set(token, (counts.get(token) || 0) + 1));
+  for (const token of rightTokens) {
+    const current = counts.get(token);
+    if (!current) return false;
+    if (current === 1) {
+      counts.delete(token);
+    } else {
+      counts.set(token, current - 1);
+    }
+  }
+  return counts.size === 0;
+}
+
+function normalizeComparisonText(text = '') {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
+function buildProofreadComparisons({ originalTexts = [], beforeTexts = [], afterTexts = [] }) {
+  const total = Math.max(originalTexts.length, beforeTexts.length, afterTexts.length);
+  return Array.from({ length: total }, (_, index) => {
+    const original = originalTexts[index] || '';
+    const beforeDisplay = restorePunctuationTokens(
+      applyOriginalFormatting(original, beforeTexts[index] || '')
+    );
+    const afterDisplay = restorePunctuationTokens(
+      applyOriginalFormatting(original, afterTexts[index] || '')
+    );
+    const changed = normalizeComparisonText(beforeDisplay) !== normalizeComparisonText(afterDisplay);
+    return {
+      segmentIndex: index,
+      before: beforeDisplay,
+      after: afterDisplay,
+      changed
+    };
+  });
+}
+
+function normalizeProofreadDebugPayloads(payloads, warnings) {
+  const normalized = Array.isArray(payloads) ? payloads.map((payload) => ({ ...payload })) : [];
+  if (!Array.isArray(warnings) || warnings.length === 0) return normalized;
+  if (!normalized.length) {
+    return [{ phase: 'PROOFREAD', parseIssues: warnings }];
+  }
+  const [first, ...rest] = normalized;
+  const parseIssues = Array.isArray(first.parseIssues) ? [...first.parseIssues, ...warnings] : warnings;
+  return [{ ...first, parseIssues }, ...rest];
 }
 
 function restorePunctuationTokens(text = '') {

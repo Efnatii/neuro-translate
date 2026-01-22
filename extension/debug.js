@@ -326,7 +326,8 @@ function renderProofreadSection(item, entryKey) {
     `;
   }
 
-  const comparisons = Array.isArray(item?.proofreadComparisons) ? item.proofreadComparisons : [];
+  const comparisonsAll = Array.isArray(item?.proofreadComparisons) ? item.proofreadComparisons : [];
+  const comparisons = comparisonsAll.filter((comparison) => comparison?.changed);
   const hasComparisons = comparisons.length > 0;
   const diffView = hasComparisons ? renderProofreadDiffView(comparisons) : '<div class="empty">Нет правок.</div>';
   const sideBySideView = hasComparisons
