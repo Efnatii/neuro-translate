@@ -531,9 +531,10 @@ async function translatePage(settings) {
   const averageBlockLength = blocks.length ? Math.round(textStats.totalLength / blocks.length) : 0;
   const initialConcurrency = selectInitialConcurrency(averageBlockLength, blocks.length);
   const singleBlockConcurrency = Boolean(settings.singleBlockConcurrency);
-  let maxAllowedConcurrency = Math.max(1, Math.min(6, blocks.length));
+  const translationConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(6, blocks.length));
+  let maxAllowedConcurrency = translationConcurrency;
   const requestDurations = [];
-  let dynamicMaxConcurrency = initialConcurrency;
+  let dynamicMaxConcurrency = Math.min(initialConcurrency, maxAllowedConcurrency);
   let activeTranslationWorkers = 0;
   let activeProofreadWorkers = 0;
   let translationQueueDone = false;
@@ -541,13 +542,7 @@ async function translatePage(settings) {
   const proofreadQueue = [];
   const translationQueueKeys = new Set();
   const proofreadQueueKeys = new Set();
-  let proofreadConcurrency = Math.max(1, Math.min(4, blocks.length));
-
-  if (singleBlockConcurrency) {
-    maxAllowedConcurrency = 1;
-    dynamicMaxConcurrency = 1;
-    proofreadConcurrency = 1;
-  }
+  let proofreadConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(4, blocks.length));
 
   const getBlockKey = (block) =>
     block
