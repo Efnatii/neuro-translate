@@ -13,9 +13,43 @@ function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
 }
 
+function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
+  return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('Storage get timed out'));
+    }, timeoutMs);
+    try {
+      chrome.storage.local.get(keysOrDefaults, (items) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        if (!items || typeof items !== 'object') {
+          resolve({});
+          return;
+        }
+        resolve(items);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 async function getModelThroughputInfo(model) {
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
-  return modelThroughputById?.[model] || null;
+  try {
+    const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
+    return modelThroughputById?.[model] || null;
+  } catch (error) {
+    console.warn('Failed to read model throughput info, using defaults.', error);
+    return null;
+  }
 }
 
 function calculateTranslationTimeoutMs(texts, throughputInfo) {

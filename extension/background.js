@@ -35,13 +35,25 @@ const DEFAULT_STATE = {
   tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
 
+let STATE_CACHE = null;
+let STATE_CACHE_READY = false;
+
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
 const CONTENT_READY_BY_TAB = new Map();
 
-function storageLocalGet(keysOrDefaults) {
+function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
   return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('Storage get timed out'));
+    }, timeoutMs);
     try {
       chrome.storage.local.get(keysOrDefaults, (items) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
         if (chrome.runtime.lastError) {
           reject(chrome.runtime.lastError);
           return;
@@ -58,10 +70,19 @@ function storageLocalGet(keysOrDefaults) {
   });
 }
 
-function storageLocalSet(items) {
+function storageLocalSet(items, timeoutMs = 1500) {
   return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('Storage set timed out'));
+    }, timeoutMs);
     try {
       chrome.storage.local.set(items, () => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
         if (chrome.runtime.lastError) {
           reject(chrome.runtime.lastError);
           return;
@@ -72,6 +93,50 @@ function storageLocalSet(items) {
       reject(error);
     }
   });
+}
+
+function applyStatePatch(patch = {}) {
+  const allowedKeys = new Set([
+    'apiKey',
+    'deepseekApiKey',
+    'translationModel',
+    'contextModel',
+    'proofreadModel',
+    'contextGenerationEnabled',
+    'proofreadEnabled',
+    'blockLengthLimit',
+    'tpmLimitsByModel',
+    'outputRatioByRole',
+    'tpmSafetyBufferTokens',
+    'modelThroughputById'
+  ]);
+  const next = STATE_CACHE && typeof STATE_CACHE === 'object' ? { ...STATE_CACHE } : { ...DEFAULT_STATE };
+
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (!allowedKeys.has(key)) continue;
+    if (['apiKey', 'deepseekApiKey', 'translationModel', 'contextModel', 'proofreadModel'].includes(key)) {
+      next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
+      continue;
+    }
+    if (['contextGenerationEnabled', 'proofreadEnabled'].includes(key)) {
+      next[key] = Boolean(value);
+      continue;
+    }
+    if (['blockLengthLimit', 'tpmSafetyBufferTokens'].includes(key)) {
+      const numValue = Number(value);
+      next[key] = Number.isFinite(numValue) ? numValue : DEFAULT_STATE[key];
+      continue;
+    }
+    if (['tpmLimitsByModel', 'outputRatioByRole', 'modelThroughputById'].includes(key)) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        next[key] = value;
+      }
+      continue;
+    }
+  }
+
+  STATE_CACHE = next;
+  STATE_CACHE_READY = true;
 }
 
 function isDeepseekModel(model = '') {
@@ -112,25 +177,38 @@ function buildMissingKeyReason(roleLabel, config, model) {
 }
 
 async function getState() {
-  const stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
-  const safeStored = stored && typeof stored === 'object' ? stored : {};
-  const merged = { ...DEFAULT_STATE, ...safeStored };
-  if (!merged.blockLengthLimit && safeStored.chunkLengthLimit) {
-    merged.blockLengthLimit = safeStored.chunkLengthLimit;
+  if (STATE_CACHE_READY && STATE_CACHE && typeof STATE_CACHE === 'object') {
+    return { ...DEFAULT_STATE, ...STATE_CACHE };
   }
-  if (!merged.translationModel && safeStored.model) {
-    merged.translationModel = safeStored.model;
+
+  try {
+    const stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+    const safeStored = stored && typeof stored === 'object' ? stored : {};
+    const merged = { ...DEFAULT_STATE, ...safeStored };
+    if (!merged.blockLengthLimit && safeStored.chunkLengthLimit) {
+      merged.blockLengthLimit = safeStored.chunkLengthLimit;
+    }
+    if (!merged.translationModel && safeStored.model) {
+      merged.translationModel = safeStored.model;
+    }
+    if (!merged.contextModel && safeStored.model) {
+      merged.contextModel = safeStored.model;
+    }
+    applyStatePatch(merged);
+    return { ...DEFAULT_STATE, ...STATE_CACHE };
+  } catch (error) {
+    console.warn('Failed to load state from storage, using defaults.', error);
+    STATE_CACHE = { ...DEFAULT_STATE };
+    STATE_CACHE_READY = true;
+    return { ...DEFAULT_STATE };
   }
-  if (!merged.contextModel && safeStored.model) {
-    merged.contextModel = safeStored.model;
-  }
-  return merged;
 }
 
 async function saveState(partial) {
   const current = await getState();
   const next = { ...current, ...partial };
   await storageLocalSet(next);
+  applyStatePatch(next);
   return next;
 }
 
@@ -141,6 +219,15 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.runtime.onStartup.addListener(async () => {
   await warmUpContentScripts('startup');
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  const patch = {};
+  for (const [key, change] of Object.entries(changes || {})) {
+    patch[key] = change?.newValue;
+  }
+  applyStatePatch(patch);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -171,6 +258,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'GET_TAB_ID') {
     sendResponse({ tabId: sender?.tab?.id ?? null });
+    return true;
+  }
+
+  if (message?.type === 'SYNC_STATE_CACHE') {
+    try {
+      applyStatePatch(message?.state || {});
+    } catch (error) {
+      console.warn('Failed to sync state cache.', error);
+    }
+    sendResponse({ ok: true });
     return true;
   }
 
@@ -266,6 +363,28 @@ async function warmUpContentScripts(reason) {
 async function handleGetSettings(message, sendResponse) {
   try {
     const state = await getState();
+    if (!state || typeof state !== 'object') {
+      sendResponse({
+        allowed: false,
+        disallowedReason:
+          'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+        apiKey: DEFAULT_STATE.apiKey,
+        translationModel: DEFAULT_STATE.translationModel,
+        contextModel: DEFAULT_STATE.contextModel,
+        proofreadModel: DEFAULT_STATE.proofreadModel,
+        contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+        proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+        tpmLimitsByRole: {
+          translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+          context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+          proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+        },
+        outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+        tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+      });
+      return;
+    }
     const translationConfig = getApiConfigForModel(state.translationModel, state);
     const contextConfig = getApiConfigForModel(state.contextModel, state);
     const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
