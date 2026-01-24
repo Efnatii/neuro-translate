@@ -128,7 +128,7 @@ function invokeSettingsAsPromise(handler, message, timeoutMs = 1500) {
   });
 }
 
-function storageLocalGet(keysOrDefaults, timeoutMs = 2200) {
+function storageLocalGet(keysOrDefaults, timeoutMs = 6000) {
   return new Promise((resolve, reject) => {
     let hasCompleted = false;
     const timeoutId = setTimeout(() => {
@@ -238,7 +238,17 @@ async function getState() {
   }
 
   try {
-    const stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+    let stored;
+    try {
+      stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+    } catch (error) {
+      if (error?.message === 'storageLocalGet timeout') {
+        console.warn('storageLocalGet timed out, retrying with extended timeout.', error);
+        stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null }, 8000);
+      } else {
+        throw error;
+      }
+    }
     const safeStored = stored && typeof stored === 'object' ? stored : {};
     const merged = { ...DEFAULT_STATE, ...safeStored };
     if (!merged.blockLengthLimit && safeStored.chunkLengthLimit) {
@@ -351,6 +361,9 @@ chrome.runtime.onConnect.addListener((port) => {
 
     let responsePromise;
     switch (type) {
+      case 'RPC_HEARTBEAT':
+        responsePromise = Promise.resolve({ ok: true, ts: Date.now() });
+        break;
       case 'TRANSLATE_TEXT':
         responsePromise = invokeHandlerAsPromise(handleTranslateText, msg, 240000);
         break;

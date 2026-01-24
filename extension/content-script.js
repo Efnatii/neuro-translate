@@ -100,6 +100,10 @@ const SUPPORTED_MODEL_IDS = new Set([
 ]);
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
+const RPC_HEARTBEAT_INTERVAL_MS = 20000;
+const RPC_PORT_ROTATE_MS = 240000;
+let rpcHeartbeatTimer = null;
+let rpcPortCreatedAt = 0;
 const ntRpcPending = new Map();
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
@@ -342,9 +346,11 @@ async function startTranslation() {
   configureTpmLimiter(settings);
   translationInProgress = true;
   try {
+    startRpcHeartbeat();
     await translatePage(settings);
   } finally {
     translationInProgress = false;
+    stopRpcHeartbeat();
   }
 }
 
@@ -998,6 +1004,7 @@ function ensureRpcPort() {
   if (ntRpcPort) return ntRpcPort;
   try {
     ntRpcPort = chrome.runtime.connect({ name: NT_RPC_PORT_NAME });
+    rpcPortCreatedAt = Date.now();
   } catch (error) {
     console.warn('Failed to connect RPC port', error);
     ntRpcPort = null;
@@ -1029,24 +1036,66 @@ function ensureRpcPort() {
     }
     ntRpcPending.clear();
     ntRpcPort = null;
+    rpcPortCreatedAt = 0;
   });
 
   return ntRpcPort;
 }
 
+function startRpcHeartbeat() {
+  if (rpcHeartbeatTimer) return;
+  rpcHeartbeatTimer = setInterval(() => {
+    sendRpcRequest({ type: 'RPC_HEARTBEAT' }, 'RPC heartbeat failed', 2000).then(() => {});
+  }, RPC_HEARTBEAT_INTERVAL_MS);
+}
+
+function stopRpcHeartbeat() {
+  if (!rpcHeartbeatTimer) return;
+  clearInterval(rpcHeartbeatTimer);
+  rpcHeartbeatTimer = null;
+}
+
+function shouldRotateRpcPort() {
+  return rpcPortCreatedAt && Date.now() - rpcPortCreatedAt > RPC_PORT_ROTATE_MS;
+}
+
+function rotateRpcPort(reason = '') {
+  if (ntRpcPort) {
+    try {
+      ntRpcPort.disconnect();
+    } catch (error) {
+      // ignore
+    }
+  }
+  ntRpcPort = null;
+  rpcPortCreatedAt = 0;
+  console.info('RPC port rotated', { reason });
+}
+
+function getRpcPortAgeMs() {
+  return rpcPortCreatedAt ? Date.now() - rpcPortCreatedAt : 0;
+}
+
 function sendRpcRequest(payload, fallbackError, timeoutMs) {
-  const port = ensureRpcPort();
+  let rotated = false;
+  if (shouldRotateRpcPort()) {
+    rotateRpcPort('age');
+    rotated = true;
+  }
+  let port = ensureRpcPort();
   if (!port) {
     return Promise.resolve({
       success: false,
       error: fallbackError,
       isRuntimeError: true,
-      rpcUnavailable: true
+      rpcUnavailable: true,
+      rpcRotated: rotated,
+      rpcPortAgeMs: getRpcPortAgeMs()
     });
   }
   const rpcId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   return new Promise((resolve) => {
-    const timeoutId = setTimeout(() => {
+    let timeoutId = setTimeout(() => {
       ntRpcPending.delete(rpcId);
       resolve({
         success: false,
@@ -1061,12 +1110,45 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
       ntRpcPending.delete(rpcId);
       clearTimeout(timeoutId);
       console.warn('RPC postMessage failed', error);
-      resolve({
-        success: false,
-        error: fallbackError,
-        isRuntimeError: true,
-        rpcUnavailable: true
-      });
+      rotateRpcPort('postMessage-failed');
+      rotated = true;
+      port = ensureRpcPort();
+      if (!port) {
+        resolve({
+          success: false,
+          error: fallbackError,
+          isRuntimeError: true,
+          rpcUnavailable: true,
+          rpcRotated: rotated,
+          rpcPortAgeMs: getRpcPortAgeMs()
+        });
+        return;
+      }
+      const retryRpcId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      timeoutId = setTimeout(() => {
+        ntRpcPending.delete(retryRpcId);
+        resolve({
+          success: false,
+          error: fallbackError || 'RPC timeout',
+          isRuntimeError: true
+        });
+      }, timeoutMs);
+      ntRpcPending.set(retryRpcId, { resolve, timeoutId });
+      try {
+        port.postMessage({ rpcId: retryRpcId, ...payload });
+      } catch (retryError) {
+        ntRpcPending.delete(retryRpcId);
+        clearTimeout(timeoutId);
+        console.warn('RPC postMessage failed', retryError);
+        resolve({
+          success: false,
+          error: fallbackError,
+          isRuntimeError: true,
+          rpcUnavailable: true,
+          rpcRotated: rotated,
+          rpcPortAgeMs: getRpcPortAgeMs()
+        });
+      }
     }
   });
 }
@@ -1085,7 +1167,9 @@ async function sendRuntimeMessage(payload, fallbackError) {
     if (rpcResponse.rpcUnavailable) {
       console.warn('Falling back to runtime.sendMessage...', {
         type: payload?.type,
-        error: rpcResponse.error
+        reason: rpcResponse.error,
+        rotated: Boolean(rpcResponse.rpcRotated),
+        portAgeMs: rpcResponse.rpcPortAgeMs ?? getRpcPortAgeMs()
       });
       return sendRuntimeMessageLegacy(payload, fallbackError);
     }
@@ -2197,6 +2281,7 @@ function restoreOriginal(entries) {
 
 async function cancelTranslation() {
   cancelRequested = true;
+  stopRpcHeartbeat();
   await flushPersistDebugState('cancelTranslation');
   const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
   if (entriesToRestore.length) {
