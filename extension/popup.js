@@ -62,6 +62,23 @@ async function init() {
   activeTabId = tab?.id || null;
 
   const state = await getState();
+  try {
+    chrome.runtime.sendMessage({
+      type: 'SYNC_STATE_CACHE',
+      state: {
+        apiKey: state.apiKey,
+        deepseekApiKey: state.deepseekApiKey,
+        translationModel: state.translationModel,
+        contextModel: state.contextModel,
+        proofreadModel: state.proofreadModel,
+        contextGenerationEnabled: state.contextGenerationEnabled,
+        proofreadEnabled: state.proofreadEnabled,
+        blockLengthLimit: state.blockLengthLimit
+      }
+    });
+  } catch (error) {
+    // Best-effort sync for Edge; ignore failures.
+  }
   apiKeyInput.value = state.apiKey || '';
   deepseekApiKeyInput.value = state.deepseekApiKey || '';
   renderModelOptions(translationModelSelect, state.translationModel);
