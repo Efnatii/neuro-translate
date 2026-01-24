@@ -32,6 +32,7 @@ const SHORT_CONTEXT_MAX_CHARS = 800;
 const TRANSLATION_MAX_TOKENS_PER_REQUEST = 2600;
 const PROOFREAD_SUSPICIOUS_RATIO = 0.35;
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
+const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
   'gpt-4.1-mini': 200000,
@@ -62,6 +63,8 @@ const DEFAULT_STATE = {
   tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
 const pendingSettingsRequests = new Map();
+let ntRpcPort = null;
+const ntRpcPending = new Map();
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -938,7 +941,111 @@ async function requestProofreading(payload) {
   );
 }
 
-function sendRuntimeMessage(payload, fallbackError) {
+function ensureRpcPort() {
+  if (ntRpcPort) return ntRpcPort;
+  try {
+    ntRpcPort = chrome.runtime.connect({ name: NT_RPC_PORT_NAME });
+  } catch (error) {
+    console.warn('Failed to connect RPC port', error);
+    ntRpcPort = null;
+    return null;
+  }
+
+  ntRpcPort.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    const rpcId = msg.rpcId;
+    if (typeof rpcId !== 'string') return;
+    const entry = ntRpcPending.get(rpcId);
+    if (!entry) return;
+    ntRpcPending.delete(rpcId);
+    clearTimeout(entry.timeoutId);
+    entry.resolve(msg.response);
+  });
+
+  ntRpcPort.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError;
+    console.warn('RPC port disconnected', err?.message || '');
+    for (const [rpcId, entry] of ntRpcPending.entries()) {
+      clearTimeout(entry.timeoutId);
+      entry.resolve({
+        success: false,
+        error: err?.message || 'RPC port disconnected',
+        isRuntimeError: true,
+        rpcUnavailable: true
+      });
+    }
+    ntRpcPending.clear();
+    ntRpcPort = null;
+  });
+
+  return ntRpcPort;
+}
+
+function sendRpcRequest(payload, fallbackError, timeoutMs) {
+  const port = ensureRpcPort();
+  if (!port) {
+    return Promise.resolve({
+      success: false,
+      error: fallbackError,
+      isRuntimeError: true,
+      rpcUnavailable: true
+    });
+  }
+  const rpcId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve) => {
+    const timeoutId = setTimeout(() => {
+      ntRpcPending.delete(rpcId);
+      resolve({
+        success: false,
+        error: fallbackError || 'RPC timeout',
+        isRuntimeError: true
+      });
+    }, timeoutMs);
+    ntRpcPending.set(rpcId, { resolve, timeoutId });
+    try {
+      port.postMessage({ rpcId, ...payload });
+    } catch (error) {
+      ntRpcPending.delete(rpcId);
+      clearTimeout(timeoutId);
+      console.warn('RPC postMessage failed', error);
+      resolve({
+        success: false,
+        error: fallbackError,
+        isRuntimeError: true,
+        rpcUnavailable: true
+      });
+    }
+  });
+}
+
+function getRpcTimeoutMs(type) {
+  if (type === 'TRANSLATE_TEXT') return 240000;
+  if (type === 'GENERATE_CONTEXT') return 120000;
+  if (type === 'PROOFREAD_TEXT') return 180000;
+  return 30000;
+}
+
+async function sendRuntimeMessage(payload, fallbackError) {
+  const timeoutMs = getRpcTimeoutMs(payload?.type);
+  const rpcResponse = await sendRpcRequest(payload, fallbackError, timeoutMs);
+  if (rpcResponse && typeof rpcResponse === 'object') {
+    if (rpcResponse.rpcUnavailable) {
+      console.warn('Falling back to runtime.sendMessage...', {
+        type: payload?.type,
+        error: rpcResponse.error
+      });
+      return sendRuntimeMessageLegacy(payload, fallbackError);
+    }
+    return rpcResponse;
+  }
+  return {
+    success: false,
+    error: fallbackError,
+    isRuntimeError: true
+  };
+}
+
+function sendRuntimeMessageLegacy(payload, fallbackError) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(payload, (response) => {
       const runtimeError = chrome.runtime.lastError;
@@ -1992,11 +2099,20 @@ async function cancelTranslation() {
 }
 
 function getActiveTabId() {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'GET_TAB_ID' }, (response) => {
-      resolve(response?.tabId ?? null);
+  return (async () => {
+    const response = await sendRpcRequest({ type: 'GET_TAB_ID' }, 'GET_TAB_ID failed', 2000);
+    if (response?.tabId != null) {
+      return response.tabId;
+    }
+    if (response?.rpcUnavailable) {
+      console.warn('Falling back to runtime.sendMessage for GET_TAB_ID.', response.error);
+    }
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: 'GET_TAB_ID' }, (legacyResponse) => {
+        resolve(legacyResponse?.tabId ?? null);
+      });
     });
-  });
+  })();
 }
 
 async function setTranslationVisibility(visible) {
