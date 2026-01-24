@@ -3,6 +3,24 @@ const PROOFREAD_MAX_CHARS_PER_CHUNK = 4000;
 const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
 const PROOFREAD_MAX_OUTPUT_TOKENS = 4096;
+const PROOFREAD_SYSTEM_PROMPT = [
+  'You are an expert translation proofreader and editor.',
+  'Your job is to improve the translated text for clarity, fluency, and readability while preserving the original meaning.',
+  'Fix typos, punctuation, grammar, and awkward phrasing. Do not add, omit, or distort information.',
+  'Do not add new sentences, do not reorder content, and do not change the structure of the text.',
+  'Preserve modality, tense, aspect, tone, and level of certainty.',
+  'Keep numbers, units, currencies, dates, and formatting intact unless they are clearly incorrect.',
+  'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
+  'Keep punctuation tokens unchanged and in place.',
+  PUNCTUATION_TOKEN_HINT,
+  'Use the source block only to verify meaning; do not translate it or copy it into the output.',
+  'Use the translated block as context to maintain consistency across segments.',
+  'Never include the context text in the output unless it is already part of the segments.',
+  'Return a JSON object with an "items" array.',
+  'Each item must include the original "id" and the corrected "text" string.',
+  'Do not add, remove, or reorder items. Keep ids unchanged.',
+  'If a segment does not need edits, return the original text unchanged.'
+].join(' ');
 
 function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const items = Array.isArray(input?.items) ? input.items : [];
@@ -15,22 +33,7 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
     {
       role: 'system',
       content: [
-        'You are an expert translation proofreader and editor.',
-        'Your job is to improve the translated text for clarity, fluency, and readability while preserving the original meaning.',
-        'Fix typos, punctuation, grammar, and awkward phrasing. Do not add, omit, or distort information.',
-        'Do not add new sentences, do not reorder content, and do not change the structure of the text.',
-        'Preserve modality, tense, aspect, tone, and level of certainty.',
-        'Keep numbers, units, currencies, dates, and formatting intact unless they are clearly incorrect.',
-        'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
-        'Keep punctuation tokens unchanged and in place.',
-        PUNCTUATION_TOKEN_HINT,
-        'Use the source block only to verify meaning; do not translate it or copy it into the output.',
-        'Use the translated block as context to maintain consistency across segments.',
-        'Never include the context text in the output unless it is already part of the segments.',
-        'Return a JSON object with an "items" array.',
-        'Each item must include the original "id" and the corrected "text" string.',
-        'Do not add, remove, or reorder items. Keep ids unchanged.',
-        'If a segment does not need edits, return the original text unchanged.',
+        PROOFREAD_SYSTEM_PROMPT,
         strict
           ? 'Strict mode: return every input id exactly once in the output items array.'
           : '',
@@ -44,21 +47,13 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
       role: 'user',
       content: [
         language ? `Target language: ${language}` : '',
-        context
-          ? [
-              'Use the context only for disambiguation.',
-              'Do not translate, quote, or include the context in the output.',
-              `Context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
-            ].join('\n')
-          : '',
-        sourceBlock
-          ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>`
-          : '',
+        context ? `Context: <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>` : '',
+        sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
         translatedBlock
           ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`
           : '',
-        `Return only JSON. Expected items count: ${items.length}.`,
-        'Segments to proofread (translated) as JSON array of {id, text}:',
+        `Expected items count: ${items.length}.`,
+        'Segments to proofread (JSON array of {id, text}):',
         JSON.stringify(items)
       ]
         .filter(Boolean)
@@ -530,6 +525,10 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       }
     }
   };
+  if (apiBaseUrl === OPENAI_API_URL) {
+    requestPayload.prompt_cache_key = 'neuro-translate:proofread:v1';
+    requestPayload.prompt_cache_retention = 'in_memory';
+  }
   const startedAt = Date.now();
   const response = await fetch(apiBaseUrl, {
     method: 'POST',

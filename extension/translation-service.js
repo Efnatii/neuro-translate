@@ -1,5 +1,23 @@
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
 const MAX_TRANSLATION_TIMEOUT_MS = 180000;
+const TRANSLATE_SYSTEM_PROMPT = [
+  'You are a professional translator.',
+  'Translate every element of the provided "texts" list into the target language with natural, idiomatic phrasing that preserves meaning and readability.',
+  'Never omit, add, or generalize information. Preserve modality, tense, aspect, tone, and level of certainty.',
+  'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
+  'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
+  'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
+  'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
+  'Do not leave any source text untranslated. Do not copy the source text verbatim except for placeholders, markup, punctuation tokens, or text that is already in the target language.',
+  'The final output must be entirely in the target language with no source-language fragments.',
+  'Ensure terminology consistency within the same request.',
+  PUNCTUATION_TOKEN_HINT,
+  'Determine the most appropriate tone/style based on the provided context.',
+  'If page context is provided in the user message, use it only for disambiguation; never introduce new facts.',
+  'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
+  'If no context is provided, do not invent context or add assumptions.',
+  'Never include page context text in the translations unless it is explicitly part of the source segments.'
+].join(' ');
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -213,27 +231,10 @@ async function performTranslationRequest(
     {
       role: 'system',
       content: [
-        'You are a professional translator.',
-        'Translate every element of the provided "texts" list into the target language with natural, idiomatic phrasing that preserves meaning and readability.',
-        'Never omit, add, or generalize information. Preserve modality, tense, aspect, tone, and level of certainty.',
-        'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
-        'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
-        'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
-        'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
-        'Do not leave any source text untranslated. Do not copy the source text verbatim except for placeholders, markup, punctuation tokens, or text that is already in the target language.',
-        'The final output must be entirely in the target language with no source-language fragments.',
-        'Ensure terminology consistency within the same request.',
+        TRANSLATE_SYSTEM_PROMPT,
         strictTargetLanguage
           ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
           : null,
-        PUNCTUATION_TOKEN_HINT,
-        'Determine the most appropriate tone/style based on the provided context.',
-        'If page context is provided in the user message, use it only for disambiguation; never introduce new facts.',
-        'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
-        'If no context is provided, do not invent context or add assumptions.',
-        'Never include page context text in the translations unless it is explicitly part of the source segments.',
-        'Respond only with a JSON object containing the translated segments in the same order as the input segments under a "translations" array.',
-        'Do not add commentary.',
         `Target language: ${targetLanguage}.`
       ]
         .filter(Boolean)
@@ -242,30 +243,11 @@ async function performTranslationRequest(
     {
       role: 'user',
       content: [
-        `Translate the following segments into ${targetLanguage}.`,
-        'Determine the style automatically based on context.',
-        context
-          ? [
-              'Use the page context for disambiguation only.',
-              'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
-              `Page context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
-            ].join('\n')
-          : '',
-        'Do not omit or add information; preserve modality, tense, aspect, tone, and level of certainty.',
-        'You may add or adjust punctuation marks for naturalness, but do not change punctuation tokens.',
-        'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
-        'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
-        'Translate names/titles/terms; if unsure, transliterate rather than leaving them untranslated, except for established brands.',
-        'Do not leave any source text untranslated. Do not copy segments verbatim except for placeholders, markup, punctuation tokens, or text already in the target language.',
-        `Ensure the output is entirely in ${targetLanguage} with no source-language fragments.`,
-        'Never include page context text in the translations unless it is explicitly part of the source segments.',
-        'Keep terminology consistent within a single request.',
-        strictTargetLanguage
-          ? `Every translation must be in ${targetLanguage}. If something would typically remain in the source language, transliterate it into ${targetLanguage} instead.`
-          : null,
-        `Do not change punctuation service tokens. ${PUNCTUATION_TOKEN_HINT}`,
-        `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items, one per segment, in the same order.`,
-        'Segments to translate:',
+        `Target language: ${targetLanguage}.`,
+        context ? `Page context: <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>` : '',
+        `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items in the same order as provided.`,
+        'Do not add commentary.',
+        'Segments:',
         '<<<SEGMENTS_START>>>',
         ...tokenizedTexts.map((text) => text),
         '<<<SEGMENTS_END>>>'
@@ -298,6 +280,10 @@ async function performTranslationRequest(
       }
     }
   };
+  if (apiBaseUrl === OPENAI_API_URL) {
+    requestPayload.prompt_cache_key = 'neuro-translate:translate:v1';
+    requestPayload.prompt_cache_retention = 'in_memory';
+  }
   const startedAt = Date.now();
   const response = await fetch(apiBaseUrl, {
     method: 'POST',
