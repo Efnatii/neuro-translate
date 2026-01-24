@@ -73,7 +73,11 @@ async function init() {
         proofreadModel: state.proofreadModel,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
-        blockLengthLimit: state.blockLengthLimit
+        blockLengthLimit: state.blockLengthLimit,
+        tpmLimitsByModel: state.tpmLimitsByModel,
+        outputRatioByRole: state.outputRatioByRole,
+        tpmSafetyBufferTokens: state.tpmSafetyBufferTokens,
+        modelThroughputById: state.modelThroughputById
       }
     });
   } catch (error) {
@@ -215,7 +219,10 @@ async function getState() {
         'chunkLengthLimit',
         'translationStatusByTab',
         'translationVisibilityByTab',
-        'modelThroughputById'
+        'modelThroughputById',
+        'tpmLimitsByModel',
+        'outputRatioByRole',
+        'tpmSafetyBufferTokens'
       ],
       (data) => {
       resolve({
@@ -229,7 +236,10 @@ async function getState() {
         blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {},
-        modelThroughputById: data.modelThroughputById || {}
+        modelThroughputById: data.modelThroughputById || {},
+        tpmLimitsByModel: data.tpmLimitsByModel || {},
+        outputRatioByRole: data.outputRatioByRole || {},
+        tpmSafetyBufferTokens: data.tpmSafetyBufferTokens
       });
     });
   });

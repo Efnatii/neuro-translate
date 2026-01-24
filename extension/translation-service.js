@@ -19,7 +19,7 @@ function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
     const timeoutId = setTimeout(() => {
       if (hasCompleted) return;
       hasCompleted = true;
-      reject(new Error('Storage get timed out'));
+      reject(new Error('storageLocalGet timeout'));
     }, timeoutMs);
     try {
       chrome.storage.local.get(keysOrDefaults, (items) => {
