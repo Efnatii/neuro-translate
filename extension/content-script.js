@@ -905,9 +905,9 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
       context: batchContext
     });
     await ensureTpmBudget('translation', estimatedTokens);
-    await incrementDebugAiRequestCount();
     const batchResult = await withRateLimitRetry(
       async () => {
+        await incrementDebugAiRequestCount();
         const response = await sendRuntimeMessage(
           {
             type: 'TRANSLATE_TEXT',
@@ -968,9 +968,9 @@ async function requestProofreading(payload) {
     sourceTexts: [sourceBlock, translatedBlock]
   });
   await ensureTpmBudget('proofread', estimatedTokens);
-  await incrementDebugAiRequestCount();
   return withRateLimitRetry(
     async () => {
+      await incrementDebugAiRequestCount();
       const response = await sendRuntimeMessage(
         {
           type: 'PROOFREAD_TEXT',
@@ -2224,11 +2224,11 @@ function incrementDebugAiRequestCount() {
 
 function recordAiResponseMetrics(debugPayloads) {
   if (!debugState) return;
-  if (!Array.isArray(debugPayloads) || !debugPayloads.length) return;
   const currentCount = Number.isFinite(debugState.aiResponseCount) ? debugState.aiResponseCount : 0;
-  debugState.aiResponseCount = currentCount + debugPayloads.length;
+  debugState.aiResponseCount = currentCount + 1;
+  const payloads = Array.isArray(debugPayloads) ? debugPayloads : [];
   let totalCostUsd = Number.isFinite(debugState.totalCostUsd) ? debugState.totalCostUsd : 0;
-  debugPayloads.forEach((payload) => {
+  payloads.forEach((payload) => {
     if (Number.isFinite(payload?.costUsd)) {
       totalCostUsd += payload.costUsd;
     }
