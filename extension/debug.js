@@ -109,6 +109,43 @@ async function getDebugStore() {
   });
 }
 
+async function getThroughputSummary() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+    return '';
+  }
+  return new Promise((resolve) => {
+    chrome.storage.local.get(
+      ['translationModel', 'contextModel', 'proofreadModel', 'modelThroughputById'],
+      (data) => {
+        const modelThroughputById = data?.modelThroughputById || {};
+        const translationModel = data?.translationModel;
+        const contextModel = data?.contextModel;
+        const proofreadModel = data?.proofreadModel;
+        const parts = [];
+        const translationInfo = translationModel ? modelThroughputById?.[translationModel] : null;
+        const contextInfo = contextModel ? modelThroughputById?.[contextModel] : null;
+        const proofreadInfo = proofreadModel ? modelThroughputById?.[proofreadModel] : null;
+
+        if (Number.isFinite(translationInfo?.tokensPerSecond) && translationInfo.tokensPerSecond > 0) {
+          parts.push(`T=${Number(translationInfo.tokensPerSecond).toFixed(1)}`);
+        }
+        if (Number.isFinite(contextInfo?.tokensPerSecond) && contextInfo.tokensPerSecond > 0) {
+          parts.push(`C=${Number(contextInfo.tokensPerSecond).toFixed(1)}`);
+        }
+        if (Number.isFinite(proofreadInfo?.tokensPerSecond) && proofreadInfo.tokensPerSecond > 0) {
+          parts.push(`P=${Number(proofreadInfo.tokensPerSecond).toFixed(1)}`);
+        }
+
+        if (!parts.length) {
+          resolve('');
+          return;
+        }
+        resolve(`TPS: ${parts.join(' ')}`);
+      }
+    );
+  });
+}
+
 async function clearContext() {
   if (!sourceUrl) return;
   const store = await getDebugStore();
@@ -136,7 +173,15 @@ function startAutoRefresh() {
   if (canListen) {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'local') return;
-      if (!changes[DEBUG_STORAGE_KEY]) return;
+      if (
+        !changes[DEBUG_STORAGE_KEY] &&
+        !changes.modelThroughputById &&
+        !changes.translationModel &&
+        !changes.contextModel &&
+        !changes.proofreadModel
+      ) {
+        return;
+      }
       refreshDebug();
     });
     return;
@@ -148,16 +193,19 @@ function startAutoRefresh() {
 }
 
 async function refreshDebug() {
-  const debugData = await getDebugData(sourceUrl);
+  const [debugData, throughputSummary] = await Promise.all([
+    getDebugData(sourceUrl),
+    getThroughputSummary()
+  ]);
   if (!debugData) {
-    renderEmpty('Ожидание отладочных данных...');
+    renderEmpty('Ожидание отладочных данных...', throughputSummary);
     return;
   }
 
-  renderDebug(sourceUrl, debugData);
+  renderDebug(sourceUrl, debugData, throughputSummary);
 }
 
-function renderEmpty(message) {
+function renderEmpty(message, throughputSummary = '') {
   metaEl.textContent = message;
   contextEl.innerHTML = '';
   entriesEl.innerHTML = '';
@@ -165,13 +213,13 @@ function renderEmpty(message) {
     items: [],
     contextStatus: 'pending',
     context: ''
-  }, message);
+  }, message, throughputSummary);
 }
 
-function renderDebug(url, data) {
+function renderDebug(url, data, throughputSummary = '') {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
-  renderSummary(data);
+  renderSummary(data, '', throughputSummary);
 
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const contextText = data.context?.trim();
@@ -257,7 +305,7 @@ function renderDebug(url, data) {
   });
 }
 
-function renderSummary(data, fallbackMessage = '') {
+function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
   if (!summaryEl) return;
   const items = Array.isArray(data.items) ? data.items : [];
   const total = items.length;
@@ -268,6 +316,9 @@ function renderSummary(data, fallbackMessage = '') {
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const aiRequestCount = Number.isFinite(data.aiRequestCount) ? data.aiRequestCount : 0;
+  const aiResponseCount = Number.isFinite(data.aiResponseCount) ? data.aiResponseCount : 0;
+  const totalCostUsd = Number.isFinite(data.totalCostUsd) ? data.totalCostUsd : null;
+  const totalCostLabel = totalCostUsd != null ? `$${totalCostUsd.toFixed(4)}` : '—';
   const overallStatus = getOverallStatus({
     completed,
     inProgress,
@@ -275,9 +326,10 @@ function renderSummary(data, fallbackMessage = '') {
     total,
     contextStatus
   });
+  const throughputLabel = throughputSummary ? ` • ${throughputSummary}` : '';
   const summaryLine = fallbackMessage
-    ? fallbackMessage
-    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount}`;
+    ? `${fallbackMessage}${throughputLabel}`
+    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}${throughputLabel}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>
