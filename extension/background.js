@@ -10,9 +10,7 @@ const DEFAULT_TPM_LIMITS_BY_MODEL = {
   'gpt-4.1': 300000,
   'gpt-4o-mini': 200000,
   'gpt-4o': 300000,
-  'o4-mini': 200000,
-  'deepseek-chat': 200000,
-  'deepseek-reasoner': 100000
+  'o4-mini': 200000
 };
 const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
   translation: 0.6,
@@ -23,7 +21,6 @@ const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
 
 const DEFAULT_STATE = {
   apiKey: '',
-  deepseekApiKey: '',
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
@@ -41,7 +38,6 @@ let STATE_CACHE_READY = false;
 const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const STATE_CACHE_KEYS = new Set([
   'apiKey',
-  'deepseekApiKey',
   'translationModel',
   'contextModel',
   'proofreadModel',
@@ -189,7 +185,7 @@ function applyStatePatch(patch = {}) {
 
   for (const [key, value] of Object.entries(patch || {})) {
     if (!STATE_CACHE_KEYS.has(key)) continue;
-    if (['apiKey', 'deepseekApiKey', 'translationModel', 'contextModel', 'proofreadModel'].includes(key)) {
+    if (['apiKey', 'translationModel', 'contextModel', 'proofreadModel'].includes(key)) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
     }
@@ -214,19 +210,7 @@ function applyStatePatch(patch = {}) {
   STATE_CACHE_READY = true;
 }
 
-function isDeepseekModel(model = '') {
-  return model.startsWith('deepseek');
-}
-
 function getApiConfigForModel(model, state) {
-  if (isDeepseekModel(model)) {
-    return {
-      apiKey: state.deepseekApiKey,
-      apiBaseUrl: DEEPSEEK_API_URL,
-      provider: 'deepseek'
-    };
-  }
-
   return {
     apiKey: state.apiKey,
     apiBaseUrl: OPENAI_API_URL,
@@ -242,13 +226,8 @@ function getTpmLimitForModel(model, tpmLimitsByModel) {
   return tpmLimitsByModel[model] ?? fallback;
 }
 
-function getProviderLabel(provider) {
-  return provider === 'deepseek' ? 'DeepSeek' : 'OpenAI';
-}
-
 function buildMissingKeyReason(roleLabel, config, model) {
-  const providerLabel = getProviderLabel(config.provider);
-  return `Перевод недоступен: укажите ключ ${providerLabel} для модели ${model} (${roleLabel}).`;
+  return `Перевод недоступен: укажите OpenAI API ключ для модели ${model} (${roleLabel}).`;
 }
 
 async function getState() {
@@ -268,6 +247,31 @@ async function getState() {
     }
     if (!merged.contextModel && safeStored.model) {
       merged.contextModel = safeStored.model;
+    }
+    const previousModels = {
+      translationModel: merged.translationModel,
+      contextModel: merged.contextModel,
+      proofreadModel: merged.proofreadModel
+    };
+    if (merged.translationModel?.startsWith('deepseek')) {
+      merged.translationModel = DEFAULT_STATE.translationModel;
+    }
+    if (merged.contextModel?.startsWith('deepseek')) {
+      merged.contextModel = DEFAULT_STATE.contextModel;
+    }
+    if (merged.proofreadModel?.startsWith('deepseek')) {
+      merged.proofreadModel = DEFAULT_STATE.proofreadModel;
+    }
+    if (
+      merged.translationModel !== previousModels.translationModel ||
+      merged.contextModel !== previousModels.contextModel ||
+      merged.proofreadModel !== previousModels.proofreadModel
+    ) {
+      await storageLocalSet({
+        translationModel: merged.translationModel,
+        contextModel: merged.contextModel,
+        proofreadModel: merged.proofreadModel
+      });
     }
     applyStatePatch(merged);
     return { ...DEFAULT_STATE, ...STATE_CACHE };

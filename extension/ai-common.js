@@ -1,5 +1,4 @@
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
-const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
 const MODEL_PRICE_PER_M_TOKEN = {
@@ -7,8 +6,6 @@ const MODEL_PRICE_PER_M_TOKEN = {
   'gpt-4.1-nano': 0.5,
   'gpt-4o-mini': 0.75,
   'gpt-4.1-mini': 2,
-  'deepseek-chat': 0.7,
-  'deepseek-reasoner': 0.7,
   'gpt-5-mini': 2.25,
   'gpt-4.1': 10,
   'gpt-5.1': 11.25,
