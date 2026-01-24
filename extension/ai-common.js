@@ -128,3 +128,52 @@ function calculateUsageCost(usage, model) {
   if (!Number.isFinite(pricePerM)) return null;
   return (normalized.total_tokens / 1_000_000) * pricePerM;
 }
+
+const PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS = new Set();
+const PROMPT_CACHE_KEY_UNSUPPORTED_MODELS = new Set();
+
+function isUnsupportedParamError(status, errorPayload, errorText, paramName) {
+  if (status !== 400) return false;
+  const apiParam = errorPayload?.error?.param || errorPayload?.param || '';
+  const apiMsg = errorPayload?.error?.message || errorPayload?.message || errorText || '';
+  const msg = String(apiMsg || '').toLowerCase();
+  const p = String(apiParam || '').toLowerCase();
+  const needle = String(paramName || '').toLowerCase();
+  return p === needle || msg.includes(needle);
+}
+
+function applyPromptCacheParams(requestPayload, apiBaseUrl, model, cacheKey) {
+  if (!requestPayload || typeof requestPayload !== 'object') return;
+  if (apiBaseUrl !== OPENAI_API_URL) return;
+
+  if (cacheKey && typeof cacheKey === 'string' && model && !PROMPT_CACHE_KEY_UNSUPPORTED_MODELS.has(model)) {
+    requestPayload.prompt_cache_key = cacheKey;
+  }
+}
+
+function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorPayload, errorText) {
+  if (!requestPayload || typeof requestPayload !== 'object') return { changed: false };
+
+  let changed = false;
+
+  if (
+    requestPayload.prompt_cache_retention !== undefined &&
+    isUnsupportedParamError(status, errorPayload, errorText, 'prompt_cache_retention')
+  ) {
+    if (model) PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS.add(model);
+    delete requestPayload.prompt_cache_retention;
+    changed = true;
+  }
+
+  if (
+    requestPayload.prompt_cache_key !== undefined &&
+    isUnsupportedParamError(status, errorPayload, errorText, 'prompt_cache_key')
+  ) {
+    if (model) PROMPT_CACHE_KEY_UNSUPPORTED_MODELS.add(model);
+    delete requestPayload.prompt_cache_key;
+    if (requestPayload.prompt_cache_retention !== undefined) delete requestPayload.prompt_cache_retention;
+    changed = true;
+  }
+
+  return { changed };
+}

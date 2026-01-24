@@ -280,12 +280,9 @@ async function performTranslationRequest(
       }
     }
   };
-  if (apiBaseUrl === OPENAI_API_URL) {
-    requestPayload.prompt_cache_key = 'neuro-translate:translate:v1';
-    requestPayload.prompt_cache_retention = 'in_memory';
-  }
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:translate:v1');
   const startedAt = Date.now();
-  const response = await fetch(apiBaseUrl, {
+  let response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -296,25 +293,57 @@ async function performTranslationRequest(
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
+    let errorText = await response.text();
     let errorPayload = null;
     try {
       errorPayload = JSON.parse(errorText);
     } catch (parseError) {
       errorPayload = null;
     }
-    const retryAfterMs = parseRetryAfterMs(response, errorPayload);
-    const sanitizedErrorText = isHtmlPayload(errorText)
-      ? response.statusText || 'Bad Gateway'
-      : errorText;
-    const errorMessage =
-      errorPayload?.error?.message || errorPayload?.message || sanitizedErrorText || 'Unknown error';
-    const error = new Error(`Translation request failed: ${response.status} ${errorMessage}`);
-    error.status = response.status;
-    error.retryAfterMs = retryAfterMs;
-    error.isRateLimit = response.status === 429 || response.status === 503;
-    error.isRetryable = isRetryableStatus(response.status);
-    throw error;
+    const stripped = stripUnsupportedPromptCacheParams(
+      requestPayload,
+      model,
+      response.status,
+      errorPayload,
+      errorText
+    );
+    if (response.status === 400 && stripped.changed) {
+      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
+        model,
+        status: response.status
+      });
+      response = await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestPayload),
+        signal
+      });
+      if (!response.ok) {
+        errorText = await response.text();
+        try {
+          errorPayload = JSON.parse(errorText);
+        } catch (parseError) {
+          errorPayload = null;
+        }
+      }
+    }
+    if (!response.ok) {
+      const retryAfterMs = parseRetryAfterMs(response, errorPayload);
+      const sanitizedErrorText = isHtmlPayload(errorText)
+        ? response.statusText || 'Bad Gateway'
+        : errorText;
+      const errorMessage =
+        errorPayload?.error?.message || errorPayload?.message || sanitizedErrorText || 'Unknown error';
+      const error = new Error(`Translation request failed: ${response.status} ${errorMessage}`);
+      error.status = response.status;
+      error.retryAfterMs = retryAfterMs;
+      error.isRateLimit = response.status === 429 || response.status === 503;
+      error.isRetryable = isRetryableStatus(response.status);
+      throw error;
+    }
   }
 
   const data = await response.json();
