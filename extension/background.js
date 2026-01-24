@@ -38,6 +38,42 @@ const DEFAULT_STATE = {
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
 const CONTENT_READY_BY_TAB = new Map();
 
+function storageLocalGet(keysOrDefaults) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.storage.local.get(keysOrDefaults, (items) => {
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        if (!items || typeof items !== 'object') {
+          resolve({});
+          return;
+        }
+        resolve(items);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function storageLocalSet(items) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.storage.local.set(items, () => {
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        resolve();
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 function isDeepseekModel(model = '') {
   return model.startsWith('deepseek');
 }
@@ -76,16 +112,17 @@ function buildMissingKeyReason(roleLabel, config, model) {
 }
 
 async function getState() {
-  const stored = await chrome.storage.local.get({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
-  const merged = { ...DEFAULT_STATE, ...stored };
-  if (!merged.blockLengthLimit && stored.chunkLengthLimit) {
-    merged.blockLengthLimit = stored.chunkLengthLimit;
+  const stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+  const safeStored = stored && typeof stored === 'object' ? stored : {};
+  const merged = { ...DEFAULT_STATE, ...safeStored };
+  if (!merged.blockLengthLimit && safeStored.chunkLengthLimit) {
+    merged.blockLengthLimit = safeStored.chunkLengthLimit;
   }
-  if (!merged.translationModel && merged.model) {
-    merged.translationModel = merged.model;
+  if (!merged.translationModel && safeStored.model) {
+    merged.translationModel = safeStored.model;
   }
-  if (!merged.contextModel && merged.model) {
-    merged.contextModel = merged.model;
+  if (!merged.contextModel && safeStored.model) {
+    merged.contextModel = safeStored.model;
   }
   return merged;
 }
@@ -93,7 +130,7 @@ async function getState() {
 async function saveState(partial) {
   const current = await getState();
   const next = { ...current, ...partial };
-  await chrome.storage.local.set(next);
+  await storageLocalSet(next);
   return next;
 }
 
@@ -389,22 +426,22 @@ async function handleTranslationProgress(message, sender) {
     message: message.message || '',
     timestamp: Date.now()
   };
-  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
   translationStatusByTab[tabId] = status;
-  await chrome.storage.local.set({ translationStatusByTab });
+  await storageLocalSet({ translationStatusByTab });
 }
 
 async function handleGetTranslationStatus(sendResponse, tabId) {
-  const { translationStatusByTab = {} } = await chrome.storage.local.get({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
   sendResponse(translationStatusByTab[tabId] || null);
 }
 
 async function handleTranslationVisibility(message, sender) {
   const tabId = sender?.tab?.id;
   if (!tabId) return;
-  const { translationVisibilityByTab = {} } = await chrome.storage.local.get({ translationVisibilityByTab: {} });
+  const { translationVisibilityByTab = {} } = await storageLocalGet({ translationVisibilityByTab: {} });
   translationVisibilityByTab[tabId] = Boolean(message.visible);
-  await chrome.storage.local.set({ translationVisibilityByTab });
+  await storageLocalSet({ translationVisibilityByTab });
   chrome.runtime.sendMessage({
     type: 'TRANSLATION_VISIBILITY_CHANGED',
     tabId,
@@ -415,12 +452,12 @@ async function handleTranslationVisibility(message, sender) {
 async function handleTranslationCancelled(message, sender) {
   const tabId = message?.tabId ?? sender?.tab?.id;
   if (!tabId) return;
-  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await chrome.storage.local.get({
+  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await storageLocalGet({
     translationStatusByTab: {},
     translationVisibilityByTab: {}
   });
   delete translationStatusByTab[tabId];
   translationVisibilityByTab[tabId] = false;
-  await chrome.storage.local.set({ translationStatusByTab, translationVisibilityByTab });
+  await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
   chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
 }
