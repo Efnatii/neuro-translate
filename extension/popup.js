@@ -35,6 +35,8 @@ let currentContextModelId = null;
 let currentProofreadModelId = null;
 let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
+let pendingFailureToken = 0;
+let pendingFailureTimeoutId = null;
 
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.45 },
@@ -329,6 +331,22 @@ function getMessageFailureStatus(result) {
   }
 }
 
+function scheduleFailureStatus(message, delayMs = 750) {
+  pendingFailureToken += 1;
+  const token = pendingFailureToken;
+  clearTimeout(pendingFailureTimeoutId);
+  pendingFailureTimeoutId = setTimeout(() => {
+    if (token !== pendingFailureToken) return;
+    setTemporaryStatus(message, 2500);
+  }, delayMs);
+}
+
+function cancelScheduledFailure() {
+  pendingFailureToken += 1;
+  clearTimeout(pendingFailureTimeoutId);
+  pendingFailureTimeoutId = null;
+}
+
 async function sendMessageToActiveTabSafe(message, options = {}) {
   const tab = await getActiveTab();
   if (!tab?.id) {
@@ -355,38 +373,41 @@ async function ensureActiveTabConnection() {
   if (!connected.ok) {
     return { ok: false, reason: connected.reason || 'content-script-unavailable' };
   }
+  cancelScheduledFailure();
   return { ok: true, tab };
 }
 
 async function sendCancel() {
   const connection = await ensureActiveTabConnection();
   if (!connection.ok) {
-    setTemporaryStatus(getMessageFailureStatus(connection));
+    scheduleFailureStatus(getMessageFailureStatus(connection));
     return;
   }
   const result = await sendMessageToTabSafe(connection.tab, { type: 'CANCEL_TRANSLATION' }, {
     skipEnsureConnection: true
   });
   if (!result.ok) {
-    setTemporaryStatus(getMessageFailureStatus(result));
+    scheduleFailureStatus(getMessageFailureStatus(result));
     return;
   }
+  cancelScheduledFailure();
   setTemporaryStatus('Отменяем перевод...');
 }
 
 async function sendTranslateRequest() {
   const connection = await ensureActiveTabConnection();
   if (!connection.ok) {
-    setTemporaryStatus(getMessageFailureStatus(connection));
+    scheduleFailureStatus(getMessageFailureStatus(connection));
     return;
   }
   const result = await sendMessageToTabSafe(connection.tab, { type: 'START_TRANSLATION' }, {
     skipEnsureConnection: true
   });
   if (!result.ok) {
-    setTemporaryStatus(getMessageFailureStatus(result));
+    scheduleFailureStatus(getMessageFailureStatus(result));
     return;
   }
+  cancelScheduledFailure();
   updateTranslationVisibility(true);
   updateTranslationVisibilityStorage(true);
   setTemporaryStatus('Запускаем перевод страницы...');
@@ -395,7 +416,7 @@ async function sendTranslateRequest() {
 async function handleToggleTranslationVisibility() {
   const connection = await ensureActiveTabConnection();
   if (!connection.ok) {
-    setTemporaryStatus(getMessageFailureStatus(connection));
+    scheduleFailureStatus(getMessageFailureStatus(connection));
     return;
   }
   const tab = connection.tab;
@@ -412,9 +433,10 @@ async function handleToggleTranslationVisibility() {
     visible: nextVisible
   }, { skipEnsureConnection: true });
   if (!result.ok) {
-    setTemporaryStatus(getMessageFailureStatus(result));
+    scheduleFailureStatus(getMessageFailureStatus(result));
     return;
   }
+  cancelScheduledFailure();
   updateTranslationVisibility(nextVisible);
   updateTranslationVisibilityStorage(nextVisible);
   setTemporaryStatus(nextVisible ? 'Показываем перевод.' : 'Показываем оригинал.');
@@ -422,12 +444,14 @@ async function handleToggleTranslationVisibility() {
 
 function handleStorageChange(changes) {
   if (changes.translationStatusByTab) {
+    cancelScheduledFailure();
     const nextStatuses = changes.translationStatusByTab.newValue || {};
     currentTranslationStatus = activeTabId ? nextStatuses[activeTabId] : null;
     updateCanShowTranslation(currentTranslationStatus);
     renderStatus();
   }
   if (changes.translationVisibilityByTab) {
+    cancelScheduledFailure();
     const nextVisibility = changes.translationVisibilityByTab.newValue || {};
     renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
   }
@@ -450,6 +474,7 @@ async function handleRuntimeMessage(message, sender) {
     if (typeof message.tabId === 'number' && activeTabId && message.tabId !== activeTabId) {
       return;
     }
+    cancelScheduledFailure();
     if (typeof message.tabId === 'number') {
       await handleTranslationCancelled(message.tabId);
     }
@@ -459,6 +484,7 @@ async function handleRuntimeMessage(message, sender) {
     if (activeTabId && sender?.tab?.id && sender.tab.id !== activeTabId) {
       return;
     }
+    cancelScheduledFailure();
     renderTranslationVisibility(Boolean(message.visible));
     return;
   }
@@ -468,6 +494,7 @@ async function handleRuntimeMessage(message, sender) {
   if (activeTabId && typeof message.tabId === 'number' && message.tabId !== activeTabId) {
     return;
   }
+  cancelScheduledFailure();
   renderTranslationVisibility(Boolean(message.visible));
 }
 
@@ -665,7 +692,7 @@ async function handleOpenDebug() {
 async function sendBlockLengthLimitUpdate(blockLengthLimit) {
   const connection = await ensureActiveTabConnection();
   if (!connection.ok) {
-    setTemporaryStatus(getMessageFailureStatus(connection));
+    scheduleFailureStatus(getMessageFailureStatus(connection));
     return;
   }
   const result = await sendMessageToTabSafe(connection.tab, {
@@ -673,9 +700,10 @@ async function sendBlockLengthLimitUpdate(blockLengthLimit) {
     blockLengthLimit
   }, { expectResponse: true, skipEnsureConnection: true });
   if (!result.ok) {
-    setTemporaryStatus(getMessageFailureStatus(result));
+    scheduleFailureStatus(getMessageFailureStatus(result));
     return;
   }
+  cancelScheduledFailure();
   setTemporaryStatus(`Максимальная длина блока: ${blockLengthLimit} символов.`);
   const response = result.response;
   if (response?.updated && typeof response.totalBlocks === 'number') {
