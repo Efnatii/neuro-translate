@@ -2,8 +2,9 @@ const PROOFREAD_SCHEMA_NAME = 'proofread_translations';
 const PROOFREAD_MAX_CHARS_PER_CHUNK = 4000;
 const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
+const PROOFREAD_MAX_OUTPUT_TOKENS = 4096;
 
-function buildProofreadPrompt(input, strict = false) {
+function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const items = Array.isArray(input?.items) ? input.items : [];
   const sourceBlock = input?.sourceBlock ?? '';
   const translatedBlock = input?.translatedBlock ?? '';
@@ -33,6 +34,7 @@ function buildProofreadPrompt(input, strict = false) {
         strict
           ? 'Strict mode: return every input id exactly once in the output items array.'
           : '',
+        extraReminder,
         'Return only JSON, without commentary.'
       ]
         .filter(Boolean)
@@ -84,6 +86,29 @@ async function proofreadTranslation(
   const revisionsById = new Map();
   const rawProofreadParts = [];
   const debugPayloads = [];
+  const appendParseIssue = (issue) => {
+    if (!issue) return;
+    const last = debugPayloads[debugPayloads.length - 1];
+    if (last) {
+      if (!Array.isArray(last.parseIssues)) {
+        last.parseIssues = [];
+      }
+      last.parseIssues.push(issue);
+      return;
+    }
+    debugPayloads.push({
+      phase: 'PROOFREAD',
+      model,
+      latencyMs: null,
+      usage: null,
+      costUsd: null,
+      inputChars: null,
+      outputChars: null,
+      request: null,
+      response: null,
+      parseIssues: [issue]
+    });
+  };
 
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
@@ -93,7 +118,7 @@ async function proofreadTranslation(
       apiKey,
       model,
       apiBaseUrl,
-      false
+      { strict: false }
     );
     rawProofreadParts.push(result.rawProofread);
     if (Array.isArray(result.debug)) {
@@ -107,13 +132,14 @@ async function proofreadTranslation(
         missing: quality.missingCount,
         received: quality.receivedCount
       });
+      appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
         { sourceBlock, translatedBlock, context, language },
         apiKey,
         model,
         apiBaseUrl,
-        true
+        { strict: true }
       );
       rawProofreadParts.push(result.rawProofread);
       if (Array.isArray(result.debug)) {
@@ -124,11 +150,41 @@ async function proofreadTranslation(
     }
 
     if (quality.isPoor && chunk.length > 1) {
+      console.info('Proofread chunk still incomplete after strict retry, retrying with higher max tokens.', {
+        chunkIndex: index + 1,
+        missing: quality.missingCount,
+        received: quality.receivedCount,
+        threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
+      });
+      appendParseIssue('retry:retryable');
+      result = await requestProofreadChunk(
+        chunk,
+        { sourceBlock, translatedBlock, context, language },
+        apiKey,
+        model,
+        apiBaseUrl,
+        {
+          strict: true,
+          maxTokensOverride: 1.5,
+          extraReminder: 'Return every input id exactly once. Do not omit any ids.'
+        }
+      );
+      rawProofreadParts.push(result.rawProofread);
+      if (Array.isArray(result.debug)) {
+        debugPayloads.push(...result.debug);
+      }
+      quality = evaluateProofreadResult(chunk, result.itemsById, result.parseError);
+      logProofreadChunk('proofread-retry-expanded', index, chunks.length, chunk.length, quality, result.parseError);
+    }
+
+    if (quality.isPoor && chunk.length > 1) {
       console.warn('Proofread chunk still incomplete, falling back to per-item requests.', {
         chunkIndex: index + 1,
         missing: quality.missingCount,
-        received: quality.receivedCount
+        received: quality.receivedCount,
+        threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
+      appendParseIssue('fallback:per-item');
       for (const item of chunk) {
         const singleResult = await requestProofreadChunk(
           [item],
@@ -136,7 +192,7 @@ async function proofreadTranslation(
           apiKey,
           model,
           apiBaseUrl,
-          true
+          { strict: true }
         );
         rawProofreadParts.push(singleResult.rawProofread);
         if (Array.isArray(singleResult.debug)) {
@@ -406,7 +462,8 @@ function logProofreadChunk(label, index, totalChunks, chunkSize, quality, parseE
   console.info(`Proofread chunk processed (${label}).`, summary);
 }
 
-async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, strict) {
+async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
+  const { strict = false, maxTokensOverride = null, extraReminder = '' } = options;
   const prompt = applyPromptCaching(
     buildProofreadPrompt(
       {
@@ -416,16 +473,30 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         context: metadata?.context,
         language: metadata?.language
       },
-      strict
+      strict,
+      extraReminder
     ),
     apiBaseUrl
   );
+  const itemsChars = items.reduce((sum, item) => sum + (item?.text?.length || 0), 0);
   const inputChars =
-    items.reduce((sum, item) => sum + (item?.text?.length || 0), 0) +
+    itemsChars +
     (metadata?.context?.length || 0) +
     (metadata?.sourceBlock?.length || 0) +
     (metadata?.translatedBlock?.length || 0);
-  const maxTokens = Math.min(2000, Math.max(256, Math.ceil(inputChars / 4) + 120));
+  const approxOut =
+    Math.ceil(itemsChars / 4) +
+    Math.ceil(items.length * 12) +
+    200;
+  const baseMaxTokens = Math.min(PROOFREAD_MAX_OUTPUT_TOKENS, Math.max(512, approxOut));
+  const adjustedMaxTokens =
+    maxTokensOverride == null
+      ? baseMaxTokens
+      : Math.min(
+          PROOFREAD_MAX_OUTPUT_TOKENS,
+          Math.max(512, Math.ceil(baseMaxTokens * maxTokensOverride))
+        );
+  const maxTokens = adjustedMaxTokens;
 
   const requestPayload = {
     model,
@@ -520,6 +591,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
 
   let rawProofread = content;
   if (parseError) {
+    debugPayload.parseIssues.push('fallback:format-repair');
     const repaired = await requestProofreadFormatRepair(
       content,
       items,
@@ -673,6 +745,29 @@ async function repairProofreadSegments(
     return translations;
   }
 
+  if (Array.isArray(debugPayloads)) {
+    const last = debugPayloads[debugPayloads.length - 1];
+    if (last) {
+      if (!Array.isArray(last.parseIssues)) {
+        last.parseIssues = [];
+      }
+      last.parseIssues.push('fallback:language-repair');
+    } else {
+      debugPayloads.push({
+        phase: 'PROOFREAD',
+        model,
+        latencyMs: null,
+        usage: null,
+        costUsd: null,
+        inputChars: null,
+        outputChars: null,
+        request: null,
+        response: null,
+        parseIssues: ['fallback:language-repair']
+      });
+    }
+  }
+
   const prompt = applyPromptCaching([
     {
       role: 'system',
@@ -757,7 +852,7 @@ async function repairProofreadSegments(
       outputChars: content?.length || 0,
       request: requestPayload,
       response: content,
-      parseIssues: []
+      parseIssues: ['fallback:language-repair']
     };
     if (Array.isArray(debugPayloads)) {
       debugPayloads.push(debugPayload);

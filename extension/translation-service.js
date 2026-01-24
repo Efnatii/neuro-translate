@@ -84,6 +84,29 @@ async function translateTexts(
   let lastRetryDelayMs = null;
   let lastRawTranslation = '';
   const debugPayloads = [];
+  const appendParseIssue = (issue) => {
+    if (!issue) return;
+    const last = debugPayloads[debugPayloads.length - 1];
+    if (last) {
+      if (!Array.isArray(last.parseIssues)) {
+        last.parseIssues = [];
+      }
+      last.parseIssues.push(issue);
+      return;
+    }
+    debugPayloads.push({
+      phase: 'TRANSLATE',
+      model,
+      latencyMs: null,
+      usage: null,
+      costUsd: null,
+      inputChars: null,
+      outputChars: null,
+      request: null,
+      response: null,
+      parseIssues: [issue]
+    });
+  };
   const throughputInfo = await getModelThroughputInfo(model);
   const timeoutMs = calculateTranslationTimeoutMs(texts, throughputInfo);
 
@@ -123,6 +146,7 @@ async function translateTexts(
       const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
       if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
         timeoutAttempts += 1;
+        appendParseIssue('retry:timeout');
         console.warn('Translation attempt timed out, retrying...');
         continue;
       }
@@ -134,6 +158,7 @@ async function translateTexts(
         const retryDelayMs = calculateRetryDelayMs(retryableRetries, error?.retryAfterMs);
         lastRetryDelayMs = retryDelayMs;
         const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
+        appendParseIssue('retry:retryable');
         console.warn(`Translation attempt ${retryLabel}, retrying after ${retryDelayMs}ms...`);
         await sleep(retryDelayMs);
         continue;
@@ -142,6 +167,7 @@ async function translateTexts(
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
+        appendParseIssue('fallback:per-item');
         const translations = await translateIndividually(
           texts,
           apiKey,
@@ -621,6 +647,29 @@ async function repairTranslationsForLanguage(
     return translations;
   }
 
+  if (Array.isArray(debugPayloads)) {
+    const last = debugPayloads[debugPayloads.length - 1];
+    if (last) {
+      if (!Array.isArray(last.parseIssues)) {
+        last.parseIssues = [];
+      }
+      last.parseIssues.push('fallback:language-repair');
+    } else {
+      debugPayloads.push({
+        phase: 'TRANSLATE',
+        model,
+        latencyMs: null,
+        usage: null,
+        costUsd: null,
+        inputChars: null,
+        outputChars: null,
+        request: null,
+        response: null,
+        parseIssues: ['fallback:language-repair']
+      });
+    }
+  }
+
   try {
     const repairResult = await performTranslationRepairRequest(
       repairItems,
@@ -632,6 +681,10 @@ async function repairTranslationsForLanguage(
       apiBaseUrl
     );
     if (repairResult?.debug && Array.isArray(debugPayloads)) {
+      if (!Array.isArray(repairResult.debug.parseIssues)) {
+        repairResult.debug.parseIssues = [];
+      }
+      repairResult.debug.parseIssues.push('fallback:language-repair');
       debugPayloads.push(repairResult.debug);
     }
     repairIndices.forEach((index, position) => {
