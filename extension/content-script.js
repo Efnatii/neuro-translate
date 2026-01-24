@@ -639,7 +639,8 @@ async function translatePage(settings) {
             await updateDebugEntry(currentIndex + 1, {
               proofreadStatus: 'done',
               proofread: [],
-              proofreadComparisons: []
+              proofreadComparisons: [],
+              proofreadExecuted: false
             });
           } else {
             enqueueProofreadTask({
@@ -696,7 +697,7 @@ async function translatePage(settings) {
 
       activeProofreadWorkers += 1;
       try {
-        await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress' });
+        await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress', proofreadExecuted: true });
         const proofreadResult = await requestProofreading({
           segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
           sourceBlock: formatBlockText(task.originalTexts),
@@ -789,7 +790,8 @@ async function translatePage(settings) {
         await updateDebugEntry(task.index + 1, {
           proofreadStatus: 'failed',
           proofread: [],
-          proofreadComparisons
+          proofreadComparisons,
+          proofreadExecuted: true
         });
         reportProgress('Вычитка выполняется');
       } finally {
@@ -1987,6 +1989,7 @@ async function initializeDebugState(blocks, settings = {}) {
     proofreadRaw: '',
     proofreadDebug: [],
     proofreadComparisons: [],
+    proofreadExecuted: false,
     proofreadApplied: proofreadEnabled,
     translationStatus: 'pending',
     proofreadStatus: proofreadEnabled ? 'pending' : 'disabled'

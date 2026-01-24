@@ -334,24 +334,16 @@ function renderProofreadSection(item, entryKey) {
     ? renderProofreadSideBySideView(comparisons)
     : '<div class="empty">Нет правок.</div>';
   const finalView = hasComparisons ? renderProofreadFinalView(comparisons) : '<div class="empty">Нет правок.</div>';
-  const defaultView = hasComparisons ? 'diff' : 'final';
+  const defaultView = 'diff';
   const state = getProofreadState(entryKey, defaultView);
-  const statusLabel = getProofreadStatusLabel(item);
-  const statusClass = getProofreadStatusClass(item);
+  const statusLabel = getProofreadStatusLabel(item, hasComparisons);
+  const statusClass = getProofreadStatusClass(item, hasComparisons);
   const latency = getProofreadLatency(item);
   const changes = getProofreadChangesSummary(comparisons);
   const isExpanded = Boolean(state.expanded);
   const showView = state.view || defaultView;
-
-  return `
-      <div class="block proofread-block${isExpanded ? ' is-expanded' : ''}" data-proofread-id="${escapeHtml(entryKey)}" data-proofread-view="${escapeHtml(showView)}">
-        <div class="proofread-header">
-          <div class="proofread-title">
-            <span class="label">Вычитка</span>
-            <span class="proofread-status ${escapeHtml(statusClass)}">${escapeHtml(statusLabel)}</span>
-            <span class="proofread-metric">${escapeHtml(latency)}</span>
-            <span class="proofread-metric">${escapeHtml(changes)}</span>
-          </div>
+  const controls = hasComparisons
+    ? `
           <div class="proofread-controls">
             <div class="proofread-toggle">
               <button class="toggle-button${showView === 'diff' ? ' is-active' : ''}" type="button" data-action="set-proofread-view" data-view="diff">
@@ -368,7 +360,10 @@ function renderProofreadSection(item, entryKey) {
               ${isExpanded ? 'Свернуть' : 'Развернуть'}
             </button>
           </div>
-        </div>
+        `
+    : '';
+  const proofreadBody = hasComparisons
+    ? `
         <div class="proofread-body">
           <div class="proofread-view proofread-view--diff">${diffView}</div>
           <div class="proofread-view proofread-view--side">${sideBySideView}</div>
@@ -379,6 +374,25 @@ function renderProofreadSection(item, entryKey) {
             </button>
           </div>
         </div>
+      `
+    : `
+        <div class="proofread-body">
+          <div class="empty">Нет правок.</div>
+        </div>
+      `;
+
+  return `
+      <div class="block proofread-block${isExpanded ? ' is-expanded' : ''}" data-proofread-id="${escapeHtml(entryKey)}" data-proofread-view="${escapeHtml(showView)}">
+        <div class="proofread-header">
+          <div class="proofread-title">
+            <span class="label">Вычитка</span>
+            <span class="proofread-status ${escapeHtml(statusClass)}">${escapeHtml(statusLabel)}</span>
+            <span class="proofread-metric">${escapeHtml(latency)}</span>
+            <span class="proofread-metric">${escapeHtml(changes)}</span>
+          </div>
+          ${controls}
+        </div>
+        ${proofreadBody}
       </div>
       <div class="block">
         <details class="ai-response">
@@ -414,6 +428,8 @@ function getOverallEntryStatus(item) {
 function normalizeStatus(status, value, proofreadApplied = true) {
   if (status && STATUS_CONFIG[status]) return status;
   if (proofreadApplied === false) return 'disabled';
+  if (Array.isArray(value)) return value.length ? 'done' : 'pending';
+  if (typeof value === 'string') return value.trim() ? 'done' : 'pending';
   if (value) return 'done';
   return 'pending';
 }
@@ -687,18 +703,34 @@ function getProofreadState(entryKey, defaultView) {
   return next;
 }
 
-function getProofreadStatusLabel(item) {
-  if (item?.proofreadApplied === false) return 'Skipped';
-  const status = normalizeStatus(item?.proofreadStatus, item?.proofread, true);
-  if (status === 'failed') return 'Error';
-  return 'Applied';
+function getProofreadStatusLabel(item, hasComparisons) {
+  if (item?.proofreadApplied === false) return 'Отключено';
+  const status = STATUS_CONFIG[item?.proofreadStatus]
+    ? item.proofreadStatus
+    : normalizeStatus(item?.proofreadStatus, item?.proofread, true);
+  if (status === 'failed') return 'Ошибка';
+  if (status === 'in_progress') return 'В работе';
+  if (status === 'pending') return 'Ожидает';
+  if (status === 'disabled') return 'Отключено';
+  if (status === 'done') {
+    if (hasComparisons) return 'Применено';
+    return item?.proofreadExecuted ? 'Без изменений' : 'Не требовалось';
+  }
+  return 'Ожидает';
 }
 
-function getProofreadStatusClass(item) {
+function getProofreadStatusClass(item, hasComparisons) {
   if (item?.proofreadApplied === false) return 'proofread-status--skipped';
-  const status = normalizeStatus(item?.proofreadStatus, item?.proofread, true);
+  const status = STATUS_CONFIG[item?.proofreadStatus]
+    ? item.proofreadStatus
+    : normalizeStatus(item?.proofreadStatus, item?.proofread, true);
   if (status === 'failed') return 'proofread-status--error';
-  return 'proofread-status--applied';
+  if (status === 'done') {
+    if (hasComparisons) return 'proofread-status--applied';
+    return item?.proofreadExecuted ? 'proofread-status--applied' : 'proofread-status--skipped';
+  }
+  if (status === 'disabled') return 'proofread-status--skipped';
+  return '';
 }
 
 function getProofreadLatency(item) {
