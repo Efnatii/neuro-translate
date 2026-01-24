@@ -458,6 +458,19 @@ function logProofreadChunk(label, index, totalChunks, chunkSize, quality, parseE
   console.info(`Proofread chunk processed (${label}).`, summary);
 }
 
+function buildProofreadBodyPreview(payload, maxLength = 800) {
+  if (payload == null) return null;
+  let raw = '';
+  try {
+    raw = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  } catch (error) {
+    raw = String(payload);
+  }
+  if (!raw) return null;
+  if (raw.length <= maxLength) return raw;
+  return `${raw.slice(0, maxLength)}…`;
+}
+
 async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
   const { strict = false, maxTokensOverride = null, extraReminder = '' } = options;
   const prompt = applyPromptCaching(
@@ -589,7 +602,35 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content;
   if (!content) {
-    return { itemsById: new Map(), rawProofread: '', parseError: 'no-content', debug: [] };
+    const latencyMs = Date.now() - startedAt;
+    const usage = normalizeUsage(data?.usage);
+    const emptyDebugPayload = {
+      phase: 'PROOFREAD',
+      model,
+      latencyMs,
+      usage,
+      costUsd: calculateUsageCost(usage, model),
+      inputChars,
+      outputChars: 0,
+      request: requestPayload,
+      response: {
+        id: data?.id ?? null,
+        status: response.status,
+        statusText: response.statusText,
+        model: data?.model ?? model,
+        emptyContent: true,
+        bodyPreview: buildProofreadBodyPreview(data)
+      },
+      parseIssues: ['no-content', 'api-empty-content']
+    };
+    const rawProofread =
+      '[no-content] Модель вернула пустой message.content. Проверь модель/response_format. См. debug.';
+    return {
+      itemsById: new Map(),
+      rawProofread,
+      parseError: 'no-content',
+      debug: [emptyDebugPayload]
+    };
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
