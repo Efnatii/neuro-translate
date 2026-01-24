@@ -38,6 +38,7 @@ const DEFAULT_STATE = {
 
 let STATE_CACHE = null;
 let STATE_CACHE_READY = false;
+const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const STATE_CACHE_KEYS = new Set([
   'apiKey',
   'deepseekApiKey',
@@ -56,6 +57,78 @@ const STATE_CACHE_KEYS = new Set([
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
 const CONTENT_READY_BY_TAB = new Map();
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
+
+function invokeHandlerAsPromise(handler, message, timeoutMs = 240000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const safeResolve = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      if (payload && typeof payload === 'object') {
+        resolve(payload);
+        return;
+      }
+      resolve({
+        success: false,
+        error: 'Background RPC response is empty',
+        isRuntimeError: true
+      });
+    };
+    const timeoutId = setTimeout(() => {
+      safeResolve({ success: false, error: 'Background RPC timeout', isRuntimeError: true });
+    }, timeoutMs);
+    try {
+      const maybePromise = handler(message, (response) => {
+        safeResolve(response);
+      });
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.catch((error) => {
+          safeResolve({
+            success: false,
+            error: error?.message || String(error),
+            isRuntimeError: true
+          });
+        });
+      }
+    } catch (error) {
+      safeResolve({
+        success: false,
+        error: error?.message || String(error),
+        isRuntimeError: true
+      });
+    }
+  });
+}
+
+function invokeSettingsAsPromise(handler, message, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const safeResolve = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve(payload && typeof payload === 'object' ? payload : null);
+    };
+    const timeoutId = setTimeout(() => {
+      safeResolve(null);
+    }, timeoutMs);
+    try {
+      const maybePromise = handler(message, (response) => {
+        safeResolve(response);
+      });
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.catch((error) => {
+          console.warn('Settings handler failed in RPC.', error);
+          safeResolve(null);
+        });
+      }
+    } catch (error) {
+      console.warn('Settings handler threw in RPC.', error);
+      safeResolve(null);
+    }
+  });
+}
 
 function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
   return new Promise((resolve, reject) => {
@@ -230,6 +303,65 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     patch[key] = change?.newValue;
   }
   applyStatePatch(patch);
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (!port || port.name !== NT_RPC_PORT_NAME) return;
+  const tabId = port.sender?.tab?.id ?? null;
+  port.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    const rpcId = msg.rpcId;
+    if (typeof rpcId !== 'string') return;
+    const type = msg.type;
+    const postResponse = (response) => {
+      try {
+        port.postMessage({ rpcId, response });
+      } catch (error) {
+        console.warn('Failed to post RPC response.', { error, rpcId, type, tabId });
+      }
+    };
+
+    let responsePromise;
+    switch (type) {
+      case 'TRANSLATE_TEXT':
+        responsePromise = invokeHandlerAsPromise(handleTranslateText, msg, 240000);
+        break;
+      case 'GENERATE_CONTEXT':
+        responsePromise = invokeHandlerAsPromise(handleGenerateContext, msg, 120000);
+        break;
+      case 'PROOFREAD_TEXT':
+        responsePromise = invokeHandlerAsPromise(handleProofreadText, msg, 180000);
+        break;
+      case 'GET_SETTINGS':
+        responsePromise = invokeSettingsAsPromise(handleGetSettings, msg, 1500).then((settings) => ({
+          ok: true,
+          settings
+        }));
+        break;
+      case 'GET_TAB_ID':
+        responsePromise = Promise.resolve({ ok: true, tabId });
+        break;
+      default:
+        responsePromise = Promise.resolve({
+          success: false,
+          error: `Unknown RPC type: ${type}`,
+          isRuntimeError: true
+        });
+        break;
+    }
+
+    Promise.resolve(responsePromise)
+      .then((response) => {
+        postResponse(response);
+      })
+      .catch((error) => {
+        postResponse({
+          success: false,
+          error: error?.message || String(error),
+          isRuntimeError: true
+        });
+      });
+  });
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
