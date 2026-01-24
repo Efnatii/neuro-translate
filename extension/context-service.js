@@ -93,12 +93,9 @@ async function generateTranslationContext(
     model,
     messages: prompt
   };
-  if (apiBaseUrl === OPENAI_API_URL) {
-    requestPayload.prompt_cache_key = 'neuro-translate:context:v1';
-    requestPayload.prompt_cache_retention = 'in_memory';
-  }
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:context:v1');
   const startedAt = Date.now();
-  const response = await fetch(apiBaseUrl, {
+  let response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -108,8 +105,40 @@ async function generateTranslationContext(
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Context request failed: ${response.status} ${errorText}`);
+    let errorText = await response.text();
+    let errorPayload = null;
+    try {
+      errorPayload = JSON.parse(errorText);
+    } catch (parseError) {
+      errorPayload = null;
+    }
+    const stripped = stripUnsupportedPromptCacheParams(
+      requestPayload,
+      model,
+      response.status,
+      errorPayload,
+      errorText
+    );
+    if (response.status === 400 && stripped.changed) {
+      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
+        model,
+        status: response.status
+      });
+      response = await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestPayload)
+      });
+      if (!response.ok) {
+        errorText = await response.text();
+      }
+    }
+    if (!response.ok) {
+      throw new Error(`Context request failed: ${response.status} ${errorText}`);
+    }
   }
 
   const data = await response.json();
