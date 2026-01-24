@@ -32,11 +32,26 @@ const DEFAULT_STATE = {
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
-  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS,
+  modelThroughputById: {}
 };
 
 let STATE_CACHE = null;
 let STATE_CACHE_READY = false;
+const STATE_CACHE_KEYS = new Set([
+  'apiKey',
+  'deepseekApiKey',
+  'translationModel',
+  'contextModel',
+  'proofreadModel',
+  'contextGenerationEnabled',
+  'proofreadEnabled',
+  'blockLengthLimit',
+  'tpmLimitsByModel',
+  'outputRatioByRole',
+  'tpmSafetyBufferTokens',
+  'modelThroughputById'
+]);
 
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
 const CONTENT_READY_BY_TAB = new Map();
@@ -47,7 +62,7 @@ function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
     const timeoutId = setTimeout(() => {
       if (hasCompleted) return;
       hasCompleted = true;
-      reject(new Error('Storage get timed out'));
+      reject(new Error('storageLocalGet timeout'));
     }, timeoutMs);
     try {
       chrome.storage.local.get(keysOrDefaults, (items) => {
@@ -76,7 +91,7 @@ function storageLocalSet(items, timeoutMs = 1500) {
     const timeoutId = setTimeout(() => {
       if (hasCompleted) return;
       hasCompleted = true;
-      reject(new Error('Storage set timed out'));
+      reject(new Error('storageLocalSet timeout'));
     }, timeoutMs);
     try {
       chrome.storage.local.set(items, () => {
@@ -96,24 +111,10 @@ function storageLocalSet(items, timeoutMs = 1500) {
 }
 
 function applyStatePatch(patch = {}) {
-  const allowedKeys = new Set([
-    'apiKey',
-    'deepseekApiKey',
-    'translationModel',
-    'contextModel',
-    'proofreadModel',
-    'contextGenerationEnabled',
-    'proofreadEnabled',
-    'blockLengthLimit',
-    'tpmLimitsByModel',
-    'outputRatioByRole',
-    'tpmSafetyBufferTokens',
-    'modelThroughputById'
-  ]);
   const next = STATE_CACHE && typeof STATE_CACHE === 'object' ? { ...STATE_CACHE } : { ...DEFAULT_STATE };
 
   for (const [key, value] of Object.entries(patch || {})) {
-    if (!allowedKeys.has(key)) continue;
+    if (!STATE_CACHE_KEYS.has(key)) continue;
     if (['apiKey', 'deepseekApiKey', 'translationModel', 'contextModel', 'proofreadModel'].includes(key)) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
@@ -198,8 +199,7 @@ async function getState() {
     return { ...DEFAULT_STATE, ...STATE_CACHE };
   } catch (error) {
     console.warn('Failed to load state from storage, using defaults.', error);
-    STATE_CACHE = { ...DEFAULT_STATE };
-    STATE_CACHE_READY = true;
+    applyStatePatch(DEFAULT_STATE);
     return { ...DEFAULT_STATE };
   }
 }
@@ -225,6 +225,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'local') return;
   const patch = {};
   for (const [key, change] of Object.entries(changes || {})) {
+    if (!STATE_CACHE_KEYS.has(key)) continue;
     patch[key] = change?.newValue;
   }
   applyStatePatch(patch);
@@ -361,10 +362,11 @@ async function warmUpContentScripts(reason) {
 }
 
 async function handleGetSettings(message, sendResponse) {
+  let response = null;
   try {
     const state = await getState();
     if (!state || typeof state !== 'object') {
-      sendResponse({
+      response = {
         allowed: false,
         disallowedReason:
           'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
@@ -382,55 +384,92 @@ async function handleGetSettings(message, sendResponse) {
         },
         outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
         tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
-      });
-      return;
+      };
+    } else {
+      const translationConfig = getApiConfigForModel(state.translationModel, state);
+      const contextConfig = getApiConfigForModel(state.contextModel, state);
+      const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
+      const tpmLimitsByRole = {
+        translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
+        context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
+        proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
+      };
+      const hasTranslationKey = Boolean(translationConfig.apiKey);
+      const hasContextKey = Boolean(contextConfig.apiKey);
+      const hasProofreadKey = Boolean(proofreadConfig.apiKey);
+      let disallowedReason = null;
+      if (!hasTranslationKey) {
+        disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
+      } else if (state.contextGenerationEnabled && !hasContextKey) {
+        disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
+      } else if (state.proofreadEnabled && !hasProofreadKey) {
+        disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
+      }
+      response = {
+        allowed:
+          hasTranslationKey &&
+          (!state.contextGenerationEnabled || hasContextKey) &&
+          (!state.proofreadEnabled || hasProofreadKey),
+        disallowedReason,
+        apiKey: state.apiKey,
+        translationModel: state.translationModel,
+        contextModel: state.contextModel,
+        proofreadModel: state.proofreadModel,
+        contextGenerationEnabled: state.contextGenerationEnabled,
+        proofreadEnabled: state.proofreadEnabled,
+        blockLengthLimit: state.blockLengthLimit,
+        tpmLimitsByRole,
+        outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
+        tpmSafetyBufferTokens:
+          Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
+            ? state.tpmSafetyBufferTokens
+            : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+      };
     }
-    const translationConfig = getApiConfigForModel(state.translationModel, state);
-    const contextConfig = getApiConfigForModel(state.contextModel, state);
-    const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
-    const tpmLimitsByRole = {
-      translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
-      context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
-      proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
-    };
-    const hasTranslationKey = Boolean(translationConfig.apiKey);
-    const hasContextKey = Boolean(contextConfig.apiKey);
-    const hasProofreadKey = Boolean(proofreadConfig.apiKey);
-    let disallowedReason = null;
-    if (!hasTranslationKey) {
-      disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
-    } else if (state.contextGenerationEnabled && !hasContextKey) {
-      disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
-    } else if (state.proofreadEnabled && !hasProofreadKey) {
-      disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
-    }
-    sendResponse({
-      allowed:
-        hasTranslationKey &&
-        (!state.contextGenerationEnabled || hasContextKey) &&
-        (!state.proofreadEnabled || hasProofreadKey),
-      disallowedReason,
-      apiKey: state.apiKey,
-      translationModel: state.translationModel,
-      contextModel: state.contextModel,
-      proofreadModel: state.proofreadModel,
-      contextGenerationEnabled: state.contextGenerationEnabled,
-      proofreadEnabled: state.proofreadEnabled,
-      blockLengthLimit: state.blockLengthLimit,
-      tpmLimitsByRole,
-      outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
-      tpmSafetyBufferTokens:
-        Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
-          ? state.tpmSafetyBufferTokens
-          : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
-    });
   } catch (error) {
     console.error('Failed to fetch settings.', error);
-    sendResponse({
+    response = {
       allowed: false,
       disallowedReason:
-        'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.'
-    });
+        'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+      apiKey: DEFAULT_STATE.apiKey,
+      translationModel: DEFAULT_STATE.translationModel,
+      contextModel: DEFAULT_STATE.contextModel,
+      proofreadModel: DEFAULT_STATE.proofreadModel,
+      contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+      proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+      tpmLimitsByRole: {
+        translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+        context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+        proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+      },
+      outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+      tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+    };
+  } finally {
+    if (!response) {
+      response = {
+        allowed: false,
+        disallowedReason:
+          'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+        apiKey: DEFAULT_STATE.apiKey,
+        translationModel: DEFAULT_STATE.translationModel,
+        contextModel: DEFAULT_STATE.contextModel,
+        proofreadModel: DEFAULT_STATE.proofreadModel,
+        contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+        proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+        tpmLimitsByRole: {
+          translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+          context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+          proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+        },
+        outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+        tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+      };
+    }
+    sendResponse(response);
   }
 }
 
