@@ -14,7 +14,10 @@ const STATUS_CONFIG = {
 
 let sourceUrl = '';
 let refreshTimer = null;
+let throughputTimer = null;
+let lastThroughputCheckAt = 0;
 const proofreadUiState = new Map();
+const THROUGHPUT_REFRESH_INTERVAL_MS = 15000;
 
 init();
 
@@ -121,26 +124,13 @@ async function getThroughputSummary() {
         const translationModel = data?.translationModel;
         const contextModel = data?.contextModel;
         const proofreadModel = data?.proofreadModel;
-        const parts = [];
         const translationInfo = translationModel ? modelThroughputById?.[translationModel] : null;
         const contextInfo = contextModel ? modelThroughputById?.[contextModel] : null;
         const proofreadInfo = proofreadModel ? modelThroughputById?.[proofreadModel] : null;
-
-        if (Number.isFinite(translationInfo?.tokensPerSecond) && translationInfo.tokensPerSecond > 0) {
-          parts.push(`T=${Number(translationInfo.tokensPerSecond).toFixed(1)}`);
-        }
-        if (Number.isFinite(contextInfo?.tokensPerSecond) && contextInfo.tokensPerSecond > 0) {
-          parts.push(`C=${Number(contextInfo.tokensPerSecond).toFixed(1)}`);
-        }
-        if (Number.isFinite(proofreadInfo?.tokensPerSecond) && proofreadInfo.tokensPerSecond > 0) {
-          parts.push(`P=${Number(proofreadInfo.tokensPerSecond).toFixed(1)}`);
-        }
-
-        if (!parts.length) {
-          resolve('');
-          return;
-        }
-        resolve(`TPS: ${parts.join(' ')}`);
+        const formatTps = (info) => {
+          return Number.isFinite(info?.tokensPerSecond) ? Number(info.tokensPerSecond).toFixed(1) : '—';
+        };
+        resolve(`TPS: T=${formatTps(translationInfo)} C=${formatTps(contextInfo)} P=${formatTps(proofreadInfo)}`);
       }
     );
   });
@@ -169,6 +159,9 @@ function startAutoRefresh() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
   }
+  if (throughputTimer) {
+    clearInterval(throughputTimer);
+  }
   const canListen = typeof chrome !== 'undefined' && chrome.storage?.onChanged;
   if (canListen) {
     chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -184,12 +177,17 @@ function startAutoRefresh() {
       }
       refreshDebug();
     });
-    return;
   }
 
-  refreshTimer = setInterval(() => {
+  if (!canListen) {
+    refreshTimer = setInterval(() => {
+      refreshDebug();
+    }, 1000);
+  }
+
+  throughputTimer = setInterval(() => {
     refreshDebug();
-  }, 1000);
+  }, THROUGHPUT_REFRESH_INTERVAL_MS);
 }
 
 async function refreshDebug() {
@@ -203,6 +201,30 @@ async function refreshDebug() {
   }
 
   renderDebug(sourceUrl, debugData, throughputSummary);
+  requestThroughputCheck();
+}
+
+async function requestThroughputCheck() {
+  if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage || !chrome.storage?.local) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastThroughputCheckAt < THROUGHPUT_REFRESH_INTERVAL_MS) {
+    return;
+  }
+  lastThroughputCheckAt = now;
+  const data = await new Promise((resolve) => {
+    chrome.storage.local.get(['translationModel', 'contextModel', 'proofreadModel'], (stored) => resolve(stored));
+  });
+  [data?.translationModel, data?.contextModel, data?.proofreadModel].forEach((model) => {
+    if (model) {
+      chrome.runtime.sendMessage({ type: 'RUN_MODEL_THROUGHPUT_TEST', model }, () => {
+        if (chrome.runtime.lastError) {
+          console.debug('Failed to request throughput test.', chrome.runtime.lastError.message);
+        }
+      });
+    }
+  });
 }
 
 function renderEmpty(message, throughputSummary = '') {
