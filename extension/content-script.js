@@ -442,14 +442,20 @@ async function translatePage(settings) {
   debugEntries = [];
   debugState = null;
   latestContextSummary = cachedContext || existingContext;
-  await clearTranslationDebugInfo(location.href);
+  await resetTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
   const maxBlockLength = normalizeBlockLength(settings.blockLengthLimit, textStats.averageNodeLength);
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
   const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
   translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
-  await initializeDebugState(blocks, settings);
+  const initialContext = latestContextSummary;
+  const initialContextStatus = settings.contextGenerationEnabled
+    ? initialContext
+      ? 'done'
+      : 'pending'
+    : 'disabled';
+  await initializeDebugState(blocks, settings, { initialContext, initialContextStatus });
   if (latestContextSummary) {
     await updateDebugContext(latestContextSummary, 'done');
   }
@@ -1991,8 +1997,12 @@ async function resetTranslationDebugInfo(url) {
   await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
 }
 
-async function initializeDebugState(blocks, settings = {}) {
+async function initializeDebugState(blocks, settings = {}, initial = {}) {
   const proofreadEnabled = Boolean(settings.proofreadEnabled);
+  const initialContext = typeof initial.initialContext === 'string' ? initial.initialContext : '';
+  const initialContextStatus =
+    initial.initialContextStatus ||
+    (settings.contextGenerationEnabled ? 'pending' : 'disabled');
   debugEntries = blocks.map((block, index) => ({
     index: index + 1,
     original: formatBlockText(block.map(({ original }) => original)),
@@ -2011,8 +2021,8 @@ async function initializeDebugState(blocks, settings = {}) {
     proofreadStatus: proofreadEnabled ? 'pending' : 'disabled'
   }));
   debugState = {
-    context: '',
-    contextStatus: settings.contextGenerationEnabled ? 'pending' : 'disabled',
+    context: initialContext || '',
+    contextStatus: initialContextStatus,
     items: debugEntries,
     aiRequestCount: 0,
     updatedAt: Date.now()
