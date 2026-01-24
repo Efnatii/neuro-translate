@@ -796,16 +796,7 @@ async function translatePage(settings) {
           );
         }
 
-        task.block.forEach(({ node, path, original, originalHash }, index) => {
-          if (!shouldApplyTranslation(node, original, originalHash)) {
-            return;
-          }
-          const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-          if (translationVisible) {
-            node.nodeValue = withOriginalFormatting;
-          }
-          updateActiveEntry(path, original, withOriginalFormatting, originalHash);
-        });
+        updatePageWithProofreading(task, finalTranslations);
 
         const rawProofreadPayload = proofreadResult.rawProofread || '';
         const rawProofread =
@@ -850,6 +841,19 @@ async function translatePage(settings) {
       }
     }
   };
+
+  function updatePageWithProofreading(task, finalTranslations) {
+    task.block.forEach(({ node, path, original, originalHash }, index) => {
+      if (!shouldApplyTranslation(node, original, originalHash)) {
+        return;
+      }
+      const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
+      if (translationVisible) {
+        node.nodeValue = withOriginalFormatting;
+      }
+      updateActiveEntry(path, original, withOriginalFormatting, originalHash);
+    });
+  }
 
   blocks.forEach((block, index) => {
     enqueueTranslationBlock(block, index);
