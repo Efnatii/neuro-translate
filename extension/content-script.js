@@ -31,6 +31,37 @@ const RATE_LIMIT_RETRY_ATTEMPTS = 2;
 const SHORT_CONTEXT_MAX_CHARS = 800;
 const TRANSLATION_MAX_TOKENS_PER_REQUEST = 2600;
 const PROOFREAD_SUSPICIOUS_RATIO = 0.35;
+const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
+const DEFAULT_TPM_LIMITS_BY_MODEL = {
+  default: 200000,
+  'gpt-4.1-mini': 200000,
+  'gpt-4.1': 300000,
+  'gpt-4o-mini': 200000,
+  'gpt-4o': 300000,
+  'o4-mini': 200000,
+  'deepseek-chat': 200000,
+  'deepseek-reasoner': 100000
+};
+const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
+  translation: 0.6,
+  context: 0.4,
+  proofread: 0.5
+};
+const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
+const DEFAULT_STATE = {
+  apiKey: '',
+  deepseekApiKey: '',
+  translationModel: 'gpt-4.1-mini',
+  contextModel: 'gpt-4.1-mini',
+  proofreadModel: 'gpt-4.1-mini',
+  contextGenerationEnabled: false,
+  proofreadEnabled: false,
+  blockLengthLimit: 1200,
+  tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
+  outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+};
+const pendingSettingsRequests = new Map();
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -95,7 +126,158 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       });
     return true;
   }
+
+  if (message?.type === NT_SETTINGS_RESPONSE_TYPE && typeof message.requestId === 'string') {
+    const entry = pendingSettingsRequests.get(message.requestId);
+    if (entry) {
+      pendingSettingsRequests.delete(message.requestId);
+      clearTimeout(entry.timeoutId);
+      entry.resolve(message.settings && typeof message.settings === 'object' ? message.settings : null);
+    }
+  }
 });
+
+function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
+  return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('storageLocalGet timeout'));
+    }, timeoutMs);
+    try {
+      chrome.storage.local.get(keysOrDefaults, (items) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        if (!items || typeof items !== 'object') {
+          resolve({});
+          return;
+        }
+        resolve(items);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function isDeepseekModel(model = '') {
+  return model.startsWith('deepseek');
+}
+
+function getTpmLimitForModel(model, tpmLimitsByModel) {
+  if (!tpmLimitsByModel || typeof tpmLimitsByModel !== 'object') {
+    return DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  }
+  const fallback = tpmLimitsByModel.default ?? DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  return tpmLimitsByModel[model] ?? fallback;
+}
+
+function getProviderLabel(provider) {
+  return provider === 'deepseek' ? 'DeepSeek' : 'OpenAI';
+}
+
+function buildMissingKeyReason(roleLabel, config, model) {
+  const providerLabel = getProviderLabel(config.provider);
+  return `Перевод недоступен: укажите ключ ${providerLabel} для модели ${model} (${roleLabel}).`;
+}
+
+function getApiConfigForModel(model, state) {
+  if (isDeepseekModel(model)) {
+    return {
+      apiKey: state.deepseekApiKey,
+      provider: 'deepseek'
+    };
+  }
+  return {
+    apiKey: state.apiKey,
+    provider: 'openai'
+  };
+}
+
+async function readSettingsFromStorage() {
+  const stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+  const safeStored = stored && typeof stored === 'object' ? stored : {};
+  const merged = { ...DEFAULT_STATE, ...safeStored };
+  if (!merged.blockLengthLimit && safeStored.chunkLengthLimit) {
+    merged.blockLengthLimit = safeStored.chunkLengthLimit;
+  }
+  if (!merged.translationModel && safeStored.model) {
+    merged.translationModel = safeStored.model;
+  }
+  if (!merged.contextModel && safeStored.model) {
+    merged.contextModel = safeStored.model;
+  }
+  return merged;
+}
+
+function buildSettingsFromState(state) {
+  if (!state || typeof state !== 'object') {
+    return {
+      allowed: false,
+      disallowedReason:
+        'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+      apiKey: DEFAULT_STATE.apiKey,
+      translationModel: DEFAULT_STATE.translationModel,
+      contextModel: DEFAULT_STATE.contextModel,
+      proofreadModel: DEFAULT_STATE.proofreadModel,
+      contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+      proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+      tpmLimitsByRole: {
+        translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+        context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+        proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+      },
+      outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+      tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+    };
+  }
+  const translationConfig = getApiConfigForModel(state.translationModel, state);
+  const contextConfig = getApiConfigForModel(state.contextModel, state);
+  const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
+  const tpmLimitsByRole = {
+    translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
+    context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
+    proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
+  };
+  const hasTranslationKey = Boolean(translationConfig.apiKey);
+  const hasContextKey = Boolean(contextConfig.apiKey);
+  const hasProofreadKey = Boolean(proofreadConfig.apiKey);
+  let disallowedReason = null;
+  if (!hasTranslationKey) {
+    disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
+  } else if (state.contextGenerationEnabled && !hasContextKey) {
+    disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
+  } else if (state.proofreadEnabled && !hasProofreadKey) {
+    disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
+  }
+  return {
+    allowed:
+      hasTranslationKey &&
+      (!state.contextGenerationEnabled || hasContextKey) &&
+      (!state.proofreadEnabled || hasProofreadKey),
+    disallowedReason,
+    apiKey: state.apiKey,
+    translationModel: state.translationModel,
+    contextModel: state.contextModel,
+    proofreadModel: state.proofreadModel,
+    contextGenerationEnabled: state.contextGenerationEnabled,
+    proofreadEnabled: state.proofreadEnabled,
+    blockLengthLimit: state.blockLengthLimit,
+    tpmLimitsByRole,
+    outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
+    tpmSafetyBufferTokens:
+      Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
+        ? state.tpmSafetyBufferTokens
+        : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+  };
+}
 
 async function startTranslation() {
   if (translationInProgress) {
@@ -131,33 +313,81 @@ async function startTranslation() {
 }
 
 async function requestSettings() {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'GET_SETTINGS', url: location.href }, (response) => {
-      if (chrome.runtime.lastError) {
-        console.error('Failed to reach extension background script.', chrome.runtime.lastError.message);
-        resolve({
-          allowed: false,
-          disallowedReason:
-            'Не удалось связаться с фоном расширения. Перезагрузите вкладку или расширение.'
-        });
-        return;
-      }
-      if (response) {
-        resolve(response);
-        return;
-      }
-      console.warn('Settings response is empty without runtime error.');
-      if (!response) {
-        resolve({
-          allowed: false,
-          disallowedReason:
-            'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.'
-        });
-        return;
-      }
-      resolve(response);
-    });
+  const requestId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  let timeoutId;
+  const settingsPromise = new Promise((resolve) => {
+    timeoutId = setTimeout(() => {
+      pendingSettingsRequests.delete(requestId);
+      resolve(null);
+    }, 1500);
+    pendingSettingsRequests.set(requestId, { resolve, timeoutId });
   });
+
+  try {
+    chrome.runtime.sendMessage({ type: 'GET_SETTINGS', requestId, url: location.href }, (ack) => {
+      if (chrome.runtime.lastError) {
+        const entry = pendingSettingsRequests.get(requestId);
+        if (entry) {
+          pendingSettingsRequests.delete(requestId);
+          clearTimeout(entry.timeoutId);
+          entry.resolve(null);
+        }
+        return;
+      }
+      if (ack && typeof ack === 'object' && typeof ack.allowed !== 'undefined') {
+        const entry = pendingSettingsRequests.get(requestId);
+        if (entry) {
+          pendingSettingsRequests.delete(requestId);
+          clearTimeout(entry.timeoutId);
+          entry.resolve(ack);
+        }
+      }
+    });
+  } catch (error) {
+    const entry = pendingSettingsRequests.get(requestId);
+    if (entry) {
+      pendingSettingsRequests.delete(requestId);
+      clearTimeout(entry.timeoutId);
+      entry.resolve(null);
+    }
+  }
+
+  let settings = await settingsPromise;
+  if (settings && typeof settings === 'object') {
+    return settings;
+  }
+
+  try {
+    const state = await readSettingsFromStorage();
+    settings = buildSettingsFromState(state);
+    try {
+      chrome.runtime.sendMessage({
+        type: 'SYNC_STATE_CACHE',
+        state: {
+          apiKey: state.apiKey,
+          deepseekApiKey: state.deepseekApiKey,
+          translationModel: state.translationModel,
+          contextModel: state.contextModel,
+          proofreadModel: state.proofreadModel,
+          contextGenerationEnabled: state.contextGenerationEnabled,
+          proofreadEnabled: state.proofreadEnabled,
+          blockLengthLimit: state.blockLengthLimit,
+          tpmLimitsByModel: state.tpmLimitsByModel,
+          outputRatioByRole: state.outputRatioByRole,
+          tpmSafetyBufferTokens: state.tpmSafetyBufferTokens
+        }
+      });
+    } catch (error) {
+      // ignore
+    }
+    return settings;
+  } catch (error) {
+    return {
+      allowed: false,
+      disallowedReason:
+        'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.'
+    };
+  }
 }
 
 async function translatePage(settings) {

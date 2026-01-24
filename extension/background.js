@@ -55,6 +55,7 @@ const STATE_CACHE_KEYS = new Set([
 
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
 const CONTENT_READY_BY_TAB = new Map();
+const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
 
 function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
   return new Promise((resolve, reject) => {
@@ -233,7 +234,53 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'GET_SETTINGS') {
-    handleGetSettings(message, sendResponse);
+    const requestId =
+      typeof message?.requestId === 'string' && message.requestId
+        ? message.requestId
+        : `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    sendResponse({ ok: true, requestId });
+    const tabId = sender?.tab?.id;
+    if (!tabId) {
+      return true;
+    }
+    Promise.resolve()
+      .then(async () => {
+        const settings = await computeSettingsViaHandle({ ...message, requestId });
+        const safeSettings =
+          settings && typeof settings === 'object'
+            ? settings
+            : {
+                allowed: false,
+                disallowedReason:
+                  'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+                apiKey: DEFAULT_STATE.apiKey,
+                translationModel: DEFAULT_STATE.translationModel,
+                contextModel: DEFAULT_STATE.contextModel,
+                proofreadModel: DEFAULT_STATE.proofreadModel,
+                contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+                proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+                blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+                tpmLimitsByRole: {
+                  translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+                  context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+                  proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+                },
+                outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+                tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+              };
+        chrome.tabs.sendMessage(
+          tabId,
+          { type: NT_SETTINGS_RESPONSE_TYPE, requestId, settings: safeSettings },
+          () => {
+            if (chrome.runtime.lastError) {
+              console.debug('Failed to deliver settings response to tab.', chrome.runtime.lastError.message);
+            }
+          }
+        );
+      })
+      .catch((error) => {
+        console.warn('Failed to compute settings for tab message.', error);
+      });
     return true;
   }
 
@@ -359,6 +406,29 @@ async function warmUpContentScripts(reason) {
   } catch (error) {
     console.warn('Failed to warm up content scripts.', error);
   }
+}
+
+function computeSettingsViaHandle(messageForHandle) {
+  return new Promise((resolve) => {
+    let done = false;
+    const safeResolve = (payload) => {
+      if (done) return;
+      done = true;
+      resolve(payload && typeof payload === 'object' ? payload : null);
+    };
+    const timer = setTimeout(() => safeResolve(null), 1500);
+    Promise.resolve()
+      .then(() =>
+        handleGetSettings(messageForHandle, (resp) => {
+          clearTimeout(timer);
+          safeResolve(resp);
+        })
+      )
+      .catch(() => {
+        clearTimeout(timer);
+        safeResolve(null);
+      });
+  });
 }
 
 async function handleGetSettings(message, sendResponse) {
