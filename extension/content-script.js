@@ -528,13 +528,8 @@ async function translatePage(settings) {
     return shortContextSummary;
   };
 
-  const averageBlockLength = blocks.length ? Math.round(textStats.totalLength / blocks.length) : 0;
-  const initialConcurrency = selectInitialConcurrency(averageBlockLength, blocks.length);
   const singleBlockConcurrency = Boolean(settings.singleBlockConcurrency);
   const translationConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(6, blocks.length));
-  let maxAllowedConcurrency = translationConcurrency;
-  const requestDurations = [];
-  let dynamicMaxConcurrency = Math.min(initialConcurrency, maxAllowedConcurrency);
   let activeTranslationWorkers = 0;
   let activeProofreadWorkers = 0;
   let translationQueueDone = false;
@@ -571,60 +566,28 @@ async function translatePage(settings) {
     return true;
   };
 
-  const acquireTranslationSlot = async () => {
-    while (activeTranslationWorkers >= dynamicMaxConcurrency && !cancelRequested) {
-      await delay(50);
-    }
-    activeTranslationWorkers += 1;
-  };
-
-  const releaseTranslationSlot = () => {
-    activeTranslationWorkers = Math.max(0, activeTranslationWorkers - 1);
-  };
-
-  const adjustConcurrency = (durationMs) => {
-    requestDurations.push(durationMs);
-    if (requestDurations.length > 5) requestDurations.shift();
-    const averageDuration =
-      requestDurations.reduce((sum, value) => sum + value, 0) / requestDurations.length;
-
-    if (averageDuration > 4500 && dynamicMaxConcurrency > 1) {
-      dynamicMaxConcurrency = Math.max(1, dynamicMaxConcurrency - 1);
-    } else if (averageDuration < 2500 && dynamicMaxConcurrency < maxAllowedConcurrency) {
-      dynamicMaxConcurrency += 1;
-    }
-  };
-
   const translationWorker = async () => {
     while (true) {
       if (cancelRequested) return;
-      await acquireTranslationSlot();
-
-      if (cancelRequested) {
-        releaseTranslationSlot();
-        return;
-      }
-
       const queuedItem = translationQueue.shift();
       if (!queuedItem) {
-        releaseTranslationSlot();
         return;
       }
+      activeTranslationWorkers += 1;
       const currentIndex = queuedItem.index;
       const block = queuedItem.block;
-      await updateDebugEntry(currentIndex + 1, {
-        translationStatus: 'in_progress',
-        proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
-      });
-      reportProgress('Перевод выполняется');
-      const preparedTexts = block.map(({ original }) =>
-        prepareTextForTranslation(original)
-      );
-      const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
-      const blockTranslations = [];
-
-      const startTime = performance.now();
       try {
+        await updateDebugEntry(currentIndex + 1, {
+          translationStatus: 'in_progress',
+          proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
+        });
+        reportProgress('Перевод выполняется');
+        const preparedTexts = block.map(({ original }) =>
+          prepareTextForTranslation(original)
+        );
+        const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
+        const blockTranslations = [];
+
         const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
         const result = await translate(
           uniqueTexts,
@@ -707,7 +670,11 @@ async function translatePage(settings) {
           translationStatus: 'failed',
           proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled'
         });
-        releaseTranslationSlot();
+      } finally {
+        activeTranslationWorkers = Math.max(0, activeTranslationWorkers - 1);
+      }
+
+      if (translationError) {
         reportProgress(
           'Ошибка перевода',
           translationProgress.completedBlocks,
@@ -716,10 +683,6 @@ async function translatePage(settings) {
         );
         return;
       }
-
-      const duration = performance.now() - startTime;
-      adjustConcurrency(duration);
-      releaseTranslationSlot();
 
       translationProgress.completedBlocks += 1;
       reportProgress(
@@ -860,13 +823,14 @@ async function translatePage(settings) {
     reportProgress('Перевод запущен', translationProgress.completedBlocks, totalBlocks, 0);
   }
 
-  const workers = Array.from({ length: maxAllowedConcurrency }, () => translationWorker());
+  const workers = Array.from({ length: translationConcurrency }, () => translationWorker());
   const proofreadWorkers = settings.proofreadEnabled
     ? Array.from({ length: proofreadConcurrency }, () => proofreadWorker())
     : [];
-  await Promise.all(workers);
-  translationQueueDone = true;
-  await Promise.all(proofreadWorkers);
+  const translationCompletion = Promise.all(workers).then(() => {
+    translationQueueDone = true;
+  });
+  await Promise.all([...proofreadWorkers, translationCompletion]);
 
   if (translationError) {
     await flushPersistDebugState('translatePage:error');
