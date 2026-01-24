@@ -55,9 +55,7 @@ const DEFAULT_TPM_LIMITS_BY_MODEL = {
   'gpt-4.1': 300000,
   'gpt-4o-mini': 200000,
   'gpt-4o': 300000,
-  'o4-mini': 200000,
-  'deepseek-chat': 200000,
-  'deepseek-reasoner': 100000
+  'o4-mini': 200000
 };
 const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
   translation: 0.6,
@@ -67,7 +65,6 @@ const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
 const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
 const DEFAULT_STATE = {
   apiKey: '',
-  deepseekApiKey: '',
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
@@ -78,6 +75,22 @@ const DEFAULT_STATE = {
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
   tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
+const SUPPORTED_MODEL_IDS = new Set([
+  'gpt-5-nano',
+  'gpt-4.1-nano',
+  'gpt-4o-mini',
+  'gpt-4.1-mini',
+  'gpt-5-mini',
+  'gpt-4.1',
+  'gpt-5.1',
+  'gpt-5',
+  'gpt-5.1-chat-latest',
+  'gpt-5-chat-latest',
+  'gpt-4o',
+  'gpt-5.2',
+  'gpt-5.2-chat-latest',
+  'gpt-4o-2024-05-13'
+]);
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
 const ntRpcPending = new Map();
@@ -185,10 +198,6 @@ function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
   });
 }
 
-function isDeepseekModel(model = '') {
-  return model.startsWith('deepseek');
-}
-
 function getTpmLimitForModel(model, tpmLimitsByModel) {
   if (!tpmLimitsByModel || typeof tpmLimitsByModel !== 'object') {
     return DEFAULT_TPM_LIMITS_BY_MODEL.default;
@@ -197,26 +206,8 @@ function getTpmLimitForModel(model, tpmLimitsByModel) {
   return tpmLimitsByModel[model] ?? fallback;
 }
 
-function getProviderLabel(provider) {
-  return provider === 'deepseek' ? 'DeepSeek' : 'OpenAI';
-}
-
-function buildMissingKeyReason(roleLabel, config, model) {
-  const providerLabel = getProviderLabel(config.provider);
-  return `Перевод недоступен: укажите ключ ${providerLabel} для модели ${model} (${roleLabel}).`;
-}
-
-function getApiConfigForModel(model, state) {
-  if (isDeepseekModel(model)) {
-    return {
-      apiKey: state.deepseekApiKey,
-      provider: 'deepseek'
-    };
-  }
-  return {
-    apiKey: state.apiKey,
-    provider: 'openai'
-  };
+function buildMissingKeyReason(roleLabel, model) {
+  return `Перевод недоступен: укажите OpenAI API ключ для модели ${model} (${roleLabel}).`;
 }
 
 async function readSettingsFromStorage() {
@@ -231,6 +222,35 @@ async function readSettingsFromStorage() {
   }
   if (!merged.contextModel && safeStored.model) {
     merged.contextModel = safeStored.model;
+  }
+  const previousModels = {
+    translationModel: merged.translationModel,
+    contextModel: merged.contextModel,
+    proofreadModel: merged.proofreadModel
+  };
+  const normalizeModel = (model, fallback) => {
+    if (!model || model.startsWith('deepseek')) {
+      return fallback;
+    }
+    return SUPPORTED_MODEL_IDS.has(model) ? model : fallback;
+  };
+  merged.translationModel = normalizeModel(merged.translationModel, DEFAULT_STATE.translationModel);
+  merged.contextModel = normalizeModel(merged.contextModel, DEFAULT_STATE.contextModel);
+  merged.proofreadModel = normalizeModel(merged.proofreadModel, DEFAULT_STATE.proofreadModel);
+  if (
+    merged.translationModel !== previousModels.translationModel ||
+    merged.contextModel !== previousModels.contextModel ||
+    merged.proofreadModel !== previousModels.proofreadModel
+  ) {
+    try {
+      await chrome.storage.local.set({
+        translationModel: merged.translationModel,
+        contextModel: merged.contextModel,
+        proofreadModel: merged.proofreadModel
+      });
+    } catch (error) {
+      console.warn('Failed to normalize stored model ids.', error);
+    }
   }
   return merged;
 }
@@ -257,30 +277,18 @@ function buildSettingsFromState(state) {
       tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
     };
   }
-  const translationConfig = getApiConfigForModel(state.translationModel, state);
-  const contextConfig = getApiConfigForModel(state.contextModel, state);
-  const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
   const tpmLimitsByRole = {
     translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
     context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
     proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
   };
-  const hasTranslationKey = Boolean(translationConfig.apiKey);
-  const hasContextKey = Boolean(contextConfig.apiKey);
-  const hasProofreadKey = Boolean(proofreadConfig.apiKey);
+  const hasApiKey = Boolean(state.apiKey);
   let disallowedReason = null;
-  if (!hasTranslationKey) {
-    disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
-  } else if (state.contextGenerationEnabled && !hasContextKey) {
-    disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
-  } else if (state.proofreadEnabled && !hasProofreadKey) {
-    disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
+  if (!hasApiKey) {
+    disallowedReason = buildMissingKeyReason('перевод', state.translationModel);
   }
   return {
-    allowed:
-      hasTranslationKey &&
-      (!state.contextGenerationEnabled || hasContextKey) &&
-      (!state.proofreadEnabled || hasProofreadKey),
+    allowed: hasApiKey,
     disallowedReason,
     apiKey: state.apiKey,
     translationModel: state.translationModel,
@@ -384,7 +392,6 @@ async function requestSettings() {
         type: 'SYNC_STATE_CACHE',
         state: {
           apiKey: state.apiKey,
-          deepseekApiKey: state.deepseekApiKey,
           translationModel: state.translationModel,
           contextModel: state.contextModel,
           proofreadModel: state.proofreadModel,
