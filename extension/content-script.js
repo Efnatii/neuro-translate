@@ -30,6 +30,12 @@ let translationVisible = false;
 let latestContextSummary = '';
 let debugEntries = [];
 let debugState = null;
+let debugPersistTimer = null;
+let debugPersistInFlight = false;
+let debugPersistDirty = false;
+const DEBUG_PERSIST_DEBOUNCE_MS = 250;
+const DEBUG_PERSIST_MAX_INTERVAL_MS = 2000;
+let debugLastPersistAt = 0;
 let tpmLimiter = null;
 let tpmSettings = {
   outputRatioByRole: {
@@ -848,16 +854,20 @@ async function translatePage(settings) {
   await Promise.all(proofreadWorkers);
 
   if (translationError) {
+    await flushPersistDebugState('translatePage:error');
     reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
   if (cancelRequested) {
+    await flushPersistDebugState('translatePage:cancelled');
     reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
+  await flushPersistDebugState('translatePage:completed');
   reportProgress('Перевод завершён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
+  await flushPersistDebugState('translatePage:before-save');
   await saveTranslationsToMemory(activeTranslationEntries);
 }
 
@@ -2037,40 +2047,78 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
   await saveTranslationDebugInfo(location.href, debugState);
 }
 
-async function persistDebugState() {
+function schedulePersistDebugState(reason = '') {
   if (!debugState) return;
-  debugState.updatedAt = Date.now();
-  debugState.items = debugEntries;
-  await saveTranslationDebugInfo(location.href, debugState);
+  debugPersistDirty = true;
+  const now = Date.now();
+  if (now - debugLastPersistAt > DEBUG_PERSIST_MAX_INTERVAL_MS) {
+    if (debugPersistTimer) {
+      clearTimeout(debugPersistTimer);
+      debugPersistTimer = null;
+    }
+    void flushPersistDebugState(`max-interval:${reason}`);
+    return;
+  }
+  if (debugPersistTimer) return;
+  debugPersistTimer = setTimeout(() => {
+    debugPersistTimer = null;
+    void flushPersistDebugState(`debounce:${reason}`);
+  }, DEBUG_PERSIST_DEBOUNCE_MS);
 }
 
-async function updateDebugContext(context, status) {
+async function flushPersistDebugState(reason = '') {
+  if (!debugState) return;
+  if (debugPersistTimer) {
+    clearTimeout(debugPersistTimer);
+    debugPersistTimer = null;
+  }
+  if (debugPersistInFlight) {
+    debugPersistDirty = true;
+    return;
+  }
+  debugPersistInFlight = true;
+  debugPersistDirty = false;
+  debugState.updatedAt = Date.now();
+  debugState.items = debugEntries;
+  try {
+    await saveTranslationDebugInfo(location.href, debugState);
+  } finally {
+    debugPersistInFlight = false;
+    debugLastPersistAt = Date.now();
+  }
+  if (debugPersistDirty) {
+    debugPersistDirty = false;
+    await flushPersistDebugState(`dirty:${reason}`);
+  }
+}
+
+function updateDebugContext(context, status) {
   if (!debugState) return;
   debugState.context = typeof context === 'string' ? context : debugState.context || '';
   if (status) {
     debugState.contextStatus = status;
   }
-  await persistDebugState();
+  schedulePersistDebugState('updateDebugContext');
 }
 
-async function updateDebugContextStatus(status) {
+function updateDebugContextStatus(status) {
   if (!debugState) return;
   debugState.contextStatus = status;
-  await persistDebugState();
+  schedulePersistDebugState('updateDebugContextStatus');
 }
 
-async function updateDebugEntry(index, updates = {}) {
+function updateDebugEntry(index, updates = {}) {
   const entry = debugEntries.find((item) => item.index === index);
   if (!entry) return;
   Object.assign(entry, updates);
-  await persistDebugState();
+  schedulePersistDebugState('updateDebugEntry');
 }
 
-async function incrementDebugAiRequestCount() {
+function incrementDebugAiRequestCount() {
   if (!debugState) return;
   const currentCount = Number.isFinite(debugState.aiRequestCount) ? debugState.aiRequestCount : 0;
   debugState.aiRequestCount = currentCount + 1;
-  await persistDebugState();
+  schedulePersistDebugState('aiRequestCount');
 }
 
 async function getTranslationsObject() {
@@ -2117,6 +2165,7 @@ function restoreOriginal(entries) {
 
 async function cancelTranslation() {
   cancelRequested = true;
+  await flushPersistDebugState('cancelTranslation');
   const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
   if (entriesToRestore.length) {
     restoreOriginal(entriesToRestore);
