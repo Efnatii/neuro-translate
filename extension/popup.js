@@ -4,6 +4,7 @@ const contextModelSelect = document.getElementById('contextModel');
 const proofreadModelSelect = document.getElementById('proofreadModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
+const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
 const blockLengthLimitInput = document.getElementById('blockLengthLimit');
 const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
@@ -70,6 +71,7 @@ async function init() {
         proofreadModel: state.proofreadModel,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
+        singleBlockConcurrency: state.singleBlockConcurrency,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByModel: state.tpmLimitsByModel,
         outputRatioByRole: state.outputRatioByRole,
@@ -94,6 +96,7 @@ async function init() {
   };
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
+  renderSingleBlockConcurrency(state.singleBlockConcurrency);
   renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   updateCanShowTranslation(currentTranslationStatus);
@@ -111,6 +114,7 @@ async function init() {
   proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
+  singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
   cancelButton.addEventListener('click', sendCancel);
@@ -176,6 +180,16 @@ async function handleProofreadEnabledChange() {
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
+async function handleSingleBlockConcurrencyChange() {
+  const singleBlockConcurrency = singleBlockConcurrencyCheckbox.checked;
+  await chrome.storage.local.set({ singleBlockConcurrency });
+  setTemporaryStatus(
+    singleBlockConcurrency
+      ? 'Ограничение параллельности включено.'
+      : 'Ограничение параллельности отключено.'
+  );
+}
+
 async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
   await chrome.storage.local.set({ blockLengthLimit });
@@ -200,6 +214,7 @@ async function getState() {
         'proofreadModel',
         'contextGenerationEnabled',
         'proofreadEnabled',
+        'singleBlockConcurrency',
         'blockLengthLimit',
         'chunkLengthLimit',
         'translationStatusByTab',
@@ -237,6 +252,7 @@ async function getState() {
         proofreadModel,
         contextGenerationEnabled: data.contextGenerationEnabled,
         proofreadEnabled: data.proofreadEnabled,
+        singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
         blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {},
@@ -270,6 +286,10 @@ function renderContextGeneration(enabled) {
 
 function renderProofreadEnabled(enabled) {
   proofreadEnabledCheckbox.checked = Boolean(enabled);
+}
+
+function renderSingleBlockConcurrency(enabled) {
+  singleBlockConcurrencyCheckbox.checked = Boolean(enabled);
 }
 
 function renderBlockLengthLimit(limit) {

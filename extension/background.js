@@ -26,6 +26,7 @@ const DEFAULT_STATE = {
   proofreadModel: 'gpt-4.1-mini',
   contextGenerationEnabled: false,
   proofreadEnabled: false,
+  singleBlockConcurrency: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -43,6 +44,7 @@ const STATE_CACHE_KEYS = new Set([
   'proofreadModel',
   'contextGenerationEnabled',
   'proofreadEnabled',
+  'singleBlockConcurrency',
   'blockLengthLimit',
   'tpmLimitsByModel',
   'outputRatioByRole',
@@ -189,7 +191,7 @@ function applyStatePatch(patch = {}) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
     }
-    if (['contextGenerationEnabled', 'proofreadEnabled'].includes(key)) {
+    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency'].includes(key)) {
       next[key] = Boolean(value);
       continue;
     }
@@ -604,6 +606,7 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModel: DEFAULT_STATE.proofreadModel,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
           translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -645,6 +648,7 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModel: state.proofreadModel,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
+        singleBlockConcurrency: state.singleBlockConcurrency,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByRole,
         outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -666,6 +670,7 @@ async function handleGetSettings(message, sendResponse) {
       proofreadModel: DEFAULT_STATE.proofreadModel,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
         translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -687,6 +692,7 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModel: DEFAULT_STATE.proofreadModel,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
           translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),

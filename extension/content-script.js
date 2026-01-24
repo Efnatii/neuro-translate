@@ -76,6 +76,7 @@ const DEFAULT_STATE = {
   proofreadModel: 'gpt-4.1-mini',
   contextGenerationEnabled: false,
   proofreadEnabled: false,
+  singleBlockConcurrency: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -273,6 +274,7 @@ function buildSettingsFromState(state) {
       proofreadModel: DEFAULT_STATE.proofreadModel,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
         translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -302,6 +304,7 @@ function buildSettingsFromState(state) {
     proofreadModel: state.proofreadModel,
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
+    singleBlockConcurrency: Boolean(state.singleBlockConcurrency),
     blockLengthLimit: state.blockLengthLimit,
     tpmLimitsByRole,
     outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -521,7 +524,8 @@ async function translatePage(settings) {
 
   const averageBlockLength = blocks.length ? Math.round(textStats.totalLength / blocks.length) : 0;
   const initialConcurrency = selectInitialConcurrency(averageBlockLength, blocks.length);
-  const maxAllowedConcurrency = Math.max(1, Math.min(6, blocks.length));
+  const singleBlockConcurrency = Boolean(settings.singleBlockConcurrency);
+  let maxAllowedConcurrency = Math.max(1, Math.min(6, blocks.length));
   const requestDurations = [];
   let dynamicMaxConcurrency = initialConcurrency;
   let activeTranslationWorkers = 0;
@@ -531,7 +535,13 @@ async function translatePage(settings) {
   const proofreadQueue = [];
   const translationQueueKeys = new Set();
   const proofreadQueueKeys = new Set();
-  const proofreadConcurrency = Math.max(1, Math.min(4, blocks.length));
+  let proofreadConcurrency = Math.max(1, Math.min(4, blocks.length));
+
+  if (singleBlockConcurrency) {
+    maxAllowedConcurrency = 1;
+    dynamicMaxConcurrency = 1;
+    proofreadConcurrency = 1;
+  }
 
   const getBlockKey = (block) =>
     block
