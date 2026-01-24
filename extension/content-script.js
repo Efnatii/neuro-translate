@@ -800,9 +800,68 @@ async function translatePage(settings) {
     }
   };
 
+  let proofreadSelfCheckCompleted = false;
+
+  function runProofreadSelfCheck() {
+    if (proofreadSelfCheckCompleted) return;
+    proofreadSelfCheckCompleted = true;
+    try {
+      const original = 'Hello';
+      const translated = 'Привет';
+      const proofread = 'Здравствуйте';
+      const mockEntry = {
+        path: [0],
+        original,
+        originalHash: getOriginalHash(original, null),
+        translated
+      };
+      const mockNode = { nodeValue: translated, nodeType: Node.TEXT_NODE, isConnected: true };
+      const applyAllowed = shouldApplyProofreadTranslation(mockNode, mockEntry, original);
+      if (applyAllowed) {
+        mockNode.nodeValue = proofread;
+      }
+      const userChangedNode = { nodeValue: 'Мой текст', nodeType: Node.TEXT_NODE, isConnected: true };
+      const shouldBlock = shouldApplyProofreadTranslation(userChangedNode, mockEntry, original);
+      console.debug('Neuro Translate proofread self-check', {
+        applied: mockNode.nodeValue === proofread,
+        blocked: !shouldBlock
+      });
+    } catch (error) {
+      console.debug('Neuro Translate proofread self-check failed', error);
+    }
+  }
+
+  function getActiveTranslationEntry(path, original, originalHash) {
+    const entry = activeTranslationEntries.find((item) => isSamePath(item.path, path));
+    if (!entry) return null;
+    const resolvedOriginalHash = getOriginalHash(original, originalHash);
+    if (
+      Number.isFinite(resolvedOriginalHash) &&
+      Number.isFinite(entry.originalHash) &&
+      entry.originalHash !== resolvedOriginalHash
+    ) {
+      return null;
+    }
+    return entry;
+  }
+
+  function shouldApplyProofreadTranslation(node, entry, original) {
+    if (!node || node.nodeType !== Node.TEXT_NODE || !node.isConnected) return false;
+    if (!entry) return false;
+    const currentText = node.nodeValue ?? '';
+    const storedOriginal = typeof entry.original === 'string' ? entry.original : original;
+    const storedTranslated = typeof entry.translated === 'string' ? entry.translated : '';
+    return currentText === storedTranslated || currentText === storedOriginal;
+  }
+
   function updatePageWithProofreading(task, finalTranslations) {
+    runProofreadSelfCheck();
+    let skipped = 0;
+    let applied = 0;
     task.block.forEach(({ node, path, original, originalHash }, index) => {
-      if (!shouldApplyTranslation(node, original, originalHash)) {
+      const entry = getActiveTranslationEntry(path, original, originalHash);
+      if (!shouldApplyProofreadTranslation(node, entry, original)) {
+        skipped += 1;
         return;
       }
       const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
@@ -810,7 +869,14 @@ async function translatePage(settings) {
         node.nodeValue = withOriginalFormatting;
       }
       updateActiveEntry(path, original, withOriginalFormatting, originalHash);
+      applied += 1;
     });
+    if (skipped > 0 && applied === 0) {
+      console.info('Proofread skipped: DOM text no longer matches stored translation.', {
+        blockIndex: task?.index != null ? task.index + 1 : undefined,
+        skipped
+      });
+    }
   }
 
   blocks.forEach((block, index) => {
