@@ -130,7 +130,7 @@ function invokeSettingsAsPromise(handler, message, timeoutMs = 1500) {
   });
 }
 
-function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
+function storageLocalGet(keysOrDefaults, timeoutMs = 2200) {
   return new Promise((resolve, reject) => {
     let hasCompleted = false;
     const timeoutId = setTimeout(() => {
@@ -159,7 +159,7 @@ function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
   });
 }
 
-function storageLocalSet(items, timeoutMs = 1500) {
+function storageLocalSet(items, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     let hasCompleted = false;
     const timeoutId = setTimeout(() => {
@@ -273,7 +273,9 @@ async function getState() {
     return { ...DEFAULT_STATE, ...STATE_CACHE };
   } catch (error) {
     console.warn('Failed to load state from storage, using defaults.', error);
-    applyStatePatch(DEFAULT_STATE);
+    if (STATE_CACHE_READY && STATE_CACHE && typeof STATE_CACHE === 'object') {
+      return { ...DEFAULT_STATE, ...STATE_CACHE };
+    }
     return { ...DEFAULT_STATE };
   }
 }
@@ -286,9 +288,29 @@ async function saveState(partial) {
   return next;
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
-  await saveState({});
-  await warmUpContentScripts('installed');
+async function ensureDefaultKeysOnFreshInstall() {
+  const stored = await storageLocalGet({});
+  const safeStored = stored && typeof stored === 'object' ? stored : {};
+  const patch = {};
+  for (const [key, value] of Object.entries(DEFAULT_STATE)) {
+    if (safeStored[key] === undefined) {
+      patch[key] = value;
+    }
+  }
+  if (Object.keys(patch).length > 0) {
+    await storageLocalSet(patch);
+  }
+  applyStatePatch({ ...DEFAULT_STATE, ...safeStored, ...patch });
+}
+
+chrome.runtime.onInstalled.addListener(async (details) => {
+  const reason = details?.reason;
+  if (reason === 'install') {
+    await ensureDefaultKeysOnFreshInstall();
+  } else {
+    await getState();
+  }
+  await warmUpContentScripts(reason || 'installed');
 });
 
 chrome.runtime.onStartup.addListener(async () => {
