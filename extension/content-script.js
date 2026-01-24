@@ -937,6 +937,7 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
     if (Array.isArray(batchResult.debug)) {
       debugParts.push(...batchResult.debug);
     }
+    recordAiResponseMetrics(batchResult?.debug || []);
   }
 
   return {
@@ -981,6 +982,7 @@ async function requestProofreading(payload) {
         }
         throw new Error(response?.error || 'Не удалось выполнить вычитку.');
       }
+      recordAiResponseMetrics(response?.debug || []);
       return {
         success: true,
         translations: Array.isArray(response.translations) ? response.translations : [],
@@ -1318,6 +1320,7 @@ async function requestTranslationContext(text, targetLanguage) {
     }
     throw new Error(response?.error || 'Не удалось сгенерировать контекст.');
   }
+  recordAiResponseMetrics(response?.debug || []);
   return response.context || '';
 }
 
@@ -2019,6 +2022,8 @@ async function resetTranslationDebugInfo(url) {
     contextStatus,
     items: [],
     aiRequestCount: 0,
+    aiResponseCount: 0,
+    totalCostUsd: 0,
     updatedAt: Date.now()
   };
   await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
@@ -2052,6 +2057,8 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     contextStatus: initialContextStatus,
     items: debugEntries,
     aiRequestCount: 0,
+    aiResponseCount: 0,
+    totalCostUsd: 0,
     updatedAt: Date.now()
   };
   await saveTranslationDebugInfo(location.href, debugState);
@@ -2129,6 +2136,21 @@ function incrementDebugAiRequestCount() {
   const currentCount = Number.isFinite(debugState.aiRequestCount) ? debugState.aiRequestCount : 0;
   debugState.aiRequestCount = currentCount + 1;
   schedulePersistDebugState('aiRequestCount');
+}
+
+function recordAiResponseMetrics(debugPayloads) {
+  if (!debugState) return;
+  if (!Array.isArray(debugPayloads) || !debugPayloads.length) return;
+  const currentCount = Number.isFinite(debugState.aiResponseCount) ? debugState.aiResponseCount : 0;
+  debugState.aiResponseCount = currentCount + debugPayloads.length;
+  let totalCostUsd = Number.isFinite(debugState.totalCostUsd) ? debugState.totalCostUsd : 0;
+  debugPayloads.forEach((payload) => {
+    if (Number.isFinite(payload?.costUsd)) {
+      totalCostUsd += payload.costUsd;
+    }
+  });
+  debugState.totalCostUsd = totalCostUsd;
+  schedulePersistDebugState('aiResponseMetrics');
 }
 
 async function getTranslationsObject() {

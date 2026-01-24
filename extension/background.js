@@ -741,14 +741,14 @@ async function handleGenerateContext(message, sendResponse) {
       return;
     }
 
-    const context = await generateTranslationContext(
+    const { context, debug } = await generateTranslationContext(
       message.text,
       apiKey,
       message.targetLanguage,
       state.contextModel,
       apiBaseUrl
     );
-    sendResponse({ success: true, context });
+    sendResponse({ success: true, context, debug });
   } catch (error) {
     console.error('Context generation failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });

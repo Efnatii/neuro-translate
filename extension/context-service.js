@@ -5,7 +5,7 @@ async function generateTranslationContext(
   model,
   apiBaseUrl = OPENAI_API_URL
 ) {
-  if (!text?.trim()) return '';
+  if (!text?.trim()) return { context: '', debug: [] };
 
   const prompt = applyPromptCaching([
     {
@@ -79,16 +79,18 @@ async function generateTranslationContext(
     }
   ], apiBaseUrl);
 
+  const requestPayload = {
+    model,
+    messages: prompt
+  };
+  const startedAt = Date.now();
   const response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify({
-      model,
-      messages: prompt
-    })
+    body: JSON.stringify(requestPayload)
   });
 
   if (!response.ok) {
@@ -102,5 +104,22 @@ async function generateTranslationContext(
     throw new Error('No context returned');
   }
 
-  return typeof content === 'string' ? content.trim() : '';
+  const latencyMs = Date.now() - startedAt;
+  const usage = normalizeUsage(data?.usage);
+  const costUsd = calculateUsageCost(usage, model);
+  const trimmed = typeof content === 'string' ? content.trim() : '';
+  const debugPayload = {
+    phase: 'CONTEXT',
+    model,
+    latencyMs,
+    usage,
+    costUsd,
+    inputChars: text.length,
+    outputChars: trimmed.length,
+    request: requestPayload,
+    response: content,
+    parseIssues: []
+  };
+
+  return { context: trimmed, debug: [debugPayload] };
 }
