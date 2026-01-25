@@ -526,14 +526,12 @@ async function translatePage(settings) {
   }
 
   if (translationError) {
-    finalizePendingDebugEntries('failed');
     await flushPersistDebugState('translatePage:error');
     reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, 0);
     return;
   }
 
   if (cancelRequested) {
-    finalizePendingDebugEntries('cancelled');
     await flushPersistDebugState('translatePage:cancelled');
     reportProgress('Перевод отменён', translationProgress.completedBlocks, blocks.length, 0);
     return;
@@ -571,9 +569,6 @@ async function translatePage(settings) {
   };
 
   const enqueueProofreadTask = (task) => {
-    if (cancelRequested) {
-      return false;
-    }
     if (!task?.key || proofreadQueueKeys.has(task.key)) {
       return false;
     }
@@ -583,7 +578,6 @@ async function translatePage(settings) {
   };
 
   const translationWorker = async () => {
-    if (cancelRequested) return;
     while (true) {
       if (cancelRequested) return;
       const queuedItem = translationQueue.shift();
@@ -716,7 +710,6 @@ async function translatePage(settings) {
   };
 
   const proofreadWorker = async () => {
-    if (cancelRequested) return;
     while (true) {
       if (cancelRequested) return;
       const task = proofreadQueue.shift();
@@ -925,14 +918,12 @@ async function translatePage(settings) {
   await Promise.allSettled([...proofreadWorkers, translationCompletion]);
 
   if (translationError) {
-    finalizePendingDebugEntries('failed');
     await flushPersistDebugState('translatePage:error');
     reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
   if (cancelRequested) {
-    finalizePendingDebugEntries('cancelled');
     await flushPersistDebugState('translatePage:cancelled');
     reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
@@ -2296,32 +2287,6 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
   await saveTranslationDebugInfo(location.href, debugState);
 }
 
-function finalizePendingDebugEntries(finalStatus) {
-  if (!Array.isArray(debugEntries) || !debugEntries.length) return false;
-  const terminalStatuses = new Set(['done', 'failed', 'disabled', 'cancelled']);
-  let updated = false;
-  debugEntries.forEach((entry) => {
-    if (!entry) return;
-    if (!terminalStatuses.has(entry.translationStatus)) {
-      entry.translationStatus = finalStatus;
-      updated = true;
-    }
-    const proofreadApplied = entry.proofreadApplied !== false;
-    if (!proofreadApplied) {
-      if (entry.proofreadStatus !== 'disabled') {
-        entry.proofreadStatus = 'disabled';
-        updated = true;
-      }
-      return;
-    }
-    if (!terminalStatuses.has(entry.proofreadStatus)) {
-      entry.proofreadStatus = finalStatus;
-      updated = true;
-    }
-  });
-  return updated;
-}
-
 function schedulePersistDebugState(reason = '') {
   if (!debugState) return;
   debugPersistDirty = true;
@@ -2350,11 +2315,6 @@ async function flushPersistDebugState(reason = '') {
   if (debugPersistInFlight) {
     debugPersistDirty = true;
     return;
-  }
-  if (translationError) {
-    finalizePendingDebugEntries('failed');
-  } else if (cancelRequested) {
-    finalizePendingDebugEntries('cancelled');
   }
   debugPersistInFlight = true;
   debugPersistDirty = false;
