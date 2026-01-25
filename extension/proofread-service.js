@@ -23,14 +23,38 @@ const PROOFREAD_SYSTEM_PROMPT = [
   'If a segment does not need edits, return the original text unchanged.'
 ].join(' ');
 
+function normalizeContextPayload(context) {
+  if (!context) {
+    return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
+  }
+  if (typeof context === 'string') {
+    return { text: context, mode: '', baseAnswer: '', baseAnswerIncluded: false };
+  }
+  if (typeof context === 'object') {
+    return {
+      text: context.text || context.contextText || '',
+      mode: context.mode || context.contextMode || '',
+      baseAnswer: context.baseAnswer || '',
+      baseAnswerIncluded: Boolean(context.baseAnswerIncluded)
+    };
+  }
+  return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
+}
+
 function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const items = Array.isArray(input?.items) ? input.items : [];
   const sourceBlock = input?.sourceBlock ?? '';
   const translatedBlock = input?.translatedBlock ?? '';
   const language = input?.language ?? '';
-  const context = input?.context ?? '';
+  const normalizedContext = normalizeContextPayload(input?.context);
+  const contextText = normalizedContext.text || '';
+  const contextMode = normalizedContext.mode === 'SHORT' ? 'SHORT' : 'FULL';
+  const baseAnswerText =
+    normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer
+      ? `PREVIOUS BASE ANSWER (FULL): <<<BASE_ANSWER_START>>>${normalizedContext.baseAnswer}<<<BASE_ANSWER_END>>>`
+      : '';
 
-  return [
+  const messages = [
     {
       role: 'system',
       content: [
@@ -44,23 +68,44 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
         .filter(Boolean)
         .join(' ')
     },
-    {
+  ];
+
+  if (contextText) {
+    messages.push({
       role: 'user',
       content: [
         language ? `Target language: ${language}` : '',
-        context ? `Context: <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>` : '',
-        sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
-        translatedBlock
-          ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`
-          : '',
-        `Expected items count: ${items.length}.`,
-        'Segments to proofread (JSON array of {id, text}):',
-        JSON.stringify(items)
+        `Context (${contextMode}): <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
       ]
         .filter(Boolean)
         .join('\n')
-    }
-  ];
+    });
+  }
+
+  if (baseAnswerText) {
+    messages.push({
+      role: 'assistant',
+      content: baseAnswerText
+    });
+  }
+
+  messages.push({
+    role: 'user',
+    content: [
+      language ? `Target language: ${language}` : '',
+      sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
+      translatedBlock
+        ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`
+        : '',
+      `Expected items count: ${items.length}.`,
+      'Segments to proofread (JSON array of {id, text}):',
+      JSON.stringify(items)
+    ]
+      .filter(Boolean)
+      .join('\n')
+  });
+
+  return messages;
 }
 
 async function proofreadTranslation(

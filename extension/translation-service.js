@@ -30,6 +30,86 @@ function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
 }
 
+function normalizeContextPayload(context) {
+  if (!context) {
+    return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
+  }
+  if (typeof context === 'string') {
+    return { text: context, mode: '', baseAnswer: '', baseAnswerIncluded: false };
+  }
+  if (typeof context === 'object') {
+    return {
+      text: context.text || context.contextText || '',
+      mode: context.mode || context.contextMode || '',
+      baseAnswer: context.baseAnswer || '',
+      baseAnswerIncluded: Boolean(context.baseAnswerIncluded)
+    };
+  }
+  return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
+}
+
+function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload, strictTargetLanguage }) {
+  const normalizedContext = normalizeContextPayload(contextPayload);
+  const contextText = normalizedContext.text || '';
+  const contextMode = normalizedContext.mode === 'SHORT' ? 'SHORT' : 'FULL';
+  const hasContext = Boolean(contextText);
+  const baseAnswerText =
+    normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer
+      ? `PREVIOUS BASE ANSWER (FULL): <<<BASE_ANSWER_START>>>${normalizedContext.baseAnswer}<<<BASE_ANSWER_END>>>`
+      : '';
+
+  const messages = [
+    {
+      role: 'system',
+      content: [
+        TRANSLATE_SYSTEM_PROMPT,
+        strictTargetLanguage
+          ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
+          : null,
+        `Target language: ${targetLanguage}.`
+      ]
+        .filter(Boolean)
+        .join(' ')
+    }
+  ];
+
+  if (hasContext) {
+    messages.push({
+      role: 'user',
+      content: [
+        `Target language: ${targetLanguage}.`,
+        `Page ${contextMode} context: <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
+      ]
+        .filter(Boolean)
+        .join('\n')
+    });
+  }
+
+  if (baseAnswerText) {
+    messages.push({
+      role: 'assistant',
+      content: baseAnswerText
+    });
+  }
+
+  messages.push({
+    role: 'user',
+    content: [
+      `Target language: ${targetLanguage}.`,
+      `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items in the same order as provided.`,
+      'Do not add commentary.',
+      'Segments:',
+      '<<<SEGMENTS_START>>>',
+      ...tokenizedTexts.map((text) => text),
+      '<<<SEGMENTS_END>>>'
+    ]
+      .filter(Boolean)
+      .join('\n')
+  });
+
+  return messages;
+}
+
 async function translateTexts(
   texts,
   apiKey,
@@ -170,37 +250,24 @@ async function performTranslationRequest(
   allowLengthRetry = true
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
-  const inputChars = tokenizedTexts.reduce((sum, text) => sum + (text?.length || 0), 0) + (context?.length || 0);
+  const normalizedContext = normalizeContextPayload(context);
+  const contextText = normalizedContext.text || '';
+  const baseAnswerText =
+    normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer ? normalizedContext.baseAnswer : '';
+  const inputChars =
+    tokenizedTexts.reduce((sum, text) => sum + (text?.length || 0), 0) +
+    (contextText?.length || 0) +
+    (baseAnswerText?.length || 0);
 
-  const prompt = applyPromptCaching([
-    {
-      role: 'system',
-      content: [
-        TRANSLATE_SYSTEM_PROMPT,
-        strictTargetLanguage
-          ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
-          : null,
-        `Target language: ${targetLanguage}.`
-      ]
-        .filter(Boolean)
-        .join(' ')
-    },
-    {
-      role: 'user',
-      content: [
-        `Target language: ${targetLanguage}.`,
-        context ? `Page context: <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>` : '',
-        `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items in the same order as provided.`,
-        'Do not add commentary.',
-        'Segments:',
-        '<<<SEGMENTS_START>>>',
-        ...tokenizedTexts.map((text) => text),
-        '<<<SEGMENTS_END>>>'
-      ]
-        .filter(Boolean)
-        .join('\n')
-    }
-  ], apiBaseUrl);
+  const prompt = applyPromptCaching(
+    buildTranslationPrompt({
+      tokenizedTexts,
+      targetLanguage,
+      contextPayload: normalizedContext,
+      strictTargetLanguage
+    }),
+    apiBaseUrl
+  );
 
   const requestPayload = {
     model,

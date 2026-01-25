@@ -61,7 +61,7 @@ const CONTEXT_SYSTEM_PROMPT = [
 ].join('\n');
 const SHORT_CONTEXT_SYSTEM_PROMPT = [
   'You are a translation context summarizer.',
-  'Condense the provided full translation context into a short, high-signal brief.',
+  'Generate a short, high-signal translation context from the provided text.',
   'Keep it concise and factual; no fluff, no repetition.',
   'Preserve key terminology, ambiguity notes, and style guidance.',
   'Output plain text only (no JSON, no code).',
@@ -175,13 +175,13 @@ async function generateTranslationContext(
 }
 
 async function generateShortTranslationContext(
-  fullContext,
+  text,
   apiKey,
   targetLanguage = 'ru',
   model,
   apiBaseUrl = OPENAI_API_URL
 ) {
-  if (!fullContext?.trim()) return { context: '', debug: [] };
+  if (!text?.trim()) return { context: '', debug: [] };
 
   const prompt = applyPromptCaching([
     {
@@ -192,10 +192,10 @@ async function generateShortTranslationContext(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Summarize the full context into a short, actionable brief.',
+        'Generate a short, actionable translation context from the source text.',
         'Keep it compact and useful for translation disambiguation.',
-        'Full context:',
-        fullContext
+        'Text:',
+        text
       ].join('\n')
     }
   ], apiBaseUrl);
@@ -266,7 +266,7 @@ async function generateShortTranslationContext(
     model,
     latencyMs,
     usage,
-    inputChars: fullContext.length,
+    inputChars: text.length,
     outputChars: trimmed.length,
     request: requestPayload,
     response: content,
