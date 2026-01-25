@@ -15,7 +15,6 @@ const STATUS_CONFIG = {
 let sourceUrl = '';
 let refreshTimer = null;
 let throughputTimer = null;
-let lastThroughputCheckAt = 0;
 const proofreadUiState = new Map();
 const THROUGHPUT_REFRESH_INTERVAL_MS = 15000;
 
@@ -127,10 +126,24 @@ async function getThroughputSummary() {
         const translationInfo = translationModel ? modelThroughputById?.[translationModel] : null;
         const contextInfo = contextModel ? modelThroughputById?.[contextModel] : null;
         const proofreadInfo = proofreadModel ? modelThroughputById?.[proofreadModel] : null;
+        const infos = [translationInfo, contextInfo, proofreadInfo];
         const formatTps = (info) => {
           return Number.isFinite(info?.tokensPerSecond) ? Number(info.tokensPerSecond).toFixed(1) : '—';
         };
-        resolve(`TPS: T=${formatTps(translationInfo)} C=${formatTps(contextInfo)} P=${formatTps(proofreadInfo)}`);
+        const hasData = infos.some((info) => Number.isFinite(info?.tokensPerSecond));
+        if (!hasData) {
+          resolve('—');
+          return;
+        }
+        const lastCheckedAt = infos
+          .map((info) => (Number.isFinite(info?.timestamp) ? info.timestamp : 0))
+          .reduce((max, value) => Math.max(max, value), 0);
+        const lastCheckedLabel = lastCheckedAt
+          ? ` • Проверено: ${new Date(lastCheckedAt).toLocaleString('ru-RU')}`
+          : '';
+        resolve(
+          `TPS: T=${formatTps(translationInfo)} C=${formatTps(contextInfo)} P=${formatTps(proofreadInfo)}${lastCheckedLabel}`
+        );
       }
     );
   });
@@ -201,30 +214,6 @@ async function refreshDebug() {
   }
 
   renderDebug(sourceUrl, debugData, throughputSummary);
-  requestThroughputCheck();
-}
-
-async function requestThroughputCheck() {
-  if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage || !chrome.storage?.local) {
-    return;
-  }
-  const now = Date.now();
-  if (now - lastThroughputCheckAt < THROUGHPUT_REFRESH_INTERVAL_MS) {
-    return;
-  }
-  lastThroughputCheckAt = now;
-  const data = await new Promise((resolve) => {
-    chrome.storage.local.get(['translationModel', 'contextModel', 'proofreadModel'], (stored) => resolve(stored));
-  });
-  [data?.translationModel, data?.contextModel, data?.proofreadModel].forEach((model) => {
-    if (model) {
-      chrome.runtime.sendMessage({ type: 'RUN_MODEL_THROUGHPUT_TEST', model }, () => {
-        if (chrome.runtime.lastError) {
-          console.debug('Failed to request throughput test.', chrome.runtime.lastError.message);
-        }
-      });
-    }
-  });
 }
 
 function renderEmpty(message, throughputSummary = '') {

@@ -53,8 +53,15 @@ const STATE_CACHE_KEYS = new Set([
 ]);
 
 const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
+const MODEL_THROUGHPUT_TEST_THROTTLE_MS = 2 * 60 * 1000;
+const TRANSLATION_ACTIVITY_GRACE_MS = 45000;
+const THROUGHPUT_CHECK_INTERVAL_MS = 30000;
 const CONTENT_READY_BY_TAB = new Map();
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
+const ACTIVE_TRANSLATION_TABS = new Map();
+const LAST_THROUGHPUT_REQUEST_BY_MODEL = new Map();
+let lastThroughputScheduleAt = 0;
+let throughputTestInFlight = false;
 
 function invokeHandlerAsPromise(handler, message, timeoutMs = 240000) {
   return new Promise((resolve) => {
@@ -554,7 +561,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   CONTENT_READY_BY_TAB.delete(tabId);
+  ACTIVE_TRANSLATION_TABS.delete(tabId);
 });
+
+setInterval(() => {
+  maybeTriggerThroughputTests('timer');
+}, THROUGHPUT_CHECK_INTERVAL_MS);
 
 async function warmUpContentScripts(reason) {
   try {
@@ -820,6 +832,163 @@ async function handleModelThroughputTest(message, sendResponse) {
   }
 }
 
+async function runModelThroughputTest(apiKey, model, apiBaseUrl = OPENAI_API_URL) {
+  if (!apiKey) {
+    throw new Error('API key is missing.');
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), MODEL_THROUGHPUT_TEST_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const requestPayload = {
+      model,
+      messages: [
+        {
+          role: 'system',
+          content: 'You output plain text only.'
+        },
+        {
+          role: 'user',
+          content: 'Generate 200 tokens of random English words. Output only the words.'
+        }
+      ],
+      max_tokens: 200,
+      temperature: 0.3
+    };
+    const response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(requestPayload),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Throughput request failed: ${response.status} ${errorText}`);
+    }
+    const data = await response.json();
+    const endedAt = Date.now();
+    const durationMs = Math.max(1, endedAt - startedAt);
+    const usage = normalizeUsage(data?.usage);
+    let completionTokens = Number(usage?.completion_tokens);
+    if (!Number.isFinite(completionTokens) || completionTokens <= 0) {
+      const content = data?.choices?.[0]?.message?.content || '';
+      completionTokens = Math.max(1, Math.round(content.length / 4));
+    }
+    const tokensPerSecond = completionTokens / (durationMs / 1000);
+    return {
+      success: true,
+      model,
+      durationMs,
+      tokensPerSecond: Number.isFinite(tokensPerSecond) ? tokensPerSecond : null,
+      completionTokens: Number.isFinite(completionTokens) ? completionTokens : null,
+      totalTokens: Number.isFinite(usage?.total_tokens) ? usage.total_tokens : null,
+      timestamp: Date.now()
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function saveModelThroughputResult(model, result) {
+  if (!model) return;
+  const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
+  modelThroughputById[model] = {
+    ...result,
+    model,
+    timestamp: Number.isFinite(result?.timestamp) ? result.timestamp : Date.now()
+  };
+  await storageLocalSet({ modelThroughputById });
+}
+
+function isTranslationActive(status) {
+  if (!status) return false;
+  const completedBlocks = status.completedBlocks ?? status.completedChunks ?? 0;
+  const totalBlocks = status.totalBlocks ?? status.totalChunks ?? 0;
+  const inProgressBlocks = status.inProgressBlocks ?? status.inProgressChunks ?? 0;
+  if (!totalBlocks) return false;
+  return completedBlocks < totalBlocks || inProgressBlocks > 0;
+}
+
+function trackTranslationActivity(tabId, status) {
+  if (!tabId) return;
+  if (isTranslationActive(status)) {
+    ACTIVE_TRANSLATION_TABS.set(tabId, { lastProgressAt: Date.now() });
+  } else {
+    ACTIVE_TRANSLATION_TABS.delete(tabId);
+  }
+}
+
+function hasActiveTranslations(now) {
+  let hasActive = false;
+  ACTIVE_TRANSLATION_TABS.forEach((value, tabId) => {
+    if (!value || now - value.lastProgressAt > TRANSLATION_ACTIVITY_GRACE_MS) {
+      ACTIVE_TRANSLATION_TABS.delete(tabId);
+      return;
+    }
+    hasActive = true;
+  });
+  return hasActive;
+}
+
+function shouldRunThroughputTest(model, previousInfo, now) {
+  if (!model) return false;
+  const lastRequestedAt = LAST_THROUGHPUT_REQUEST_BY_MODEL.get(model) || 0;
+  const lastStoredAt = Number.isFinite(previousInfo?.timestamp) ? previousInfo.timestamp : 0;
+  const lastKnownAt = Math.max(lastRequestedAt, lastStoredAt);
+  return now - lastKnownAt >= MODEL_THROUGHPUT_TEST_THROTTLE_MS;
+}
+
+async function runPeriodicThroughputTests(reason) {
+  if (throughputTestInFlight) return;
+  throughputTestInFlight = true;
+  try {
+    const state = await getState();
+    const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
+    const modelsToTest = new Set();
+    if (state.translationModel) modelsToTest.add(state.translationModel);
+    if (state.contextGenerationEnabled && state.contextModel) modelsToTest.add(state.contextModel);
+    if (state.proofreadEnabled && state.proofreadModel) modelsToTest.add(state.proofreadModel);
+
+    const now = Date.now();
+    for (const model of modelsToTest) {
+      if (!shouldRunThroughputTest(model, modelThroughputById[model], now)) {
+        continue;
+      }
+      const { apiKey, apiBaseUrl } = getApiConfigForModel(model, state);
+      if (!apiKey) {
+        continue;
+      }
+      LAST_THROUGHPUT_REQUEST_BY_MODEL.set(model, now);
+      try {
+        const result = await runModelThroughputTest(apiKey, model, apiBaseUrl);
+        await saveModelThroughputResult(model, result);
+      } catch (error) {
+        const failure = {
+          success: false,
+          error: error?.message || 'Throughput test failed',
+          timestamp: Date.now(),
+          model,
+          reason
+        };
+        await saveModelThroughputResult(model, failure);
+      }
+    }
+  } finally {
+    throughputTestInFlight = false;
+  }
+}
+
+function maybeTriggerThroughputTests(reason) {
+  const now = Date.now();
+  if (!hasActiveTranslations(now)) return;
+  if (now - lastThroughputScheduleAt < THROUGHPUT_CHECK_INTERVAL_MS) return;
+  lastThroughputScheduleAt = now;
+  void runPeriodicThroughputTests(reason);
+}
+
 async function handleTranslationProgress(message, sender) {
   const tabId = sender?.tab?.id;
   if (!tabId) return;
@@ -834,6 +1003,8 @@ async function handleTranslationProgress(message, sender) {
   const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
   translationStatusByTab[tabId] = status;
   await storageLocalSet({ translationStatusByTab });
+  trackTranslationActivity(tabId, status);
+  maybeTriggerThroughputTests('progress');
 }
 
 async function handleGetTranslationStatus(sendResponse, tabId) {
@@ -864,5 +1035,6 @@ async function handleTranslationCancelled(message, sender) {
   delete translationStatusByTab[tabId];
   translationVisibilityByTab[tabId] = false;
   await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
+  ACTIVE_TRANSLATION_TABS.delete(tabId);
   chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
 }
