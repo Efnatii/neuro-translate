@@ -155,7 +155,6 @@ async function generateTranslationContext(
     model,
     latencyMs,
     usage,
-    costUsd: null,
     inputChars: text.length,
     outputChars: trimmed.length,
     request: requestPayload,
