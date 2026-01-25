@@ -541,14 +541,29 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   };
   applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
   const startedAt = Date.now();
-  let response = await fetch(apiBaseUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
-  });
+  const executeRequest = async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60000);
+    try {
+      return await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestPayload),
+        signal: controller.signal
+      });
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        throw new Error('Proofread request timed out');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  let response = await executeRequest();
 
   if (!response.ok) {
     let errorText = await response.text();
@@ -570,14 +585,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         model,
         status: response.status
       });
-      response = await fetch(apiBaseUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload)
-      });
+      response = await executeRequest();
       if (!response.ok) {
         errorText = await response.text();
         try {
@@ -648,6 +656,11 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     parseIssues: []
   };
   const debugPayloads = [debugPayload];
+  console.debug('Proofread request completed', {
+    status: response.status,
+    model,
+    costUsd
+  });
 
   let parsed = null;
   let parseError = null;
@@ -742,14 +755,27 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
     }
   };
   const startedAt = Date.now();
-  const response = await fetch(apiBaseUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
+  let response;
+  try {
+    response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(requestPayload),
+      signal: controller.signal
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Proofread request timed out');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!response.ok) {
     return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
@@ -771,6 +797,12 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
     response: content,
     parseIssues: []
   };
+
+  console.debug('Proofread format repair completed', {
+    status: response.status,
+    model,
+    costUsd
+  });
 
   let parsed = null;
   let parseError = null;
@@ -894,6 +926,8 @@ async function repairProofreadSegments(
     }
   };
   const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
   try {
     const response = await fetch(apiBaseUrl, {
       method: 'POST',
@@ -901,7 +935,8 @@ async function repairProofreadSegments(
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`
       },
-      body: JSON.stringify(requestPayload)
+      body: JSON.stringify(requestPayload),
+      signal: controller.signal
     });
     if (!response.ok) {
       return translations;
@@ -923,6 +958,11 @@ async function repairProofreadSegments(
       response: content,
       parseIssues: ['fallback:language-repair']
     };
+    console.debug('Proofread language repair completed', {
+      status: response.status,
+      model,
+      costUsd
+    });
     if (Array.isArray(debugPayloads)) {
       debugPayloads.push(debugPayload);
     }
@@ -940,7 +980,13 @@ async function repairProofreadSegments(
       }
     });
   } catch (error) {
-    console.warn('Proofread language repair failed; keeping original revisions.', error);
+    if (error?.name === 'AbortError') {
+      console.warn('Proofread language repair timed out; keeping original revisions.', error);
+    } else {
+      console.warn('Proofread language repair failed; keeping original revisions.', error);
+    }
+  } finally {
+    clearTimeout(timer);
   }
 
   return translations;
