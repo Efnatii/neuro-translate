@@ -24,8 +24,10 @@ const DEFAULT_STATE = {
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
+  proofreadGoalsModel: 'gpt-4.1-mini',
   contextGenerationEnabled: false,
   proofreadEnabled: false,
+  proofreadGoalsEnabled: false,
   singleBlockConcurrency: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
@@ -42,8 +44,10 @@ const STATE_CACHE_KEYS = new Set([
   'translationModel',
   'contextModel',
   'proofreadModel',
+  'proofreadGoalsModel',
   'contextGenerationEnabled',
   'proofreadEnabled',
+  'proofreadGoalsEnabled',
   'singleBlockConcurrency',
   'blockLengthLimit',
   'tpmLimitsByModel',
@@ -187,11 +191,13 @@ function applyStatePatch(patch = {}) {
 
   for (const [key, value] of Object.entries(patch || {})) {
     if (!STATE_CACHE_KEYS.has(key)) continue;
-    if (['apiKey', 'translationModel', 'contextModel', 'proofreadModel'].includes(key)) {
+    if (['apiKey', 'translationModel', 'contextModel', 'proofreadModel', 'proofreadGoalsModel'].includes(key)) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
     }
-    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency'].includes(key)) {
+    if (
+      ['contextGenerationEnabled', 'proofreadEnabled', 'proofreadGoalsEnabled', 'singleBlockConcurrency'].includes(key)
+    ) {
       next[key] = Boolean(value);
       continue;
     }
@@ -260,10 +266,14 @@ async function getState() {
     if (!merged.contextModel && safeStored.model) {
       merged.contextModel = safeStored.model;
     }
+    if (!merged.proofreadGoalsModel) {
+      merged.proofreadGoalsModel = merged.proofreadModel;
+    }
     const previousModels = {
       translationModel: merged.translationModel,
       contextModel: merged.contextModel,
-      proofreadModel: merged.proofreadModel
+      proofreadModel: merged.proofreadModel,
+      proofreadGoalsModel: merged.proofreadGoalsModel
     };
     if (merged.translationModel?.startsWith('deepseek')) {
       merged.translationModel = DEFAULT_STATE.translationModel;
@@ -274,15 +284,20 @@ async function getState() {
     if (merged.proofreadModel?.startsWith('deepseek')) {
       merged.proofreadModel = DEFAULT_STATE.proofreadModel;
     }
+    if (merged.proofreadGoalsModel?.startsWith('deepseek')) {
+      merged.proofreadGoalsModel = merged.proofreadModel || DEFAULT_STATE.proofreadGoalsModel;
+    }
     if (
       merged.translationModel !== previousModels.translationModel ||
       merged.contextModel !== previousModels.contextModel ||
-      merged.proofreadModel !== previousModels.proofreadModel
+      merged.proofreadModel !== previousModels.proofreadModel ||
+      merged.proofreadGoalsModel !== previousModels.proofreadGoalsModel
     ) {
       await storageLocalSet({
         translationModel: merged.translationModel,
         contextModel: merged.contextModel,
-        proofreadModel: merged.proofreadModel
+        proofreadModel: merged.proofreadModel,
+        proofreadGoalsModel: merged.proofreadGoalsModel
       });
     }
     applyStatePatch(merged);
@@ -430,8 +445,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 translationModel: DEFAULT_STATE.translationModel,
                 contextModel: DEFAULT_STATE.contextModel,
                 proofreadModel: DEFAULT_STATE.proofreadModel,
+                proofreadGoalsModel: DEFAULT_STATE.proofreadGoalsModel,
                 contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
                 proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+                proofreadGoalsEnabled: DEFAULT_STATE.proofreadGoalsEnabled,
                 blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
                 tpmLimitsByRole: {
                   translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -617,8 +634,10 @@ async function handleGetSettings(message, sendResponse) {
         translationModel: DEFAULT_STATE.translationModel,
         contextModel: DEFAULT_STATE.contextModel,
         proofreadModel: DEFAULT_STATE.proofreadModel,
+        proofreadGoalsModel: DEFAULT_STATE.proofreadGoalsModel,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        proofreadGoalsEnabled: DEFAULT_STATE.proofreadGoalsEnabled,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
@@ -659,8 +678,10 @@ async function handleGetSettings(message, sendResponse) {
         translationModel: state.translationModel,
         contextModel: state.contextModel,
         proofreadModel: state.proofreadModel,
+        proofreadGoalsModel: state.proofreadGoalsModel || state.proofreadModel,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
+        proofreadGoalsEnabled: Boolean(state.proofreadGoalsEnabled),
         singleBlockConcurrency: state.singleBlockConcurrency,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByRole,
@@ -681,8 +702,10 @@ async function handleGetSettings(message, sendResponse) {
       translationModel: DEFAULT_STATE.translationModel,
       contextModel: DEFAULT_STATE.contextModel,
       proofreadModel: DEFAULT_STATE.proofreadModel,
+      proofreadGoalsModel: DEFAULT_STATE.proofreadGoalsModel,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      proofreadGoalsEnabled: DEFAULT_STATE.proofreadGoalsEnabled,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
@@ -703,8 +726,10 @@ async function handleGetSettings(message, sendResponse) {
         translationModel: DEFAULT_STATE.translationModel,
         contextModel: DEFAULT_STATE.contextModel,
         proofreadModel: DEFAULT_STATE.proofreadModel,
+        proofreadGoalsModel: DEFAULT_STATE.proofreadGoalsModel,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        proofreadGoalsEnabled: DEFAULT_STATE.proofreadGoalsEnabled,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
@@ -777,7 +802,7 @@ async function handleProofreadText(message, sendResponse) {
       return;
     }
 
-    const { translations, rawProofread, debug } = await proofreadTranslation(
+    const { translations, rawProofread, debug, proofreadGoalsRaw, proofreadGoalsParsed, proofreadGoalsStatus, proofreadGoalsUsed } = await proofreadTranslation(
       message.segments,
       message.sourceBlock,
       message.translatedBlock,
@@ -785,9 +810,23 @@ async function handleProofreadText(message, sendResponse) {
       message.language,
       apiKey,
       state.proofreadModel,
-      apiBaseUrl
+      apiBaseUrl,
+      {
+        proofreadGoalsEnabled: message?.proofreadGoalsEnabled,
+        proofreadGoalsModel: message?.proofreadGoalsModel || state.proofreadGoalsModel || state.proofreadModel,
+        sourceSegments: message?.sourceSegments || []
+      }
     );
-    sendResponse({ success: true, translations, rawProofread, debug });
+    sendResponse({
+      success: true,
+      translations,
+      rawProofread,
+      debug,
+      proofreadGoalsRaw,
+      proofreadGoalsParsed,
+      proofreadGoalsStatus,
+      proofreadGoalsUsed
+    });
   } catch (error) {
     console.error('Proofreading failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
