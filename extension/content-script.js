@@ -37,6 +37,7 @@ let debugPersistDirty = false;
 const MAX_REQUESTS_PER_RUN = 300;
 // Per-block cap across translation/proofread/context requests to avoid endless fallbacks.
 const MAX_REQUESTS_PER_BLOCK = 20;
+const REQUEST_LOG_LIMIT = 300;
 let requestCountByRun = 0;
 const requestCountByBlock = new Map();
 const DEBUG_PERSIST_DEBOUNCE_MS = 250;
@@ -506,7 +507,7 @@ async function translatePage(settings) {
         latestContextSummary = await requestTranslationContext(
           pageText,
           settings.targetLanguage || 'ru',
-          { blockIndex: null }
+          { blockIndex: null, model: settings.contextModel }
         );
         if (latestContextSummary && contextCacheKey) {
           await setContextCacheEntry(contextCacheKey, {
@@ -611,7 +612,7 @@ async function translatePage(settings) {
           settings.targetLanguage || 'ru',
           fullContextSummary,
           keepPunctuationTokens,
-          { blockIndex: currentIndex + 1 }
+          { blockIndex: currentIndex + 1, model: settings.translationModel }
         );
         if (!result?.success) {
           throw new Error(result?.error || 'Не удалось выполнить перевод.');
@@ -735,7 +736,8 @@ async function translatePage(settings) {
           translatedBlock: formatBlockText(task.translatedTexts),
           context: fullContextSummary,
           language: settings.targetLanguage || 'ru',
-          blockIndex: task.index + 1
+          blockIndex: task.index + 1,
+          model: settings.proofreadModel
         });
         if (!proofreadResult?.success) {
           throw new Error(proofreadResult?.error || 'Не удалось выполнить вычитку.');
@@ -946,6 +948,7 @@ async function translatePage(settings) {
 
 async function translate(texts, targetLanguage, context, keepPunctuationTokens = false, options = {}) {
   const blockIndex = Number.isFinite(options?.blockIndex) ? options.blockIndex : null;
+  const model = options?.model || '';
   const batches = splitTextsByTokenEstimate(
     Array.isArray(texts) ? texts : [texts],
     context,
@@ -954,6 +957,7 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
   const translations = [];
   const rawParts = [];
   const debugParts = [];
+  let attemptCounter = 0;
 
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
@@ -969,29 +973,84 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
     await ensureTpmBudget('translation', estimatedTokens);
     const batchResult = await withRateLimitRetry(
       async () => {
+        attemptCounter += 1;
+        const requestId = createRequestLogId();
+        appendRequestLogEntry({
+          requestId,
+          phase: 'TRANSLATE',
+          event: 'request',
+          blockIndex,
+          batchSize: batch.length,
+          model,
+          timestamp: Date.now(),
+          attempt: attemptCounter,
+          status: 'pending',
+          error: ''
+        });
         await incrementDebugAiRequestCount();
-        const response = await sendRuntimeMessage(
-          {
-            type: 'TRANSLATE_TEXT',
-            texts: batch,
-            targetLanguage,
-            context: batchContext,
-            keepPunctuationTokens
-          },
-          'Не удалось выполнить перевод.'
-        );
-        if (!response?.success) {
-          if (response?.isRuntimeError) {
-            return { success: false, error: response.error || 'Не удалось выполнить перевод.' };
+        try {
+          const response = await sendRuntimeMessage(
+            {
+              type: 'TRANSLATE_TEXT',
+              texts: batch,
+              targetLanguage,
+              context: batchContext,
+              keepPunctuationTokens
+            },
+            'Не удалось выполнить перевод.'
+          );
+          if (!response?.success) {
+            const errorMessage = response?.error || 'Не удалось выполнить перевод.';
+            appendRequestLogEntry({
+              requestId,
+              phase: 'TRANSLATE',
+              event: 'response',
+              blockIndex,
+              batchSize: batch.length,
+              model,
+              timestamp: Date.now(),
+              attempt: attemptCounter,
+              status: 'error',
+              error: errorMessage
+            });
+            if (response?.isRuntimeError) {
+              return { success: false, error: errorMessage };
+            }
+            throw new Error(errorMessage);
           }
-          throw new Error(response?.error || 'Не удалось выполнить перевод.');
+          appendRequestLogEntry({
+            requestId,
+            phase: 'TRANSLATE',
+            event: 'response',
+            blockIndex,
+            batchSize: batch.length,
+            model,
+            timestamp: Date.now(),
+            attempt: attemptCounter,
+            status: 'success',
+            error: ''
+          });
+          return {
+            success: true,
+            translations: Array.isArray(response.translations) ? response.translations : [],
+            rawTranslation: response.rawTranslation || '',
+            debug: response.debug || []
+          };
+        } catch (error) {
+          appendRequestLogEntry({
+            requestId,
+            phase: 'TRANSLATE',
+            event: 'response',
+            blockIndex,
+            batchSize: batch.length,
+            model,
+            timestamp: Date.now(),
+            attempt: attemptCounter,
+            status: 'error',
+            error: error?.message || 'Не удалось выполнить перевод.'
+          });
+          throw error;
         }
-        return {
-          success: true,
-          translations: Array.isArray(response.translations) ? response.translations : [],
-          rawTranslation: response.rawTranslation || '',
-          debug: response.debug || []
-        };
       },
       'Translation'
     );
@@ -1018,6 +1077,7 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
 
 async function requestProofreading(payload) {
   const blockIndex = Number.isFinite(payload?.blockIndex) ? payload.blockIndex : null;
+  const model = payload?.model || '';
   const segments = Array.isArray(payload?.segments) ? payload.segments : [];
   const segmentTexts = segments.map((segment) =>
     typeof segment === 'string' ? segment : segment?.text || ''
@@ -1035,33 +1095,89 @@ async function requestProofreading(payload) {
     sourceTexts: [sourceBlock, translatedBlock]
   });
   await ensureTpmBudget('proofread', estimatedTokens);
+  let attemptCounter = 0;
   return withRateLimitRetry(
     async () => {
+      attemptCounter += 1;
+      const requestId = createRequestLogId();
+      appendRequestLogEntry({
+        requestId,
+        phase: 'PROOFREAD',
+        event: 'request',
+        blockIndex,
+        batchSize: segmentTexts.length,
+        model,
+        timestamp: Date.now(),
+        attempt: attemptCounter,
+        status: 'pending',
+        error: ''
+      });
       await incrementDebugAiRequestCount();
-      const response = await sendRuntimeMessage(
-        {
-          type: 'PROOFREAD_TEXT',
-          segments,
-          sourceBlock,
-          translatedBlock,
-          context,
-          language: payload?.language || ''
-        },
-        'Не удалось выполнить вычитку.'
-      );
-      if (!response?.success) {
-        if (response?.isRuntimeError) {
-          return { success: false, error: response.error || 'Не удалось выполнить вычитку.' };
+      try {
+        const response = await sendRuntimeMessage(
+          {
+            type: 'PROOFREAD_TEXT',
+            segments,
+            sourceBlock,
+            translatedBlock,
+            context,
+            language: payload?.language || ''
+          },
+          'Не удалось выполнить вычитку.'
+        );
+        if (!response?.success) {
+          const errorMessage = response?.error || 'Не удалось выполнить вычитку.';
+          appendRequestLogEntry({
+            requestId,
+            phase: 'PROOFREAD',
+            event: 'response',
+            blockIndex,
+            batchSize: segmentTexts.length,
+            model,
+            timestamp: Date.now(),
+            attempt: attemptCounter,
+            status: 'error',
+            error: errorMessage
+          });
+          if (response?.isRuntimeError) {
+            return { success: false, error: errorMessage };
+          }
+          throw new Error(errorMessage);
         }
-        throw new Error(response?.error || 'Не удалось выполнить вычитку.');
+        appendRequestLogEntry({
+          requestId,
+          phase: 'PROOFREAD',
+          event: 'response',
+          blockIndex,
+          batchSize: segmentTexts.length,
+          model,
+          timestamp: Date.now(),
+          attempt: attemptCounter,
+          status: 'success',
+          error: ''
+        });
+        recordAiResponseMetrics(response?.debug || []);
+        return {
+          success: true,
+          translations: Array.isArray(response.translations) ? response.translations : [],
+          rawProofread: response.rawProofread || '',
+          debug: response.debug || null
+        };
+      } catch (error) {
+        appendRequestLogEntry({
+          requestId,
+          phase: 'PROOFREAD',
+          event: 'response',
+          blockIndex,
+          batchSize: segmentTexts.length,
+          model,
+          timestamp: Date.now(),
+          attempt: attemptCounter,
+          status: 'error',
+          error: error?.message || 'Не удалось выполнить вычитку.'
+        });
+        throw error;
       }
-      recordAiResponseMetrics(response?.debug || []);
-      return {
-        success: true,
-        translations: Array.isArray(response.translations) ? response.translations : [],
-        rawProofread: response.rawProofread || '',
-        debug: response.debug || null
-      };
     },
     'Proofreading'
   );
@@ -1453,6 +1569,7 @@ function shouldProofreadSegment(text = '', targetLanguage = '') {
 
 async function requestTranslationContext(text, targetLanguage, options = {}) {
   const blockIndex = Number.isFinite(options?.blockIndex) ? options.blockIndex : null;
+  const model = options?.model || '';
   const requestCheck = canSendRequest({ blockIndex, phase: 'context' });
   if (!requestCheck.allowed) {
     throw new Error(requestCheck.reason || 'Context request aborted.');
@@ -1461,23 +1578,84 @@ async function requestTranslationContext(text, targetLanguage, options = {}) {
     texts: [text]
   });
   await ensureTpmBudget('context', estimatedTokens);
-  await incrementDebugAiRequestCount();
-  const response = await sendRuntimeMessage(
-    {
-      type: 'GENERATE_CONTEXT',
-      text,
-      targetLanguage
+  let attemptCounter = 0;
+  return withRateLimitRetry(
+    async () => {
+      attemptCounter += 1;
+      const requestId = createRequestLogId();
+      appendRequestLogEntry({
+        requestId,
+        phase: 'CONTEXT',
+        event: 'request',
+        blockIndex,
+        batchSize: 1,
+        model,
+        timestamp: Date.now(),
+        attempt: attemptCounter,
+        status: 'pending',
+        error: ''
+      });
+      await incrementDebugAiRequestCount();
+      try {
+        const response = await sendRuntimeMessage(
+          {
+            type: 'GENERATE_CONTEXT',
+            text,
+            targetLanguage
+          },
+          'Не удалось сгенерировать контекст.'
+        );
+        if (!response?.success) {
+          const errorMessage = response?.error || 'Не удалось сгенерировать контекст.';
+          appendRequestLogEntry({
+            requestId,
+            phase: 'CONTEXT',
+            event: 'response',
+            blockIndex,
+            batchSize: 1,
+            model,
+            timestamp: Date.now(),
+            attempt: attemptCounter,
+            status: 'error',
+            error: errorMessage
+          });
+          if (response?.isRuntimeError) {
+            return '';
+          }
+          throw new Error(errorMessage);
+        }
+        appendRequestLogEntry({
+          requestId,
+          phase: 'CONTEXT',
+          event: 'response',
+          blockIndex,
+          batchSize: 1,
+          model,
+          timestamp: Date.now(),
+          attempt: attemptCounter,
+          status: 'success',
+          error: ''
+        });
+        recordAiResponseMetrics(response?.debug || []);
+        return response.context || '';
+      } catch (error) {
+        appendRequestLogEntry({
+          requestId,
+          phase: 'CONTEXT',
+          event: 'response',
+          blockIndex,
+          batchSize: 1,
+          model,
+          timestamp: Date.now(),
+          attempt: attemptCounter,
+          status: 'error',
+          error: error?.message || 'Не удалось сгенерировать контекст.'
+        });
+        throw error;
+      }
     },
-    'Не удалось сгенерировать контекст.'
+    'Context'
   );
-  if (!response?.success) {
-    if (response?.isRuntimeError) {
-      return '';
-    }
-    throw new Error(response?.error || 'Не удалось сгенерировать контекст.');
-  }
-  recordAiResponseMetrics(response?.debug || []);
-  return response.context || '';
 }
 
 function deduplicateTexts(texts) {
@@ -2250,6 +2428,7 @@ async function resetTranslationDebugInfo(url) {
     contextStatus,
     lastAbortReason: '',
     items: [],
+    requestLog: [],
     aiRequestCount: 0,
     aiResponseCount: 0,
     totalCostUsd: 0,
@@ -2288,6 +2467,7 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     contextStatus: initialContextStatus,
     lastAbortReason: '',
     items: debugEntries,
+    requestLog: [],
     aiRequestCount: 0,
     aiResponseCount: 0,
     totalCostUsd: 0,
@@ -2394,6 +2574,24 @@ function updateDebugEntry(index, updates = {}) {
   if (!entry) return;
   Object.assign(entry, updates);
   schedulePersistDebugState('updateDebugEntry');
+}
+
+function createRequestLogId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function appendRequestLogEntry(entry) {
+  if (!debugState) return;
+  const nextEntry = entry && typeof entry === 'object' ? entry : null;
+  if (!nextEntry) return;
+  if (!Array.isArray(debugState.requestLog)) {
+    debugState.requestLog = [];
+  }
+  debugState.requestLog.push(nextEntry);
+  if (debugState.requestLog.length > REQUEST_LOG_LIMIT) {
+    debugState.requestLog.splice(0, debugState.requestLog.length - REQUEST_LOG_LIMIT);
+  }
+  schedulePersistDebugState('requestLog');
 }
 
 function incrementDebugAiRequestCount() {

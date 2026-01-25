@@ -1,6 +1,10 @@
 const metaEl = document.getElementById('meta');
 const contextEl = document.getElementById('context');
 const summaryEl = document.getElementById('summary');
+const requestLogEl = document.getElementById('request-log');
+const requestLogContentEl = document.getElementById('request-log-content');
+const requestLogPhaseEl = document.getElementById('request-log-phase');
+const requestLogStatusEl = document.getElementById('request-log-status');
 const entriesEl = document.getElementById('entries');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
@@ -17,8 +21,13 @@ let sourceUrl = '';
 let refreshTimer = null;
 let throughputTimer = null;
 let lastThroughputCheckAt = 0;
+let lastDebugData = null;
 const proofreadUiState = new Map();
 const THROUGHPUT_REFRESH_INTERVAL_MS = 15000;
+const requestLogFilters = {
+  phase: 'ALL',
+  status: 'ALL'
+};
 
 init();
 
@@ -77,6 +86,32 @@ async function init() {
         });
         return;
       }
+    });
+  }
+
+  if (requestLogEl) {
+    requestLogEl.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const clearButton = target.closest('[data-action="clear-request-log"]');
+      if (clearButton) {
+        event.preventDefault();
+        clearRequestLog();
+      }
+    });
+  }
+
+  if (requestLogPhaseEl) {
+    requestLogPhaseEl.addEventListener('change', () => {
+      requestLogFilters.phase = requestLogPhaseEl.value || 'ALL';
+      renderRequestLog(lastDebugData?.requestLog || []);
+    });
+  }
+
+  if (requestLogStatusEl) {
+    requestLogStatusEl.addEventListener('change', () => {
+      requestLogFilters.status = requestLogStatusEl.value || 'ALL';
+      renderRequestLog(lastDebugData?.requestLog || []);
     });
   }
 
@@ -156,6 +191,23 @@ async function clearContext() {
   await refreshDebug();
 }
 
+async function clearRequestLog() {
+  if (!sourceUrl) return;
+  const store = await getDebugStore();
+  if (!store) return;
+  const current = store[sourceUrl];
+  if (!current) return;
+  store[sourceUrl] = {
+    ...current,
+    requestLog: [],
+    updatedAt: Date.now()
+  };
+  await new Promise((resolve) => {
+    chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: store }, () => resolve());
+  });
+  await refreshDebug();
+}
+
 function startAutoRefresh() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
@@ -201,6 +253,7 @@ async function refreshDebug() {
     return;
   }
 
+  lastDebugData = debugData;
   renderDebug(sourceUrl, debugData, throughputSummary);
   requestThroughputCheck();
 }
@@ -232,6 +285,7 @@ function renderEmpty(message, throughputSummary = '') {
   metaEl.textContent = message;
   contextEl.innerHTML = '';
   entriesEl.innerHTML = '';
+  renderRequestLog([]);
   renderSummary({
     items: [],
     contextStatus: 'pending',
@@ -243,6 +297,7 @@ function renderDebug(url, data, throughputSummary = '') {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
   renderSummary(data, '', throughputSummary);
+  renderRequestLog(Array.isArray(data.requestLog) ? data.requestLog : []);
 
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const contextText = data.context?.trim();
@@ -326,6 +381,82 @@ function renderDebug(url, data, throughputSummary = '') {
     `;
     entriesEl.appendChild(entry);
   });
+}
+
+function renderRequestLog(entries) {
+  if (!requestLogContentEl) return;
+  const logEntries = Array.isArray(entries) ? entries : [];
+  const filtered = logEntries.filter((entry) => {
+    if (!entry) return false;
+    if (requestLogFilters.phase !== 'ALL' && entry.phase !== requestLogFilters.phase) {
+      return false;
+    }
+    if (requestLogFilters.status !== 'ALL' && entry.status !== requestLogFilters.status) {
+      return false;
+    }
+    return true;
+  });
+
+  if (!logEntries.length) {
+    requestLogContentEl.innerHTML = '<div class="empty">Запросов пока нет.</div>';
+    return;
+  }
+
+  if (!filtered.length) {
+    requestLogContentEl.innerHTML = '<div class="empty">Нет записей для выбранного фильтра.</div>';
+    return;
+  }
+
+  const rows = filtered
+    .slice()
+    .reverse()
+    .map((entry) => {
+      const timestamp = entry.timestamp ? new Date(entry.timestamp).toLocaleString('ru-RU') : '—';
+      const phaseLabel = entry.phase || '—';
+      const eventLabel = entry.event === 'response' ? 'Ответ' : 'Запрос';
+      const blockLabel = Number.isFinite(entry.blockIndex) ? `#${entry.blockIndex}` : '—';
+      const batchLabel = Number.isFinite(entry.batchSize) ? String(entry.batchSize) : '—';
+      const modelLabel = entry.model || '—';
+      const attemptLabel = Number.isFinite(entry.attempt) ? String(entry.attempt) : '—';
+      const statusLabel = entry.status || 'pending';
+      const statusClass = `request-log-status request-log-status--${escapeHtml(statusLabel)}`;
+      const errorLabel = entry.error ? escapeHtml(entry.error) : '—';
+      return `
+        <tr>
+          <td>${escapeHtml(timestamp)}</td>
+          <td><span class="request-log-phase">${escapeHtml(phaseLabel)}</span></td>
+          <td>${escapeHtml(eventLabel)}</td>
+          <td>${escapeHtml(blockLabel)}</td>
+          <td>${escapeHtml(batchLabel)}</td>
+          <td>${escapeHtml(modelLabel)}</td>
+          <td>${escapeHtml(attemptLabel)}</td>
+          <td><span class="${statusClass}">${escapeHtml(statusLabel)}</span></td>
+          <td>${errorLabel}</td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  requestLogContentEl.innerHTML = `
+    <table class="request-log-table">
+      <thead>
+        <tr>
+          <th>Время</th>
+          <th>Фаза</th>
+          <th>Событие</th>
+          <th>Блок</th>
+          <th>Батч</th>
+          <th>Модель</th>
+          <th>Attempt</th>
+          <th>Статус</th>
+          <th>Ошибка</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `;
 }
 
 function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
