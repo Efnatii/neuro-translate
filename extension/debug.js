@@ -361,11 +361,9 @@ function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
     contextStatus
   });
   const throughputLabel = throughputSummary ? ` • ${throughputSummary}` : '';
-  const lastAbortReason = typeof data.lastAbortReason === 'string' ? data.lastAbortReason.trim() : '';
-  const abortLabel = lastAbortReason ? ` • Остановка: ${lastAbortReason}` : '';
   const summaryLine = fallbackMessage
     ? `${fallbackMessage}${throughputLabel}`
-    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'}${contextLengthLabel}${fullContextLabel} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}${throughputLabel}${abortLabel}`;
+    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'}${contextLengthLabel}${fullContextLabel} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}${throughputLabel}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>

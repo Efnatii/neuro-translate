@@ -3,10 +3,6 @@ const PROOFREAD_MAX_CHARS_PER_CHUNK = 4000;
 const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
 const PROOFREAD_MAX_OUTPUT_TOKENS = 4096;
-// Limits for fallback retries to keep per-block proofread requests bounded.
-const PROOFREAD_MAX_FALLBACK_BRANCHES = 4;
-const PROOFREAD_MAX_FALLBACK_ITEMS = 60;
-const PROOFREAD_FALLBACK_ERROR = 'Too many retries for block';
 const PROOFREAD_SYSTEM_PROMPT = [
   'You are an expert translation proofreader and editor.',
   'Your job is to improve the translated text for clarity, fluency, and readability while preserving the original meaning.',
@@ -67,17 +63,6 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   ];
 }
 
-function assertProofreadFallbackBudget(fallbackState, { branchIncrement = 0, itemIncrement = 0 } = {}) {
-  if (!fallbackState) return;
-  fallbackState.branches += branchIncrement;
-  fallbackState.items += itemIncrement;
-  if (fallbackState.branches > PROOFREAD_MAX_FALLBACK_BRANCHES || fallbackState.items > PROOFREAD_MAX_FALLBACK_ITEMS) {
-    const error = new Error(PROOFREAD_FALLBACK_ERROR);
-    error.isTooManyRetries = true;
-    throw error;
-  }
-}
-
 async function proofreadTranslation(
   segments,
   sourceBlock,
@@ -97,7 +82,6 @@ async function proofreadTranslation(
   const revisionsById = new Map();
   const rawProofreadParts = [];
   const debugPayloads = [];
-  const fallbackState = { branches: 0, items: 0 };
   const appendParseIssue = (issue) => {
     if (!issue) return;
     const last = debugPayloads[debugPayloads.length - 1];
@@ -145,10 +129,6 @@ async function proofreadTranslation(
         received: quality.receivedCount
       });
       appendParseIssue('retry:retryable');
-      assertProofreadFallbackBudget(fallbackState, {
-        branchIncrement: 1,
-        itemIncrement: chunk.length
-      });
       result = await requestProofreadChunk(
         chunk,
         { sourceBlock, translatedBlock, context, language },
@@ -173,10 +153,6 @@ async function proofreadTranslation(
         threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
       appendParseIssue('retry:retryable');
-      assertProofreadFallbackBudget(fallbackState, {
-        branchIncrement: 1,
-        itemIncrement: chunk.length
-      });
       result = await requestProofreadChunk(
         chunk,
         { sourceBlock, translatedBlock, context, language },
@@ -205,10 +181,6 @@ async function proofreadTranslation(
         threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
       appendParseIssue('fallback:per-item');
-      assertProofreadFallbackBudget(fallbackState, {
-        branchIncrement: 1,
-        itemIncrement: chunk.length
-      });
       for (const item of chunk) {
         const singleResult = await requestProofreadChunk(
           [item],
