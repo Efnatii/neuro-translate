@@ -299,13 +299,12 @@ async function performTranslationRequest(
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const costUsd = calculateUsageCost(usage, model);
   const debugPayload = {
     phase: 'TRANSLATE',
     model,
     latencyMs,
     usage,
-    costUsd,
+    costUsd: null,
     inputChars,
     outputChars: content?.length || 0,
     request: requestPayload,
@@ -554,13 +553,12 @@ async function performTranslationRepairRequest(
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const costUsd = calculateUsageCost(usage, model);
   const debugPayload = {
     phase: 'TRANSLATE_REPAIR',
     model,
     latencyMs,
     usage,
-    costUsd,
+    costUsd: null,
     inputChars: normalizedItems.reduce(
       (sum, item) => sum + (item.source?.length || 0) + (item.draft?.length || 0),
       0

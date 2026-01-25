@@ -26,21 +26,21 @@ let pendingFailureToken = 0;
 let pendingFailureTimeoutId = null;
 
 const models = [
-  { id: 'gpt-5-nano', name: 'GPT-5 Nano', price: 0.45 },
-  { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', price: 0.5 },
-  { id: 'gpt-4o-mini', name: 'GPT-4o Mini', price: 0.75 },
-  { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', price: 2 },
-  { id: 'gpt-5-mini', name: 'GPT-5 Mini', price: 2.25 },
-  { id: 'gpt-4.1', name: 'GPT-4.1', price: 10 },
-  { id: 'gpt-5.1', name: 'GPT-5.1', price: 11.25 },
-  { id: 'gpt-5', name: 'GPT-5', price: 11.25 },
-  { id: 'gpt-5.1-chat-latest', name: 'GPT-5.1 Chat Latest', price: 11.25 },
-  { id: 'gpt-5-chat-latest', name: 'GPT-5 Chat Latest', price: 11.25 },
-  { id: 'gpt-4o', name: 'GPT-4o', price: 12.5 },
-  { id: 'gpt-5.2', name: 'GPT-5.2', price: 15.75 },
-  { id: 'gpt-5.2-chat-latest', name: 'GPT-5.2 Chat Latest', price: 15.75 },
-  { id: 'gpt-4o-2024-05-13', name: 'GPT-4o (2024-05-13)', price: 20 }
-].sort((a, b) => a.price - b.price);
+  { id: 'gpt-5-nano', name: 'GPT-5 Nano' },
+  { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano' },
+  { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
+  { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini' },
+  { id: 'gpt-5-mini', name: 'GPT-5 Mini' },
+  { id: 'gpt-4.1', name: 'GPT-4.1' },
+  { id: 'gpt-5.1', name: 'GPT-5.1' },
+  { id: 'gpt-5', name: 'GPT-5' },
+  { id: 'gpt-5.1-chat-latest', name: 'GPT-5.1 Chat Latest' },
+  { id: 'gpt-5-chat-latest', name: 'GPT-5 Chat Latest' },
+  { id: 'gpt-4o', name: 'GPT-4o' },
+  { id: 'gpt-5.2', name: 'GPT-5.2' },
+  { id: 'gpt-5.2-chat-latest', name: 'GPT-5.2 Chat Latest' },
+  { id: 'gpt-4o-2024-05-13', name: 'GPT-4o (2024-05-13)' }
+];
 
 init();
 
@@ -236,7 +236,7 @@ function renderModelOptions(select, selected) {
   models.forEach((model) => {
     const option = document.createElement('option');
     option.value = model.id;
-    option.textContent = `${model.name} ($${model.price}/1M токенов)`;
+    option.textContent = model.name;
     option.selected = model.id === currentModel;
     select.appendChild(option);
   });

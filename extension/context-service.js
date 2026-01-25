@@ -149,14 +149,13 @@ async function generateTranslationContext(
 
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const costUsd = calculateUsageCost(usage, model);
   const trimmed = typeof content === 'string' ? content.trim() : '';
   const debugPayload = {
     phase: 'CONTEXT',
     model,
     latencyMs,
     usage,
-    costUsd,
+    costUsd: null,
     inputChars: text.length,
     outputChars: trimmed.length,
     request: requestPayload,

@@ -18,6 +18,7 @@ const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
   proofread: 0.5
 };
 const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
+const OPENAI_BILLING_USAGE_URL = 'https://api.openai.com/dashboard/billing/usage';
 
 const DEFAULT_STATE = {
   apiKey: '',
@@ -177,6 +178,71 @@ function storageLocalSet(items, timeoutMs = 3000) {
       reject(error);
     }
   });
+}
+
+function formatDateAsUtcYmd(date) {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function getCurrentBillingRange() {
+  const now = new Date();
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  return {
+    startDate: formatDateAsUtcYmd(start),
+    endDate: formatDateAsUtcYmd(end)
+  };
+}
+
+async function fetchOpenAiBillingTotalUsd(apiKey) {
+  const { startDate, endDate } = getCurrentBillingRange();
+  const url = `${OPENAI_BILLING_USAGE_URL}?start_date=${startDate}&end_date=${endDate}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${apiKey}`
+    }
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Billing usage request failed: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  const totalUsage = Number(data?.total_usage);
+  if (!Number.isFinite(totalUsage)) return null;
+  return totalUsage / 100;
+}
+
+async function fetchBillingDeltaUsd(apiKey) {
+  if (!apiKey) return { deltaUsd: null, totalUsd: null };
+  const { lastBillingTotalUsd } = await storageLocalGet({ lastBillingTotalUsd: null });
+  const lastTotal = Number.isFinite(lastBillingTotalUsd) ? lastBillingTotalUsd : null;
+  const totalUsd = await fetchOpenAiBillingTotalUsd(apiKey);
+  if (!Number.isFinite(totalUsd)) {
+    return { deltaUsd: null, totalUsd: null };
+  }
+  await storageLocalSet({ lastBillingTotalUsd: totalUsd });
+  if (!Number.isFinite(lastTotal)) {
+    return { deltaUsd: null, totalUsd };
+  }
+  const deltaUsd = totalUsd - lastTotal;
+  return {
+    deltaUsd: Number.isFinite(deltaUsd) && deltaUsd >= 0 ? deltaUsd : null,
+    totalUsd
+  };
+}
+
+function applyBillingDeltaToDebugPayloads(debugPayloads, deltaUsd) {
+  if (!Array.isArray(debugPayloads) || !debugPayloads.length) return debugPayloads;
+  if (!Number.isFinite(deltaUsd)) return debugPayloads;
+  const lastPayload = debugPayloads[debugPayloads.length - 1];
+  if (lastPayload && typeof lastPayload === 'object') {
+    lastPayload.costUsd = deltaUsd;
+  }
+  return debugPayloads;
 }
 
 function applyStatePatch(patch = {}) {
@@ -730,6 +796,12 @@ async function handleTranslateText(message, sendResponse) {
       apiBaseUrl,
       message.keepPunctuationTokens
     );
+    try {
+      const { deltaUsd } = await fetchBillingDeltaUsd(apiKey);
+      applyBillingDeltaToDebugPayloads(debug, deltaUsd);
+    } catch (error) {
+      console.warn('Failed to fetch billing usage for translation.', error);
+    }
     sendResponse({ success: true, translations, rawTranslation, debug });
   } catch (error) {
     console.error('Translation failed', error);
@@ -753,6 +825,12 @@ async function handleGenerateContext(message, sendResponse) {
       state.contextModel,
       apiBaseUrl
     );
+    try {
+      const { deltaUsd } = await fetchBillingDeltaUsd(apiKey);
+      applyBillingDeltaToDebugPayloads(debug, deltaUsd);
+    } catch (error) {
+      console.warn('Failed to fetch billing usage for context.', error);
+    }
     sendResponse({ success: true, context, debug });
   } catch (error) {
     console.error('Context generation failed', error);
@@ -779,6 +857,12 @@ async function handleProofreadText(message, sendResponse) {
       state.proofreadModel,
       apiBaseUrl
     );
+    try {
+      const { deltaUsd } = await fetchBillingDeltaUsd(apiKey);
+      applyBillingDeltaToDebugPayloads(debug, deltaUsd);
+    } catch (error) {
+      console.warn('Failed to fetch billing usage for proofreading.', error);
+    }
     sendResponse({ success: true, translations, rawProofread, debug });
   } catch (error) {
     console.error('Proofreading failed', error);
