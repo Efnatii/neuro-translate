@@ -71,23 +71,16 @@ function pingContentScript(tabId, timeoutMs = 700) {
       resolve({ ok: false, reason: 'timeout' });
     }, timeoutMs);
 
-    try {
-      chrome.tabs.sendMessage(tabId, { type: NT_PING_TYPE }, (response) => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timeoutId);
-        if (chrome.runtime.lastError) {
-          resolve({ ok: false, reason: chrome.runtime.lastError.message });
-          return;
-        }
-        resolve({ ok: true, response });
-      });
-    } catch (error) {
+    chrome.tabs.sendMessage(tabId, { type: NT_PING_TYPE }, (response) => {
       if (finished) return;
       finished = true;
       clearTimeout(timeoutId);
-      resolve({ ok: false, reason: error?.message || 'ping-failed' });
-    }
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, reason: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve({ ok: true, response });
+    });
   });
 }
 
@@ -153,27 +146,14 @@ async function ensureConnected(tabId, options = {}) {
 
 function sendMessageToTab(tabId, message, expectResponse = false) {
   return new Promise((resolve) => {
-    try {
-      chrome.tabs.sendMessage(tabId, message, (response) => {
-        if (chrome.runtime.lastError) {
-          resolve({ ok: false, reason: chrome.runtime.lastError.message });
-          return;
-        }
-        resolve({ ok: true, response: expectResponse ? response : undefined });
-      });
-    } catch (error) {
-      resolve({ ok: false, reason: error?.message || 'send-failed' });
-    }
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, reason: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve({ ok: true, response: expectResponse ? response : undefined });
+    });
   });
-}
-
-function isConnectionError(reason = '') {
-  const normalized = String(reason).toLowerCase();
-  return (
-    normalized.includes('could not establish connection') ||
-    normalized.includes('receiving end does not exist') ||
-    normalized.includes('no receiver')
-  );
 }
 
 async function sendMessageToTabSafe(tab, message, options = {}) {
@@ -212,22 +192,5 @@ async function sendMessageToTabSafe(tab, message, options = {}) {
     }
   }
 
-  const initialSend = await sendMessageToTab(tabId, message, options.expectResponse);
-  if (
-    initialSend.ok ||
-    options.skipEnsureConnection ||
-    !isConnectionError(initialSend.reason)
-  ) {
-    return initialSend;
-  }
-  const reconnected = await ensureConnected(tabId, {
-    pingTimeoutMs: options.pingTimeoutMs ?? 700,
-    retryCount: 1,
-    retryDelayMs: options.retryDelayMs ?? 200,
-    useBackgroundInjection: options.useBackgroundInjection
-  });
-  if (!reconnected.ok) {
-    return { ok: false, reason: reconnected.reason || initialSend.reason || 'content-script-unavailable' };
-  }
   return sendMessageToTab(tabId, message, options.expectResponse);
 }
