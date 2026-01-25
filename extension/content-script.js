@@ -581,7 +581,8 @@ async function translatePage(settings) {
       try {
         await updateDebugEntry(currentIndex + 1, {
           translationStatus: 'in_progress',
-          proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
+          proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled',
+          translationStartedAt: Date.now()
         });
         reportProgress('Перевод выполняется');
         const preparedTexts = block.map(({ original }) =>
@@ -638,6 +639,7 @@ async function translatePage(settings) {
           translated: formatBlockText(blockTranslations),
           translatedSegments: translatedTexts,
           translationStatus: 'done',
+          translationCompletedAt: Date.now(),
           translationRaw: result.rawTranslation || '',
           translationDebug: result.debug || []
         });
@@ -647,12 +649,13 @@ async function translatePage(settings) {
             .map((text, index) => ({ id: String(index), text }))
             .filter((segment) => shouldProofreadSegment(segment.text, settings.targetLanguage || 'ru'));
           if (!proofreadSegments.length) {
-            await updateDebugEntry(currentIndex + 1, {
-              proofreadStatus: 'done',
-              proofread: [],
-              proofreadComparisons: [],
-              proofreadExecuted: false
-            });
+          await updateDebugEntry(currentIndex + 1, {
+            proofreadStatus: 'done',
+            proofread: [],
+            proofreadComparisons: [],
+            proofreadExecuted: false,
+            proofreadCompletedAt: Date.now()
+          });
           } else {
             enqueueProofreadTask({
               block,
@@ -670,7 +673,8 @@ async function translatePage(settings) {
         cancelRequested = true;
         await updateDebugEntry(currentIndex + 1, {
           translationStatus: 'failed',
-          proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled'
+          proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled',
+          translationCompletedAt: Date.now()
         });
       } finally {
         activeTranslationWorkers = Math.max(0, activeTranslationWorkers - 1);
@@ -779,7 +783,8 @@ async function translatePage(settings) {
           proofread: proofreadSummary,
           proofreadRaw: rawProofread,
           proofreadDebug: proofreadDebugPayloads,
-          proofreadComparisons
+          proofreadComparisons,
+          proofreadCompletedAt: Date.now()
         });
         reportProgress('Вычитка выполняется');
       } catch (error) {
@@ -793,7 +798,8 @@ async function translatePage(settings) {
           proofreadStatus: 'failed',
           proofread: [],
           proofreadComparisons,
-          proofreadExecuted: true
+          proofreadExecuted: true,
+          proofreadCompletedAt: Date.now()
         });
         reportProgress('Вычитка выполняется');
       } finally {
@@ -901,17 +907,20 @@ async function translatePage(settings) {
   await Promise.all([...proofreadWorkers, translationCompletion]);
 
   if (translationError) {
+    updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:error');
     reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
   if (cancelRequested) {
+    updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:cancelled');
     reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
+  updateDebugSessionEndTime();
   await flushPersistDebugState('translatePage:completed');
   reportProgress('Перевод завершён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
   await flushPersistDebugState('translatePage:before-save');
@@ -2138,7 +2147,8 @@ async function resetTranslationDebugInfo(url) {
     items: [],
     aiRequestCount: 0,
     aiResponseCount: 0,
-    totalCostUsd: 0,
+    sessionStartTime: entry.sessionStartTime ?? null,
+    sessionEndTime: entry.sessionEndTime ?? null,
     updatedAt: Date.now()
   };
   await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
@@ -2173,7 +2183,8 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     items: debugEntries,
     aiRequestCount: 0,
     aiResponseCount: 0,
-    totalCostUsd: 0,
+    sessionStartTime: Math.floor(Date.now() / 1000),
+    sessionEndTime: null,
     updatedAt: Date.now()
   };
   await saveTranslationDebugInfo(location.href, debugState);
@@ -2239,6 +2250,12 @@ function updateDebugContextStatus(status) {
   schedulePersistDebugState('updateDebugContextStatus');
 }
 
+function updateDebugSessionEndTime() {
+  if (!debugState) return;
+  debugState.sessionEndTime = Math.floor(Date.now() / 1000);
+  schedulePersistDebugState('sessionEndTime');
+}
+
 function updateDebugEntry(index, updates = {}) {
   const entry = debugEntries.find((item) => item.index === index);
   if (!entry) return;
@@ -2257,14 +2274,6 @@ function recordAiResponseMetrics(debugPayloads) {
   if (!debugState) return;
   const currentCount = Number.isFinite(debugState.aiResponseCount) ? debugState.aiResponseCount : 0;
   debugState.aiResponseCount = currentCount + 1;
-  const payloads = Array.isArray(debugPayloads) ? debugPayloads : [];
-  let totalCostUsd = Number.isFinite(debugState.totalCostUsd) ? debugState.totalCostUsd : 0;
-  payloads.forEach((payload) => {
-    if (Number.isFinite(payload?.costUsd) && payload.costUsd >= 0) {
-      totalCostUsd += payload.costUsd;
-    }
-  });
-  debugState.totalCostUsd = totalCostUsd;
   schedulePersistDebugState('aiResponseMetrics');
 }
 
@@ -2313,6 +2322,7 @@ function restoreOriginal(entries) {
 async function cancelTranslation() {
   cancelRequested = true;
   stopRpcHeartbeat();
+  updateDebugSessionEndTime();
   await flushPersistDebugState('cancelTranslation');
   const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
   if (entriesToRestore.length) {

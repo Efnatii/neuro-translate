@@ -3,6 +3,7 @@ importScripts('messaging.js');
 importScripts('translation-service.js');
 importScripts('context-service.js');
 importScripts('proofread-service.js');
+importScripts('openai-org-metrics.js');
 
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
@@ -18,8 +19,6 @@ const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
   proofread: 0.5
 };
 const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
-const OPENAI_BILLING_USAGE_URL = 'https://api.openai.com/dashboard/billing/usage';
-
 const DEFAULT_STATE = {
   apiKey: '',
   openAiOrganization: '',
@@ -184,138 +183,10 @@ function storageLocalSet(items, timeoutMs = 3000) {
   });
 }
 
-function formatDateAsUtcYmd(date) {
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(date.getUTCDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
-
-function getCurrentBillingRange() {
-  const now = new Date();
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  return {
-    startDate: formatDateAsUtcYmd(start),
-    endDate: formatDateAsUtcYmd(end)
-  };
-}
-
-function extractBillingErrorDetail(errorText) {
-  if (!errorText) return '';
-  try {
-    const parsed = JSON.parse(errorText);
-    return parsed?.error?.message || parsed?.message || '';
-  } catch (error) {
-    return errorText;
-  }
-}
-
-function formatBillingErrorMessage(status, errorText) {
-  const detail = String(extractBillingErrorDetail(errorText) || '').trim();
-  let baseMessage = 'Цена недоступна: не удалось получить данные биллинга.';
-  if (status === 401 || status === 403) {
-    baseMessage = 'Цена недоступна: ключ не авторизован для биллинга.';
-  } else if (status === 404) {
-    baseMessage = 'Цена недоступна: биллинг не найден для этого аккаунта.';
-  } else if (status === 429) {
-    baseMessage = 'Цена недоступна: превышен лимит запросов к биллингу.';
-  } else if (status >= 500) {
-    baseMessage = 'Цена недоступна: ошибка сервиса биллинга.';
-  }
-  if (!detail) return baseMessage;
-  return `${baseMessage} ${detail}`;
-}
-
-function buildBillingHeaders(apiKey, organization, project) {
-  const headers = { Authorization: `Bearer ${apiKey}` };
-  if (organization) headers['OpenAI-Organization'] = organization;
-  if (project) headers['OpenAI-Project'] = project;
-  return headers;
-}
-
-async function fetchOpenAiBillingTotalUsd(apiKey, { organization, project } = {}) {
-  const { startDate, endDate } = getCurrentBillingRange();
-  const url = `${OPENAI_BILLING_USAGE_URL}?start_date=${startDate}&end_date=${endDate}`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: buildBillingHeaders(apiKey, organization, project)
-  });
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.warn('Billing usage request failed.', {
-      status: response.status,
-      statusText: response.statusText,
-      body: errorText
-    });
-    throw new Error(formatBillingErrorMessage(response.status, errorText));
-  }
-  const data = await response.json();
-  const totalUsage = Number(data?.total_usage);
-  if (!Number.isFinite(totalUsage)) return null;
-  return totalUsage / 100;
-}
-
-async function fetchBillingDeltaUsd(state) {
-  if (!state?.apiKey) return { deltaUsd: null, totalUsd: null };
-  const { lastBillingTotalUsd } = await storageLocalGet({ lastBillingTotalUsd: null });
-  const lastTotal = Number.isFinite(lastBillingTotalUsd) ? lastBillingTotalUsd : null;
-  let totalUsd = null;
-  try {
-    totalUsd = await fetchOpenAiBillingTotalUsd(state.apiKey, {
-      organization: state.openAiOrganization,
-      project: state.openAiProject
-    });
-  } catch (error) {
-    return {
-      deltaUsd: null,
-      totalUsd: null,
-      billingWarning: error?.message || 'Цена недоступна: не удалось запросить биллинг.'
-    };
-  }
-  if (!Number.isFinite(totalUsd)) {
-    return { deltaUsd: null, totalUsd: null };
-  }
-  await storageLocalSet({ lastBillingTotalUsd: totalUsd });
-  if (!Number.isFinite(lastTotal)) {
-    return { deltaUsd: null, totalUsd };
-  }
-  const deltaUsd = totalUsd - lastTotal;
-  return {
-    deltaUsd: Number.isFinite(deltaUsd) && deltaUsd >= 0 ? deltaUsd : null,
-    totalUsd
-  };
-}
-
-function applyBillingDeltaToDebugPayloads(debugPayloads, deltaUsd, billingWarning) {
-  if (!Array.isArray(debugPayloads)) return debugPayloads;
-  const lastPayload = debugPayloads.length ? debugPayloads[debugPayloads.length - 1] : null;
-  if (billingWarning) {
-    const warningMessage = `billing: ${billingWarning}`;
-    if (lastPayload && typeof lastPayload === 'object') {
-      if (!Array.isArray(lastPayload.parseIssues)) {
-        lastPayload.parseIssues = [];
-      }
-      lastPayload.parseIssues.push(warningMessage);
-    } else {
-      debugPayloads.push({
-        phase: 'BILLING',
-        model: '—',
-        latencyMs: null,
-        usage: null,
-        costUsd: null,
-        inputChars: null,
-        outputChars: null,
-        request: null,
-        response: null,
-        parseIssues: [warningMessage]
-      });
-    }
-  }
-  if (lastPayload && typeof lastPayload === 'object' && Number.isFinite(deltaUsd)) {
-    lastPayload.costUsd = deltaUsd;
-  }
-  return debugPayloads;
+async function getAdminApiKey() {
+  const { openAiAdminApiKey } = await storageLocalGet({ openAiAdminApiKey: '' });
+  if (typeof openAiAdminApiKey !== 'string') return '';
+  return openAiAdminApiKey.trim();
 }
 
 function applyStatePatch(patch = {}) {
@@ -684,6 +555,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'GET_ORG_COSTS') {
+    handleOrgCostsRequest(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'GET_ORG_USAGE') {
+    handleOrgUsageRequest(message, sendResponse);
+    return true;
+  }
+
   return false;
 });
 
@@ -873,12 +754,6 @@ async function handleTranslateText(message, sendResponse) {
       apiBaseUrl,
       message.keepPunctuationTokens
     );
-    try {
-      const { deltaUsd, billingWarning } = await fetchBillingDeltaUsd(state);
-      applyBillingDeltaToDebugPayloads(debug, deltaUsd, billingWarning);
-    } catch (error) {
-      console.warn('Failed to fetch billing usage for translation.', error);
-    }
     sendResponse({ success: true, translations, rawTranslation, debug });
   } catch (error) {
     console.error('Translation failed', error);
@@ -902,12 +777,6 @@ async function handleGenerateContext(message, sendResponse) {
       state.contextModel,
       apiBaseUrl
     );
-    try {
-      const { deltaUsd, billingWarning } = await fetchBillingDeltaUsd(state);
-      applyBillingDeltaToDebugPayloads(debug, deltaUsd, billingWarning);
-    } catch (error) {
-      console.warn('Failed to fetch billing usage for context.', error);
-    }
     sendResponse({ success: true, context, debug });
   } catch (error) {
     console.error('Context generation failed', error);
@@ -934,12 +803,6 @@ async function handleProofreadText(message, sendResponse) {
       state.proofreadModel,
       apiBaseUrl
     );
-    try {
-      const { deltaUsd, billingWarning } = await fetchBillingDeltaUsd(state);
-      applyBillingDeltaToDebugPayloads(debug, deltaUsd, billingWarning);
-    } catch (error) {
-      console.warn('Failed to fetch billing usage for proofreading.', error);
-    }
     sendResponse({ success: true, translations, rawProofread, debug });
   } catch (error) {
     console.error('Proofreading failed', error);
@@ -992,4 +855,42 @@ async function handleTranslationCancelled(message, sender) {
   translationVisibilityByTab[tabId] = false;
   await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
   chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
+}
+
+async function handleOrgCostsRequest(message, sendResponse) {
+  try {
+    const adminKey = await getAdminApiKey();
+    const params = {
+      start_time: message?.start_time,
+      end_time: message?.end_time,
+      bucket_width: message?.bucket_width,
+      group_by: message?.group_by,
+      project_ids: message?.project_ids,
+      limit: message?.limit
+    };
+    const result = await fetchOrgCosts({ adminKey, ...params });
+    sendResponse(result);
+  } catch (error) {
+    sendResponse({ ok: false, errorType: 'runtime', message: error?.message || String(error) });
+  }
+}
+
+async function handleOrgUsageRequest(message, sendResponse) {
+  try {
+    const adminKey = await getAdminApiKey();
+    const params = {
+      start_time: message?.start_time,
+      end_time: message?.end_time,
+      bucket_width: message?.bucket_width,
+      group_by: message?.group_by,
+      project_ids: message?.project_ids,
+      models: message?.models,
+      limit: message?.limit,
+      page: message?.page
+    };
+    const result = await fetchOrgUsageCompletions({ adminKey, ...params });
+    sendResponse(result);
+  } catch (error) {
+    sendResponse({ ok: false, errorType: 'runtime', message: error?.message || String(error) });
+  }
 }

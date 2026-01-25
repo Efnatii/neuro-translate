@@ -4,6 +4,11 @@ const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const COST_SETTINGS_KEYS = [
+  'openAiProject',
+  'showRealCosts',
+  'allocateRealCosts'
+];
 const STATUS_CONFIG = {
   pending: { label: 'Ожидает', className: 'status-pending' },
   in_progress: { label: 'В работе', className: 'status-in-progress' },
@@ -109,6 +114,41 @@ async function getDebugStore() {
   });
 }
 
+async function getCostSettings() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+    return { openAiProject: '', showRealCosts: false, allocateRealCosts: false };
+  }
+  return new Promise((resolve) => {
+    chrome.storage.local.get(COST_SETTINGS_KEYS, (data) => {
+      resolve({
+        openAiProject: data?.openAiProject || '',
+        showRealCosts: Boolean(data?.showRealCosts),
+        allocateRealCosts: Boolean(data?.allocateRealCosts)
+      });
+    });
+  });
+}
+
+function sendRuntimeMessage(type, payload) {
+  return new Promise((resolve) => {
+    if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+      resolve({ ok: false, errorType: 'runtime', message: 'Runtime API недоступен.' });
+      return;
+    }
+    chrome.runtime.sendMessage({ type, ...payload }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({
+          ok: false,
+          errorType: 'runtime',
+          message: chrome.runtime.lastError.message || 'Runtime error'
+        });
+        return;
+      }
+      resolve(response || { ok: false, errorType: 'runtime', message: 'Пустой ответ.' });
+    });
+  });
+}
+
 async function clearContext() {
   if (!sourceUrl) return;
   const store = await getDebugStore();
@@ -157,7 +197,195 @@ async function refreshDebug() {
     return;
   }
 
-  renderDebug(sourceUrl, debugData);
+  const costSettings = await getCostSettings();
+  const orgMetrics = await loadOrgMetrics(debugData, costSettings);
+  renderDebug(sourceUrl, debugData, costSettings, orgMetrics);
+}
+
+function getUtcDayStartSeconds(timestampSec) {
+  const date = new Date(timestampSec * 1000);
+  return Math.floor(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()) / 1000);
+}
+
+function getUtcDayStartFromMs(timestampMs) {
+  const seconds = Math.floor(timestampMs / 1000);
+  return getUtcDayStartSeconds(seconds);
+}
+
+function getUtcDayLabel(timestampSec) {
+  const date = new Date(timestampSec * 1000);
+  return date.toISOString().slice(0, 10);
+}
+
+function collectModelsFromDebug(debugData) {
+  const items = Array.isArray(debugData?.items) ? debugData.items : [];
+  const models = new Set();
+  items.forEach((item) => {
+    const payloads = [
+      ...(Array.isArray(item?.translationDebug) ? item.translationDebug : []),
+      ...(Array.isArray(item?.proofreadDebug) ? item.proofreadDebug : [])
+    ];
+    payloads.forEach((payload) => {
+      const model = payload?.model;
+      if (typeof model === 'string' && model.trim()) {
+        models.add(model.trim());
+      }
+    });
+  });
+  return Array.from(models);
+}
+
+function extractTokensFromUsage(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return { inputTokens: 0, outputTokens: 0, totalTokens: 0, hasBreakdown: false };
+  }
+  const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens ?? usage.inputTokens);
+  const outputTokens = Number(
+    usage.completion_tokens ?? usage.output_tokens ?? usage.completionTokens ?? usage.outputTokens
+  );
+  const totalTokens = Number(usage.total_tokens ?? usage.totalTokens);
+  const hasBreakdown = Number.isFinite(inputTokens) || Number.isFinite(outputTokens);
+  return {
+    inputTokens: Number.isFinite(inputTokens) ? inputTokens : 0,
+    outputTokens: Number.isFinite(outputTokens) ? outputTokens : 0,
+    totalTokens: Number.isFinite(totalTokens) ? totalTokens : 0,
+    hasBreakdown
+  };
+}
+
+function collectTokensFromPayloads(payloads) {
+  const tokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0, hasBreakdown: false };
+  (Array.isArray(payloads) ? payloads : []).forEach((payload) => {
+    const { inputTokens, outputTokens, totalTokens, hasBreakdown } = extractTokensFromUsage(payload?.usage);
+    tokens.inputTokens += inputTokens;
+    tokens.outputTokens += outputTokens;
+    tokens.totalTokens += totalTokens;
+    if (hasBreakdown) tokens.hasBreakdown = true;
+  });
+  return tokens;
+}
+
+function getEntryCompletedAt(entry) {
+  const proofreadCompletedAt = Number(entry?.proofreadCompletedAt);
+  const translationCompletedAt = Number(entry?.translationCompletedAt);
+  if (Number.isFinite(proofreadCompletedAt)) return proofreadCompletedAt;
+  if (Number.isFinite(translationCompletedAt)) return translationCompletedAt;
+  return null;
+}
+
+function buildCostsByDay(buckets) {
+  const map = new Map();
+  (Array.isArray(buckets) ? buckets : []).forEach((bucket) => {
+    const start = Number(bucket?.start_time);
+    const amount = Number(bucket?.amount_usd);
+    if (!Number.isFinite(start) || !Number.isFinite(amount)) return;
+    const dayStart = getUtcDayStartSeconds(start);
+    map.set(dayStart, (map.get(dayStart) || 0) + amount);
+  });
+  return map;
+}
+
+function buildUsageTotalsByDay(buckets) {
+  const map = new Map();
+  (Array.isArray(buckets) ? buckets : []).forEach((bucket) => {
+    const start = Number(bucket?.start_time);
+    if (!Number.isFinite(start)) return;
+    const dayStart = getUtcDayStartSeconds(start);
+    const current = map.get(dayStart) || { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    const input = Number(bucket?.input_tokens) || 0;
+    const output = Number(bucket?.output_tokens) || 0;
+    current.inputTokens += input;
+    current.outputTokens += output;
+    current.totalTokens += Number(bucket?.total_tokens) || input + output;
+    map.set(dayStart, current);
+  });
+  return map;
+}
+
+function sumUsageTokensInRange(buckets, startSec, endSec) {
+  const totals = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  (Array.isArray(buckets) ? buckets : []).forEach((bucket) => {
+    const start = Number(bucket?.start_time);
+    if (!Number.isFinite(start)) return;
+    if (start < startSec || start >= endSec) return;
+    const input = Number(bucket?.input_tokens) || 0;
+    const output = Number(bucket?.output_tokens) || 0;
+    totals.inputTokens += input;
+    totals.outputTokens += output;
+    totals.totalTokens += Number(bucket?.total_tokens) || input + output;
+  });
+  return totals;
+}
+
+async function loadOrgMetrics(debugData, costSettings) {
+  if (!costSettings.showRealCosts) {
+    return { status: 'disabled', message: 'Показ реальных расходов выключен в настройках.' };
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const todayStart = getUtcDayStartSeconds(nowSec);
+  const last7Start = todayStart - 6 * 86400;
+  const items = Array.isArray(debugData?.items) ? debugData.items : [];
+  const dayStarts = new Set([todayStart, last7Start]);
+  items.forEach((item) => {
+    const completedAt = getEntryCompletedAt(item);
+    if (Number.isFinite(completedAt)) {
+      dayStarts.add(getUtcDayStartFromMs(completedAt));
+    }
+  });
+
+  const sessionStart = Number(debugData?.sessionStartTime);
+  const sessionEnd = Number(debugData?.sessionEndTime) || nowSec;
+  if (Number.isFinite(sessionStart)) {
+    const sessionStartDay = getUtcDayStartSeconds(sessionStart);
+    const sessionEndDay = getUtcDayStartSeconds(sessionEnd);
+    dayStarts.add(sessionStartDay);
+    dayStarts.add(sessionEndDay);
+  }
+
+  const dayArray = Array.from(dayStarts).filter((value) => Number.isFinite(value));
+  const rangeStart = dayArray.length ? Math.min(...dayArray) : last7Start;
+  const rangeEnd = dayArray.length ? Math.max(...dayArray) + 86400 : todayStart + 86400;
+  const projectIds = costSettings.openAiProject ? [costSettings.openAiProject] : undefined;
+  const models = collectModelsFromDebug(debugData);
+
+  const costsResponse = await sendRuntimeMessage('GET_ORG_COSTS', {
+    start_time: rangeStart,
+    end_time: rangeEnd,
+    bucket_width: '1d',
+    group_by: ['project_id'],
+    project_ids: projectIds
+  });
+
+  if (!costsResponse?.ok) {
+    return {
+      status: 'error',
+      message: costsResponse?.message || 'Не удалось получить расходы OpenAI.',
+      errorType: costsResponse?.errorType || 'request_failed'
+    };
+  }
+
+  let usageResponse = null;
+  if (costSettings.allocateRealCosts) {
+    usageResponse = await sendRuntimeMessage('GET_ORG_USAGE', {
+      start_time: rangeStart,
+      end_time: rangeEnd,
+      bucket_width: '1h',
+      group_by: ['project_id', 'model'],
+      project_ids: projectIds,
+      models: models.length ? models : undefined
+    });
+  }
+
+  return {
+    status: 'ok',
+    costs: costsResponse,
+    usage: usageResponse,
+    rangeStart,
+    rangeEnd,
+    sessionStart: Number.isFinite(sessionStart) ? sessionStart : null,
+    sessionEnd: Number.isFinite(sessionStart) ? sessionEnd : null
+  };
 }
 
 function renderEmpty(message) {
@@ -168,13 +396,13 @@ function renderEmpty(message) {
     items: [],
     contextStatus: 'pending',
     context: ''
-  }, message);
+  }, { showRealCosts: false, allocateRealCosts: false }, null, message);
 }
 
-function renderDebug(url, data) {
+function renderDebug(url, data, costSettings, orgMetrics) {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
-  renderSummary(data, '');
+  renderSummary(data, costSettings, orgMetrics, '');
 
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const contextText = data.context?.trim();
@@ -207,6 +435,7 @@ function renderDebug(url, data) {
        <div class="empty">Контекст не сформирован.</div>`;
 
   const items = Array.isArray(data.items) ? data.items : [];
+  const allocationState = buildAllocationState(costSettings, orgMetrics);
   if (!items.length) {
     entriesEl.innerHTML = '<div class="empty">Нет данных о блоках перевода.</div>';
     return;
@@ -220,6 +449,10 @@ function renderDebug(url, data) {
     const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
     const entryKey = getProofreadEntryKey(item, index);
     const proofreadSection = renderProofreadSection(item, entryKey);
+    const costInfo = buildBlockCostInfo(item, allocationState);
+    const tokensLabel = formatTokenSummary(costInfo.tokenInfo);
+    const allocatedLabel =
+      Number.isFinite(costInfo.allocatedUsd) ? formatUsd(costInfo.allocatedUsd) : `— (${costInfo.reason})`;
     entry.innerHTML = `
       <div class="entry-header">
         <h2>Блок ${item.index || ''}</h2>
@@ -231,6 +464,16 @@ function renderDebug(url, data) {
           <div class="status-group">
             <span class="status-label">Вычитка</span>
             ${renderStatusBadge(proofreadStatus)}
+          </div>
+        </div>
+        <div class="status-row status-row--metrics">
+          <div class="status-group">
+            <span class="status-label">Tokens in/out</span>
+            <span>${escapeHtml(tokensLabel)}</span>
+          </div>
+          <div class="status-group">
+            <span class="status-label">Allocated</span>
+            <span>${escapeHtml(allocatedLabel)}</span>
           </div>
         </div>
       </div>
@@ -260,7 +503,7 @@ function renderDebug(url, data) {
   });
 }
 
-function renderSummary(data, fallbackMessage = '') {
+function renderSummary(data, costSettings, orgMetrics, fallbackMessage = '') {
   if (!summaryEl) return;
   const items = Array.isArray(data.items) ? data.items : [];
   const total = items.length;
@@ -272,8 +515,6 @@ function renderSummary(data, fallbackMessage = '') {
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const aiRequestCount = Number.isFinite(data.aiRequestCount) ? data.aiRequestCount : 0;
   const aiResponseCount = Number.isFinite(data.aiResponseCount) ? data.aiResponseCount : 0;
-  const totalCostUsd = Number.isFinite(data.totalCostUsd) ? data.totalCostUsd : null;
-  const totalCostLabel = totalCostUsd != null ? `$${totalCostUsd.toFixed(4)}` : '—';
   const overallStatus = getOverallStatus({
     completed,
     inProgress,
@@ -283,7 +524,8 @@ function renderSummary(data, fallbackMessage = '') {
   });
   const summaryLine = fallbackMessage
     ? `${fallbackMessage}`
-    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}`;
+    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount}`;
+  const costSummary = buildCostSummary(data, costSettings, orgMetrics);
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>
@@ -299,6 +541,7 @@ function renderSummary(data, fallbackMessage = '') {
         </div>
       </div>
     </div>
+    ${renderCostSummarySection(costSummary)}
   `;
 }
 
@@ -312,6 +555,162 @@ function getOverallStatus({ completed, inProgress, failed, total, contextStatus 
   }
   if (contextStatus === 'disabled') return 'disabled';
   return 'pending';
+}
+
+function formatUsd(amount) {
+  if (!Number.isFinite(amount)) return '—';
+  return `$${amount.toFixed(4)}`;
+}
+
+function buildCostSummary(data, costSettings, orgMetrics) {
+  if (!costSettings?.showRealCosts) {
+    return {
+      status: 'disabled',
+      message: 'Показ реальных расходов выключен в настройках.'
+    };
+  }
+  if (!orgMetrics) {
+    return { status: 'pending', message: 'Загрузка расходов OpenAI...' };
+  }
+  if (orgMetrics.status !== 'ok') {
+    return {
+      status: 'error',
+      message: orgMetrics.message || 'Не удалось получить расходы OpenAI.'
+    };
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const todayStart = getUtcDayStartSeconds(nowSec);
+  const last7Start = todayStart - 6 * 86400;
+  const costsByDay = buildCostsByDay(orgMetrics.costs?.buckets);
+  let todayUsd = costsByDay.get(todayStart) ?? null;
+  let last7Usd = null;
+  let todayMessage = '';
+  let last7Message = '';
+  if (costsByDay.size === 0) {
+    todayUsd = null;
+    last7Usd = null;
+    todayMessage = 'Нет данных Costs API.';
+    last7Message = 'Нет данных Costs API.';
+  } else if (!costsByDay.has(todayStart)) {
+    todayMessage = `Нет расходов за ${getUtcDayLabel(todayStart)}.`;
+  }
+  if (costsByDay.size > 0) {
+    last7Usd = 0;
+    for (let day = last7Start; day <= todayStart; day += 86400) {
+      last7Usd += costsByDay.get(day) || 0;
+    }
+  }
+
+  let sessionUsd = null;
+  let sessionMessage = '';
+  if (orgMetrics.sessionStart && orgMetrics.usage?.ok && Array.isArray(orgMetrics.usage?.buckets)) {
+    const usageBuckets = orgMetrics.usage.buckets;
+    const usageByDay = buildUsageTotalsByDay(usageBuckets);
+    const sessionStart = orgMetrics.sessionStart;
+    const sessionEnd = orgMetrics.sessionEnd || nowSec;
+    const sessionStartDay = getUtcDayStartSeconds(sessionStart);
+    const sessionEndDay = getUtcDayStartSeconds(sessionEnd);
+    sessionUsd = 0;
+    for (let day = sessionStartDay; day <= sessionEndDay; day += 86400) {
+      const dayStart = day;
+      const dayEnd = day + 86400;
+      const windowStart = Math.max(sessionStart, dayStart);
+      const windowEnd = Math.min(sessionEnd, dayEnd);
+      const sessionTokens = sumUsageTokensInRange(usageBuckets, windowStart, windowEnd);
+      const dayTotals = usageByDay.get(dayStart);
+      const daySpend = costsByDay.get(dayStart);
+      if (!Number.isFinite(daySpend)) {
+        sessionMessage = `Нет расходов за ${getUtcDayLabel(dayStart)}.`;
+        continue;
+      }
+      const dayTotalTokens = dayTotals?.totalTokens || 0;
+      if (!dayTotalTokens || !sessionTokens.totalTokens) {
+        sessionMessage = 'Недостаточно usage-данных для расчёта сессии.';
+        sessionUsd = null;
+        break;
+      }
+      sessionUsd += daySpend * (sessionTokens.totalTokens / dayTotalTokens);
+    }
+  } else if (orgMetrics.sessionStart) {
+    sessionMessage = costSettings.allocateRealCosts
+      ? 'Нет usage-данных для распределения стоимости по сессии.'
+      : 'Распределение по сессии выключено.';
+  }
+
+  return {
+    status: 'ok',
+    todayUsd,
+    last7Usd,
+    sessionUsd,
+    sessionMessage,
+    todayMessage,
+    last7Message,
+    updatedAt: orgMetrics.costs?.updatedAt || null,
+    warning: orgMetrics.costs?.warning || null,
+    usageWarning: orgMetrics.usage?.warning || null
+  };
+}
+
+function renderCostSummarySection(costSummary) {
+  const statusLabel = costSummary?.status === 'ok' ? '' : costSummary?.message || '';
+  const updatedLabel = costSummary?.updatedAt
+    ? new Date(costSummary.updatedAt).toLocaleString('ru-RU')
+    : '—';
+  const warningLines = [costSummary?.warning, costSummary?.usageWarning]
+    .filter(Boolean)
+    .map((warning) => `<div class="cost-warning">${escapeHtml(warning)}</div>`)
+    .join('');
+  if (costSummary?.status !== 'ok') {
+    return `
+      <div class="cost-summary">
+        <div class="label">Расходы OpenAI (реальные)</div>
+        <div class="cost-row">
+          <span class="cost-label">Статус</span>
+          <span class="cost-value">${escapeHtml(statusLabel || '—')}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  const todayLine =
+    costSummary.todayUsd != null
+      ? formatUsd(costSummary.todayUsd)
+      : costSummary.todayMessage
+        ? `— (${escapeHtml(costSummary.todayMessage)})`
+        : '—';
+  const last7Line =
+    costSummary.last7Usd != null
+      ? formatUsd(costSummary.last7Usd)
+      : costSummary.last7Message
+        ? `— (${escapeHtml(costSummary.last7Message)})`
+        : '—';
+  const sessionLine =
+    costSummary.sessionUsd != null
+      ? formatUsd(costSummary.sessionUsd)
+      : costSummary.sessionMessage
+        ? `— (${escapeHtml(costSummary.sessionMessage)})`
+        : '—';
+
+  return `
+    <div class="cost-summary">
+      <div class="label">Расходы OpenAI (реальные)</div>
+      <div class="cost-row">
+        <span class="cost-label">Сегодня (USD)</span>
+        <span class="cost-value">${todayLine}</span>
+      </div>
+      <div class="cost-row">
+        <span class="cost-label">Последние 7 дней</span>
+        <span class="cost-value">${last7Line}</span>
+      </div>
+      <div class="cost-row">
+        <span class="cost-label">Текущая сессия (allocated)</span>
+        <span class="cost-value">${sessionLine}</span>
+      </div>
+      <div class="cost-meta">Обновлено: ${escapeHtml(updatedLabel)}</div>
+      ${warningLines}
+    </div>
+  `;
 }
 
 function renderProofreadSection(item, entryKey) {
@@ -409,6 +808,87 @@ function renderProofreadSection(item, entryKey) {
         </details>
       </div>
     `;
+}
+
+function buildAllocationState(costSettings, orgMetrics) {
+  if (!costSettings?.showRealCosts) {
+    return { enabled: false, reason: 'Показ реальных расходов выключен.' };
+  }
+  if (!orgMetrics) {
+    return { enabled: false, reason: 'Загрузка расходов OpenAI...' };
+  }
+  if (orgMetrics.status !== 'ok') {
+    return { enabled: false, reason: orgMetrics.message || 'Расходы недоступны.' };
+  }
+  if (!costSettings.allocateRealCosts) {
+    return { enabled: false, reason: 'Распределение расходов выключено.' };
+  }
+  if (!orgMetrics.usage?.ok) {
+    return { enabled: false, reason: orgMetrics.usage?.message || 'Usage API недоступен.' };
+  }
+  const costsByDay = buildCostsByDay(orgMetrics.costs?.buckets);
+  const usageByDay = buildUsageTotalsByDay(orgMetrics.usage?.buckets);
+  return {
+    enabled: true,
+    costsByDay,
+    usageByDay,
+    usageBuckets: orgMetrics.usage?.buckets || []
+  };
+}
+
+function buildBlockTokenInfo(item) {
+  const translationTokens = collectTokensFromPayloads(item?.translationDebug);
+  const proofreadTokens = collectTokensFromPayloads(item?.proofreadDebug);
+  const inputTokens = translationTokens.inputTokens + proofreadTokens.inputTokens;
+  const outputTokens = translationTokens.outputTokens + proofreadTokens.outputTokens;
+  const hasBreakdown = translationTokens.hasBreakdown || proofreadTokens.hasBreakdown;
+  const totalTokens = hasBreakdown
+    ? inputTokens + outputTokens
+    : translationTokens.totalTokens + proofreadTokens.totalTokens;
+  return { inputTokens, outputTokens, totalTokens, hasBreakdown };
+}
+
+function formatTokenSummary(tokenInfo) {
+  if (!tokenInfo) return '—';
+  const input = Number.isFinite(tokenInfo.inputTokens) ? tokenInfo.inputTokens : 0;
+  const output = Number.isFinite(tokenInfo.outputTokens) ? tokenInfo.outputTokens : 0;
+  const total = Number.isFinite(tokenInfo.totalTokens) ? tokenInfo.totalTokens : 0;
+  if (tokenInfo.hasBreakdown) {
+    return `${input} in / ${output} out`;
+  }
+  if (total > 0) {
+    return `— / — (total ${total})`;
+  }
+  return '—';
+}
+
+function buildBlockCostInfo(item, allocationState) {
+  const tokenInfo = buildBlockTokenInfo(item);
+  if (!allocationState?.enabled) {
+    return { tokenInfo, allocatedUsd: null, reason: allocationState?.reason || 'Недоступно.' };
+  }
+  const completedAt = getEntryCompletedAt(item);
+  if (!Number.isFinite(completedAt)) {
+    return { tokenInfo, allocatedUsd: null, reason: 'Нет времени выполнения блока.' };
+  }
+  const dayStart = getUtcDayStartFromMs(completedAt);
+  const daySpend = allocationState.costsByDay.get(dayStart);
+  if (!Number.isFinite(daySpend)) {
+    return { tokenInfo, allocatedUsd: null, reason: `Нет costs за ${getUtcDayLabel(dayStart)}.` };
+  }
+  const dayTotals = allocationState.usageByDay.get(dayStart);
+  const dayTotalTokens = dayTotals?.totalTokens || 0;
+  const blockTokens = tokenInfo.hasBreakdown
+    ? tokenInfo.inputTokens + tokenInfo.outputTokens
+    : tokenInfo.totalTokens;
+  if (!dayTotalTokens || !blockTokens) {
+    return { tokenInfo, allocatedUsd: null, reason: 'Недостаточно токенов для распределения.' };
+  }
+  return {
+    tokenInfo,
+    allocatedUsd: daySpend * (blockTokens / dayTotalTokens),
+    reason: ''
+  };
 }
 
 function getOverallEntryStatus(item) {
