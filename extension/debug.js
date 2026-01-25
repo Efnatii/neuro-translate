@@ -341,18 +341,6 @@ function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
   const aiResponseCount = Number.isFinite(data.aiResponseCount) ? data.aiResponseCount : 0;
   const totalCostUsd = Number.isFinite(data.totalCostUsd) ? data.totalCostUsd : null;
   const totalCostLabel = totalCostUsd != null ? `$${totalCostUsd.toFixed(4)}` : '—';
-  const contextLength = Number.isFinite(data.contextLength)
-    ? data.contextLength
-    : typeof data.context === 'string'
-      ? data.context.length
-      : null;
-  const contextLengthLabel = contextLength != null ? ` • Длина контекста: ${contextLength}` : '';
-  const fullContextLabel =
-    data.fullContextAlways === true
-      ? ' • Полный контекст: да'
-      : data.fullContextAlways === false
-        ? ' • Полный контекст: нет'
-        : '';
   const overallStatus = getOverallStatus({
     completed,
     inProgress,
@@ -363,7 +351,7 @@ function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
   const throughputLabel = throughputSummary ? ` • ${throughputSummary}` : '';
   const summaryLine = fallbackMessage
     ? `${fallbackMessage}${throughputLabel}`
-    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'}${contextLengthLabel}${fullContextLabel} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}${throughputLabel}`;
+    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}${throughputLabel}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>
