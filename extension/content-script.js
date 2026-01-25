@@ -887,7 +887,7 @@ async function translatePage(settings) {
   const translationCompletion = Promise.all(workers).then(() => {
     translationQueueDone = true;
   });
-  await Promise.allSettled([...proofreadWorkers, translationCompletion]);
+  await Promise.all([...proofreadWorkers, translationCompletion]);
 
   if (translationError) {
     await flushPersistDebugState('translatePage:error');
