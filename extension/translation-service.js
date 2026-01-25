@@ -1,5 +1,9 @@
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
 const MAX_TRANSLATION_TIMEOUT_MS = 180000;
+// Limits for fallback retries to avoid unbounded per-item translation loops.
+const MAX_TRANSLATION_FALLBACK_BRANCHES = 4;
+const MAX_TRANSLATION_FALLBACK_ITEMS = 40;
+const TRANSLATION_FALLBACK_ERROR = 'Too many retries for block';
 const TRANSLATE_SYSTEM_PROMPT = [
   'You are a professional translator.',
   'Translate every element of the provided "texts" list into the target language with natural, idiomatic phrasing that preserves meaning and readability.',
@@ -29,6 +33,20 @@ const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 
 
 function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
+}
+
+function assertTranslationFallbackBudget(fallbackState, { branchIncrement = 0, itemIncrement = 0 } = {}) {
+  if (!fallbackState) return;
+  fallbackState.branches += branchIncrement;
+  fallbackState.items += itemIncrement;
+  if (
+    fallbackState.branches > MAX_TRANSLATION_FALLBACK_BRANCHES ||
+    fallbackState.items > MAX_TRANSLATION_FALLBACK_ITEMS
+  ) {
+    const error = new Error(TRANSLATION_FALLBACK_ERROR);
+    error.isTooManyRetries = true;
+    throw error;
+  }
 }
 
 function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
@@ -94,6 +112,7 @@ async function translateTexts(
 ) {
   if (!Array.isArray(texts) || !texts.length) return { translations: [], rawTranslation: '' };
 
+  const fallbackState = { branches: 0, items: 0 };
   const maxTimeoutAttempts = 2;
   const maxRetryableRetries = 3;
   let timeoutAttempts = 0;
@@ -141,7 +160,11 @@ async function translateTexts(
         controller.signal,
         context,
         apiBaseUrl,
-        !keepPunctuationTokens
+        !keepPunctuationTokens,
+        false,
+        true,
+        true,
+        fallbackState
       );
       lastRawTranslation = result.rawTranslation;
       if (Array.isArray(result?.debug)) {
@@ -186,6 +209,10 @@ async function translateTexts(
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
         appendParseIssue('fallback:per-item');
+        assertTranslationFallbackBudget(fallbackState, {
+          branchIncrement: 1,
+          itemIncrement: texts.length
+        });
         const translations = await translateIndividually(
           texts,
           apiKey,
@@ -194,7 +221,10 @@ async function translateTexts(
           context,
           apiBaseUrl,
           keepPunctuationTokens,
-          debugPayloads
+          true,
+          true,
+          debugPayloads,
+          fallbackState
         );
         return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
       }
@@ -222,7 +252,8 @@ async function performTranslationRequest(
   restorePunctuation = true,
   strictTargetLanguage = false,
   allowRefusalRetry = true,
-  allowLengthRetry = true
+  allowLengthRetry = true,
+  fallbackState = null
 ) {
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const inputChars = tokenizedTexts.reduce((sum, text) => sum + (text?.length || 0), 0) + (context?.length || 0);
@@ -394,6 +425,10 @@ async function performTranslationRequest(
     });
 
     const retryTexts = refusalIndices.map((index) => texts[index]);
+    assertTranslationFallbackBudget(fallbackState, {
+      branchIncrement: 1,
+      itemIncrement: retryTexts.length
+    });
     const retryResults = await translateIndividually(
       retryTexts,
       apiKey,
@@ -404,7 +439,8 @@ async function performTranslationRequest(
       !restorePunctuation,
       false,
       true,
-      debugPayloads
+      debugPayloads,
+      fallbackState
     );
 
     refusalIndices.forEach((index, retryPosition) => {
@@ -442,7 +478,9 @@ async function performTranslationRequest(
         apiBaseUrl,
         restorePunctuation,
         true,
-        allowRefusalRetry
+        allowRefusalRetry,
+        true,
+        fallbackState
       );
       const retryTranslations = retryResults?.translations || [];
       if (Array.isArray(retryResults?.debug)) {
@@ -469,6 +507,10 @@ async function performTranslationRequest(
       console.warn('Translation length anomaly detected; retrying segments individually.', {
         segmentIndices: lengthRetryIndices
       });
+      assertTranslationFallbackBudget(fallbackState, {
+        branchIncrement: 1,
+        itemIncrement: lengthRetryIndices.length
+      });
       const retryResults = await translateIndividually(
         retryTexts,
         apiKey,
@@ -479,7 +521,8 @@ async function performTranslationRequest(
         !restorePunctuation,
         allowRefusalRetry,
         false,
-        debugPayloads
+        debugPayloads,
+        fallbackState
       );
       lengthRetryIndices.forEach((index, retryPosition) => {
         if (retryResults?.[retryPosition]) {
@@ -497,7 +540,8 @@ async function performTranslationRequest(
     model,
     context,
     apiBaseUrl,
-    debugPayloads
+    debugPayloads,
+    fallbackState
   );
 
   return {
@@ -648,7 +692,8 @@ async function repairTranslationsForLanguage(
   model,
   context,
   apiBaseUrl,
-  debugPayloads
+  debugPayloads,
+  fallbackState = null
 ) {
   const repairItems = [];
   const repairIndices = [];
@@ -661,6 +706,11 @@ async function repairTranslationsForLanguage(
   if (!repairItems.length) {
     return translations;
   }
+
+  assertTranslationFallbackBudget(fallbackState, {
+    branchIncrement: 1,
+    itemIncrement: repairItems.length
+  });
 
   if (Array.isArray(debugPayloads)) {
     const last = debugPayloads[debugPayloads.length - 1];
@@ -725,7 +775,8 @@ async function translateIndividually(
   keepPunctuationTokens = false,
   allowRefusalRetry = true,
   allowLengthRetry = true,
-  debugPayloads = null
+  debugPayloads = null,
+  fallbackState = null
 ) {
   const results = [];
   const maxRetryableRetries = 3;
@@ -746,7 +797,8 @@ async function translateIndividually(
           !keepPunctuationTokens,
           false,
           allowRefusalRetry,
-          allowLengthRetry
+          allowLengthRetry,
+          fallbackState
         );
         if (Array.isArray(result?.debug) && Array.isArray(debugPayloads)) {
           debugPayloads.push(...result.debug);
