@@ -286,7 +286,6 @@ function renderDebug(url, data, throughputSummary = '') {
     const translationStatus = normalizeStatus(item.translationStatus, item.translated);
     const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
     const entryKey = getProofreadEntryKey(item, index);
-    const goalsSection = renderProofreadGoalsSection(item);
     const proofreadSection = renderProofreadSection(item, entryKey);
     entry.innerHTML = `
       <div class="entry-header">
@@ -322,7 +321,6 @@ function renderDebug(url, data, throughputSummary = '') {
           </div>
         </details>
       </div>
-      ${goalsSection}
       ${proofreadSection}
     `;
     entriesEl.appendChild(entry);
@@ -428,7 +426,6 @@ function renderProofreadSection(item, entryKey) {
   const statusClass = getProofreadStatusClass(item, hasComparisons);
   const latency = getProofreadLatency(item);
   const changes = getProofreadChangesSummary(comparisons);
-  const goalsTag = item?.proofreadGoalsUsed ? '<span class="proofread-goals-tag">Цели</span>' : '';
   const isExpanded = Boolean(state.expanded);
   const showView = state.view || defaultView;
   const controls = hasComparisons
@@ -475,7 +472,6 @@ function renderProofreadSection(item, entryKey) {
         <div class="proofread-header">
           <div class="proofread-title">
             <span class="label">Вычитка</span>
-            ${goalsTag}
             <span class="proofread-status ${escapeHtml(statusClass)}">${escapeHtml(statusLabel)}</span>
             <span class="proofread-metric">${escapeHtml(latency)}</span>
             <span class="proofread-metric">${escapeHtml(changes)}</span>
@@ -491,50 +487,6 @@ function renderProofreadSection(item, entryKey) {
             ${renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD')}
           </div>
         </details>
-      </div>
-    `;
-}
-
-function renderProofreadGoalsSection(item) {
-  if (item?.proofreadApplied === false) {
-    return `
-      <div class="block">
-        <div class="label">Цели вычитки</div>
-        <div class="empty">Вычитка выключена.</div>
-      </div>
-    `;
-  }
-  const status =
-    item?.proofreadGoalsStatus && STATUS_CONFIG[item.proofreadGoalsStatus]
-      ? item.proofreadGoalsStatus
-      : item?.proofreadGoalsUsed
-        ? 'done'
-        : 'disabled';
-  const statusLabel = STATUS_CONFIG[status]?.label || '—';
-  const raw = typeof item?.proofreadGoalsRaw === 'string' ? item.proofreadGoalsRaw : '';
-  const parsedText = formatGoalsParsed(item?.proofreadGoalsParsed);
-  const rawContent = raw.trim()
-    ? `<pre class="raw-response">${escapeHtml(raw)}</pre>`
-    : '<div class="empty">Нет данных.</div>';
-  const parsedContent = parsedText.trim()
-    ? `<pre class="raw-response raw-json">${escapeHtml(parsedText)}</pre>`
-    : '<div class="empty">Нет данных.</div>';
-  return `
-      <div class="block">
-        <div class="label-row">
-          <div class="label">Цели вычитки</div>
-          <span class="status-badge ${STATUS_CONFIG[status]?.className || ''}">${escapeHtml(statusLabel)}</span>
-        </div>
-        <div class="goals-grid">
-          <div>
-            <div class="goals-subtitle">Raw</div>
-            ${rawContent}
-          </div>
-          <div>
-            <div class="goals-subtitle">Parsed</div>
-            ${parsedContent}
-          </div>
-        </div>
       </div>
     `;
 }
@@ -869,24 +821,11 @@ function getProofreadStatusClass(item, hasComparisons) {
 
 function getProofreadLatency(item) {
   const debug = Array.isArray(item?.proofreadDebug) ? item.proofreadDebug : [];
-  const latency =
-    debug.find((entry) => entry?.phase === 'PROOFREAD_APPLY' && Number.isFinite(entry?.latencyMs))?.latencyMs ??
-    debug.find((entry) => entry?.phase === 'PROOFREAD' && Number.isFinite(entry?.latencyMs))?.latencyMs ??
-    debug.find((entry) => Number.isFinite(entry?.latencyMs))?.latencyMs;
+  const latency = debug.find((entry) => Number.isFinite(entry?.latencyMs))?.latencyMs;
   if (Number.isFinite(latency)) {
     return `${Math.round(latency)} ms`;
   }
   return '— ms';
-}
-
-function formatGoalsParsed(goalsParsed) {
-  if (goalsParsed == null) return '';
-  if (typeof goalsParsed === 'string') return goalsParsed;
-  try {
-    return JSON.stringify(goalsParsed, null, 2);
-  } catch (error) {
-    return String(goalsParsed);
-  }
 }
 
 function getProofreadChangesSummary(comparisons) {

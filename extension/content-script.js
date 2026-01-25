@@ -73,10 +73,8 @@ const DEFAULT_STATE = {
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
-  proofreadGoalsModel: 'gpt-4.1-mini',
   contextGenerationEnabled: false,
   proofreadEnabled: false,
-  proofreadGoalsEnabled: false,
   singleBlockConcurrency: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
@@ -235,14 +233,10 @@ async function readSettingsFromStorage() {
   if (!merged.contextModel && safeStored.model) {
     merged.contextModel = safeStored.model;
   }
-  if (!merged.proofreadGoalsModel) {
-    merged.proofreadGoalsModel = merged.proofreadModel;
-  }
   const previousModels = {
     translationModel: merged.translationModel,
     contextModel: merged.contextModel,
-    proofreadModel: merged.proofreadModel,
-    proofreadGoalsModel: merged.proofreadGoalsModel
+    proofreadModel: merged.proofreadModel
   };
   const normalizeModel = (model, fallback) => {
     if (!model || model.startsWith('deepseek')) {
@@ -253,19 +247,16 @@ async function readSettingsFromStorage() {
   merged.translationModel = normalizeModel(merged.translationModel, DEFAULT_STATE.translationModel);
   merged.contextModel = normalizeModel(merged.contextModel, DEFAULT_STATE.contextModel);
   merged.proofreadModel = normalizeModel(merged.proofreadModel, DEFAULT_STATE.proofreadModel);
-  merged.proofreadGoalsModel = normalizeModel(merged.proofreadGoalsModel, merged.proofreadModel);
   if (
     merged.translationModel !== previousModels.translationModel ||
     merged.contextModel !== previousModels.contextModel ||
-    merged.proofreadModel !== previousModels.proofreadModel ||
-    merged.proofreadGoalsModel !== previousModels.proofreadGoalsModel
+    merged.proofreadModel !== previousModels.proofreadModel
   ) {
     try {
       await chrome.storage.local.set({
         translationModel: merged.translationModel,
         contextModel: merged.contextModel,
-        proofreadModel: merged.proofreadModel,
-        proofreadGoalsModel: merged.proofreadGoalsModel
+        proofreadModel: merged.proofreadModel
       });
     } catch (error) {
       console.warn('Failed to normalize stored model ids.', error);
@@ -284,10 +275,8 @@ function buildSettingsFromState(state) {
       translationModel: DEFAULT_STATE.translationModel,
       contextModel: DEFAULT_STATE.contextModel,
       proofreadModel: DEFAULT_STATE.proofreadModel,
-      proofreadGoalsModel: DEFAULT_STATE.proofreadGoalsModel,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
-      proofreadGoalsEnabled: DEFAULT_STATE.proofreadGoalsEnabled,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
@@ -316,10 +305,8 @@ function buildSettingsFromState(state) {
     translationModel: state.translationModel,
     contextModel: state.contextModel,
     proofreadModel: state.proofreadModel,
-    proofreadGoalsModel: state.proofreadGoalsModel || state.proofreadModel,
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
-    proofreadGoalsEnabled: Boolean(state.proofreadGoalsEnabled),
     singleBlockConcurrency: Boolean(state.singleBlockConcurrency),
     blockLengthLimit: state.blockLengthLimit,
     tpmLimitsByRole,
@@ -422,10 +409,8 @@ async function requestSettings() {
           translationModel: state.translationModel,
           contextModel: state.contextModel,
           proofreadModel: state.proofreadModel,
-          proofreadGoalsModel: state.proofreadGoalsModel,
           contextGenerationEnabled: state.contextGenerationEnabled,
           proofreadEnabled: state.proofreadEnabled,
-          proofreadGoalsEnabled: state.proofreadGoalsEnabled,
           blockLengthLimit: state.blockLengthLimit,
           tpmLimitsByModel: state.tpmLimitsByModel,
           outputRatioByRole: state.outputRatioByRole,
@@ -655,9 +640,7 @@ async function translatePage(settings) {
               proofreadStatus: 'done',
               proofread: [],
               proofreadComparisons: [],
-              proofreadExecuted: false,
-              proofreadGoalsStatus: 'disabled',
-              proofreadGoalsUsed: false
+              proofreadExecuted: false
             });
           } else {
             enqueueProofreadTask({
@@ -713,20 +696,14 @@ async function translatePage(settings) {
       }
 
       activeProofreadWorkers += 1;
-      let proofreadResult = null;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress', proofreadExecuted: true });
-        proofreadResult = await requestProofreading({
+        const proofreadResult = await requestProofreading({
           segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
-          sourceSegments: (task.proofreadSegments || []).map(
-            (segment) => task.originalTexts[Number(segment.id)] || ''
-          ),
           sourceBlock: formatBlockText(task.originalTexts),
           translatedBlock: formatBlockText(task.translatedTexts),
           context: fullContextSummary,
-          language: settings.targetLanguage || 'ru',
-          proofreadGoalsEnabled: settings.proofreadGoalsEnabled,
-          proofreadGoalsModel: settings.proofreadGoalsModel
+          language: settings.targetLanguage || 'ru'
         });
         if (!proofreadResult?.success) {
           throw new Error(proofreadResult?.error || 'Не удалось выполнить вычитку.');
@@ -791,11 +768,7 @@ async function translatePage(settings) {
           proofread: proofreadSummary,
           proofreadRaw: rawProofread,
           proofreadDebug: proofreadDebugPayloads,
-          proofreadComparisons,
-          proofreadGoalsRaw: proofreadResult?.proofreadGoalsRaw || '',
-          proofreadGoalsParsed: proofreadResult?.proofreadGoalsParsed ?? null,
-          proofreadGoalsStatus: proofreadResult?.proofreadGoalsStatus || null,
-          proofreadGoalsUsed: Boolean(proofreadResult?.proofreadGoalsUsed)
+          proofreadComparisons
         });
         reportProgress('Вычитка выполняется');
       } catch (error) {
@@ -809,11 +782,7 @@ async function translatePage(settings) {
           proofreadStatus: 'failed',
           proofread: [],
           proofreadComparisons,
-          proofreadExecuted: true,
-          proofreadGoalsRaw: proofreadResult?.proofreadGoalsRaw || '',
-          proofreadGoalsParsed: proofreadResult?.proofreadGoalsParsed ?? null,
-          proofreadGoalsStatus: proofreadResult?.proofreadGoalsStatus || null,
-          proofreadGoalsUsed: Boolean(proofreadResult?.proofreadGoalsUsed)
+          proofreadExecuted: true
         });
         reportProgress('Вычитка выполняется');
       } finally {
@@ -1018,15 +987,7 @@ async function requestProofreading(payload) {
     context,
     sourceTexts: [sourceBlock, translatedBlock]
   });
-  const goalsEnabled = Boolean(payload?.proofreadGoalsEnabled);
-  const goalsTokens = goalsEnabled
-    ? estimateTokensForRole('proofread', {
-        texts: segmentTexts,
-        context,
-        sourceTexts: [sourceBlock, translatedBlock]
-      })
-    : 0;
-  await ensureTpmBudget('proofread', estimatedTokens + goalsTokens);
+  await ensureTpmBudget('proofread', estimatedTokens);
   return withRateLimitRetry(
     async () => {
       await incrementDebugAiRequestCount();
@@ -1034,13 +995,10 @@ async function requestProofreading(payload) {
         {
           type: 'PROOFREAD_TEXT',
           segments,
-          sourceSegments: payload?.sourceSegments || [],
           sourceBlock,
           translatedBlock,
           context,
-          language: payload?.language || '',
-          proofreadGoalsEnabled: goalsEnabled,
-          proofreadGoalsModel: payload?.proofreadGoalsModel || ''
+          language: payload?.language || ''
         },
         'Не удалось выполнить вычитку.'
       );
@@ -1055,11 +1013,7 @@ async function requestProofreading(payload) {
         success: true,
         translations: Array.isArray(response.translations) ? response.translations : [],
         rawProofread: response.rawProofread || '',
-        debug: response.debug || null,
-        proofreadGoalsRaw: response.proofreadGoalsRaw,
-        proofreadGoalsParsed: response.proofreadGoalsParsed,
-        proofreadGoalsStatus: response.proofreadGoalsStatus,
-        proofreadGoalsUsed: response.proofreadGoalsUsed
+        debug: response.debug || null
       };
     },
     'Proofreading'
@@ -1371,14 +1325,9 @@ function normalizeProofreadDebugPayloads(payloads, warnings) {
   if (!normalized.length) {
     return [{ phase: 'PROOFREAD', parseIssues: warnings }];
   }
-  const targetIndex = normalized.findIndex((entry) =>
-    ['PROOFREAD_APPLY', 'PROOFREAD'].includes(entry?.phase)
-  );
-  const index = targetIndex >= 0 ? targetIndex : 0;
-  const target = normalized[index];
-  const parseIssues = Array.isArray(target?.parseIssues) ? [...target.parseIssues, ...warnings] : warnings;
-  normalized[index] = { ...target, parseIssues };
-  return normalized;
+  const [first, ...rest] = normalized;
+  const parseIssues = Array.isArray(first.parseIssues) ? [...first.parseIssues, ...warnings] : warnings;
+  return [{ ...first, parseIssues }, ...rest];
 }
 
 function restorePunctuationTokens(text = '') {
@@ -2170,7 +2119,6 @@ async function resetTranslationDebugInfo(url) {
 
 async function initializeDebugState(blocks, settings = {}, initial = {}) {
   const proofreadEnabled = Boolean(settings.proofreadEnabled);
-  const proofreadGoalsEnabled = Boolean(settings.proofreadGoalsEnabled);
   const initialContext = typeof initial.initialContext === 'string' ? initial.initialContext : '';
   const initialContextStatus =
     initial.initialContextStatus ||
@@ -2189,10 +2137,6 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     proofreadComparisons: [],
     proofreadExecuted: false,
     proofreadApplied: proofreadEnabled,
-    proofreadGoalsRaw: '',
-    proofreadGoalsParsed: null,
-    proofreadGoalsStatus: proofreadEnabled && proofreadGoalsEnabled ? 'pending' : 'disabled',
-    proofreadGoalsUsed: false,
     translationStatus: 'pending',
     proofreadStatus: proofreadEnabled ? 'pending' : 'disabled'
   }));

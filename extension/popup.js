@@ -2,10 +2,8 @@ const apiKeyInput = document.getElementById('apiKey');
 const translationModelSelect = document.getElementById('translationModel');
 const contextModelSelect = document.getElementById('contextModel');
 const proofreadModelSelect = document.getElementById('proofreadModel');
-const proofreadGoalsModelSelect = document.getElementById('proofreadGoalsModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
-const proofreadGoalsEnabledCheckbox = document.getElementById('proofreadGoalsEnabled');
 const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
 const blockLengthLimitInput = document.getElementById('blockLengthLimit');
 const blockLengthValueLabel = document.getElementById('blockLengthValue');
@@ -34,7 +32,6 @@ let currentThroughputByRole = {
 let currentTranslationModelId = null;
 let currentContextModelId = null;
 let currentProofreadModelId = null;
-let currentProofreadGoalsModelId = null;
 let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
 let pendingFailureToken = 0;
@@ -72,10 +69,8 @@ async function init() {
         translationModel: state.translationModel,
         contextModel: state.contextModel,
         proofreadModel: state.proofreadModel,
-        proofreadGoalsModel: state.proofreadGoalsModel,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
-        proofreadGoalsEnabled: state.proofreadGoalsEnabled,
         singleBlockConcurrency: state.singleBlockConcurrency,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByModel: state.tpmLimitsByModel,
@@ -91,11 +86,9 @@ async function init() {
   renderModelOptions(translationModelSelect, state.translationModel);
   renderModelOptions(contextModelSelect, state.contextModel);
   renderModelOptions(proofreadModelSelect, state.proofreadModel);
-  renderModelOptions(proofreadGoalsModelSelect, state.proofreadGoalsModel);
   currentTranslationModelId = translationModelSelect.value;
   currentContextModelId = contextModelSelect.value;
   currentProofreadModelId = proofreadModelSelect.value;
-  currentProofreadGoalsModelId = proofreadGoalsModelSelect.value;
   currentThroughputByRole = {
     translation: state.modelThroughputById?.[currentTranslationModelId] || null,
     context: state.modelThroughputById?.[currentContextModelId] || null,
@@ -103,7 +96,6 @@ async function init() {
   };
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
-  renderProofreadGoalsEnabled(state.proofreadGoalsEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
   renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
@@ -120,10 +112,8 @@ async function init() {
   translationModelSelect.addEventListener('change', handleTranslationModelChange);
   contextModelSelect.addEventListener('change', handleContextModelChange);
   proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
-  proofreadGoalsModelSelect.addEventListener('change', handleProofreadGoalsModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
-  proofreadGoalsEnabledCheckbox.addEventListener('change', handleProofreadGoalsEnabledChange);
   singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
@@ -176,13 +166,6 @@ async function handleProofreadModelChange() {
   runModelThroughputTest(proofreadModel, 'proofread');
 }
 
-async function handleProofreadGoalsModelChange() {
-  const proofreadGoalsModel = proofreadGoalsModelSelect.value;
-  await chrome.storage.local.set({ proofreadGoalsModel });
-  currentProofreadGoalsModelId = proofreadGoalsModel;
-  setTemporaryStatus('Модель для целей вычитки сохранена.');
-}
-
 async function handleContextGenerationChange() {
   const contextGenerationEnabled = contextGenerationCheckbox.checked;
   await chrome.storage.local.set({ contextGenerationEnabled });
@@ -195,16 +178,6 @@ async function handleProofreadEnabledChange() {
   const proofreadEnabled = proofreadEnabledCheckbox.checked;
   await chrome.storage.local.set({ proofreadEnabled });
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
-}
-
-async function handleProofreadGoalsEnabledChange() {
-  const proofreadGoalsEnabled = proofreadGoalsEnabledCheckbox.checked;
-  await chrome.storage.local.set({ proofreadGoalsEnabled });
-  setTemporaryStatus(
-    proofreadGoalsEnabled
-      ? 'Рефлексивная вычитка включена.'
-      : 'Рефлексивная вычитка отключена.'
-  );
 }
 
 async function handleSingleBlockConcurrencyChange() {
@@ -239,10 +212,8 @@ async function getState() {
         'translationModel',
         'contextModel',
         'proofreadModel',
-        'proofreadGoalsModel',
         'contextGenerationEnabled',
         'proofreadEnabled',
-        'proofreadGoalsEnabled',
         'singleBlockConcurrency',
         'blockLengthLimit',
         'chunkLengthLimit',
@@ -264,33 +235,23 @@ async function getState() {
       const storedTranslationModel = data.translationModel || data.model;
       const storedContextModel = data.contextModel || data.model;
       const storedProofreadModel = data.proofreadModel || data.model;
-      const storedProofreadGoalsModel = data.proofreadGoalsModel || storedProofreadModel || data.model;
       const translationModel = normalizeModel(storedTranslationModel);
       const contextModel = normalizeModel(storedContextModel);
       const proofreadModel = normalizeModel(storedProofreadModel);
-      const proofreadGoalsModel = normalizeModel(storedProofreadGoalsModel);
       if (
         translationModel !== storedTranslationModel ||
         contextModel !== storedContextModel ||
-        proofreadModel !== storedProofreadModel ||
-        proofreadGoalsModel !== storedProofreadGoalsModel
+        proofreadModel !== storedProofreadModel
       ) {
-        chrome.storage.local.set({
-          translationModel,
-          contextModel,
-          proofreadModel,
-          proofreadGoalsModel
-        });
+        chrome.storage.local.set({ translationModel, contextModel, proofreadModel });
       }
       resolve({
         apiKey: data.apiKey || '',
         translationModel,
         contextModel,
         proofreadModel,
-        proofreadGoalsModel,
         contextGenerationEnabled: data.contextGenerationEnabled,
         proofreadEnabled: data.proofreadEnabled,
-        proofreadGoalsEnabled: data.proofreadGoalsEnabled,
         singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
         blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
         translationStatusByTab: data.translationStatusByTab || {},
@@ -325,10 +286,6 @@ function renderContextGeneration(enabled) {
 
 function renderProofreadEnabled(enabled) {
   proofreadEnabledCheckbox.checked = Boolean(enabled);
-}
-
-function renderProofreadGoalsEnabled(enabled) {
-  proofreadGoalsEnabledCheckbox.checked = Boolean(enabled);
 }
 
 function renderSingleBlockConcurrency(enabled) {
@@ -528,13 +485,6 @@ function handleStorageChange(changes) {
       proofread: currentProofreadModelId ? nextThroughput[currentProofreadModelId] : null
     };
     renderThroughputStatuses();
-  }
-  if (changes.proofreadGoalsEnabled) {
-    renderProofreadGoalsEnabled(changes.proofreadGoalsEnabled.newValue);
-  }
-  if (changes.proofreadGoalsModel) {
-    renderModelOptions(proofreadGoalsModelSelect, changes.proofreadGoalsModel.newValue);
-    currentProofreadGoalsModelId = proofreadGoalsModelSelect.value;
   }
 }
 
