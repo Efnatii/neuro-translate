@@ -1,12 +1,15 @@
 const apiKeyInput = document.getElementById('apiKey');
 const openAiOrganizationInput = document.getElementById('openAiOrganization');
 const openAiProjectInput = document.getElementById('openAiProject');
+const openAiAdminApiKeyInput = document.getElementById('openAiAdminApiKey');
 const translationModelSelect = document.getElementById('translationModel');
 const contextModelSelect = document.getElementById('contextModel');
 const proofreadModelSelect = document.getElementById('proofreadModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
 const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
+const showRealCostsCheckbox = document.getElementById('showRealCosts');
+const allocateRealCostsCheckbox = document.getElementById('allocateRealCosts');
 const blockLengthLimitInput = document.getElementById('blockLengthLimit');
 const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
@@ -20,6 +23,7 @@ const openDebugButton = document.getElementById('openDebug');
 let keySaveTimeout = null;
 let organizationSaveTimeout = null;
 let projectSaveTimeout = null;
+let adminKeySaveTimeout = null;
 let activeTabId = null;
 let translationVisible = false;
 let canShowTranslation = false;
@@ -28,6 +32,7 @@ let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
 let pendingFailureToken = 0;
 let pendingFailureTimeoutId = null;
+let storedAdminApiKey = '';
 
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano' },
@@ -45,6 +50,16 @@ const models = [
   { id: 'gpt-5.2-chat-latest', name: 'GPT-5.2 Chat Latest' },
   { id: 'gpt-4o-2024-05-13', name: 'GPT-4o (2024-05-13)' }
 ];
+
+function redactKey(value) {
+  if (!value) return '';
+  const trimmed = String(value);
+  if (trimmed.length <= 8) {
+    return `${trimmed.slice(0, 2)}...${trimmed.slice(-2)}`;
+  }
+  const prefix = trimmed.startsWith('sk-') ? 'sk-' : trimmed.slice(0, 3);
+  return `${prefix}...${trimmed.slice(-4)}`;
+}
 
 init();
 
@@ -78,12 +93,17 @@ async function init() {
   apiKeyInput.value = state.apiKey || '';
   openAiOrganizationInput.value = state.openAiOrganization || '';
   openAiProjectInput.value = state.openAiProject || '';
+  storedAdminApiKey = state.openAiAdminApiKey || '';
+  const redactedAdminKey = redactKey(storedAdminApiKey);
+  openAiAdminApiKeyInput.value = redactedAdminKey;
+  openAiAdminApiKeyInput.dataset.redactedValue = redactedAdminKey;
   renderModelOptions(translationModelSelect, state.translationModel);
   renderModelOptions(contextModelSelect, state.contextModel);
   renderModelOptions(proofreadModelSelect, state.proofreadModel);
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
+  renderCostSettings(state.showRealCosts, state.allocateRealCosts);
   renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   updateCanShowTranslation(currentTranslationStatus);
@@ -97,12 +117,15 @@ async function init() {
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   openAiOrganizationInput.addEventListener('input', handleOpenAiOrganizationChange);
   openAiProjectInput.addEventListener('input', handleOpenAiProjectChange);
+  openAiAdminApiKeyInput.addEventListener('input', handleAdminApiKeyChange);
   translationModelSelect.addEventListener('change', handleTranslationModelChange);
   contextModelSelect.addEventListener('change', handleContextModelChange);
   proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
   singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
+  showRealCostsCheckbox.addEventListener('change', handleShowRealCostsChange);
+  allocateRealCostsCheckbox.addEventListener('change', handleAllocateRealCostsChange);
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
   cancelButton.addEventListener('click', sendCancel);
@@ -135,6 +158,26 @@ function handleOpenAiProjectChange() {
   projectSaveTimeout = setTimeout(async () => {
     await chrome.storage.local.set({ openAiProject });
     setTemporaryStatus('Проект OpenAI сохранён.');
+  }, 300);
+}
+
+function handleAdminApiKeyChange() {
+  clearTimeout(adminKeySaveTimeout);
+  const rawValue = openAiAdminApiKeyInput.value.trim();
+  const redactedValue = openAiAdminApiKeyInput.dataset.redactedValue || '';
+  adminKeySaveTimeout = setTimeout(async () => {
+    if (rawValue === redactedValue && storedAdminApiKey) {
+      return;
+    }
+    const nextKey = rawValue ? rawValue : '';
+    await chrome.storage.local.set({ openAiAdminApiKey: nextKey });
+    storedAdminApiKey = nextKey;
+    const nextRedacted = redactKey(nextKey);
+    openAiAdminApiKeyInput.value = nextRedacted;
+    openAiAdminApiKeyInput.dataset.redactedValue = nextRedacted;
+    setTemporaryStatus(
+      nextKey ? 'Admin API Key сохранён.' : 'Admin API Key удалён.'
+    );
   }, 300);
 }
 
@@ -181,6 +224,24 @@ async function handleSingleBlockConcurrencyChange() {
   );
 }
 
+async function handleShowRealCostsChange() {
+  const showRealCosts = showRealCostsCheckbox.checked;
+  await chrome.storage.local.set({ showRealCosts });
+  renderCostSettings(showRealCosts, allocateRealCostsCheckbox.checked);
+  setTemporaryStatus(showRealCosts ? 'Показ реальных расходов включен.' : 'Показ реальных расходов выключен.');
+}
+
+async function handleAllocateRealCostsChange() {
+  const allocateRealCosts = allocateRealCostsCheckbox.checked;
+  await chrome.storage.local.set({ allocateRealCosts });
+  renderCostSettings(showRealCostsCheckbox.checked, allocateRealCosts);
+  setTemporaryStatus(
+    allocateRealCosts
+      ? 'Распределение расходов по блокам включено.'
+      : 'Распределение расходов по блокам выключено.'
+  );
+}
+
 async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
   await chrome.storage.local.set({ blockLengthLimit });
@@ -201,6 +262,7 @@ async function getState() {
         'apiKey',
         'openAiOrganization',
         'openAiProject',
+        'openAiAdminApiKey',
         'model',
         'translationModel',
         'contextModel',
@@ -208,6 +270,8 @@ async function getState() {
         'contextGenerationEnabled',
         'proofreadEnabled',
         'singleBlockConcurrency',
+        'showRealCosts',
+        'allocateRealCosts',
         'blockLengthLimit',
         'chunkLengthLimit',
         'translationStatusByTab',
@@ -241,12 +305,15 @@ async function getState() {
           apiKey: data.apiKey || '',
           openAiOrganization: data.openAiOrganization || '',
           openAiProject: data.openAiProject || '',
+          openAiAdminApiKey: data.openAiAdminApiKey || '',
           translationModel,
           contextModel,
           proofreadModel,
           contextGenerationEnabled: data.contextGenerationEnabled,
           proofreadEnabled: data.proofreadEnabled,
           singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
+          showRealCosts: Boolean(data.showRealCosts),
+          allocateRealCosts: Boolean(data.allocateRealCosts),
           blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
           translationStatusByTab: data.translationStatusByTab || {},
           translationVisibilityByTab: data.translationVisibilityByTab || {},
@@ -284,6 +351,14 @@ function renderProofreadEnabled(enabled) {
 
 function renderSingleBlockConcurrency(enabled) {
   singleBlockConcurrencyCheckbox.checked = Boolean(enabled);
+}
+
+function renderCostSettings(showRealCosts, allocateRealCosts) {
+  const show = Boolean(showRealCosts);
+  const allocate = Boolean(allocateRealCosts);
+  showRealCostsCheckbox.checked = show;
+  allocateRealCostsCheckbox.checked = allocate;
+  allocateRealCostsCheckbox.disabled = !show;
 }
 
 function renderBlockLengthLimit(limit) {

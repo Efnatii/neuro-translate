@@ -222,6 +222,23 @@
           OpenAI Project
           <input type="text" id="openAiProject" placeholder="Проект (опционально)" autocomplete="off" />
         </label>
+        <label>
+          Admin API Key (для реальных расходов OpenAI Usage/Costs)
+          <input type="password" id="openAiAdminApiKey" placeholder="Введите Admin API Key" autocomplete="off" />
+        </label>
+      </div>
+    </details>
+    <details class="section" id="costSettings">
+      <summary>Расходы OpenAI</summary>
+      <div class="details-body">
+        <label class="toggle">
+          <input type="checkbox" id="showRealCosts" />
+          Показывать реальные расходы (Costs API)
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="allocateRealCosts" />
+          Распределять реальные расходы по блокам (allocated)
+        </label>
       </div>
     </details>
     <div class="section">
