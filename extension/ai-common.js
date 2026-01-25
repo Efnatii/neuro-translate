@@ -37,6 +37,20 @@ function parseRetryAfterMsFromMessage(message = '') {
   return null;
 }
 
+function isContextOverflowErrorMessage(message = '') {
+  if (typeof message !== 'string') return false;
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('context length') ||
+    normalized.includes('maximum context') ||
+    normalized.includes('context window') ||
+    normalized.includes('token limit') ||
+    normalized.includes('too many tokens') ||
+    normalized.includes('maximum tokens') ||
+    normalized.includes('input is too long')
+  );
+}
+
 function parseRetryAfterMs(response, errorPayload) {
   const retryAfterHeader = response?.headers?.get?.('Retry-After');
   if (retryAfterHeader) {

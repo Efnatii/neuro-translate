@@ -594,6 +594,22 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       error.status = response.status;
       error.retryAfterMs = retryAfterMs;
       error.isRateLimit = response.status === 429 || response.status === 503;
+      error.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
+      error.debugPayload = {
+        phase: 'PROOFREAD',
+        model,
+        latencyMs: Date.now() - startedAt,
+        usage: null,
+        inputChars,
+        outputChars: 0,
+        request: requestPayload,
+        response: {
+          status: response.status,
+          statusText: response.statusText,
+          error: errorMessage
+        },
+        parseIssues: ['request-failed']
+      };
       throw error;
     }
   }

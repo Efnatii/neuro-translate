@@ -374,6 +374,9 @@ chrome.runtime.onConnect.addListener((port) => {
       case 'GENERATE_CONTEXT':
         responsePromise = invokeHandlerAsPromise(handleGenerateContext, msg, 120000);
         break;
+      case 'GENERATE_SHORT_CONTEXT':
+        responsePromise = invokeHandlerAsPromise(handleGenerateShortContext, msg, 120000);
+        break;
       case 'PROOFREAD_TEXT':
         responsePromise = invokeHandlerAsPromise(handleProofreadText, msg, 180000);
         break;
@@ -468,6 +471,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'GENERATE_CONTEXT') {
     handleGenerateContext(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'GENERATE_SHORT_CONTEXT') {
+    handleGenerateShortContext(message, sendResponse);
     return true;
   }
 
@@ -740,7 +748,11 @@ async function handleTranslateText(message, sendResponse) {
     sendResponse({ success: true, translations, rawTranslation, debug });
   } catch (error) {
     console.error('Translation failed', error);
-    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+    sendResponse({
+      success: false,
+      error: error?.message || 'Unknown error',
+      contextOverflow: Boolean(error?.isContextOverflow)
+    });
   }
 }
 
@@ -767,6 +779,29 @@ async function handleGenerateContext(message, sendResponse) {
   }
 }
 
+async function handleGenerateShortContext(message, sendResponse) {
+  try {
+    const state = await getState();
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.contextModel, state);
+    if (!apiKey) {
+      sendResponse({ success: false, error: 'API key is missing.' });
+      return;
+    }
+
+    const { context, debug } = await generateShortTranslationContext(
+      message.text,
+      apiKey,
+      message.targetLanguage,
+      state.contextModel,
+      apiBaseUrl
+    );
+    sendResponse({ success: true, context, debug });
+  } catch (error) {
+    console.error('Short context generation failed', error);
+    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+  }
+}
+
 async function handleProofreadText(message, sendResponse) {
   try {
     const state = await getState();
@@ -789,7 +824,11 @@ async function handleProofreadText(message, sendResponse) {
     sendResponse({ success: true, translations, rawProofread, debug });
   } catch (error) {
     console.error('Proofreading failed', error);
-    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+    sendResponse({
+      success: false,
+      error: error?.message || 'Unknown error',
+      contextOverflow: Boolean(error?.isContextOverflow)
+    });
   }
 }
 

@@ -251,6 +251,7 @@ function renderDebug(url, data) {
     const proofreadSection = renderProofreadSection(item, entryKey);
     const tokenInfo = buildBlockTokenInfo(item);
     const tokensLabel = formatTokenSummary(tokenInfo);
+    const contextSnapshots = renderContextSnapshots(item);
     entry.innerHTML = `
       <div class="entry-header">
         <h2>Блок ${item.index || ''}</h2>
@@ -275,6 +276,7 @@ function renderDebug(url, data) {
         <div class="label">Оригинал</div>
         <pre>${escapeHtml(item.original || '')}</pre>
       </div>
+      ${contextSnapshots}
       <div class="block">
         <div class="label">Перевод</div>
         ${
@@ -309,6 +311,8 @@ function renderSummary(data, fallbackMessage = '') {
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const aiRequestCount = Number.isFinite(data.aiRequestCount) ? data.aiRequestCount : 0;
   const aiResponseCount = Number.isFinite(data.aiResponseCount) ? data.aiResponseCount : 0;
+  const contextUsage = collectContextUsageCounts(items);
+  const contextUsageLabel = formatContextUsageSummary(contextUsage);
   const overallStatus = getOverallStatus({
     completed,
     inProgress,
@@ -318,7 +322,7 @@ function renderSummary(data, fallbackMessage = '') {
   });
   const summaryLine = fallbackMessage
     ? `${fallbackMessage}`
-    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount}`;
+    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • ${contextUsageLabel}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>
@@ -580,6 +584,17 @@ function renderDebugPayload(payload, index) {
   const latency = formatLatency(payload?.latencyMs);
   const inputChars = formatCharCount(payload?.inputChars);
   const outputChars = formatCharCount(payload?.outputChars);
+  const contextType = payload?.contextTypeUsed;
+  const contextLabel = contextType === 'full' ? 'FULL' : contextType === 'short' ? 'SHORT' : '';
+  const contextBadge = contextLabel
+    ? `<span class="context-pill context-pill--${escapeHtml(contextType)}">${escapeHtml(contextLabel)}</span>`
+    : '';
+  const contextMeta = contextLabel
+    ? `<div class="debug-context">Context used: ${contextBadge}</div>`
+    : '';
+  const contextSection = contextLabel
+    ? renderDebugSection('Context text sent', payload?.contextTextSent)
+    : '';
   const requestSection = renderDebugSection('Request (raw)', payload?.request);
   const responseSection = renderDebugSection('Response (raw)', payload?.response);
   const parseSection = renderDebugParseSection(payload?.parseIssues);
@@ -599,11 +614,66 @@ function renderDebugPayload(payload, index) {
         <span>Input: ${escapeHtml(inputChars)}</span>
         <span>Output: ${escapeHtml(outputChars)}</span>
       </div>
+      ${contextMeta}
+      ${contextSection}
       ${requestSection}
       ${responseSection}
       ${parseSection}
     </div>
   `;
+}
+
+function renderContextSnapshots(item) {
+  const full = typeof item?.fullContextSnapshot === 'string' ? item.fullContextSnapshot.trim() : '';
+  const short = typeof item?.shortContextSnapshot === 'string' ? item.shortContextSnapshot.trim() : '';
+  const source = item?.shortContextSource === 'ai' ? 'AI-generated' : item?.shortContextSource === 'fallback' ? 'fallback' : '—';
+  return `
+    <div class="block">
+      <div class="label">Контекст блока</div>
+      <div class="context-grid">
+        ${renderContextCard('Full context', full)}
+        ${renderContextCard(`Short context <span class="context-source">${escapeHtml(source)}</span>`, short)}
+      </div>
+    </div>
+  `;
+}
+
+function renderContextCard(title, text) {
+  const body = text ? `<pre>${escapeHtml(text)}</pre>` : `<div class="empty">Контекст не задан.</div>`;
+  return `
+    <details class="context-card">
+      <summary>${title}</summary>
+      <div class="details-content">
+        ${body}
+      </div>
+    </details>
+  `;
+}
+
+function collectContextUsageCounts(items) {
+  const counts = {
+    translation: { full: 0, short: 0 },
+    proofread: { full: 0, short: 0 }
+  };
+  items.forEach((item) => {
+    (Array.isArray(item?.translationDebug) ? item.translationDebug : []).forEach((payload) => {
+      if (payload?.contextTypeUsed === 'full') counts.translation.full += 1;
+      if (payload?.contextTypeUsed === 'short') counts.translation.short += 1;
+    });
+    (Array.isArray(item?.proofreadDebug) ? item.proofreadDebug : []).forEach((payload) => {
+      if (payload?.contextTypeUsed === 'full') counts.proofread.full += 1;
+      if (payload?.contextTypeUsed === 'short') counts.proofread.short += 1;
+    });
+  });
+  return counts;
+}
+
+function formatContextUsageSummary(counts) {
+  const translationFull = Number.isFinite(counts?.translation?.full) ? counts.translation.full : 0;
+  const translationShort = Number.isFinite(counts?.translation?.short) ? counts.translation.short : 0;
+  const proofreadFull = Number.isFinite(counts?.proofread?.full) ? counts.proofread.full : 0;
+  const proofreadShort = Number.isFinite(counts?.proofread?.short) ? counts.proofread.short : 0;
+  return `Контекст FULL/SHORT (перевод): ${translationFull}/${translationShort} • (вычитка): ${proofreadFull}/${proofreadShort}`;
 }
 
 function renderDebugSection(label, value) {
