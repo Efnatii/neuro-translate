@@ -5,8 +5,10 @@ const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
 const PROOFREAD_MAX_OUTPUT_TOKENS = 4096;
 const PROOFREAD_SYSTEM_PROMPT = [
   'You are an expert translation proofreader and editor.',
-  'Your job is to improve the translated text for clarity, fluency, and readability while preserving the original meaning.',
-  'Fix typos, punctuation, grammar, and awkward phrasing. You may rewrite within a segment to improve clarity, including reordering words, and splitting or combining sentences within that segment.',
+  'Follow the selected PROOFREAD_MODE instructions exactly.',
+  'PROOFREAD_MODE=NOISE_CLEANUP: remove noise, normalize to the target language, fix strange insertions, preserve meaning, keep placeholders/tags unchanged, do not add new meaning.',
+  'PROOFREAD_MODE=READABILITY_REWRITE: rewrite for maximum clarity and naturalness while preserving meaning exactly; improve readability, phrasing, punctuation, and flow.',
+  'If text is already perfect, return it unchanged.',
   'Do not add, omit, or distort information. If rewriting, keep the meaning exactly. Do not hallucinate.',
   'Do not reorder content across segments or change which segment contains which information.',
   'Preserve modality, tense, aspect, tone, and level of certainty.',
@@ -46,6 +48,7 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const sourceBlock = input?.sourceBlock ?? '';
   const translatedBlock = input?.translatedBlock ?? '';
   const language = input?.language ?? '';
+  const proofreadMode = input?.proofreadMode === 'NOISE_CLEANUP' ? 'NOISE_CLEANUP' : 'READABILITY_REWRITE';
   const normalizedContext = normalizeContextPayload(input?.context);
   const contextText = normalizedContext.text || '';
   const contextMode = normalizedContext.mode === 'SHORT' ? 'SHORT' : 'FULL';
@@ -69,6 +72,13 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
         .join(' ')
     },
   ];
+
+  messages.push({
+    role: 'user',
+    content: [`PROOFREAD_MODE: ${proofreadMode}.`, language ? `Target language: ${language}` : '']
+      .filter(Boolean)
+      .join('\n')
+  });
 
   if (contextText) {
     messages.push({
@@ -113,6 +123,7 @@ async function proofreadTranslation(
   sourceBlock,
   translatedBlock,
   context,
+  proofreadMode,
   language,
   apiKey,
   model,
@@ -154,7 +165,7 @@ async function proofreadTranslation(
     const chunk = chunks[index];
     let result = await requestProofreadChunk(
       chunk,
-      { sourceBlock, translatedBlock, context, language },
+      { sourceBlock, translatedBlock, context, language, proofreadMode },
       apiKey,
       model,
       apiBaseUrl,
@@ -175,7 +186,7 @@ async function proofreadTranslation(
       appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
-        { sourceBlock, translatedBlock, context, language },
+        { sourceBlock, translatedBlock, context, language, proofreadMode },
         apiKey,
         model,
         apiBaseUrl,
@@ -199,7 +210,7 @@ async function proofreadTranslation(
       appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
-        { sourceBlock, translatedBlock, context, language },
+        { sourceBlock, translatedBlock, context, language, proofreadMode },
         apiKey,
         model,
         apiBaseUrl,
@@ -228,7 +239,7 @@ async function proofreadTranslation(
       for (const item of chunk) {
         const singleResult = await requestProofreadChunk(
           [item],
-          { sourceBlock, translatedBlock, context, language },
+          { sourceBlock, translatedBlock, context, language, proofreadMode },
           apiKey,
           model,
           apiBaseUrl,
@@ -261,10 +272,14 @@ async function proofreadTranslation(
 
   const translations = items.map((item) => {
     const revision = revisionsById.get(String(item.id));
+    const originalText = originalById.get(String(item.id)) || '';
     if (typeof revision === 'string') {
+      if (revision.trim()) {
       return revision;
+      }
+      return originalText;
     }
-    return originalById.get(String(item.id)) || '';
+    return originalText;
   });
 
   const repairedTranslations = await repairProofreadSegments(
@@ -524,7 +539,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         sourceBlock: metadata?.sourceBlock,
         translatedBlock: metadata?.translatedBlock,
         context: metadata?.context,
-        language: metadata?.language
+        language: metadata?.language,
+        proofreadMode: metadata?.proofreadMode
       },
       strict,
       extraReminder

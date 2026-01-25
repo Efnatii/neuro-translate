@@ -816,6 +816,7 @@ async function handleProofreadText(message, sendResponse) {
       message.sourceBlock,
       message.translatedBlock,
       message.context,
+      message.proofreadMode,
       message.language,
       apiKey,
       state.proofreadModel,
