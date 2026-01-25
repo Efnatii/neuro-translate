@@ -9,7 +9,6 @@ const STATUS_CONFIG = {
   in_progress: { label: 'В работе', className: 'status-in-progress' },
   done: { label: 'Готово', className: 'status-done' },
   failed: { label: 'Ошибка', className: 'status-failed' },
-  cancelled: { label: 'Отменено', className: 'status-cancelled' },
   disabled: { label: 'Отключено', className: 'status-disabled' }
 };
 
@@ -335,7 +334,7 @@ function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
   const overallStatuses = items.map((item) => getOverallEntryStatus(item));
   const completed = overallStatuses.filter((status) => status === 'done').length;
   const inProgress = overallStatuses.filter((status) => status === 'in_progress').length;
-  const failed = overallStatuses.filter((status) => status === 'failed' || status === 'cancelled').length;
+  const failed = overallStatuses.filter((status) => status === 'failed').length;
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const aiRequestCount = Number.isFinite(data.aiRequestCount) ? data.aiRequestCount : 0;
@@ -500,8 +499,6 @@ function getOverallEntryStatus(item) {
   const proofreadApplied = item.proofreadApplied !== false;
   const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, proofreadApplied);
 
-  if (translationStatus === 'cancelled') return 'cancelled';
-  if (proofreadApplied && proofreadStatus === 'cancelled') return 'cancelled';
   if (translationStatus === 'failed') return 'failed';
   if (proofreadApplied) {
     if (proofreadStatus === 'failed') return 'failed';
@@ -800,7 +797,6 @@ function getProofreadStatusLabel(item, hasComparisons) {
     ? item.proofreadStatus
     : normalizeStatus(item?.proofreadStatus, item?.proofread, true);
   if (status === 'failed') return 'Ошибка';
-  if (status === 'cancelled') return 'Отменено';
   if (status === 'in_progress') return 'В работе';
   if (status === 'pending') return 'Ожидает';
   if (status === 'disabled') return 'Отключено';
@@ -817,7 +813,6 @@ function getProofreadStatusClass(item, hasComparisons) {
     ? item.proofreadStatus
     : normalizeStatus(item?.proofreadStatus, item?.proofread, true);
   if (status === 'failed') return 'proofread-status--error';
-  if (status === 'cancelled') return 'proofread-status--error';
   if (status === 'done') {
     if (hasComparisons) return 'proofread-status--applied';
     return item?.proofreadExecuted ? 'proofread-status--applied' : 'proofread-status--skipped';
