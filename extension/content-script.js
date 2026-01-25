@@ -77,7 +77,6 @@ const DEFAULT_STATE = {
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   singleBlockConcurrency: false,
-  sequentialTranslationEnabled: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -280,7 +279,6 @@ function buildSettingsFromState(state) {
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
-      sequentialTranslationEnabled: DEFAULT_STATE.sequentialTranslationEnabled,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
         translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -311,7 +309,6 @@ function buildSettingsFromState(state) {
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
     singleBlockConcurrency: Boolean(state.singleBlockConcurrency),
-    sequentialTranslationEnabled: Boolean(state.sequentialTranslationEnabled),
     blockLengthLimit: state.blockLengthLimit,
     tpmLimitsByRole,
     outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -415,8 +412,6 @@ async function requestSettings() {
           proofreadModel: state.proofreadModel,
           contextGenerationEnabled: state.contextGenerationEnabled,
           proofreadEnabled: state.proofreadEnabled,
-          singleBlockConcurrency: state.singleBlockConcurrency,
-          sequentialTranslationEnabled: state.sequentialTranslationEnabled,
           blockLengthLimit: state.blockLengthLimit,
           tpmLimitsByModel: state.tpmLimitsByModel,
           outputRatioByRole: state.outputRatioByRole,
@@ -533,9 +528,7 @@ async function translatePage(settings) {
     return shortContextSummary;
   };
 
-  const sequentialTranslationEnabled = Boolean(settings.sequentialTranslationEnabled);
-  let concatenatedContext = '';
-  const singleBlockConcurrency = sequentialTranslationEnabled ? true : Boolean(settings.singleBlockConcurrency);
+  const singleBlockConcurrency = Boolean(settings.singleBlockConcurrency);
   const translationConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(6, blocks.length));
   let activeTranslationWorkers = 0;
   let activeProofreadWorkers = 0;
@@ -596,15 +589,10 @@ async function translatePage(settings) {
         const blockTranslations = [];
 
         const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
-        const contextForBlock =
-          sequentialTranslationEnabled && currentIndex > 0
-            ? concatenatedContext
-            : consumeContextForTranslation();
-        const proofreadContextForBlock = sequentialTranslationEnabled ? concatenatedContext : shortContextSummary || '';
         const result = await translate(
           uniqueTexts,
           settings.targetLanguage || 'ru',
-          contextForBlock,
+          consumeContextForTranslation(),
           keepPunctuationTokens
         );
         if (!result?.success) {
@@ -652,15 +640,6 @@ async function translatePage(settings) {
           translationDebug: result.debug || []
         });
 
-        if (sequentialTranslationEnabled) {
-          const blockSourceText = formatBlockText(block.map(({ original }) => original));
-          if (blockSourceText) {
-            concatenatedContext = concatenatedContext
-              ? `${concatenatedContext}\n\n${blockSourceText}`
-              : blockSourceText;
-          }
-        }
-
         if (settings.proofreadEnabled) {
           const proofreadSegments = translatedTexts
             .map((text, index) => ({ id: String(index), text }))
@@ -679,8 +658,7 @@ async function translatePage(settings) {
               key: queuedItem.key,
               translatedTexts,
               originalTexts: block.map(({ original }) => original),
-              proofreadSegments,
-              proofreadContext: proofreadContextForBlock
+              proofreadSegments
             });
           }
         }
@@ -733,7 +711,7 @@ async function translatePage(settings) {
           segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
           sourceBlock: formatBlockText(task.originalTexts),
           translatedBlock: formatBlockText(task.translatedTexts),
-          context: task.proofreadContext || shortContextSummary || '',
+          context: shortContextSummary || '',
           language: settings.targetLanguage || 'ru'
         });
         if (!proofreadResult?.success) {
