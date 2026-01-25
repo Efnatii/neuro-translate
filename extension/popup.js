@@ -309,11 +309,6 @@ function clampBlockLengthLimit(value) {
 
 function runModelThroughputTest(model, role) {
   if (!model) return;
-  const roleLabel = getRoleLabel(role);
-  const statusMessage = roleLabel
-    ? `Запускаем тест пропускной способности (${roleLabel})...`
-    : 'Запускаем тест пропускной способности...';
-  setTemporaryStatus(statusMessage);
   chrome.runtime.sendMessage({ type: 'RUN_MODEL_THROUGHPUT_TEST', model }, (response) => {
     if (response?.success) {
       if (role) {
