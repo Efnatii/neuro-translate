@@ -1,4 +1,6 @@
 const apiKeyInput = document.getElementById('apiKey');
+const openAiOrganizationInput = document.getElementById('openAiOrganization');
+const openAiProjectInput = document.getElementById('openAiProject');
 const translationModelSelect = document.getElementById('translationModel');
 const contextModelSelect = document.getElementById('contextModel');
 const proofreadModelSelect = document.getElementById('proofreadModel');
@@ -16,6 +18,8 @@ const toggleTranslationButton = document.getElementById('toggleTranslation');
 const openDebugButton = document.getElementById('openDebug');
 
 let keySaveTimeout = null;
+let organizationSaveTimeout = null;
+let projectSaveTimeout = null;
 let activeTabId = null;
 let translationVisible = false;
 let canShowTranslation = false;
@@ -54,6 +58,8 @@ async function init() {
       type: 'SYNC_STATE_CACHE',
       state: {
         apiKey: state.apiKey,
+        openAiOrganization: state.openAiOrganization,
+        openAiProject: state.openAiProject,
         translationModel: state.translationModel,
         contextModel: state.contextModel,
         proofreadModel: state.proofreadModel,
@@ -70,6 +76,8 @@ async function init() {
     // Best-effort sync for Edge; ignore failures.
   }
   apiKeyInput.value = state.apiKey || '';
+  openAiOrganizationInput.value = state.openAiOrganization || '';
+  openAiProjectInput.value = state.openAiProject || '';
   renderModelOptions(translationModelSelect, state.translationModel);
   renderModelOptions(contextModelSelect, state.contextModel);
   renderModelOptions(proofreadModelSelect, state.proofreadModel);
@@ -87,6 +95,8 @@ async function init() {
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
+  openAiOrganizationInput.addEventListener('input', handleOpenAiOrganizationChange);
+  openAiProjectInput.addEventListener('input', handleOpenAiProjectChange);
   translationModelSelect.addEventListener('change', handleTranslationModelChange);
   contextModelSelect.addEventListener('change', handleContextModelChange);
   proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
@@ -107,6 +117,24 @@ function handleApiKeyChange() {
   keySaveTimeout = setTimeout(async () => {
     await chrome.storage.local.set({ apiKey });
     setTemporaryStatus('API ключ сохранён.');
+  }, 300);
+}
+
+function handleOpenAiOrganizationChange() {
+  clearTimeout(organizationSaveTimeout);
+  const openAiOrganization = openAiOrganizationInput.value.trim();
+  organizationSaveTimeout = setTimeout(async () => {
+    await chrome.storage.local.set({ openAiOrganization });
+    setTemporaryStatus('Организация OpenAI сохранена.');
+  }, 300);
+}
+
+function handleOpenAiProjectChange() {
+  clearTimeout(projectSaveTimeout);
+  const openAiProject = openAiProjectInput.value.trim();
+  projectSaveTimeout = setTimeout(async () => {
+    await chrome.storage.local.set({ openAiProject });
+    setTemporaryStatus('Проект OpenAI сохранён.');
   }, 300);
 }
 
@@ -171,6 +199,8 @@ async function getState() {
     chrome.storage.local.get(
       [
         'apiKey',
+        'openAiOrganization',
+        'openAiProject',
         'model',
         'translationModel',
         'contextModel',
@@ -209,6 +239,8 @@ async function getState() {
         }
         resolve({
           apiKey: data.apiKey || '',
+          openAiOrganization: data.openAiOrganization || '',
+          openAiProject: data.openAiProject || '',
           translationModel,
           contextModel,
           proofreadModel,

@@ -71,6 +71,8 @@ const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
 const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
 const DEFAULT_STATE = {
   apiKey: '',
+  openAiOrganization: '',
+  openAiProject: '',
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
