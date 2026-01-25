@@ -3,7 +3,6 @@ importScripts('messaging.js');
 importScripts('translation-service.js');
 importScripts('context-service.js');
 importScripts('proofread-service.js');
-importScripts('openai-org-metrics.js');
 
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
@@ -181,12 +180,6 @@ function storageLocalSet(items, timeoutMs = 3000) {
       reject(error);
     }
   });
-}
-
-async function getAdminApiKey() {
-  const { openAiAdminApiKey } = await storageLocalGet({ openAiAdminApiKey: '' });
-  if (typeof openAiAdminApiKey !== 'string') return '';
-  return openAiAdminApiKey.trim();
 }
 
 function applyStatePatch(patch = {}) {
@@ -555,16 +548,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === 'GET_ORG_COSTS') {
-    handleOrgCostsRequest(message, sendResponse);
-    return true;
-  }
-
-  if (message?.type === 'GET_ORG_USAGE') {
-    handleOrgUsageRequest(message, sendResponse);
-    return true;
-  }
-
   return false;
 });
 
@@ -855,42 +838,4 @@ async function handleTranslationCancelled(message, sender) {
   translationVisibilityByTab[tabId] = false;
   await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
   chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
-}
-
-async function handleOrgCostsRequest(message, sendResponse) {
-  try {
-    const adminKey = await getAdminApiKey();
-    const params = {
-      start_time: message?.start_time,
-      end_time: message?.end_time,
-      bucket_width: message?.bucket_width,
-      group_by: message?.group_by,
-      project_ids: message?.project_ids,
-      limit: message?.limit
-    };
-    const result = await fetchOrgCosts({ adminKey, ...params });
-    sendResponse(result);
-  } catch (error) {
-    sendResponse({ ok: false, errorType: 'runtime', message: error?.message || String(error) });
-  }
-}
-
-async function handleOrgUsageRequest(message, sendResponse) {
-  try {
-    const adminKey = await getAdminApiKey();
-    const params = {
-      start_time: message?.start_time,
-      end_time: message?.end_time,
-      bucket_width: message?.bucket_width,
-      group_by: message?.group_by,
-      project_ids: message?.project_ids,
-      models: message?.models,
-      limit: message?.limit,
-      page: message?.page
-    };
-    const result = await fetchOrgUsageCompletions({ adminKey, ...params });
-    sendResponse(result);
-  } catch (error) {
-    sendResponse({ ok: false, errorType: 'runtime', message: error?.message || String(error) });
-  }
 }

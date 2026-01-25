@@ -64,7 +64,6 @@ async function translateTexts(
       model,
       latencyMs: null,
       usage: null,
-      costUsd: null,
       inputChars: null,
       outputChars: null,
       request: null,
@@ -304,7 +303,6 @@ async function performTranslationRequest(
     model,
     latencyMs,
     usage,
-    costUsd: null,
     inputChars,
     outputChars: content?.length || 0,
     request: requestPayload,
@@ -558,7 +556,6 @@ async function performTranslationRepairRequest(
     model,
     latencyMs,
     usage,
-    costUsd: null,
     inputChars: normalizedItems.reduce(
       (sum, item) => sum + (item.source?.length || 0) + (item.draft?.length || 0),
       0
@@ -619,7 +616,6 @@ async function repairTranslationsForLanguage(
         model,
         latencyMs: null,
         usage: null,
-        costUsd: null,
         inputChars: null,
         outputChars: null,
         request: null,
