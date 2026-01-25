@@ -27,6 +27,7 @@ const DEFAULT_STATE = {
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   singleBlockConcurrency: false,
+  sequentialTranslationEnabled: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -45,6 +46,7 @@ const STATE_CACHE_KEYS = new Set([
   'contextGenerationEnabled',
   'proofreadEnabled',
   'singleBlockConcurrency',
+  'sequentialTranslationEnabled',
   'blockLengthLimit',
   'tpmLimitsByModel',
   'outputRatioByRole',
@@ -191,7 +193,7 @@ function applyStatePatch(patch = {}) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
     }
-    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency'].includes(key)) {
+    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency', 'sequentialTranslationEnabled'].includes(key)) {
       next[key] = Boolean(value);
       continue;
     }
@@ -433,6 +435,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
                 proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
                 blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+                sequentialTranslationEnabled: DEFAULT_STATE.sequentialTranslationEnabled,
                 tpmLimitsByRole: {
                   translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
                   context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -662,6 +665,7 @@ async function handleGetSettings(message, sendResponse) {
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
         singleBlockConcurrency: state.singleBlockConcurrency,
+        sequentialTranslationEnabled: state.sequentialTranslationEnabled,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByRole,
         outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -684,6 +688,7 @@ async function handleGetSettings(message, sendResponse) {
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+      sequentialTranslationEnabled: DEFAULT_STATE.sequentialTranslationEnabled,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
         translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -706,6 +711,7 @@ async function handleGetSettings(message, sendResponse) {
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+        sequentialTranslationEnabled: DEFAULT_STATE.sequentialTranslationEnabled,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
           translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),

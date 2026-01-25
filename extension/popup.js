@@ -5,6 +5,7 @@ const proofreadModelSelect = document.getElementById('proofreadModel');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
 const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
+const sequentialTranslationCheckbox = document.getElementById('sequentialTranslation');
 const blockLengthLimitInput = document.getElementById('blockLengthLimit');
 const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
@@ -72,6 +73,7 @@ async function init() {
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
         singleBlockConcurrency: state.singleBlockConcurrency,
+        sequentialTranslationEnabled: state.sequentialTranslationEnabled,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByModel: state.tpmLimitsByModel,
         outputRatioByRole: state.outputRatioByRole,
@@ -97,6 +99,7 @@ async function init() {
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
+  renderSequentialTranslation(state.sequentialTranslationEnabled);
   renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   updateCanShowTranslation(currentTranslationStatus);
@@ -115,6 +118,7 @@ async function init() {
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
   singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
+  sequentialTranslationCheckbox.addEventListener('change', handleSequentialTranslationChange);
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
   cancelButton.addEventListener('click', sendCancel);
@@ -190,6 +194,16 @@ async function handleSingleBlockConcurrencyChange() {
   );
 }
 
+async function handleSequentialTranslationChange() {
+  const sequentialTranslationEnabled = sequentialTranslationCheckbox.checked;
+  await chrome.storage.local.set({ sequentialTranslationEnabled });
+  setTemporaryStatus(
+    sequentialTranslationEnabled
+      ? 'Строгий последовательный перевод включён.'
+      : 'Строгий последовательный перевод отключён.'
+  );
+}
+
 async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
   await chrome.storage.local.set({ blockLengthLimit });
@@ -215,6 +229,7 @@ async function getState() {
         'contextGenerationEnabled',
         'proofreadEnabled',
         'singleBlockConcurrency',
+        'sequentialTranslationEnabled',
         'blockLengthLimit',
         'chunkLengthLimit',
         'translationStatusByTab',
@@ -253,6 +268,7 @@ async function getState() {
         contextGenerationEnabled: data.contextGenerationEnabled,
         proofreadEnabled: data.proofreadEnabled,
         singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
+        sequentialTranslationEnabled: Boolean(data.sequentialTranslationEnabled),
         blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
         translationStatusByTab: data.translationStatusByTab || {},
         translationVisibilityByTab: data.translationVisibilityByTab || {},
@@ -290,6 +306,10 @@ function renderProofreadEnabled(enabled) {
 
 function renderSingleBlockConcurrency(enabled) {
   singleBlockConcurrencyCheckbox.checked = Boolean(enabled);
+}
+
+function renderSequentialTranslation(enabled) {
+  sequentialTranslationCheckbox.checked = Boolean(enabled);
 }
 
 function renderBlockLengthLimit(limit) {
