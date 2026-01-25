@@ -71,16 +71,23 @@ function pingContentScript(tabId, timeoutMs = 700) {
       resolve({ ok: false, reason: 'timeout' });
     }, timeoutMs);
 
-    chrome.tabs.sendMessage(tabId, { type: NT_PING_TYPE }, (response) => {
+    try {
+      chrome.tabs.sendMessage(tabId, { type: NT_PING_TYPE }, (response) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, reason: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve({ ok: true, response });
+      });
+    } catch (error) {
       if (finished) return;
       finished = true;
       clearTimeout(timeoutId);
-      if (chrome.runtime.lastError) {
-        resolve({ ok: false, reason: chrome.runtime.lastError.message });
-        return;
-      }
-      resolve({ ok: true, response });
-    });
+      resolve({ ok: false, reason: error?.message || 'ping-failed' });
+    }
   });
 }
 
@@ -146,14 +153,27 @@ async function ensureConnected(tabId, options = {}) {
 
 function sendMessageToTab(tabId, message, expectResponse = false) {
   return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, message, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve({ ok: false, reason: chrome.runtime.lastError.message });
-        return;
-      }
-      resolve({ ok: true, response: expectResponse ? response : undefined });
-    });
+    try {
+      chrome.tabs.sendMessage(tabId, message, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, reason: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve({ ok: true, response: expectResponse ? response : undefined });
+      });
+    } catch (error) {
+      resolve({ ok: false, reason: error?.message || 'send-failed' });
+    }
   });
+}
+
+function isConnectionError(reason = '') {
+  const normalized = String(reason).toLowerCase();
+  return (
+    normalized.includes('could not establish connection') ||
+    normalized.includes('receiving end does not exist') ||
+    normalized.includes('no receiver')
+  );
 }
 
 async function sendMessageToTabSafe(tab, message, options = {}) {
@@ -192,5 +212,22 @@ async function sendMessageToTabSafe(tab, message, options = {}) {
     }
   }
 
+  const initialSend = await sendMessageToTab(tabId, message, options.expectResponse);
+  if (
+    initialSend.ok ||
+    options.skipEnsureConnection ||
+    !isConnectionError(initialSend.reason)
+  ) {
+    return initialSend;
+  }
+  const reconnected = await ensureConnected(tabId, {
+    pingTimeoutMs: options.pingTimeoutMs ?? 700,
+    retryCount: 1,
+    retryDelayMs: options.retryDelayMs ?? 200,
+    useBackgroundInjection: options.useBackgroundInjection
+  });
+  if (!reconnected.ok) {
+    return { ok: false, reason: reconnected.reason || initialSend.reason || 'content-script-unavailable' };
+  }
   return sendMessageToTab(tabId, message, options.expectResponse);
 }
