@@ -22,6 +22,8 @@ const OPENAI_BILLING_USAGE_URL = 'https://api.openai.com/dashboard/billing/usage
 
 const DEFAULT_STATE = {
   apiKey: '',
+  openAiOrganization: '',
+  openAiProject: '',
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
@@ -39,6 +41,8 @@ let STATE_CACHE_READY = false;
 const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const STATE_CACHE_KEYS = new Set([
   'apiKey',
+  'openAiOrganization',
+  'openAiProject',
   'translationModel',
   'contextModel',
   'proofreadModel',
@@ -197,18 +201,54 @@ function getCurrentBillingRange() {
   };
 }
 
-async function fetchOpenAiBillingTotalUsd(apiKey) {
+function extractBillingErrorDetail(errorText) {
+  if (!errorText) return '';
+  try {
+    const parsed = JSON.parse(errorText);
+    return parsed?.error?.message || parsed?.message || '';
+  } catch (error) {
+    return errorText;
+  }
+}
+
+function formatBillingErrorMessage(status, errorText) {
+  const detail = String(extractBillingErrorDetail(errorText) || '').trim();
+  let baseMessage = 'Цена недоступна: не удалось получить данные биллинга.';
+  if (status === 401 || status === 403) {
+    baseMessage = 'Цена недоступна: ключ не авторизован для биллинга.';
+  } else if (status === 404) {
+    baseMessage = 'Цена недоступна: биллинг не найден для этого аккаунта.';
+  } else if (status === 429) {
+    baseMessage = 'Цена недоступна: превышен лимит запросов к биллингу.';
+  } else if (status >= 500) {
+    baseMessage = 'Цена недоступна: ошибка сервиса биллинга.';
+  }
+  if (!detail) return baseMessage;
+  return `${baseMessage} ${detail}`;
+}
+
+function buildBillingHeaders(apiKey, organization, project) {
+  const headers = { Authorization: `Bearer ${apiKey}` };
+  if (organization) headers['OpenAI-Organization'] = organization;
+  if (project) headers['OpenAI-Project'] = project;
+  return headers;
+}
+
+async function fetchOpenAiBillingTotalUsd(apiKey, { organization, project } = {}) {
   const { startDate, endDate } = getCurrentBillingRange();
   const url = `${OPENAI_BILLING_USAGE_URL}?start_date=${startDate}&end_date=${endDate}`;
   const response = await fetch(url, {
     method: 'GET',
-    headers: {
-      Authorization: `Bearer ${apiKey}`
-    }
+    headers: buildBillingHeaders(apiKey, organization, project)
   });
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Billing usage request failed: ${response.status} ${errorText}`);
+    console.warn('Billing usage request failed.', {
+      status: response.status,
+      statusText: response.statusText,
+      body: errorText
+    });
+    throw new Error(formatBillingErrorMessage(response.status, errorText));
   }
   const data = await response.json();
   const totalUsage = Number(data?.total_usage);
@@ -216,11 +256,23 @@ async function fetchOpenAiBillingTotalUsd(apiKey) {
   return totalUsage / 100;
 }
 
-async function fetchBillingDeltaUsd(apiKey) {
-  if (!apiKey) return { deltaUsd: null, totalUsd: null };
+async function fetchBillingDeltaUsd(state) {
+  if (!state?.apiKey) return { deltaUsd: null, totalUsd: null };
   const { lastBillingTotalUsd } = await storageLocalGet({ lastBillingTotalUsd: null });
   const lastTotal = Number.isFinite(lastBillingTotalUsd) ? lastBillingTotalUsd : null;
-  const totalUsd = await fetchOpenAiBillingTotalUsd(apiKey);
+  let totalUsd = null;
+  try {
+    totalUsd = await fetchOpenAiBillingTotalUsd(state.apiKey, {
+      organization: state.openAiOrganization,
+      project: state.openAiProject
+    });
+  } catch (error) {
+    return {
+      deltaUsd: null,
+      totalUsd: null,
+      billingWarning: error?.message || 'Цена недоступна: не удалось запросить биллинг.'
+    };
+  }
   if (!Number.isFinite(totalUsd)) {
     return { deltaUsd: null, totalUsd: null };
   }
@@ -235,11 +287,32 @@ async function fetchBillingDeltaUsd(apiKey) {
   };
 }
 
-function applyBillingDeltaToDebugPayloads(debugPayloads, deltaUsd) {
-  if (!Array.isArray(debugPayloads) || !debugPayloads.length) return debugPayloads;
-  if (!Number.isFinite(deltaUsd)) return debugPayloads;
-  const lastPayload = debugPayloads[debugPayloads.length - 1];
-  if (lastPayload && typeof lastPayload === 'object') {
+function applyBillingDeltaToDebugPayloads(debugPayloads, deltaUsd, billingWarning) {
+  if (!Array.isArray(debugPayloads)) return debugPayloads;
+  const lastPayload = debugPayloads.length ? debugPayloads[debugPayloads.length - 1] : null;
+  if (billingWarning) {
+    const warningMessage = `billing: ${billingWarning}`;
+    if (lastPayload && typeof lastPayload === 'object') {
+      if (!Array.isArray(lastPayload.parseIssues)) {
+        lastPayload.parseIssues = [];
+      }
+      lastPayload.parseIssues.push(warningMessage);
+    } else {
+      debugPayloads.push({
+        phase: 'BILLING',
+        model: '—',
+        latencyMs: null,
+        usage: null,
+        costUsd: null,
+        inputChars: null,
+        outputChars: null,
+        request: null,
+        response: null,
+        parseIssues: [warningMessage]
+      });
+    }
+  }
+  if (lastPayload && typeof lastPayload === 'object' && Number.isFinite(deltaUsd)) {
     lastPayload.costUsd = deltaUsd;
   }
   return debugPayloads;
@@ -250,7 +323,11 @@ function applyStatePatch(patch = {}) {
 
   for (const [key, value] of Object.entries(patch || {})) {
     if (!STATE_CACHE_KEYS.has(key)) continue;
-    if (['apiKey', 'translationModel', 'contextModel', 'proofreadModel'].includes(key)) {
+    if (
+      ['apiKey', 'openAiOrganization', 'openAiProject', 'translationModel', 'contextModel', 'proofreadModel'].includes(
+        key
+      )
+    ) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
     }
@@ -797,8 +874,8 @@ async function handleTranslateText(message, sendResponse) {
       message.keepPunctuationTokens
     );
     try {
-      const { deltaUsd } = await fetchBillingDeltaUsd(apiKey);
-      applyBillingDeltaToDebugPayloads(debug, deltaUsd);
+      const { deltaUsd, billingWarning } = await fetchBillingDeltaUsd(state);
+      applyBillingDeltaToDebugPayloads(debug, deltaUsd, billingWarning);
     } catch (error) {
       console.warn('Failed to fetch billing usage for translation.', error);
     }
@@ -826,8 +903,8 @@ async function handleGenerateContext(message, sendResponse) {
       apiBaseUrl
     );
     try {
-      const { deltaUsd } = await fetchBillingDeltaUsd(apiKey);
-      applyBillingDeltaToDebugPayloads(debug, deltaUsd);
+      const { deltaUsd, billingWarning } = await fetchBillingDeltaUsd(state);
+      applyBillingDeltaToDebugPayloads(debug, deltaUsd, billingWarning);
     } catch (error) {
       console.warn('Failed to fetch billing usage for context.', error);
     }
@@ -858,8 +935,8 @@ async function handleProofreadText(message, sendResponse) {
       apiBaseUrl
     );
     try {
-      const { deltaUsd } = await fetchBillingDeltaUsd(apiKey);
-      applyBillingDeltaToDebugPayloads(debug, deltaUsd);
+      const { deltaUsd, billingWarning } = await fetchBillingDeltaUsd(state);
+      applyBillingDeltaToDebugPayloads(debug, deltaUsd, billingWarning);
     } catch (error) {
       console.warn('Failed to fetch billing usage for proofreading.', error);
     }
