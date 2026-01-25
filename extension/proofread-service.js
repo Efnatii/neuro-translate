@@ -1,6 +1,4 @@
 const PROOFREAD_SCHEMA_NAME = 'proofread_translations';
-const PROOFREAD_GOALS_SCHEMA_NAME = 'proofread_goals';
-const PROOFREAD_APPLY_SCHEMA_NAME = 'proofread_apply';
 const PROOFREAD_MAX_CHARS_PER_CHUNK = 4000;
 const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
@@ -65,90 +63,6 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   ];
 }
 
-function buildProofreadGoalsPrompt(input) {
-  const items = Array.isArray(input?.items) ? input.items : [];
-  const sourceBlock = input?.sourceBlock ?? '';
-  const translatedBlock = input?.translatedBlock ?? '';
-  const language = input?.language ?? '';
-  const context = input?.context ?? '';
-
-  return [
-    {
-      role: 'system',
-      content: [
-        'You are an expert translation proofreader.',
-        'Generate a concise list of proofreading goals or checkpoints to improve the translated text.',
-        'Goals must be actionable and tied to clarity, fluency, terminology, style, grammar, and punctuation.',
-        'Do not rewrite the text or produce corrected translations.',
-        'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
-        'Keep punctuation tokens unchanged and in place.',
-        PUNCTUATION_TOKEN_HINT,
-        'Return only JSON, without commentary.'
-      ].join(' ')
-    },
-    {
-      role: 'user',
-      content: [
-        language ? `Target language: ${language}` : '',
-        context ? `Context: <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>` : '',
-        sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
-        translatedBlock
-          ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`
-          : '',
-        `Expected items count: ${items.length}.`,
-        'Segments (JSON array of {id, source, translation}):',
-        JSON.stringify(items)
-      ]
-        .filter(Boolean)
-        .join('\n')
-    }
-  ];
-}
-
-function buildProofreadApplyPrompt(input, goals, strict = false, extraReminder = '') {
-  const items = Array.isArray(input?.items) ? input.items : [];
-  const sourceBlock = input?.sourceBlock ?? '';
-  const translatedBlock = input?.translatedBlock ?? '';
-  const language = input?.language ?? '';
-  const context = input?.context ?? '';
-
-  return [
-    {
-      role: 'system',
-      content: [
-        PROOFREAD_SYSTEM_PROMPT,
-        'Apply the provided goals as hard requirements.',
-        'Override output format: return a JSON array of {id, text} objects (no wrapper object).',
-        strict
-          ? 'Strict mode: return every input id exactly once in the output array.'
-          : '',
-        extraReminder,
-        'Return only JSON, without commentary.'
-      ]
-        .filter(Boolean)
-        .join(' ')
-    },
-    {
-      role: 'user',
-      content: [
-        language ? `Target language: ${language}` : '',
-        context ? `Context: <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>` : '',
-        sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
-        translatedBlock
-          ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`
-          : '',
-        `Expected items count: ${items.length}.`,
-        'Proofreading goals (JSON array of strings; treat as hard requirements):',
-        JSON.stringify(goals || []),
-        'Segments to proofread (JSON array of {id, text}):',
-        JSON.stringify(items)
-      ]
-        .filter(Boolean)
-        .join('\n')
-    }
-  ];
-}
-
 async function proofreadTranslation(
   segments,
   sourceBlock,
@@ -157,32 +71,17 @@ async function proofreadTranslation(
   language,
   apiKey,
   model,
-  apiBaseUrl = OPENAI_API_URL,
-  options = {}
+  apiBaseUrl = OPENAI_API_URL
 ) {
   if (!Array.isArray(segments) || !segments.length) {
-    return {
-      translations: [],
-      rawProofread: '',
-      proofreadGoalsRaw: '',
-      proofreadGoalsParsed: null,
-      proofreadGoalsStatus: 'disabled',
-      proofreadGoalsUsed: false
-    };
+    return { translations: [], rawProofread: '' };
   }
 
-  const proofreadGoalsEnabled = Boolean(options?.proofreadGoalsEnabled);
-  const proofreadGoalsModel = options?.proofreadGoalsModel || model;
-  const sourceSegments = Array.isArray(options?.sourceSegments) ? options.sourceSegments : [];
   const { items, originalById } = normalizeProofreadSegments(segments);
   const chunks = chunkProofreadItems(items);
   const revisionsById = new Map();
   const rawProofreadParts = [];
   const debugPayloads = [];
-  let proofreadGoalsRaw = '';
-  let proofreadGoalsParsed = null;
-  let proofreadGoalsStatus = proofreadGoalsEnabled ? 'pending' : 'disabled';
-  let proofreadGoalsUsed = false;
   const appendParseIssue = (issue) => {
     if (!issue) return;
     const last = debugPayloads[debugPayloads.length - 1];
@@ -207,67 +106,16 @@ async function proofreadTranslation(
     });
   };
 
-  let activeGoals = null;
-  if (proofreadGoalsEnabled) {
-    const goalItems = items.map((item, index) => ({
-      id: String(item.id),
-      source: typeof sourceSegments[index] === 'string' ? sourceSegments[index] : '',
-      translation: item.text
-    }));
-    try {
-      const goalsResult = await requestProofreadGoals(
-        goalItems,
-        { sourceBlock, translatedBlock, context, language },
-        apiKey,
-        proofreadGoalsModel,
-        apiBaseUrl
-      );
-      if (Array.isArray(goalsResult.debug)) {
-        debugPayloads.push(...goalsResult.debug);
-      }
-      proofreadGoalsRaw = goalsResult.rawGoals || '';
-      if (!goalsResult.parseError && Array.isArray(goalsResult.goals)) {
-        activeGoals = goalsResult.goals;
-        proofreadGoalsParsed = goalsResult.goals;
-        proofreadGoalsStatus = 'done';
-        proofreadGoalsUsed = true;
-      } else {
-        proofreadGoalsStatus = 'failed';
-      }
-    } catch (error) {
-      console.warn('Proofread goals generation failed; continuing without goals.', error);
-      proofreadGoalsStatus = 'failed';
-    }
-    if (proofreadGoalsStatus === 'failed') {
-      appendParseIssue('fallback:goals');
-    }
-  }
-
-  const requestChunk = async (chunk, requestOptions = {}) => {
-    if (activeGoals) {
-      return requestProofreadApplyChunk(
-        chunk,
-        { sourceBlock, translatedBlock, context, language },
-        activeGoals,
-        apiKey,
-        model,
-        apiBaseUrl,
-        requestOptions
-      );
-    }
-    return requestProofreadChunk(
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    let result = await requestProofreadChunk(
       chunk,
       { sourceBlock, translatedBlock, context, language },
       apiKey,
       model,
       apiBaseUrl,
-      requestOptions
+      { strict: false }
     );
-  };
-
-  for (let index = 0; index < chunks.length; index += 1) {
-    const chunk = chunks[index];
-    let result = await requestChunk(chunk, { strict: false });
     rawProofreadParts.push(result.rawProofread);
     if (Array.isArray(result.debug)) {
       debugPayloads.push(...result.debug);
@@ -281,7 +129,14 @@ async function proofreadTranslation(
         received: quality.receivedCount
       });
       appendParseIssue('retry:retryable');
-      result = await requestChunk(chunk, { strict: true });
+      result = await requestProofreadChunk(
+        chunk,
+        { sourceBlock, translatedBlock, context, language },
+        apiKey,
+        model,
+        apiBaseUrl,
+        { strict: true }
+      );
       rawProofreadParts.push(result.rawProofread);
       if (Array.isArray(result.debug)) {
         debugPayloads.push(...result.debug);
@@ -298,11 +153,18 @@ async function proofreadTranslation(
         threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
       appendParseIssue('retry:retryable');
-      result = await requestChunk(chunk, {
-        strict: true,
-        maxTokensOverride: 1.5,
-        extraReminder: 'Return every input id exactly once. Do not omit any ids.'
-      });
+      result = await requestProofreadChunk(
+        chunk,
+        { sourceBlock, translatedBlock, context, language },
+        apiKey,
+        model,
+        apiBaseUrl,
+        {
+          strict: true,
+          maxTokensOverride: 1.5,
+          extraReminder: 'Return every input id exactly once. Do not omit any ids.'
+        }
+      );
       rawProofreadParts.push(result.rawProofread);
       if (Array.isArray(result.debug)) {
         debugPayloads.push(...result.debug);
@@ -320,7 +182,14 @@ async function proofreadTranslation(
       });
       appendParseIssue('fallback:per-item');
       for (const item of chunk) {
-        const singleResult = await requestChunk([item], { strict: true });
+        const singleResult = await requestProofreadChunk(
+          [item],
+          { sourceBlock, translatedBlock, context, language },
+          apiKey,
+          model,
+          apiBaseUrl,
+          { strict: true }
+        );
         rawProofreadParts.push(singleResult.rawProofread);
         if (Array.isArray(singleResult.debug)) {
           debugPayloads.push(...singleResult.debug);
@@ -366,15 +235,7 @@ async function proofreadTranslation(
   );
 
   const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
-  return {
-    translations: repairedTranslations,
-    rawProofread,
-    debug: debugPayloads,
-    proofreadGoalsRaw,
-    proofreadGoalsParsed,
-    proofreadGoalsStatus,
-    proofreadGoalsUsed
-  };
+  return { translations: repairedTranslations, rawProofread, debug: debugPayloads };
 }
 
 function parseJsonObjectFlexible(content = '', label = 'response') {
@@ -406,40 +267,6 @@ function parseJsonObjectFlexible(content = '', label = 'response') {
 
   if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
     throw new Error(`${label} response is not a JSON object.`);
-  }
-
-  return parsed;
-}
-
-function parseJsonArrayFlexible(content = '', label = 'response') {
-  const normalizeString = (value = '') =>
-    value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
-
-  const normalizedContent = normalizeString(String(content ?? '')).trim();
-  if (!normalizedContent) {
-    throw new Error(`${label} response is empty.`);
-  }
-
-  let parsed = null;
-  try {
-    parsed = JSON.parse(normalizedContent);
-  } catch (error) {
-    const startIndex = normalizedContent.indexOf('[');
-    const endIndex = normalizedContent.lastIndexOf(']');
-    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
-      throw new Error(`${label} response does not contain a JSON array.`);
-    }
-
-    const slice = normalizedContent.slice(startIndex, endIndex + 1);
-    try {
-      parsed = JSON.parse(slice);
-    } catch (innerError) {
-      throw new Error(`${label} response JSON parsing failed.`);
-    }
-  }
-
-  if (!Array.isArray(parsed)) {
-    throw new Error(`${label} response is not a JSON array.`);
   }
 
   return parsed;
@@ -483,13 +310,6 @@ function normalizeProofreadItems(items) {
       return { id: String(id), text };
     })
     .filter(Boolean);
-}
-
-function normalizeProofreadGoals(goals) {
-  if (!Array.isArray(goals)) return [];
-  return goals
-    .map((goal) => (typeof goal === 'string' ? goal.trim() : String(goal ?? '').trim()))
-    .filter((goal) => goal);
 }
 
 function normalizeProofreadSegments(segments) {
@@ -649,359 +469,6 @@ function buildProofreadBodyPreview(payload, maxLength = 800) {
   if (!raw) return null;
   if (raw.length <= maxLength) return raw;
   return `${raw.slice(0, maxLength)}…`;
-}
-
-async function requestProofreadGoals(items, metadata, apiKey, model, apiBaseUrl) {
-  const prompt = applyPromptCaching(
-    buildProofreadGoalsPrompt({
-      items,
-      sourceBlock: metadata?.sourceBlock,
-      translatedBlock: metadata?.translatedBlock,
-      context: metadata?.context,
-      language: metadata?.language
-    }),
-    apiBaseUrl
-  );
-  const itemsChars = items.reduce(
-    (sum, item) => sum + (item?.source?.length || 0) + (item?.translation?.length || 0),
-    0
-  );
-  const inputChars =
-    itemsChars +
-    (metadata?.context?.length || 0) +
-    (metadata?.sourceBlock?.length || 0) +
-    (metadata?.translatedBlock?.length || 0);
-  const requestPayload = {
-    model,
-    messages: prompt,
-    response_format: {
-      type: 'json_schema',
-      json_schema: {
-        name: PROOFREAD_GOALS_SCHEMA_NAME,
-        schema: {
-          type: 'array',
-          items: { type: 'string' }
-        }
-      }
-    }
-  };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread-goals:v1');
-  const startedAt = Date.now();
-  let response = await fetch(apiBaseUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
-  });
-
-  if (!response.ok) {
-    let errorText = await response.text();
-    let errorPayload = null;
-    try {
-      errorPayload = JSON.parse(errorText);
-    } catch (parseError) {
-      errorPayload = null;
-    }
-    const stripped = stripUnsupportedPromptCacheParams(
-      requestPayload,
-      model,
-      response.status,
-      errorPayload,
-      errorText
-    );
-    if (response.status === 400 && stripped.changed) {
-      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
-        model,
-        status: response.status
-      });
-      response = await fetch(apiBaseUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload)
-      });
-      if (!response.ok) {
-        errorText = await response.text();
-        try {
-          errorPayload = JSON.parse(errorText);
-        } catch (parseError) {
-          errorPayload = null;
-        }
-      }
-    }
-    if (!response.ok) {
-      const retryAfterMs = parseRetryAfterMs(response, errorPayload);
-      const errorMessage =
-        errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
-      const error = new Error(`Proofread goals request failed: ${response.status} ${errorMessage}`);
-      error.status = response.status;
-      error.retryAfterMs = retryAfterMs;
-      error.isRateLimit = response.status === 429 || response.status === 503;
-      throw error;
-    }
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    const latencyMs = Date.now() - startedAt;
-    const usage = normalizeUsage(data?.usage);
-    const emptyDebugPayload = {
-      phase: 'PROOFREAD_GOALS',
-      model,
-      latencyMs,
-      usage,
-      costUsd: calculateUsageCost(usage, model),
-      inputChars,
-      outputChars: 0,
-      request: requestPayload,
-      response: {
-        id: data?.id ?? null,
-        status: response.status,
-        statusText: response.statusText,
-        model: data?.model ?? model,
-        emptyContent: true,
-        bodyPreview: buildProofreadBodyPreview(data)
-      },
-      parseIssues: ['no-content', 'api-empty-content']
-    };
-    const rawGoals =
-      '[no-content] Модель вернула пустой message.content. Проверь модель/response_format. См. debug.';
-    return {
-      goals: [],
-      rawGoals,
-      parseError: 'no-content',
-      debug: [emptyDebugPayload]
-    };
-  }
-
-  const latencyMs = Date.now() - startedAt;
-  const usage = normalizeUsage(data?.usage);
-  const costUsd = calculateUsageCost(usage, model);
-  const debugPayload = {
-    phase: 'PROOFREAD_GOALS',
-    model,
-    latencyMs,
-    usage,
-    costUsd,
-    inputChars,
-    outputChars: content?.length || 0,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
-
-  let parsed = null;
-  let parseError = null;
-  try {
-    parsed = parseJsonArrayFlexible(content, 'proofread-goals');
-  } catch (error) {
-    parseError = error?.message || 'parse-error';
-    debugPayload.parseIssues.push(parseError);
-  }
-
-  const normalizedGoals = normalizeProofreadGoals(parsed);
-  return {
-    goals: normalizedGoals,
-    rawGoals: content,
-    parseError,
-    debug: [debugPayload]
-  };
-}
-
-async function requestProofreadApplyChunk(items, metadata, goals, apiKey, model, apiBaseUrl, options = {}) {
-  const { strict = false, maxTokensOverride = null, extraReminder = '' } = options;
-  const prompt = applyPromptCaching(
-    buildProofreadApplyPrompt(
-      {
-        items,
-        sourceBlock: metadata?.sourceBlock,
-        translatedBlock: metadata?.translatedBlock,
-        context: metadata?.context,
-        language: metadata?.language
-      },
-      goals,
-      strict,
-      extraReminder
-    ),
-    apiBaseUrl
-  );
-  const itemsChars = items.reduce((sum, item) => sum + (item?.text?.length || 0), 0);
-  const inputChars =
-    itemsChars +
-    (metadata?.context?.length || 0) +
-    (metadata?.sourceBlock?.length || 0) +
-    (metadata?.translatedBlock?.length || 0);
-  const approxOut =
-    Math.ceil(itemsChars / 4) +
-    Math.ceil(items.length * 12) +
-    200;
-  const baseMaxTokens = Math.min(PROOFREAD_MAX_OUTPUT_TOKENS, Math.max(512, approxOut));
-  const adjustedMaxTokens =
-    maxTokensOverride == null
-      ? baseMaxTokens
-      : Math.min(
-          PROOFREAD_MAX_OUTPUT_TOKENS,
-          Math.max(512, Math.ceil(baseMaxTokens * maxTokensOverride))
-        );
-  const maxTokens = adjustedMaxTokens;
-
-  const requestPayload = {
-    model,
-    messages: prompt,
-    max_tokens: maxTokens,
-    response_format: {
-      type: 'json_schema',
-      json_schema: {
-        name: PROOFREAD_APPLY_SCHEMA_NAME,
-        schema: {
-          type: 'array',
-          minItems: items.length,
-          maxItems: items.length,
-          items: {
-            type: 'object',
-            properties: {
-              id: { type: 'string' },
-              text: { type: 'string' }
-            },
-            required: ['id', 'text'],
-            additionalProperties: false
-          }
-        }
-      }
-    }
-  };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread-apply:v1');
-  const startedAt = Date.now();
-  let response = await fetch(apiBaseUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
-  });
-
-  if (!response.ok) {
-    let errorText = await response.text();
-    let errorPayload = null;
-    try {
-      errorPayload = JSON.parse(errorText);
-    } catch (parseError) {
-      errorPayload = null;
-    }
-    const stripped = stripUnsupportedPromptCacheParams(
-      requestPayload,
-      model,
-      response.status,
-      errorPayload,
-      errorText
-    );
-    if (response.status === 400 && stripped.changed) {
-      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
-        model,
-        status: response.status
-      });
-      response = await fetch(apiBaseUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload)
-      });
-      if (!response.ok) {
-        errorText = await response.text();
-        try {
-          errorPayload = JSON.parse(errorText);
-        } catch (parseError) {
-          errorPayload = null;
-        }
-      }
-    }
-    if (!response.ok) {
-      const retryAfterMs = parseRetryAfterMs(response, errorPayload);
-      const errorMessage =
-        errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
-      const error = new Error(`Proofread apply request failed: ${response.status} ${errorMessage}`);
-      error.status = response.status;
-      error.retryAfterMs = retryAfterMs;
-      error.isRateLimit = response.status === 429 || response.status === 503;
-      throw error;
-    }
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    const latencyMs = Date.now() - startedAt;
-    const usage = normalizeUsage(data?.usage);
-    const emptyDebugPayload = {
-      phase: 'PROOFREAD_APPLY',
-      model,
-      latencyMs,
-      usage,
-      costUsd: calculateUsageCost(usage, model),
-      inputChars,
-      outputChars: 0,
-      request: requestPayload,
-      response: {
-        id: data?.id ?? null,
-        status: response.status,
-        statusText: response.statusText,
-        model: data?.model ?? model,
-        emptyContent: true,
-        bodyPreview: buildProofreadBodyPreview(data)
-      },
-      parseIssues: ['no-content', 'api-empty-content']
-    };
-    const rawProofread =
-      '[no-content] Модель вернула пустой message.content. Проверь модель/response_format. См. debug.';
-    return {
-      itemsById: new Map(),
-      rawProofread,
-      parseError: 'no-content',
-      debug: [emptyDebugPayload]
-    };
-  }
-
-  const latencyMs = Date.now() - startedAt;
-  const usage = normalizeUsage(data?.usage);
-  const costUsd = calculateUsageCost(usage, model);
-  const debugPayload = {
-    phase: 'PROOFREAD_APPLY',
-    model,
-    latencyMs,
-    usage,
-    costUsd,
-    inputChars,
-    outputChars: content?.length || 0,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
-  const debugPayloads = [debugPayload];
-
-  let parsed = null;
-  let parseError = null;
-  try {
-    parsed = parseJsonArrayFlexible(content, 'proofread-apply');
-  } catch (error) {
-    parseError = error?.message || 'parse-error';
-    debugPayload.parseIssues.push(parseError);
-  }
-
-  const normalizedItems = normalizeProofreadItems(parsed);
-  const itemsById = new Map();
-  normalizedItems.forEach((item) => {
-    itemsById.set(item.id, item.text);
-  });
-
-  return { itemsById, rawProofread: content, parseError, debug: debugPayloads };
 }
 
 async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
