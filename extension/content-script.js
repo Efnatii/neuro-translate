@@ -33,12 +33,6 @@ let debugState = null;
 let debugPersistTimer = null;
 let debugPersistInFlight = false;
 let debugPersistDirty = false;
-// Hard limits to prevent runaway request loops during a single translation run.
-const MAX_REQUESTS_PER_RUN = 300;
-// Per-block cap across translation/proofread/context requests to avoid endless fallbacks.
-const MAX_REQUESTS_PER_BLOCK = 20;
-let requestCountByRun = 0;
-const requestCountByBlock = new Map();
 const DEBUG_PERSIST_DEBOUNCE_MS = 250;
 const DEBUG_PERSIST_MAX_INTERVAL_MS = 2000;
 let debugLastPersistAt = 0;
@@ -469,7 +463,6 @@ async function translatePage(settings) {
   debugEntries = [];
   debugState = null;
   latestContextSummary = cachedContext || existingContext;
-  resetRequestCounters();
   await resetTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
@@ -505,8 +498,7 @@ async function translatePage(settings) {
       try {
         latestContextSummary = await requestTranslationContext(
           pageText,
-          settings.targetLanguage || 'ru',
-          { blockIndex: null }
+          settings.targetLanguage || 'ru'
         );
         if (latestContextSummary && contextCacheKey) {
           await setContextCacheEntry(contextCacheKey, {
@@ -523,18 +515,6 @@ async function translatePage(settings) {
     } else {
       await updateDebugContext(latestContextSummary, 'done');
     }
-  }
-
-  if (translationError) {
-    await flushPersistDebugState('translatePage:error');
-    reportProgress('Ошибка перевода', translationProgress.completedBlocks, blocks.length, 0);
-    return;
-  }
-
-  if (cancelRequested) {
-    await flushPersistDebugState('translatePage:cancelled');
-    reportProgress('Перевод отменён', translationProgress.completedBlocks, blocks.length, 0);
-    return;
   }
 
   const fullContextSummary = latestContextSummary || '';
@@ -604,8 +584,7 @@ async function translatePage(settings) {
           uniqueTexts,
           settings.targetLanguage || 'ru',
           fullContextSummary,
-          keepPunctuationTokens,
-          { blockIndex: currentIndex + 1 }
+          keepPunctuationTokens
         );
         if (!result?.success) {
           throw new Error(result?.error || 'Не удалось выполнить перевод.');
@@ -678,12 +657,9 @@ async function translatePage(settings) {
         console.error('Block translation failed', error);
         translationError = error;
         cancelRequested = true;
-        const errorReason = error?.message || 'Не удалось выполнить перевод.';
-        const entry = debugEntries.find((item) => item.index === currentIndex + 1);
         await updateDebugEntry(currentIndex + 1, {
           translationStatus: 'failed',
-          proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled',
-          translationDebug: appendAbortDebugPayload(entry?.translationDebug, 'TRANSLATE', errorReason)
+          proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled'
         });
       } finally {
         activeTranslationWorkers = Math.max(0, activeTranslationWorkers - 1);
@@ -727,8 +703,7 @@ async function translatePage(settings) {
           sourceBlock: formatBlockText(task.originalTexts),
           translatedBlock: formatBlockText(task.translatedTexts),
           context: fullContextSummary,
-          language: settings.targetLanguage || 'ru',
-          blockIndex: task.index + 1
+          language: settings.targetLanguage || 'ru'
         });
         if (!proofreadResult?.success) {
           throw new Error(proofreadResult?.error || 'Не удалось выполнить вычитку.');
@@ -798,8 +773,6 @@ async function translatePage(settings) {
         reportProgress('Вычитка выполняется');
       } catch (error) {
         console.warn('Proofreading failed, keeping original translations.', error);
-        const errorReason = error?.message || 'Не удалось выполнить вычитку.';
-        const entry = debugEntries.find((item) => item.index === task.index + 1);
         const proofreadComparisons = buildProofreadComparisons({
           originalTexts: task.originalTexts,
           beforeTexts: task.translatedTexts,
@@ -809,8 +782,7 @@ async function translatePage(settings) {
           proofreadStatus: 'failed',
           proofread: [],
           proofreadComparisons,
-          proofreadExecuted: true,
-          proofreadDebug: appendAbortDebugPayload(entry?.proofreadDebug, 'PROOFREAD', errorReason)
+          proofreadExecuted: true
         });
         reportProgress('Вычитка выполняется');
       } finally {
@@ -935,8 +907,7 @@ async function translatePage(settings) {
   await saveTranslationsToMemory(activeTranslationEntries);
 }
 
-async function translate(texts, targetLanguage, context, keepPunctuationTokens = false, options = {}) {
-  const blockIndex = Number.isFinite(options?.blockIndex) ? options.blockIndex : null;
+async function translate(texts, targetLanguage, context, keepPunctuationTokens = false) {
   const batches = splitTextsByTokenEstimate(
     Array.isArray(texts) ? texts : [texts],
     context,
@@ -949,10 +920,6 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
     const batchContext = context;
-    const requestCheck = canSendRequest({ blockIndex, phase: 'translation' });
-    if (!requestCheck.allowed) {
-      return { success: false, error: requestCheck.reason || 'Translation request aborted.' };
-    }
     const estimatedTokens = estimateTokensForRole('translation', {
       texts: batch,
       context: batchContext
@@ -1008,7 +975,6 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
 }
 
 async function requestProofreading(payload) {
-  const blockIndex = Number.isFinite(payload?.blockIndex) ? payload.blockIndex : null;
   const segments = Array.isArray(payload?.segments) ? payload.segments : [];
   const segmentTexts = segments.map((segment) =>
     typeof segment === 'string' ? segment : segment?.text || ''
@@ -1016,10 +982,6 @@ async function requestProofreading(payload) {
   const sourceBlock = payload?.sourceBlock || '';
   const translatedBlock = payload?.translatedBlock || '';
   const context = payload?.context || '';
-  const requestCheck = canSendRequest({ blockIndex, phase: 'proofread' });
-  if (!requestCheck.allowed) {
-    return { success: false, error: requestCheck.reason || 'Proofread request aborted.' };
-  }
   const estimatedTokens = estimateTokensForRole('proofread', {
     texts: segmentTexts,
     context,
@@ -1442,12 +1404,7 @@ function shouldProofreadSegment(text = '', targetLanguage = '') {
   return hasProofreadNoise(text) || hasSuspiciousLanguageMix(text, targetLanguage);
 }
 
-async function requestTranslationContext(text, targetLanguage, options = {}) {
-  const blockIndex = Number.isFinite(options?.blockIndex) ? options.blockIndex : null;
-  const requestCheck = canSendRequest({ blockIndex, phase: 'context' });
-  if (!requestCheck.allowed) {
-    throw new Error(requestCheck.reason || 'Context request aborted.');
-  }
+async function requestTranslationContext(text, targetLanguage) {
   const estimatedTokens = estimateTokensForRole('context', {
     texts: [text]
   });
@@ -1719,94 +1676,6 @@ function splitTextsByTokenEstimate(texts, context, maxTokens) {
   }
 
   return batches;
-}
-
-function resetRequestCounters() {
-  requestCountByRun = 0;
-  requestCountByBlock.clear();
-}
-
-function getNextRequestCountByBlock(blockIndex) {
-  if (!Number.isFinite(blockIndex)) return null;
-  const current = requestCountByBlock.get(blockIndex) || 0;
-  return current + 1;
-}
-
-function recordRequestCount(blockIndex) {
-  requestCountByRun += 1;
-  if (!Number.isFinite(blockIndex)) return;
-  const nextCount = getNextRequestCountByBlock(blockIndex);
-  requestCountByBlock.set(blockIndex, nextCount);
-}
-
-function buildRequestLimitReason(scopeLabel, nextCount, maxCount, blockIndex) {
-  const blockLabel = Number.isFinite(blockIndex) ? ` (блок ${blockIndex})` : '';
-  return `Превышен лимит ${scopeLabel}${blockLabel}: ${nextCount}/${maxCount}.`;
-}
-
-function appendAbortDebugPayload(existingPayloads, phase, reason) {
-  const payloads = Array.isArray(existingPayloads) ? [...existingPayloads] : [];
-  payloads.push({
-    phase,
-    model: null,
-    latencyMs: null,
-    usage: null,
-    costUsd: null,
-    inputChars: null,
-    outputChars: null,
-    request: null,
-    response: null,
-    parseIssues: [reason]
-  });
-  return payloads;
-}
-
-function setAbortReason(reason) {
-  if (!debugState || !reason) return;
-  debugState.lastAbortReason = reason;
-  schedulePersistDebugState('abortReason');
-}
-
-function abortRequestsForLimit({ reason, blockIndex, phase }) {
-  cancelRequested = true;
-  translationError = new Error(reason);
-  setAbortReason(reason);
-  if (phase === 'context') {
-    updateDebugContextStatus('failed');
-    return;
-  }
-  if (!Number.isFinite(blockIndex)) return;
-  const entry = debugEntries.find((item) => item.index === blockIndex);
-  if (!entry) return;
-  const proofreadApplied = entry.proofreadApplied !== false;
-  const updates = {};
-  if (phase === 'translation') {
-    updates.translationStatus = 'failed';
-    updates.translationDebug = appendAbortDebugPayload(entry.translationDebug, 'TRANSLATE', reason);
-    updates.proofreadStatus = proofreadApplied ? 'failed' : 'disabled';
-  }
-  if (phase === 'proofread') {
-    updates.proofreadStatus = proofreadApplied ? 'failed' : 'disabled';
-    updates.proofreadDebug = appendAbortDebugPayload(entry.proofreadDebug, 'PROOFREAD', reason);
-  }
-  updateDebugEntry(blockIndex, updates);
-}
-
-function canSendRequest({ blockIndex, phase }) {
-  const nextRunCount = requestCountByRun + 1;
-  if (nextRunCount > MAX_REQUESTS_PER_RUN) {
-    const reason = buildRequestLimitReason('запросов на запуск', nextRunCount, MAX_REQUESTS_PER_RUN, blockIndex);
-    abortRequestsForLimit({ reason, blockIndex, phase });
-    return { allowed: false, reason };
-  }
-  const nextBlockCount = getNextRequestCountByBlock(blockIndex);
-  if (Number.isFinite(nextBlockCount) && nextBlockCount > MAX_REQUESTS_PER_BLOCK) {
-    const reason = buildRequestLimitReason('запросов на блок', nextBlockCount, MAX_REQUESTS_PER_BLOCK, blockIndex);
-    abortRequestsForLimit({ reason, blockIndex, phase });
-    return { allowed: false, reason };
-  }
-  recordRequestCount(blockIndex);
-  return { allowed: true };
 }
 
 async function ensureTpmBudget(role, tokens) {
@@ -2239,7 +2108,6 @@ async function resetTranslationDebugInfo(url) {
     contextLength,
     fullContextAlways,
     contextStatus,
-    lastAbortReason: '',
     items: [],
     aiRequestCount: 0,
     aiResponseCount: 0,
@@ -2277,7 +2145,6 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     contextLength: initialContext.length,
     fullContextAlways: true,
     contextStatus: initialContextStatus,
-    lastAbortReason: '',
     items: debugEntries,
     aiRequestCount: 0,
     aiResponseCount: 0,
