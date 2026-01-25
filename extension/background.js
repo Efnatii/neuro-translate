@@ -306,6 +306,28 @@ async function saveState(partial) {
   return next;
 }
 
+async function saveModelThroughputResult(model, result) {
+  if (!model) return null;
+  const resolvedResult = {
+    ...(result && typeof result === 'object' ? result : {}),
+    model,
+    timestamp: result?.timestamp ?? Date.now()
+  };
+  try {
+    const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
+    const nextThroughput = {
+      ...(modelThroughputById && typeof modelThroughputById === 'object' ? modelThroughputById : {}),
+      [model]: resolvedResult
+    };
+    await storageLocalSet({ modelThroughputById: nextThroughput });
+    applyStatePatch({ modelThroughputById: nextThroughput });
+    return resolvedResult;
+  } catch (error) {
+    console.warn('Failed to save model throughput results.', error);
+    return null;
+  }
+}
+
 async function ensureDefaultKeysOnFreshInstall() {
   const stored = await storageLocalGet({});
   const safeStored = stored && typeof stored === 'object' ? stored : {};
@@ -444,15 +466,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
                 tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
               };
-        chrome.tabs.sendMessage(
-          tabId,
-          { type: NT_SETTINGS_RESPONSE_TYPE, requestId, settings: safeSettings },
-          () => {
-            if (chrome.runtime.lastError) {
-              console.debug('Failed to deliver settings response to tab.', chrome.runtime.lastError.message);
-            }
+        try {
+          const sendResult = await sendMessageToTabSafe(
+            tabId,
+            { type: NT_SETTINGS_RESPONSE_TYPE, requestId, settings: safeSettings },
+            { pingTimeoutMs: 700, retryCount: 2, retryDelayMs: 200, useBackgroundInjection: true }
+          );
+          if (!sendResult.ok) {
+            console.debug('Failed to deliver settings response to tab.', sendResult.reason);
           }
-        );
+        } catch (error) {
+          console.debug('Failed to deliver settings response to tab.', error);
+        }
       })
       .catch((error) => {
         console.warn('Failed to compute settings for tab message.', error);

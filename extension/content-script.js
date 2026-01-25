@@ -22,6 +22,7 @@
 
 let cancelRequested = false;
 let translationError = null;
+let translationErrorMessage = '';
 let translationProgress = { completedBlocks: 0, totalBlocks: 0 };
 let translationInProgress = false;
 let activeTranslationEntries = [];
@@ -370,7 +371,9 @@ async function requestSettings() {
 
   try {
     chrome.runtime.sendMessage({ type: 'GET_SETTINGS', requestId, url: location.href }, (ack) => {
-      if (chrome.runtime.lastError) {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        console.warn('GET_SETTINGS runtime.sendMessage failed', runtimeError);
         const entry = pendingSettingsRequests.get(requestId);
         if (entry) {
           pendingSettingsRequests.delete(requestId);
@@ -389,6 +392,7 @@ async function requestSettings() {
       }
     });
   } catch (error) {
+    console.warn('GET_SETTINGS runtime.sendMessage threw', error);
     const entry = pendingSettingsRequests.get(requestId);
     if (entry) {
       pendingSettingsRequests.delete(requestId);
@@ -405,8 +409,8 @@ async function requestSettings() {
   try {
     const state = await readSettingsFromStorage();
     settings = buildSettingsFromState(state);
-    try {
-      chrome.runtime.sendMessage({
+    safeRuntimeSendMessage(
+      {
         type: 'SYNC_STATE_CACHE',
         state: {
           apiKey: state.apiKey,
@@ -422,10 +426,9 @@ async function requestSettings() {
           outputRatioByRole: state.outputRatioByRole,
           tpmSafetyBufferTokens: state.tpmSafetyBufferTokens
         }
-      });
-    } catch (error) {
-      // ignore
-    }
+      },
+      'SYNC_STATE_CACHE failed'
+    );
     return settings;
   } catch (error) {
     return {
@@ -494,6 +497,7 @@ async function translatePage(settings) {
 
   cancelRequested = false;
   translationError = null;
+  translationErrorMessage = '';
   reportProgress('Перевод запущен', 0, blocks.length, 0);
 
   if (settings.contextGenerationEnabled && !latestContextSummary) {
@@ -687,6 +691,7 @@ async function translatePage(settings) {
       } catch (error) {
         console.error('Block translation failed', error);
         translationError = error;
+        translationErrorMessage = buildTranslationErrorMessage(error);
         cancelRequested = true;
         await updateDebugEntry(currentIndex + 1, {
           translationStatus: 'failed',
@@ -698,7 +703,7 @@ async function translatePage(settings) {
 
       if (translationError) {
         reportProgress(
-          'Ошибка перевода',
+          translationErrorMessage || 'Ошибка перевода',
           translationProgress.completedBlocks,
           totalBlocks,
           activeTranslationWorkers
@@ -922,7 +927,12 @@ async function translatePage(settings) {
 
   if (translationError) {
     await flushPersistDebugState('translatePage:error');
-    reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
+    reportProgress(
+      translationErrorMessage || 'Ошибка перевода',
+      translationProgress.completedBlocks,
+      totalBlocks,
+      activeTranslationWorkers
+    );
     return;
   }
 
@@ -1235,25 +1245,53 @@ async function sendRuntimeMessage(payload, fallbackError) {
 
 function sendRuntimeMessageLegacy(payload, fallbackError) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(payload, (response) => {
-      const runtimeError = chrome.runtime.lastError;
-      if (runtimeError) {
+    try {
+      chrome.runtime.sendMessage(payload, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          resolve({
+            success: false,
+            error: runtimeError.message || fallbackError,
+            isRuntimeError: true
+          });
+          return;
+        }
+        if (response?.success) {
+          resolve(response);
+          return;
+        }
         resolve({
           success: false,
-          error: runtimeError.message || fallbackError,
-          isRuntimeError: true
+          error: response?.error || fallbackError
         });
-        return;
-      }
-      if (response?.success) {
-        resolve(response);
-        return;
-      }
+      });
+    } catch (error) {
+      console.warn('runtime.sendMessage failed', error);
       resolve({
         success: false,
-        error: response?.error || fallbackError
+        error: error?.message || fallbackError,
+        isRuntimeError: true
       });
-    });
+    }
+  });
+}
+
+function safeRuntimeSendMessage(payload, fallbackError) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(payload, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          console.warn('runtime.sendMessage failed', runtimeError);
+          resolve({ ok: false, reason: runtimeError.message || fallbackError });
+          return;
+        }
+        resolve({ ok: true, response });
+      });
+    } catch (error) {
+      console.warn('runtime.sendMessage threw', error);
+      resolve({ ok: false, reason: error?.message || fallbackError });
+    }
   });
 }
 
@@ -1835,6 +1873,17 @@ function formatBlockText(texts) {
   return texts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
+function buildTranslationErrorMessage(error) {
+  const message = typeof error?.message === 'string' ? error.message.trim() : '';
+  if (!message) {
+    return 'Не удалось выполнить перевод. Проверьте подключение и попробуйте снова.';
+  }
+  if (message.toLowerCase().includes('api key')) {
+    return 'Перевод недоступен: укажите корректный API ключ и повторите попытку.';
+  }
+  return `Ошибка перевода: ${message}`;
+}
+
 function buildShortContext(context = '') {
   if (!context) return '';
   if (context.length <= SHORT_CONTEXT_MAX_CHARS) return context.trim();
@@ -1873,13 +1922,16 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
     totalBlocks: resolvedTotal,
     inProgressBlocks: resolvedInProgress
   };
-  chrome.runtime.sendMessage({
-    type: 'TRANSLATION_PROGRESS',
-    message,
-    completedBlocks: resolvedCompleted,
-    totalBlocks: resolvedTotal,
-    inProgressBlocks: resolvedInProgress
-  });
+  safeRuntimeSendMessage(
+    {
+      type: 'TRANSLATION_PROGRESS',
+      message,
+      completedBlocks: resolvedCompleted,
+      totalBlocks: resolvedTotal,
+      inProgressBlocks: resolvedInProgress
+    },
+    'TRANSLATION_PROGRESS failed'
+  );
 }
 
 function getProgressSnapshot() {
@@ -2348,7 +2400,7 @@ async function cancelTranslation() {
   notifyVisibilityChange();
   reportProgress('Перевод отменён', 0, 0, 0);
   const tabId = await getActiveTabId();
-  chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
+  safeRuntimeSendMessage({ type: 'TRANSLATION_CANCELLED', tabId }, 'TRANSLATION_CANCELLED failed');
 }
 
 function getActiveTabId() {
@@ -2361,8 +2413,8 @@ function getActiveTabId() {
       console.warn('Falling back to runtime.sendMessage for GET_TAB_ID.', response.error);
     }
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'GET_TAB_ID' }, (legacyResponse) => {
-        resolve(legacyResponse?.tabId ?? null);
+      safeRuntimeSendMessage({ type: 'GET_TAB_ID' }, 'GET_TAB_ID failed').then((legacyResult) => {
+        resolve(legacyResult?.response?.tabId ?? null);
       });
     });
   })();
@@ -2455,6 +2507,9 @@ async function restoreTranslations() {
 }
 
 function notifyVisibilityChange() {
-  chrome.runtime.sendMessage({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible });
+  safeRuntimeSendMessage(
+    { type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible },
+    'UPDATE_TRANSLATION_VISIBILITY failed'
+  );
 }
 })();
