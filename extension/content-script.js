@@ -605,10 +605,12 @@ async function translatePage(settings) {
       };
     }
     const attemptKey = kind === 'proofread' ? 'proofreadAttemptCount' : 'translateAttemptCount';
+    const successKey = kind === 'proofread' ? 'proofreadFullSuccess' : 'translationFullSuccess';
+    const baseAnswerKey = kind === 'proofread' ? 'proofreadBaseFullAnswer' : 'translationBaseFullAnswer';
     const attemptCount = Number.isFinite(entry[attemptKey]) ? entry[attemptKey] : 0;
-    const baseAnswer =
-      kind === 'proofread' ? entry.proofreadBaseFullAnswer || '' : entry.translationBaseFullAnswer || '';
-    const contextMode = baseAnswer ? 'SHORT' : 'FULL';
+    const baseAnswer = typeof entry[baseAnswerKey] === 'string' ? entry[baseAnswerKey] : '';
+    const fullSuccess = Boolean(entry[successKey]) || Boolean(baseAnswer);
+    const contextMode = fullSuccess && baseAnswer ? 'SHORT' : 'FULL';
     if (contextMode === 'SHORT' && shortContextPromise) {
       await shortContextPromise;
     }
@@ -784,22 +786,23 @@ async function translatePage(settings) {
           translationCompletedAt: Date.now(),
           translationRaw: result.rawTranslation || '',
           translationDebug: result.debug || [],
-          ...(baseTranslationAnswer ? { translationBaseFullAnswer: baseTranslationAnswer } : {}),
+          ...(baseTranslationAnswer
+            ? { translationBaseFullAnswer: baseTranslationAnswer, translationFullSuccess: true }
+            : {}),
           ...(baseTranslationCallId ? { translationBaseFullCallId: baseTranslationCallId } : {})
         });
 
         if (settings.proofreadEnabled) {
-          const proofreadSegments = translatedTexts
-            .map((text, index) => ({ id: String(index), text }))
-            .filter((segment) => shouldProofreadSegment(segment.text, settings.targetLanguage || 'ru'));
+          const proofreadSegments = translatedTexts.map((text, index) => ({ id: String(index), text }));
+          const proofreadMode = detectProofreadMode(proofreadSegments, settings.targetLanguage || 'ru');
           if (!proofreadSegments.length) {
-          await updateDebugEntry(currentIndex + 1, {
-            proofreadStatus: 'done',
-            proofread: [],
-            proofreadComparisons: [],
-            proofreadExecuted: false,
-            proofreadCompletedAt: Date.now()
-          });
+            await updateDebugEntry(currentIndex + 1, {
+              proofreadStatus: 'done',
+              proofread: [],
+              proofreadComparisons: [],
+              proofreadExecuted: false,
+              proofreadCompletedAt: Date.now()
+            });
           } else {
             enqueueProofreadTask({
               block,
@@ -807,7 +810,8 @@ async function translatePage(settings) {
               key: queuedItem.key,
               translatedTexts,
               originalTexts: block.map(({ original }) => original),
-              proofreadSegments
+              proofreadSegments,
+              proofreadMode
             });
           }
         }
@@ -863,6 +867,7 @@ async function translatePage(settings) {
           segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
           sourceBlock: formatBlockText(task.originalTexts),
           translatedBlock: formatBlockText(task.translatedTexts),
+          proofreadMode: task.proofreadMode,
           contextMeta: {
             contextText: primaryContext.contextText,
             contextMode: primaryContext.contextMode,
@@ -891,6 +896,7 @@ async function translatePage(settings) {
             segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
             sourceBlock: formatBlockText(task.originalTexts),
             translatedBlock: formatBlockText(task.translatedTexts),
+            proofreadMode: task.proofreadMode,
             contextMeta: {
               contextText: fallbackContext.contextText,
               contextMode: fallbackContext.contextMode,
@@ -975,7 +981,9 @@ async function translatePage(settings) {
           proofreadDebug: proofreadDebugPayloads,
           proofreadComparisons,
           proofreadCompletedAt: Date.now(),
-          ...(baseProofreadAnswer ? { proofreadBaseFullAnswer: baseProofreadAnswer } : {}),
+          ...(baseProofreadAnswer
+            ? { proofreadBaseFullAnswer: baseProofreadAnswer, proofreadFullSuccess: true }
+            : {}),
           ...(baseProofreadCallId ? { proofreadBaseFullCallId: baseProofreadCallId } : {})
         });
         reportProgress('Вычитка выполняется');
@@ -1229,6 +1237,7 @@ async function requestProofreading(payload) {
   );
   const sourceBlock = payload?.sourceBlock || '';
   const translatedBlock = payload?.translatedBlock || '';
+  const proofreadMode = payload?.proofreadMode || '';
   const contextMeta =
     payload?.contextMeta && typeof payload.contextMeta === 'object'
       ? payload.contextMeta
@@ -1256,6 +1265,7 @@ async function requestProofreading(payload) {
           segments,
           sourceBlock,
           translatedBlock,
+          proofreadMode,
           context: {
             text: context,
             mode: contextMeta.contextMode,
@@ -1680,6 +1690,14 @@ function hasProofreadNoise(text = '') {
 function shouldProofreadSegment(text = '', targetLanguage = '') {
   if (!text) return false;
   return hasProofreadNoise(text) || hasSuspiciousLanguageMix(text, targetLanguage);
+}
+
+function detectProofreadMode(segments, targetLanguage = '') {
+  const list = Array.isArray(segments) ? segments : [];
+  const hasNoise = list.some((segment) =>
+    shouldProofreadSegment(typeof segment === 'string' ? segment : segment?.text || '', targetLanguage)
+  );
+  return hasNoise ? 'NOISE_CLEANUP' : 'READABILITY_REWRITE';
 }
 
 async function requestTranslationContext(text, targetLanguage) {
@@ -2510,8 +2528,10 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     proofreadCalls: [],
     translationBaseFullCallId: null,
     translationBaseFullAnswer: '',
+    translationFullSuccess: false,
     proofreadBaseFullCallId: null,
     proofreadBaseFullAnswer: '',
+    proofreadFullSuccess: false,
     translationCallCounter: 0,
     proofreadCallCounter: 0,
     translateAttemptCount: 0,
