@@ -14,10 +14,7 @@ const STATUS_CONFIG = {
 
 let sourceUrl = '';
 let refreshTimer = null;
-let throughputTimer = null;
-let lastThroughputCheckAt = 0;
 const proofreadUiState = new Map();
-const THROUGHPUT_REFRESH_INTERVAL_MS = 15000;
 
 init();
 
@@ -112,30 +109,6 @@ async function getDebugStore() {
   });
 }
 
-async function getThroughputSummary() {
-  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
-    return '';
-  }
-  return new Promise((resolve) => {
-    chrome.storage.local.get(
-      ['translationModel', 'contextModel', 'proofreadModel', 'modelThroughputById'],
-      (data) => {
-        const modelThroughputById = data?.modelThroughputById || {};
-        const translationModel = data?.translationModel;
-        const contextModel = data?.contextModel;
-        const proofreadModel = data?.proofreadModel;
-        const translationInfo = translationModel ? modelThroughputById?.[translationModel] : null;
-        const contextInfo = contextModel ? modelThroughputById?.[contextModel] : null;
-        const proofreadInfo = proofreadModel ? modelThroughputById?.[proofreadModel] : null;
-        const formatTps = (info) => {
-          return Number.isFinite(info?.tokensPerSecond) ? Number(info.tokensPerSecond).toFixed(1) : '—';
-        };
-        resolve(`TPS: T=${formatTps(translationInfo)} C=${formatTps(contextInfo)} P=${formatTps(proofreadInfo)}`);
-      }
-    );
-  });
-}
-
 async function clearContext() {
   if (!sourceUrl) return;
   const store = await getDebugStore();
@@ -159,20 +132,11 @@ function startAutoRefresh() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
   }
-  if (throughputTimer) {
-    clearInterval(throughputTimer);
-  }
   const canListen = typeof chrome !== 'undefined' && chrome.storage?.onChanged;
   if (canListen) {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'local') return;
-      if (
-        !changes[DEBUG_STORAGE_KEY] &&
-        !changes.modelThroughputById &&
-        !changes.translationModel &&
-        !changes.contextModel &&
-        !changes.proofreadModel
-      ) {
+      if (!changes[DEBUG_STORAGE_KEY]) {
         return;
       }
       refreshDebug();
@@ -184,50 +148,19 @@ function startAutoRefresh() {
       refreshDebug();
     }, 1000);
   }
-
-  throughputTimer = setInterval(() => {
-    refreshDebug();
-  }, THROUGHPUT_REFRESH_INTERVAL_MS);
 }
 
 async function refreshDebug() {
-  const [debugData, throughputSummary] = await Promise.all([
-    getDebugData(sourceUrl),
-    getThroughputSummary()
-  ]);
+  const debugData = await getDebugData(sourceUrl);
   if (!debugData) {
-    renderEmpty('Ожидание отладочных данных...', throughputSummary);
+    renderEmpty('Ожидание отладочных данных...');
     return;
   }
 
-  renderDebug(sourceUrl, debugData, throughputSummary);
-  requestThroughputCheck();
+  renderDebug(sourceUrl, debugData);
 }
 
-async function requestThroughputCheck() {
-  if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage || !chrome.storage?.local) {
-    return;
-  }
-  const now = Date.now();
-  if (now - lastThroughputCheckAt < THROUGHPUT_REFRESH_INTERVAL_MS) {
-    return;
-  }
-  lastThroughputCheckAt = now;
-  const data = await new Promise((resolve) => {
-    chrome.storage.local.get(['translationModel', 'contextModel', 'proofreadModel'], (stored) => resolve(stored));
-  });
-  [data?.translationModel, data?.contextModel, data?.proofreadModel].forEach((model) => {
-    if (model) {
-      chrome.runtime.sendMessage({ type: 'RUN_MODEL_THROUGHPUT_TEST', model }, () => {
-        if (chrome.runtime.lastError) {
-          console.debug('Failed to request throughput test.', chrome.runtime.lastError.message);
-        }
-      });
-    }
-  });
-}
-
-function renderEmpty(message, throughputSummary = '') {
+function renderEmpty(message) {
   metaEl.textContent = message;
   contextEl.innerHTML = '';
   entriesEl.innerHTML = '';
@@ -235,13 +168,13 @@ function renderEmpty(message, throughputSummary = '') {
     items: [],
     contextStatus: 'pending',
     context: ''
-  }, message, throughputSummary);
+  }, message);
 }
 
-function renderDebug(url, data, throughputSummary = '') {
+function renderDebug(url, data) {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
-  renderSummary(data, '', throughputSummary);
+  renderSummary(data, '');
 
   const contextStatus = normalizeStatus(data.contextStatus, data.context);
   const contextText = data.context?.trim();
@@ -327,7 +260,7 @@ function renderDebug(url, data, throughputSummary = '') {
   });
 }
 
-function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
+function renderSummary(data, fallbackMessage = '') {
   if (!summaryEl) return;
   const items = Array.isArray(data.items) ? data.items : [];
   const total = items.length;
@@ -348,10 +281,9 @@ function renderSummary(data, fallbackMessage = '', throughputSummary = '') {
     total,
     contextStatus
   });
-  const throughputLabel = throughputSummary ? ` • ${throughputSummary}` : '';
   const summaryLine = fallbackMessage
-    ? `${fallbackMessage}${throughputLabel}`
-    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}${throughputLabel}`;
+    ? `${fallbackMessage}`
+    : `Контекст: ${STATUS_CONFIG[contextStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount} • Потрачено: ${totalCostLabel}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>

@@ -10,10 +10,6 @@ const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
 const statusProgressBar = document.getElementById('statusProgress');
 const statusProgressFill = document.getElementById('statusProgressFill');
-const translationThroughputLabel = document.getElementById('translationThroughput');
-const contextThroughputLabel = document.getElementById('contextThroughput');
-const proofreadThroughputLabel = document.getElementById('proofreadThroughput');
-
 const cancelButton = document.getElementById('cancel');
 const translateButton = document.getElementById('translate');
 const toggleTranslationButton = document.getElementById('toggleTranslation');
@@ -24,14 +20,6 @@ let activeTabId = null;
 let translationVisible = false;
 let canShowTranslation = false;
 let currentTranslationStatus = null;
-let currentThroughputByRole = {
-  translation: null,
-  context: null,
-  proofread: null
-};
-let currentTranslationModelId = null;
-let currentContextModelId = null;
-let currentProofreadModelId = null;
 let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
 let pendingFailureToken = 0;
@@ -75,8 +63,7 @@ async function init() {
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByModel: state.tpmLimitsByModel,
         outputRatioByRole: state.outputRatioByRole,
-        tpmSafetyBufferTokens: state.tpmSafetyBufferTokens,
-        modelThroughputById: state.modelThroughputById
+        tpmSafetyBufferTokens: state.tpmSafetyBufferTokens
       }
     });
   } catch (error) {
@@ -86,14 +73,6 @@ async function init() {
   renderModelOptions(translationModelSelect, state.translationModel);
   renderModelOptions(contextModelSelect, state.contextModel);
   renderModelOptions(proofreadModelSelect, state.proofreadModel);
-  currentTranslationModelId = translationModelSelect.value;
-  currentContextModelId = contextModelSelect.value;
-  currentProofreadModelId = proofreadModelSelect.value;
-  currentThroughputByRole = {
-    translation: state.modelThroughputById?.[currentTranslationModelId] || null,
-    context: state.modelThroughputById?.[currentContextModelId] || null,
-    proofread: state.modelThroughputById?.[currentProofreadModelId] || null
-  };
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
@@ -101,7 +80,6 @@ async function init() {
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   updateCanShowTranslation(currentTranslationStatus);
   renderStatus();
-  renderThroughputStatuses();
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
   await syncTranslationVisibility();
 
@@ -135,35 +113,20 @@ function handleApiKeyChange() {
 async function handleTranslationModelChange() {
   const translationModel = translationModelSelect.value;
   await chrome.storage.local.set({ translationModel });
-  currentTranslationModelId = translationModel;
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
-  currentThroughputByRole.translation = modelThroughputById[translationModel] || null;
   renderStatus();
-  renderThroughputStatuses();
   setTemporaryStatus('Модель для перевода сохранена.');
-  runModelThroughputTest(translationModel, 'translation');
 }
 
 async function handleContextModelChange() {
   const contextModel = contextModelSelect.value;
   await chrome.storage.local.set({ contextModel });
-  currentContextModelId = contextModel;
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
-  currentThroughputByRole.context = modelThroughputById[contextModel] || null;
-  renderThroughputStatuses();
   setTemporaryStatus('Модель для контекста сохранена.');
-  runModelThroughputTest(contextModel, 'context');
 }
 
 async function handleProofreadModelChange() {
   const proofreadModel = proofreadModelSelect.value;
   await chrome.storage.local.set({ proofreadModel });
-  currentProofreadModelId = proofreadModel;
-  const { modelThroughputById = {} } = await chrome.storage.local.get({ modelThroughputById: {} });
-  currentThroughputByRole.proofread = modelThroughputById[proofreadModel] || null;
-  renderThroughputStatuses();
   setTemporaryStatus('Модель для вычитки сохранена.');
-  runModelThroughputTest(proofreadModel, 'proofread');
 }
 
 async function handleContextGenerationChange() {
@@ -219,49 +182,48 @@ async function getState() {
         'chunkLengthLimit',
         'translationStatusByTab',
         'translationVisibilityByTab',
-        'modelThroughputById',
         'tpmLimitsByModel',
         'outputRatioByRole',
         'tpmSafetyBufferTokens'
       ],
       (data) => {
-      const defaultModel = models[0]?.id;
-      const normalizeModel = (model) => {
-        if (!model || model.startsWith('deepseek')) {
-          return defaultModel;
+        const defaultModel = models[0]?.id;
+        const normalizeModel = (model) => {
+          if (!model || model.startsWith('deepseek')) {
+            return defaultModel;
+          }
+          return models.some((entry) => entry.id === model) ? model : defaultModel;
+        };
+        const storedTranslationModel = data.translationModel || data.model;
+        const storedContextModel = data.contextModel || data.model;
+        const storedProofreadModel = data.proofreadModel || data.model;
+        const translationModel = normalizeModel(storedTranslationModel);
+        const contextModel = normalizeModel(storedContextModel);
+        const proofreadModel = normalizeModel(storedProofreadModel);
+        if (
+          translationModel !== storedTranslationModel ||
+          contextModel !== storedContextModel ||
+          proofreadModel !== storedProofreadModel
+        ) {
+          chrome.storage.local.set({ translationModel, contextModel, proofreadModel });
         }
-        return models.some((entry) => entry.id === model) ? model : defaultModel;
-      };
-      const storedTranslationModel = data.translationModel || data.model;
-      const storedContextModel = data.contextModel || data.model;
-      const storedProofreadModel = data.proofreadModel || data.model;
-      const translationModel = normalizeModel(storedTranslationModel);
-      const contextModel = normalizeModel(storedContextModel);
-      const proofreadModel = normalizeModel(storedProofreadModel);
-      if (
-        translationModel !== storedTranslationModel ||
-        contextModel !== storedContextModel ||
-        proofreadModel !== storedProofreadModel
-      ) {
-        chrome.storage.local.set({ translationModel, contextModel, proofreadModel });
+        resolve({
+          apiKey: data.apiKey || '',
+          translationModel,
+          contextModel,
+          proofreadModel,
+          contextGenerationEnabled: data.contextGenerationEnabled,
+          proofreadEnabled: data.proofreadEnabled,
+          singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
+          blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
+          translationStatusByTab: data.translationStatusByTab || {},
+          translationVisibilityByTab: data.translationVisibilityByTab || {},
+          tpmLimitsByModel: data.tpmLimitsByModel || {},
+          outputRatioByRole: data.outputRatioByRole || {},
+          tpmSafetyBufferTokens: data.tpmSafetyBufferTokens
+        });
       }
-      resolve({
-        apiKey: data.apiKey || '',
-        translationModel,
-        contextModel,
-        proofreadModel,
-        contextGenerationEnabled: data.contextGenerationEnabled,
-        proofreadEnabled: data.proofreadEnabled,
-        singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
-        blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
-        translationStatusByTab: data.translationStatusByTab || {},
-        translationVisibilityByTab: data.translationVisibilityByTab || {},
-        modelThroughputById: data.modelThroughputById || {},
-        tpmLimitsByModel: data.tpmLimitsByModel || {},
-        outputRatioByRole: data.outputRatioByRole || {},
-        tpmSafetyBufferTokens: data.tpmSafetyBufferTokens
-      });
-    });
+    );
   });
 }
 
@@ -305,31 +267,6 @@ function clampBlockLengthLimit(value) {
   const max = Number(blockLengthLimitInput.max) || Number.POSITIVE_INFINITY;
   if (!Number.isFinite(value)) return min;
   return Math.min(Math.max(value, min), max);
-}
-
-function runModelThroughputTest(model, role) {
-  if (!model) return;
-  const roleLabel = getRoleLabel(role);
-  const statusMessage = roleLabel
-    ? `Запускаем тест пропускной способности (${roleLabel})...`
-    : 'Запускаем тест пропускной способности...';
-  setTemporaryStatus(statusMessage);
-  chrome.runtime.sendMessage({ type: 'RUN_MODEL_THROUGHPUT_TEST', model }, (response) => {
-    if (response?.success) {
-      if (role) {
-        currentThroughputByRole[role] = response.result || null;
-      }
-      renderThroughputStatuses();
-      setTemporaryStatus('Тест пропускной способности завершён.', 2000);
-      return;
-    }
-    const error = response?.error || 'Не удалось выполнить тест';
-    if (role) {
-      currentThroughputByRole[role] = { success: false, error, timestamp: Date.now() };
-    }
-    renderThroughputStatuses();
-    setTemporaryStatus('Тест пропускной способности не удался.', 3000);
-  });
 }
 
 async function getActiveTab() {
@@ -477,15 +414,6 @@ function handleStorageChange(changes) {
     const nextVisibility = changes.translationVisibilityByTab.newValue || {};
     renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
   }
-  if (changes.modelThroughputById) {
-    const nextThroughput = changes.modelThroughputById.newValue || {};
-    currentThroughputByRole = {
-      translation: currentTranslationModelId ? nextThroughput[currentTranslationModelId] : null,
-      context: currentContextModelId ? nextThroughput[currentContextModelId] : null,
-      proofread: currentProofreadModelId ? nextThroughput[currentProofreadModelId] : null
-    };
-    renderThroughputStatuses();
-  }
 }
 
 async function handleRuntimeMessage(message, sender) {
@@ -568,33 +496,6 @@ function updateCanShowTranslation(status) {
   canShowTranslation = completedBlocks > 0;
 }
 
-function formatThroughputStatus(info) {
-  if (!info) return '';
-  if (info.success === false) {
-    const errorText = info.error ? ` (${info.error})` : '';
-    return `Тест пропускной способности: ошибка${errorText}`;
-  }
-  if (!info.tokensPerSecond || !info.durationMs) return '';
-  const tokensPerSecond = Number(info.tokensPerSecond).toFixed(1);
-  const durationSeconds = (info.durationMs / 1000).toFixed(1);
-  return `Пропускная способность: ${tokensPerSecond} ток/с • ${durationSeconds}с`;
-}
-
-function renderThroughputStatuses() {
-  updateThroughputLabel(translationThroughputLabel, currentThroughputByRole.translation);
-  updateThroughputLabel(contextThroughputLabel, currentThroughputByRole.context);
-  updateThroughputLabel(proofreadThroughputLabel, currentThroughputByRole.proofread);
-}
-
-function updateThroughputLabel(label, info) {
-  if (!label) return;
-  if (!info) {
-    label.textContent = 'Тест не запускался';
-    return;
-  }
-  label.textContent = formatThroughputStatus(info) || 'Тест не запускался';
-}
-
 function renderProgressBar() {
   if (!statusProgressFill || !statusProgressBar) return;
   const { percent, label } = getProgressInfo(currentTranslationStatus);
@@ -619,13 +520,6 @@ function getProgressInfo(status) {
   const current = Math.min(totalBlocks, completedBlocks + inProgressBlocks);
   const percent = Math.max(0, Math.min(100, Math.round((current / totalBlocks) * 100)));
   return { percent, label: `Прогресс: ${percent}%` };
-}
-
-function getRoleLabel(role) {
-  if (role === 'translation') return 'перевод';
-  if (role === 'context') return 'контекст';
-  if (role === 'proofread') return 'вычитка';
-  return '';
 }
 
 function setTemporaryStatus(message, durationMs = 2500) {
