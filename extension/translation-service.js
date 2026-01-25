@@ -287,6 +287,22 @@ async function performTranslationRequest(
       error.retryAfterMs = retryAfterMs;
       error.isRateLimit = response.status === 429 || response.status === 503;
       error.isRetryable = isRetryableStatus(response.status);
+      error.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
+      error.debugPayload = {
+        phase: 'TRANSLATE',
+        model,
+        latencyMs: Date.now() - startedAt,
+        usage: null,
+        inputChars,
+        outputChars: 0,
+        request: requestPayload,
+        response: {
+          status: response.status,
+          statusText: response.statusText,
+          error: errorMessage
+        },
+        parseIssues: ['request-failed']
+      };
       throw error;
     }
   }

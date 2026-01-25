@@ -59,6 +59,15 @@ const CONTEXT_SYSTEM_PROMPT = [
   'Output only the sections with brief bullet points.',
   'If a section is empty, write "not specified".'
 ].join('\n');
+const SHORT_CONTEXT_SYSTEM_PROMPT = [
+  'You are a translation context summarizer.',
+  'Condense the provided full translation context into a short, high-signal brief.',
+  'Keep it concise and factual; no fluff, no repetition.',
+  'Preserve key terminology, ambiguity notes, and style guidance.',
+  'Output plain text only (no JSON, no code).',
+  'Use short bullet points where helpful.',
+  'Target length: 5-10 bullet points maximum.'
+].join('\n');
 
 async function generateTranslationContext(
   text,
@@ -156,6 +165,108 @@ async function generateTranslationContext(
     latencyMs,
     usage,
     inputChars: text.length,
+    outputChars: trimmed.length,
+    request: requestPayload,
+    response: content,
+    parseIssues: []
+  };
+
+  return { context: trimmed, debug: [debugPayload] };
+}
+
+async function generateShortTranslationContext(
+  fullContext,
+  apiKey,
+  targetLanguage = 'ru',
+  model,
+  apiBaseUrl = OPENAI_API_URL
+) {
+  if (!fullContext?.trim()) return { context: '', debug: [] };
+
+  const prompt = applyPromptCaching([
+    {
+      role: 'system',
+      content: SHORT_CONTEXT_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: [
+        `Target language: ${targetLanguage}.`,
+        'Summarize the full context into a short, actionable brief.',
+        'Keep it compact and useful for translation disambiguation.',
+        'Full context:',
+        fullContext
+      ].join('\n')
+    }
+  ], apiBaseUrl);
+
+  const requestPayload = {
+    model,
+    messages: prompt
+  };
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:context-short:v1');
+  const startedAt = Date.now();
+  let response = await fetch(apiBaseUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(requestPayload)
+  });
+
+  if (!response.ok) {
+    let errorText = await response.text();
+    let errorPayload = null;
+    try {
+      errorPayload = JSON.parse(errorText);
+    } catch (parseError) {
+      errorPayload = null;
+    }
+    const stripped = stripUnsupportedPromptCacheParams(
+      requestPayload,
+      model,
+      response.status,
+      errorPayload,
+      errorText
+    );
+    if (response.status === 400 && stripped.changed) {
+      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
+        model,
+        status: response.status
+      });
+      response = await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestPayload)
+      });
+      if (!response.ok) {
+        errorText = await response.text();
+      }
+    }
+    if (!response.ok) {
+      throw new Error(`Short context request failed: ${response.status} ${errorText}`);
+    }
+  }
+
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('No short context returned');
+  }
+
+  const latencyMs = Date.now() - startedAt;
+  const usage = normalizeUsage(data?.usage);
+  const trimmed = typeof content === 'string' ? content.trim() : '';
+  const debugPayload = {
+    phase: 'CONTEXT_SHORT',
+    model,
+    latencyMs,
+    usage,
+    inputChars: fullContext.length,
     outputChars: trimmed.length,
     request: requestPayload,
     response: content,
