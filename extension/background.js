@@ -30,8 +30,7 @@ const DEFAULT_STATE = {
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
-  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS,
-  modelThroughputById: {}
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
 
 let STATE_CACHE = null;
@@ -48,11 +47,9 @@ const STATE_CACHE_KEYS = new Set([
   'blockLengthLimit',
   'tpmLimitsByModel',
   'outputRatioByRole',
-  'tpmSafetyBufferTokens',
-  'modelThroughputById'
+  'tpmSafetyBufferTokens'
 ]);
 
-const MODEL_THROUGHPUT_TEST_TIMEOUT_MS = 15000;
 const CONTENT_READY_BY_TAB = new Map();
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
 
@@ -200,7 +197,7 @@ function applyStatePatch(patch = {}) {
       next[key] = Number.isFinite(numValue) ? numValue : DEFAULT_STATE[key];
       continue;
     }
-    if (['tpmLimitsByModel', 'outputRatioByRole', 'modelThroughputById'].includes(key)) {
+    if (['tpmLimitsByModel', 'outputRatioByRole'].includes(key)) {
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         next[key] = value;
       }
@@ -469,11 +466,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'PROOFREAD_TEXT') {
     handleProofreadText(message, sendResponse);
-    return true;
-  }
-
-  if (message?.type === 'RUN_MODEL_THROUGHPUT_TEST') {
-    handleModelThroughputTest(message, sendResponse);
     return true;
   }
 
@@ -791,32 +783,6 @@ async function handleProofreadText(message, sendResponse) {
   } catch (error) {
     console.error('Proofreading failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
-  }
-}
-
-async function handleModelThroughputTest(message, sendResponse) {
-  try {
-    const state = await getState();
-    const model = message?.model || state.translationModel;
-    const { apiKey, apiBaseUrl } = getApiConfigForModel(model, state);
-    if (!apiKey) {
-      sendResponse({ success: false, error: 'API key is missing.' });
-      return;
-    }
-
-    const result = await runModelThroughputTest(apiKey, model, apiBaseUrl);
-    await saveModelThroughputResult(model, result);
-    sendResponse({ success: true, result });
-  } catch (error) {
-    const model = message?.model || DEFAULT_STATE.translationModel;
-    const failure = {
-      success: false,
-      error: error?.message || 'Throughput test failed',
-      timestamp: Date.now(),
-      model
-    };
-    await saveModelThroughputResult(model, failure);
-    sendResponse({ success: false, error: failure.error });
   }
 }
 

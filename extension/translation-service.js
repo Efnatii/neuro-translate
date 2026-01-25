@@ -1,5 +1,4 @@
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
-const MAX_TRANSLATION_TIMEOUT_MS = 180000;
 const TRANSLATE_SYSTEM_PROMPT = [
   'You are a professional translator.',
   'Translate every element of the provided "texts" list into the target language with natural, idiomatic phrasing that preserves meaning and readability.',
@@ -29,58 +28,6 @@ const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 
 
 function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
-}
-
-function storageLocalGet(keysOrDefaults, timeoutMs = 800) {
-  return new Promise((resolve, reject) => {
-    let hasCompleted = false;
-    const timeoutId = setTimeout(() => {
-      if (hasCompleted) return;
-      hasCompleted = true;
-      reject(new Error('storageLocalGet timeout'));
-    }, timeoutMs);
-    try {
-      chrome.storage.local.get(keysOrDefaults, (items) => {
-        if (hasCompleted) return;
-        hasCompleted = true;
-        clearTimeout(timeoutId);
-        if (chrome.runtime.lastError) {
-          reject(chrome.runtime.lastError);
-          return;
-        }
-        if (!items || typeof items !== 'object') {
-          resolve({});
-          return;
-        }
-        resolve(items);
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
-}
-
-async function getModelThroughputInfo(model) {
-  try {
-    const { modelThroughputById = {} } = await storageLocalGet({ modelThroughputById: {} });
-    return modelThroughputById?.[model] || null;
-  } catch (error) {
-    console.warn('Failed to read model throughput info, using defaults.', error);
-    return null;
-  }
-}
-
-function calculateTranslationTimeoutMs(texts, throughputInfo) {
-  if (!throughputInfo?.tokensPerSecond || throughputInfo.tokensPerSecond <= 0) {
-    return DEFAULT_TRANSLATION_TIMEOUT_MS;
-  }
-
-  const totalChars = texts.reduce((sum, text) => sum + (text?.length || 0), 0);
-  const estimatedTokens = Math.max(1, Math.ceil(totalChars / 4) + 200);
-  const estimatedMs = (estimatedTokens / throughputInfo.tokensPerSecond) * 1000;
-  const paddedMs = estimatedMs * 2.5;
-
-  return Math.min(Math.max(DEFAULT_TRANSLATION_TIMEOUT_MS, Math.round(paddedMs)), MAX_TRANSLATION_TIMEOUT_MS);
 }
 
 async function translateTexts(
@@ -125,8 +72,7 @@ async function translateTexts(
       parseIssues: [issue]
     });
   };
-  const throughputInfo = await getModelThroughputInfo(model);
-  const timeoutMs = calculateTranslationTimeoutMs(texts, throughputInfo);
+  const timeoutMs = DEFAULT_TRANSLATION_TIMEOUT_MS;
 
   while (true) {
     const controller = new AbortController();
