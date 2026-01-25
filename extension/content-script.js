@@ -50,7 +50,6 @@ const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const CONTEXT_CACHE_KEY = 'contextCacheByPage';
 const RATE_LIMIT_RETRY_ATTEMPTS = 2;
-const SHORT_CONTEXT_MAX_CHARS = 800;
 const TRANSLATION_MAX_TOKENS_PER_REQUEST = 2600;
 const PROOFREAD_SUSPICIOUS_RATIO = 0.35;
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
@@ -518,15 +517,7 @@ async function translatePage(settings) {
     }
   }
 
-  const shortContextSummary = buildShortContext(latestContextSummary);
-  let fullContextUsed = false;
-  const consumeContextForTranslation = () => {
-    if (!fullContextUsed && latestContextSummary) {
-      fullContextUsed = true;
-      return latestContextSummary;
-    }
-    return shortContextSummary;
-  };
+  const fullContextSummary = latestContextSummary || '';
 
   const singleBlockConcurrency = Boolean(settings.singleBlockConcurrency);
   const translationConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(6, blocks.length));
@@ -592,7 +583,7 @@ async function translatePage(settings) {
         const result = await translate(
           uniqueTexts,
           settings.targetLanguage || 'ru',
-          consumeContextForTranslation(),
+          fullContextSummary,
           keepPunctuationTokens
         );
         if (!result?.success) {
@@ -711,7 +702,7 @@ async function translatePage(settings) {
           segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
           sourceBlock: formatBlockText(task.originalTexts),
           translatedBlock: formatBlockText(task.translatedTexts),
-          context: shortContextSummary || '',
+          context: fullContextSummary,
           language: settings.targetLanguage || 'ru'
         });
         if (!proofreadResult?.success) {
@@ -928,7 +919,7 @@ async function translate(texts, targetLanguage, context, keepPunctuationTokens =
 
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
-    const batchContext = index === 0 ? context : '';
+    const batchContext = context;
     const estimatedTokens = estimateTokensForRole('translation', {
       texts: batch,
       context: batchContext
@@ -1669,7 +1660,7 @@ function splitTextsByTokenEstimate(texts, context, maxTokens) {
   texts.forEach((text) => {
     const nextTokens = estimateTokensForRole('translation', {
       texts: [text],
-      context: current.length ? '' : context
+      context
     });
     if (current.length && currentTokens + nextTokens > maxTokens) {
       batches.push(current);
@@ -1811,30 +1802,6 @@ async function setContextCacheEntry(key, entry) {
 
 function formatBlockText(texts) {
   return texts.join(' ').replace(/\s+/g, ' ').trim();
-}
-
-function buildShortContext(context = '') {
-  if (!context) return '';
-  if (context.length <= SHORT_CONTEXT_MAX_CHARS) return context.trim();
-  const lines = context.split(/\r?\n/);
-  const preferredSections = new Set(['1)', '6)', '8)']);
-  let include = false;
-  const selected = [];
-  lines.forEach((line) => {
-    const trimmed = line.trim();
-    const headerMatch = trimmed.match(/^(\d+)\)/);
-    if (headerMatch) {
-      include = preferredSections.has(`${headerMatch[1]})`);
-    }
-    if (include) {
-      selected.push(line);
-    }
-  });
-  const compact = selected.join('\n').trim();
-  if (compact && compact.length <= SHORT_CONTEXT_MAX_CHARS) {
-    return compact;
-  }
-  return context.slice(0, SHORT_CONTEXT_MAX_CHARS).trimEnd();
 }
 
 function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0) {
@@ -2129,9 +2096,17 @@ async function resetTranslationDebugInfo(url) {
   const entry = existing[url];
   if (!entry) return;
   const context = typeof entry.context === 'string' ? entry.context : '';
+  const contextLength =
+    Number.isFinite(entry.contextLength) && entry.contextLength >= 0
+      ? entry.contextLength
+      : context.length;
+  const fullContextAlways =
+    typeof entry.fullContextAlways === 'boolean' ? entry.fullContextAlways : true;
   const contextStatus = entry.contextStatus || (context ? 'done' : 'pending');
   existing[url] = {
     context,
+    contextLength,
+    fullContextAlways,
     contextStatus,
     items: [],
     aiRequestCount: 0,
@@ -2167,6 +2142,8 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
   }));
   debugState = {
     context: initialContext || '',
+    contextLength: initialContext.length,
+    fullContextAlways: true,
     contextStatus: initialContextStatus,
     items: debugEntries,
     aiRequestCount: 0,
@@ -2225,6 +2202,8 @@ async function flushPersistDebugState(reason = '') {
 function updateDebugContext(context, status) {
   if (!debugState) return;
   debugState.context = typeof context === 'string' ? context : debugState.context || '';
+  debugState.contextLength = debugState.context.length;
+  debugState.fullContextAlways = true;
   if (status) {
     debugState.contextStatus = status;
   }
