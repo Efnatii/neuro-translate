@@ -609,7 +609,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       model,
       latencyMs,
       usage,
-      costUsd: calculateUsageCost(usage, model),
+      costUsd: null,
       inputChars,
       outputChars: 0,
       request: requestPayload,
@@ -634,13 +634,12 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const costUsd = calculateUsageCost(usage, model);
   const debugPayload = {
     phase: 'PROOFREAD',
     model,
     latencyMs,
     usage,
-    costUsd,
+    costUsd: null,
     inputChars,
     outputChars: content?.length || 0,
     request: requestPayload,
@@ -758,13 +757,12 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   const content = data?.choices?.[0]?.message?.content || '';
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const costUsd = calculateUsageCost(usage, model);
   const debugPayload = {
     phase: 'PROOFREAD_FORMAT_REPAIR',
     model,
     latencyMs,
     usage,
-    costUsd,
+    costUsd: null,
     inputChars: rawResponse?.length || 0,
     outputChars: content?.length || 0,
     request: requestPayload,
@@ -910,13 +908,12 @@ async function repairProofreadSegments(
     const content = data?.choices?.[0]?.message?.content || '';
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
-    const costUsd = calculateUsageCost(usage, model);
     const debugPayload = {
       phase: 'PROOFREAD_REPAIR',
       model,
       latencyMs,
       usage,
-      costUsd,
+      costUsd: null,
       inputChars: repairItems.reduce((sum, item) => sum + (item?.draft?.length || 0), 0),
       outputChars: content?.length || 0,
       request: requestPayload,

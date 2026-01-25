@@ -538,7 +538,7 @@ function renderDebugPayload(payload, index) {
         <div class="debug-metrics">
           <span>Latency: ${escapeHtml(latency)}</span>
           <span>Tokens: ${escapeHtml(usage)}</span>
-          <span>Cost: ${escapeHtml(cost)}</span>
+          <span>Billing Δ: ${escapeHtml(cost)}</span>
         </div>
       </div>
       <div class="debug-meta">

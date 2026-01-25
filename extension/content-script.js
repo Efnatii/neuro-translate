@@ -2258,7 +2258,7 @@ function recordAiResponseMetrics(debugPayloads) {
   const payloads = Array.isArray(debugPayloads) ? debugPayloads : [];
   let totalCostUsd = Number.isFinite(debugState.totalCostUsd) ? debugState.totalCostUsd : 0;
   payloads.forEach((payload) => {
-    if (Number.isFinite(payload?.costUsd)) {
+    if (Number.isFinite(payload?.costUsd) && payload.costUsd >= 0) {
       totalCostUsd += payload.costUsd;
     }
   });
