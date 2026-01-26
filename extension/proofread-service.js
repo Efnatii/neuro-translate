@@ -3,8 +3,6 @@ const PROOFREAD_MAX_CHARS_PER_CHUNK = 4000;
 const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
 const PROOFREAD_MAX_OUTPUT_TOKENS = 4096;
-const RETRY_VALIDATE_ENVELOPE_START = '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----';
-const RETRY_VALIDATE_ENVELOPE_END = '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----';
 const PROOFREAD_SYSTEM_PROMPT = [
   'You are an expert translation proofreader and editor.',
   'Follow the selected PROOFREAD_MODE instructions exactly.',
@@ -26,91 +24,6 @@ const PROOFREAD_SYSTEM_PROMPT = [
   'Do not add, remove, or reorder items. Keep ids unchanged.',
   'If a segment does not need edits, return the original text unchanged.'
 ].join(' ');
-
-function isRetryValidateTrigger(requestMeta) {
-  const triggerSource = requestMeta?.triggerSource || '';
-  return triggerSource === 'retry' || triggerSource === 'validate';
-}
-
-function normalizeManualOutputs(value) {
-  if (!value) return '';
-  if (typeof value === 'string') return value.trim();
-  try {
-    const serialized = JSON.stringify(value, null, 2);
-    return serialized ? serialized.trim() : '';
-  } catch (error) {
-    return String(value).trim();
-  }
-}
-
-function buildManualOutputsNoFull({ rawResponse, parsedResult, parseIssues, note }) {
-  const sections = [];
-  const rawText = normalizeManualOutputs(rawResponse);
-  if (rawText) {
-    sections.push(`[RAW RESPONSE]\n${rawText}`);
-  }
-  if (parsedResult !== undefined && parsedResult !== null) {
-    sections.push(`[PARSED OUTPUT]\n${normalizeManualOutputs(parsedResult)}`);
-  }
-  if (Array.isArray(parseIssues) && parseIssues.length) {
-    sections.push(`[PARSE/VALIDATION ISSUES]\n${parseIssues.join('\n')}`);
-  }
-  if (note) {
-    sections.push(String(note));
-  }
-  return sections.join('\n\n');
-}
-
-function resolveManualOutputsNoFull(requestMeta, normalizedContext) {
-  const fromMeta = normalizeManualOutputs(requestMeta?.manualOutputsNoFull);
-  if (fromMeta) return fromMeta;
-  if (normalizedContext?.baseAnswerIncluded && normalizedContext?.baseAnswer) {
-    return `[PREVIOUS OUTPUT]\n${normalizedContext.baseAnswer}`;
-  }
-  return '(no manual outputs found)';
-}
-
-function buildRetryValidateEnvelope(shortContextText, manualOutputsNoFull) {
-  return [
-    RETRY_VALIDATE_ENVELOPE_START,
-    '[SHORT CONTEXT (GLOBAL)]',
-    shortContextText,
-    '',
-    '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-    manualOutputsNoFull || '(no manual outputs found)',
-    RETRY_VALIDATE_ENVELOPE_END
-  ].join('\n');
-}
-
-function prependRetryValidateEnvelope(messages, envelope) {
-  if (!Array.isArray(messages)) return messages;
-  const envelopeMessage = { role: 'user', content: envelope };
-  const next = [...messages];
-  const systemIndex = next.findIndex((message) => message?.role === 'system');
-  if (systemIndex === -1) {
-    next.unshift(envelopeMessage);
-    return next;
-  }
-  next.splice(systemIndex + 1, 0, envelopeMessage);
-  return next;
-}
-
-function ensureRetryValidateEnvelope(messages, requestMeta, normalizedContext, effectiveContext) {
-  if (!isRetryValidateTrigger(requestMeta)) return messages;
-  const shortContextText = (effectiveContext?.text || normalizedContext?.shortText || normalizedContext?.text || '')
-    .trim();
-  if (!shortContextText) {
-    console.error('Retry/validate request missing short context text; aborting request.', {
-      triggerSource: requestMeta?.triggerSource,
-      stage: requestMeta?.stage,
-      purpose: requestMeta?.purpose
-    });
-    throw new Error('Retry/validate request requires short context text.');
-  }
-  const manualOutputsNoFull = resolveManualOutputsNoFull(requestMeta, normalizedContext);
-  const envelope = buildRetryValidateEnvelope(shortContextText, manualOutputsNoFull);
-  return prependRetryValidateEnvelope(messages, envelope);
-}
 
 function normalizeContextPayload(context) {
   if (!context) {
@@ -186,8 +99,7 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
     purpose: merged.purpose || 'main',
     attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
     triggerSource: merged.triggerSource || '',
-    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry),
-    manualOutputsNoFull: merged.manualOutputsNoFull || ''
+    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry)
   };
 }
 
@@ -219,7 +131,7 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    text = normalized.shortText || normalized.text || '';
+    text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -256,14 +168,13 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const shortText = normalized.shortText || normalized.text || '';
   return {
-    text: shortText,
+    text: normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '',
     mode: 'SHORT',
     baseAnswer: normalized.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
     fullText: '',
-    shortText
+    shortText: normalized.shortText || ''
   };
 }
 
@@ -459,10 +370,6 @@ async function proofreadTranslation(
         received: quality.receivedCount
       });
       appendParseIssue('retry:retryable');
-      const manualOutputsNoFull = buildManualOutputsNoFull({
-        rawResponse: result.rawProofread,
-        parseIssues: result.parseError ? [result.parseError] : []
-      });
       result = await requestProofreadChunk(
         chunk,
         { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
@@ -474,8 +381,7 @@ async function proofreadTranslation(
           requestMeta: createChildRequestMeta(baseRequestMeta, {
             purpose: 'retry',
             attempt: baseRequestMeta.attempt + 1,
-            triggerSource: 'retry',
-            manualOutputsNoFull
+            triggerSource: 'retry'
           }),
           purpose: 'retry'
         }
@@ -496,10 +402,6 @@ async function proofreadTranslation(
         threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
       appendParseIssue('retry:retryable');
-      const manualOutputsNoFull = buildManualOutputsNoFull({
-        rawResponse: result.rawProofread,
-        parseIssues: result.parseError ? [result.parseError] : []
-      });
       result = await requestProofreadChunk(
         chunk,
         { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
@@ -513,8 +415,7 @@ async function proofreadTranslation(
           requestMeta: createChildRequestMeta(baseRequestMeta, {
             purpose: 'retry',
             attempt: baseRequestMeta.attempt + 2,
-            triggerSource: 'retry',
-            manualOutputsNoFull
+            triggerSource: 'retry'
           }),
           purpose: 'retry'
         }
@@ -535,10 +436,6 @@ async function proofreadTranslation(
         threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
       appendParseIssue('fallback:per-item');
-      const manualOutputsNoFull = buildManualOutputsNoFull({
-        rawResponse: result.rawProofread,
-        parseIssues: result.parseError ? [result.parseError] : []
-      });
       for (const item of chunk) {
         const singleResult = await requestProofreadChunk(
           [item],
@@ -551,8 +448,7 @@ async function proofreadTranslation(
             requestMeta: createChildRequestMeta(baseRequestMeta, {
               purpose: 'retry',
               attempt: baseRequestMeta.attempt + 3,
-              triggerSource: 'retry',
-              manualOutputsNoFull
+              triggerSource: 'retry'
             }),
             purpose: 'retry'
           }
@@ -603,8 +499,7 @@ async function proofreadTranslation(
     apiBaseUrl,
     language,
     debugPayloads,
-    baseRequestMeta,
-    normalizedContext
+    baseRequestMeta
   );
 
   const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
@@ -853,27 +748,22 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const normalizedContext = normalizeContextPayload(metadata?.context);
   const effectiveContext = buildEffectiveContext(normalizedContext, requestMeta);
   const prompt = applyPromptCaching(
-    ensureRetryValidateEnvelope(
-      buildProofreadPrompt(
-        {
-          items,
-          sourceBlock: metadata?.sourceBlock,
-          translatedBlock: metadata?.translatedBlock,
-          context: {
-            text: effectiveContext.text,
-            mode: effectiveContext.mode,
-            baseAnswer: effectiveContext.baseAnswer,
-            baseAnswerIncluded: effectiveContext.baseAnswerIncluded
-          },
-          language: metadata?.language,
-          proofreadMode: metadata?.proofreadMode
+    buildProofreadPrompt(
+      {
+        items,
+        sourceBlock: metadata?.sourceBlock,
+        translatedBlock: metadata?.translatedBlock,
+        context: {
+          text: effectiveContext.text,
+          mode: effectiveContext.mode,
+          baseAnswer: effectiveContext.baseAnswer,
+          baseAnswerIncluded: effectiveContext.baseAnswerIncluded
         },
-        strict,
-        extraReminder
-      ),
-      requestMeta,
-      normalizedContext,
-      effectiveContext
+        language: metadata?.language,
+        proofreadMode: metadata?.proofreadMode
+      },
+      strict,
+      extraReminder
     ),
     apiBaseUrl
   );
@@ -1085,13 +975,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       createChildRequestMeta(requestMeta, {
         purpose: 'validate',
         attempt: requestMeta.attempt + 1,
-        triggerSource: 'validate',
-        manualOutputsNoFull: buildManualOutputsNoFull({
-          rawResponse: content,
-          parseIssues: [parseError]
-        })
-      }),
-      normalizedContext
+        triggerSource: 'validate'
+      })
     );
     rawProofread = repaired.rawProofread;
     if (Array.isArray(repaired.debug)) {
@@ -1112,47 +997,29 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   return { itemsById, rawProofread, parseError, debug: debugPayloads };
 }
 
-async function requestProofreadFormatRepair(
-  rawResponse,
-  items,
-  apiKey,
-  model,
-  apiBaseUrl,
-  requestMeta = null,
-  contextPayload = null
-) {
+async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, apiBaseUrl, requestMeta = null) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' });
-  const normalizedContext = normalizeContextPayload(contextPayload);
-  const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
-  const prompt = applyPromptCaching(
-    ensureRetryValidateEnvelope(
-      [
-        {
-          role: 'system',
-          content: [
-            'You are a formatter.',
-            'Convert the provided text into valid JSON that matches the required schema.',
-            'Do not change meaning or wording.',
-            'Return only JSON.'
-          ].join(' ')
-        },
-        {
-          role: 'user',
-          content: [
-            `Return JSON with an "items" array of ${items.length} objects.`,
-            'Each object must contain "id" and "text". Keep ids unchanged.',
-            'Schema example: {"items":[{"id":"0","text":"..."}]}',
-            'Original response:',
-            rawResponse
-          ].join('\n')
-        }
-      ],
-      normalizedRequestMeta,
-      normalizedContext,
-      effectiveContext
-    ),
-    apiBaseUrl
-  );
+  const prompt = applyPromptCaching([
+    {
+      role: 'system',
+      content: [
+        'You are a formatter.',
+        'Convert the provided text into valid JSON that matches the required schema.',
+        'Do not change meaning or wording.',
+        'Return only JSON.'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: [
+        `Return JSON with an "items" array of ${items.length} objects.`,
+        'Each object must contain "id" and "text". Keep ids unchanged.',
+        'Schema example: {"items":[{"id":"0","text":"..."}]}',
+        'Original response:',
+        rawResponse
+      ].join('\n')
+    }
+  ], apiBaseUrl);
 
   const requestPayload = {
     model,
@@ -1202,6 +1069,10 @@ async function requestProofreadFormatRepair(
   const content = data?.choices?.[0]?.message?.content || '';
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
+  const effectiveContext = buildEffectiveContext(
+    { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
+    normalizedRequestMeta
+  );
   const debugPayload = attachRequestMeta(
     {
       phase: 'PROOFREAD_FORMAT_REPAIR',
@@ -1244,8 +1115,7 @@ async function repairProofreadSegments(
   apiBaseUrl,
   language,
   debugPayloads,
-  requestMeta,
-  contextPayload = null
+  requestMeta
 ) {
   const repairItems = [];
   const repairIndices = [];
@@ -1286,7 +1156,7 @@ async function repairProofreadSegments(
           },
           validateRequestMeta,
           buildEffectiveContext(
-            normalizeContextPayload(contextPayload),
+            { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
             validateRequestMeta
           )
         )
@@ -1294,41 +1164,30 @@ async function repairProofreadSegments(
     }
   }
 
-  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' });
-  const normalizedContext = normalizeContextPayload(contextPayload);
-  const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
-  const prompt = applyPromptCaching(
-    ensureRetryValidateEnvelope(
-      [
-        {
-          role: 'system',
-          content: [
-            'You are a translation proofreader.',
-            'Fix the draft so the result is fully in the target language, without any source-language fragments.',
-            'Do not change meaning. Preserve placeholders, markup, code, numbers, units, and punctuation tokens.',
-            PUNCTUATION_TOKEN_HINT,
-            'Return only JSON.'
-          ].join(' ')
-        },
-        {
-          role: 'user',
-          content: [
-            language ? `Target language: ${language}` : '',
-            'Return JSON with an "items" array of {id, text}.',
-            'Use the same ids as input and keep the order.',
-            'Items (JSON array of {id, source, draft}):',
-            JSON.stringify(repairItems)
-          ]
-            .filter(Boolean)
-            .join('\n')
-        }
-      ],
-      normalizedRequestMeta,
-      normalizedContext,
-      effectiveContext
-    ),
-    apiBaseUrl
-  );
+  const prompt = applyPromptCaching([
+    {
+      role: 'system',
+      content: [
+        'You are a translation proofreader.',
+        'Fix the draft so the result is fully in the target language, without any source-language fragments.',
+        'Do not change meaning. Preserve placeholders, markup, code, numbers, units, and punctuation tokens.',
+        PUNCTUATION_TOKEN_HINT,
+        'Return only JSON.'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: [
+        language ? `Target language: ${language}` : '',
+        'Return JSON with an "items" array of {id, text}.',
+        'Use the same ids as input and keep the order.',
+        'Items (JSON array of {id, source, draft}):',
+        JSON.stringify(repairItems)
+      ]
+        .filter(Boolean)
+        .join('\n')
+    }
+  ], apiBaseUrl);
 
   const requestPayload = {
     model,
@@ -1381,8 +1240,7 @@ async function repairProofreadSegments(
     const repairRequestMeta = createChildRequestMeta(requestMeta || {}, {
       purpose: 'validate',
       attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
-      triggerSource: 'validate',
-      manualOutputsNoFull
+      triggerSource: 'validate'
     });
     const debugPayload = attachRequestMeta(
       {
@@ -1397,7 +1255,10 @@ async function repairProofreadSegments(
         parseIssues: ['fallback:language-repair']
       },
       repairRequestMeta,
-      buildEffectiveContext(normalizedContext, repairRequestMeta)
+      buildEffectiveContext(
+        { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
+        repairRequestMeta
+      )
     );
     if (Array.isArray(debugPayloads)) {
       debugPayloads.push(debugPayload);
