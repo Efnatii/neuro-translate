@@ -271,14 +271,6 @@ function truncateText(value = '', maxChars = DEBUG_PREVIEW_MAX_CHARS) {
   return { text: `${text.slice(0, maxChars)}…`, truncated: true };
 }
 
-function truncateDebugText(value, maxChars, allowTruncate = true) {
-  if (!allowTruncate) {
-    const text = typeof value === 'string' ? value : String(value ?? '');
-    return { text, truncated: false };
-  }
-  return truncateText(value, maxChars);
-}
-
 function serializeRawValue(value) {
   if (value == null) return '';
   if (typeof value === 'string') return value;
@@ -289,11 +281,10 @@ function serializeRawValue(value) {
   }
 }
 
-function buildRawPayload(value, options = {}) {
-  const allowTruncate = options.allowTruncate !== false;
+function buildRawPayload(value) {
   const serialized = serializeRawValue(value);
-  const trimmed = truncateDebugText(serialized, DEBUG_RAW_MAX_CHARS, allowTruncate);
-  const preview = truncateDebugText(serialized, DEBUG_PREVIEW_MAX_CHARS, allowTruncate);
+  const trimmed = truncateText(serialized, DEBUG_RAW_MAX_CHARS);
+  const preview = truncateText(serialized, DEBUG_PREVIEW_MAX_CHARS);
   return {
     rawText: trimmed.text,
     previewText: preview.text,
@@ -2608,18 +2599,18 @@ async function setContextCacheEntry(key, entry) {
     await storeDebugRawSafe({
       id: fullId,
       ts: Date.now(),
-      value: { type: 'context', text: truncateDebugText(contextFullText, DEBUG_RAW_MAX_CHARS, false).text }
+      value: { type: 'context', text: truncateText(contextFullText, DEBUG_RAW_MAX_CHARS).text }
     });
   }
   if (shortId) {
     await storeDebugRawSafe({
       id: shortId,
       ts: Date.now(),
-      value: { type: 'context', text: truncateDebugText(contextShortText, DEBUG_RAW_MAX_CHARS, false).text }
+      value: { type: 'context', text: truncateText(contextShortText, DEBUG_RAW_MAX_CHARS).text }
     });
   }
-  const previewFull = truncateDebugText(contextFullText, DEBUG_PREVIEW_MAX_CHARS, false);
-  const previewShort = truncateDebugText(contextShortText, DEBUG_PREVIEW_MAX_CHARS, false);
+  const previewFull = truncateText(contextFullText, DEBUG_PREVIEW_MAX_CHARS);
+  const previewShort = truncateText(contextShortText, DEBUG_PREVIEW_MAX_CHARS);
   store[key] = {
     ...entry,
     contextFull: previewFull.text,
@@ -2745,10 +2736,9 @@ async function createDebugPayloadSummary(payload, options = {}) {
   const callId = `${debugSessionId || 'session'}:${stage}:${entryIndex ?? 'unknown'}:${Date.now()}_${Math.random()
     .toString(16)
     .slice(2)}`;
-  const allowTruncate = stage === 'proofreading';
-  const requestPayload = buildRawPayload(payload.request, { allowTruncate });
-  const responsePayload = buildRawPayload(payload.response, { allowTruncate });
-  const contextPayload = buildRawPayload(payload.contextTextSent, { allowTruncate });
+  const requestPayload = buildRawPayload(payload.request);
+  const responsePayload = buildRawPayload(payload.response);
+  const contextPayload = buildRawPayload(payload.contextTextSent);
   const hasRaw = Boolean(requestPayload.rawText || responsePayload.rawText || contextPayload.rawText);
   if (hasRaw) {
     await storeDebugRawSafe({
@@ -2784,7 +2774,7 @@ async function prepareRawTextField(value, type) {
   if (!serialized) {
     return { preview: '', refId: '', truncated: false, rawTruncated: false };
   }
-  const payload = buildRawPayload(serialized, { allowTruncate: type.includes('proofread') });
+  const payload = buildRawPayload(serialized);
   const refId = `${debugSessionId || 'session'}:${type}:${Date.now()}_${Math.random().toString(16).slice(2)}`;
   await storeDebugRawSafe({
     id: refId,
@@ -3181,22 +3171,22 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
     translateAttemptCount: 0,
     proofreadAttemptCount: 0
   }));
-  const contextFullPreview = truncateDebugText(initialContextFull, DEBUG_PREVIEW_MAX_CHARS, false);
-  const contextShortPreview = truncateDebugText(initialContextShort, DEBUG_PREVIEW_MAX_CHARS, false);
+  const contextFullPreview = truncateText(initialContextFull, DEBUG_PREVIEW_MAX_CHARS);
+  const contextShortPreview = truncateText(initialContextShort, DEBUG_PREVIEW_MAX_CHARS);
   const contextFullRefId = initialContextFull ? `${debugSessionId}:context:full` : '';
   const contextShortRefId = initialContextShort ? `${debugSessionId}:context:short` : '';
   if (contextFullRefId) {
     await storeDebugRawSafe({
       id: contextFullRefId,
       ts: Date.now(),
-      value: { type: 'context', text: truncateDebugText(initialContextFull, DEBUG_RAW_MAX_CHARS, false).text }
+      value: { type: 'context', text: truncateText(initialContextFull, DEBUG_RAW_MAX_CHARS).text }
     });
   }
   if (contextShortRefId) {
     await storeDebugRawSafe({
       id: contextShortRefId,
       ts: Date.now(),
-      value: { type: 'context', text: truncateDebugText(initialContextShort, DEBUG_RAW_MAX_CHARS, false).text }
+      value: { type: 'context', text: truncateText(initialContextShort, DEBUG_RAW_MAX_CHARS).text }
     });
   }
   debugState = {
@@ -3271,7 +3261,7 @@ async function flushPersistDebugState(reason = '') {
 function updateDebugContextFull(context, status) {
   if (!debugState) return;
   const value = typeof context === 'string' ? context : debugState.contextFull || '';
-  const preview = truncateDebugText(value, DEBUG_PREVIEW_MAX_CHARS, false);
+  const preview = truncateText(value, DEBUG_PREVIEW_MAX_CHARS);
   debugState.contextFull = preview.text;
   debugState.context = preview.text;
   debugState.contextFullTruncated = preview.truncated;
@@ -3281,7 +3271,7 @@ function updateDebugContextFull(context, status) {
     void storeDebugRawSafe({
       id: refId,
       ts: Date.now(),
-      value: { type: 'context', text: truncateDebugText(value, DEBUG_RAW_MAX_CHARS, false).text }
+      value: { type: 'context', text: truncateText(value, DEBUG_RAW_MAX_CHARS).text }
     });
   }
   if (status) {
@@ -3294,7 +3284,7 @@ function updateDebugContextFull(context, status) {
 function updateDebugContextShort(context, status) {
   if (!debugState) return;
   const value = typeof context === 'string' ? context : debugState.contextShort || '';
-  const preview = truncateDebugText(value, DEBUG_PREVIEW_MAX_CHARS, false);
+  const preview = truncateText(value, DEBUG_PREVIEW_MAX_CHARS);
   debugState.contextShort = preview.text;
   debugState.contextShortTruncated = preview.truncated;
   if (value) {
@@ -3303,7 +3293,7 @@ function updateDebugContextShort(context, status) {
     void storeDebugRawSafe({
       id: refId,
       ts: Date.now(),
-      value: { type: 'context', text: truncateDebugText(value, DEBUG_RAW_MAX_CHARS, false).text }
+      value: { type: 'context', text: truncateText(value, DEBUG_RAW_MAX_CHARS).text }
     });
   }
   if (status) {
