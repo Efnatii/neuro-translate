@@ -37,6 +37,15 @@ const DEFAULT_STATE = {
 let STATE_CACHE = null;
 let STATE_CACHE_READY = false;
 const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
+const UI_PORT_NAMES = {
+  debug: 'debug',
+  popup: 'popup'
+};
+const DEBUG_DB_NAME = 'nt_debug';
+const DEBUG_DB_VERSION = 1;
+const DEBUG_RAW_STORE = 'raw';
+const DEBUG_RAW_MAX_RECORDS = 1500;
+const DEBUG_RAW_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const STATE_CACHE_KEYS = new Set([
   'apiKey',
   'openAiOrganization',
@@ -55,6 +64,175 @@ const STATE_CACHE_KEYS = new Set([
 
 const CONTENT_READY_BY_TAB = new Map();
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
+const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const DEBUG_PORTS = new Set();
+const POPUP_PORTS = new Set();
+let debugDbPromise = null;
+
+function openDebugDb() {
+  if (debugDbPromise) return debugDbPromise;
+  debugDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DEBUG_DB_NAME, DEBUG_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DEBUG_RAW_STORE)) {
+        const store = db.createObjectStore(DEBUG_RAW_STORE, { keyPath: 'id' });
+        store.createIndex('ts', 'ts', { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
+  });
+  return debugDbPromise;
+}
+
+function wrapIdbRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
+  });
+}
+
+async function withRawStore(mode, fn) {
+  const db = await openDebugDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DEBUG_RAW_STORE, mode);
+    const store = tx.objectStore(DEBUG_RAW_STORE);
+    Promise.resolve(fn(store))
+      .then((result) => {
+        tx.oncomplete = () => resolve(result);
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+      })
+      .catch((error) => {
+        tx.abort();
+        reject(error);
+      });
+  });
+}
+
+async function pruneDebugRawStore() {
+  const now = Date.now();
+  return withRawStore('readwrite', async (store) => {
+    const index = store.index('ts');
+    const total = await wrapIdbRequest(index.count());
+    let excess = Math.max(0, total - DEBUG_RAW_MAX_RECORDS);
+    return new Promise((resolve, reject) => {
+      const cursorRequest = index.openCursor();
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+        const isExpired = cursor.value?.ts && cursor.value.ts < now - DEBUG_RAW_MAX_AGE_MS;
+        if (isExpired || excess > 0) {
+          if (excess > 0) {
+            excess -= 1;
+          }
+          cursor.delete();
+          cursor.continue();
+          return;
+        }
+        resolve();
+      };
+      cursorRequest.onerror = () => reject(cursorRequest.error || new Error('IndexedDB cursor failed'));
+    });
+  });
+}
+
+async function storeDebugRaw(record) {
+  if (!record?.id) {
+    return { ok: false, error: 'missing-id' };
+  }
+  const payload = {
+    ...record,
+    ts: Number.isFinite(record.ts) ? record.ts : Date.now()
+  };
+  await withRawStore('readwrite', (store) => wrapIdbRequest(store.put(payload)));
+  await pruneDebugRawStore();
+  return { ok: true };
+}
+
+async function getDebugRaw(id) {
+  if (!id) return null;
+  return withRawStore('readonly', (store) => wrapIdbRequest(store.get(id)));
+}
+
+function registerUiPort(port, kind) {
+  const set = kind === UI_PORT_NAMES.debug ? DEBUG_PORTS : POPUP_PORTS;
+  set.add(port);
+  port.onDisconnect.addListener(() => {
+    set.delete(port);
+  });
+  port.onMessage.addListener((message) => {
+    if (!message || typeof message !== 'object') return;
+    if (kind !== UI_PORT_NAMES.debug) return;
+    if (message.type === 'DEBUG_GET_SNAPSHOT') {
+      const sourceUrl = typeof message.sourceUrl === 'string' ? message.sourceUrl : '';
+      getDebugSnapshot(sourceUrl)
+        .then((snapshot) => {
+          port.postMessage({ type: 'DEBUG_SNAPSHOT', sourceUrl, snapshot });
+        })
+        .catch((error) => {
+          port.postMessage({
+            type: 'DEBUG_SNAPSHOT',
+            sourceUrl,
+            snapshot: null,
+            error: error?.message || String(error)
+          });
+        });
+    }
+    if (message.type === 'DEBUG_GET_RAW') {
+      const rawId = typeof message.rawId === 'string' ? message.rawId : '';
+      getDebugRaw(rawId)
+        .then((record) => {
+          port.postMessage({ type: 'DEBUG_RAW', rawId, record: record || null });
+        })
+        .catch((error) => {
+          port.postMessage({
+            type: 'DEBUG_RAW',
+            rawId,
+            record: null,
+            error: error?.message || String(error)
+          });
+        });
+    }
+  });
+}
+
+function broadcastToPorts(ports, message) {
+  if (!ports.size) return false;
+  let delivered = false;
+  for (const port of ports) {
+    try {
+      port.postMessage(message);
+      delivered = true;
+    } catch (error) {
+      ports.delete(port);
+    }
+  }
+  return delivered;
+}
+
+function sendRuntimeMessageSafe(message) {
+  try {
+    chrome.runtime.sendMessage(message, () => {
+      if (chrome.runtime.lastError) {
+        // Ignore missing listeners.
+      }
+    });
+  } catch (error) {
+    // Ignore missing listeners.
+  }
+}
+
+async function getDebugSnapshot(sourceUrl) {
+  if (!sourceUrl) return null;
+  const store = await storageLocalGet({ [DEBUG_STORAGE_KEY]: {} });
+  const map = store?.[DEBUG_STORAGE_KEY] || {};
+  return map[sourceUrl] || null;
+}
 
 function invokeHandlerAsPromise(handler, message, timeoutMs = 240000) {
   return new Promise((resolve) => {
@@ -348,7 +526,12 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 });
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (!port || port.name !== NT_RPC_PORT_NAME) return;
+  if (!port) return;
+  if (port.name === UI_PORT_NAMES.debug || port.name === UI_PORT_NAMES.popup) {
+    registerUiPort(port, port.name);
+    return;
+  }
+  if (port.name !== NT_RPC_PORT_NAME) return;
   const tabId = port.sender?.tab?.id ?? null;
   port.onMessage.addListener((msg) => {
     if (!msg || typeof msg !== 'object') return;
@@ -413,6 +596,49 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'DEBUG_STORE_RAW') {
+    Promise.resolve()
+      .then(() => storeDebugRaw(message?.record || {}))
+      .then((result) => {
+        sendResponse(result || { ok: false, error: 'store-failed' });
+      })
+      .catch((error) => {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
+
+  if (message?.type === 'DEBUG_GET_RAW') {
+    Promise.resolve()
+      .then(() => getDebugRaw(message?.rawId))
+      .then((record) => {
+        sendResponse({ ok: true, record: record || null });
+      })
+      .catch((error) => {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
+
+  if (message?.type === 'DEBUG_GET_SNAPSHOT') {
+    Promise.resolve()
+      .then(() => getDebugSnapshot(message?.sourceUrl || ''))
+      .then((snapshot) => {
+        sendResponse({ ok: true, snapshot: snapshot || null });
+      })
+      .catch((error) => {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
+
+  if (message?.type === 'DEBUG_NOTIFY') {
+    const sourceUrl = typeof message?.sourceUrl === 'string' ? message.sourceUrl : '';
+    const delivered = broadcastToPorts(DEBUG_PORTS, { type: 'DEBUG_UPDATED', sourceUrl });
+    sendResponse({ ok: true, delivered });
+    return true;
+  }
+
   if (message?.type === 'GET_SETTINGS') {
     const requestId =
       typeof message?.requestId === 'string' && message.requestId
@@ -860,11 +1086,13 @@ async function handleTranslationVisibility(message, sender) {
   const { translationVisibilityByTab = {} } = await storageLocalGet({ translationVisibilityByTab: {} });
   translationVisibilityByTab[tabId] = Boolean(message.visible);
   await storageLocalSet({ translationVisibilityByTab });
-  chrome.runtime.sendMessage({
+  const payload = {
     type: 'TRANSLATION_VISIBILITY_CHANGED',
     tabId,
     visible: Boolean(message.visible)
-  });
+  };
+  broadcastToPorts(POPUP_PORTS, payload);
+  sendRuntimeMessageSafe(payload);
 }
 
 async function handleTranslationCancelled(message, sender) {
@@ -877,5 +1105,7 @@ async function handleTranslationCancelled(message, sender) {
   delete translationStatusByTab[tabId];
   translationVisibilityByTab[tabId] = false;
   await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
-  chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
+  const payload = { type: 'TRANSLATION_CANCELLED', tabId };
+  broadcastToPorts(POPUP_PORTS, payload);
+  sendRuntimeMessageSafe(payload);
 }

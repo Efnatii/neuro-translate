@@ -312,6 +312,16 @@
       color: #475569;
       font-size: 12px;
     }
+    .debug-tag {
+      background: #fef3c7;
+      color: #92400e;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
     .debug-metrics {
       display: flex;
       gap: 12px;
@@ -373,6 +383,49 @@
     }
     .debug-details[open] summary::before {
       transform: rotate(90deg);
+    }
+    .action-button--inline {
+      margin-bottom: 6px;
+      display: inline-flex;
+    }
+    .events {
+      border: 1px solid #e2e8f0;
+      background: #f8fafc;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-top: 12px;
+      font-size: 12px;
+    }
+    .events-title {
+      font-weight: 700;
+      font-size: 12px;
+      color: #475569;
+      margin-bottom: 6px;
+    }
+    .event-row {
+      display: grid;
+      grid-template-columns: 70px auto;
+      gap: 8px;
+      padding: 4px 0;
+      border-top: 1px dashed #e2e8f0;
+    }
+    .event-row:first-of-type {
+      border-top: 0;
+    }
+    .event-time {
+      font-size: 11px;
+      color: #94a3b8;
+    }
+    .event-tag {
+      font-size: 11px;
+      font-weight: 700;
+      color: #b45309;
+      text-transform: uppercase;
+    }
+    .event-message {
+      color: #475569;
+      font-size: 11px;
+      grid-column: span 2;
     }
     .proofread-header {
       display: flex;
@@ -566,6 +619,7 @@
   <h1>Отладка перевода</h1>
   <div class="meta" id="meta"></div>
   <div class="summary" id="summary"></div>
+  <div id="events"></div>
   <div class="context" id="context"></div>
   <div id="entries"></div>
   <script src="debug.js"></script>

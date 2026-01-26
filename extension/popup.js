@@ -16,6 +16,7 @@ const cancelButton = document.getElementById('cancel');
 const translateButton = document.getElementById('translate');
 const toggleTranslationButton = document.getElementById('toggleTranslation');
 const openDebugButton = document.getElementById('openDebug');
+const POPUP_PORT_NAME = 'popup';
 
 let keySaveTimeout = null;
 let organizationSaveTimeout = null;
@@ -28,6 +29,9 @@ let temporaryStatusMessage = null;
 let temporaryStatusTimeout = null;
 let pendingFailureToken = 0;
 let pendingFailureTimeoutId = null;
+let popupPort = null;
+let popupReconnectTimer = null;
+let popupReconnectDelay = 500;
 
 const models = [
   { id: 'gpt-5-nano', name: 'GPT-5 Nano' },
@@ -93,6 +97,7 @@ async function init() {
 
   chrome.storage.onChanged.addListener(handleStorageChange);
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
+  connectPopupPort();
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   openAiOrganizationInput.addEventListener('input', handleOpenAiOrganizationChange);
@@ -109,6 +114,34 @@ async function init() {
   translateButton.addEventListener('click', sendTranslateRequest);
   toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
   openDebugButton.addEventListener('click', handleOpenDebug);
+}
+
+function connectPopupPort() {
+  if (typeof chrome === 'undefined' || !chrome.runtime?.connect) return;
+  if (popupPort) return;
+  try {
+    popupPort = chrome.runtime.connect({ name: POPUP_PORT_NAME });
+  } catch (error) {
+    schedulePopupReconnect();
+    return;
+  }
+  popupReconnectDelay = 500;
+  popupPort.onMessage.addListener((message) => {
+    handleRuntimeMessage(message, {});
+  });
+  popupPort.onDisconnect.addListener(() => {
+    popupPort = null;
+    schedulePopupReconnect();
+  });
+}
+
+function schedulePopupReconnect() {
+  if (popupReconnectTimer) return;
+  popupReconnectTimer = setTimeout(() => {
+    popupReconnectTimer = null;
+    connectPopupPort();
+    popupReconnectDelay = Math.min(10000, Math.max(500, popupReconnectDelay * 2));
+  }, popupReconnectDelay);
 }
 
 function handleApiKeyChange() {
