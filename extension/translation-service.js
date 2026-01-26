@@ -25,6 +25,9 @@ const PUNCTUATION_TOKENS = new Map([
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526]);
+const SHORT_CONTEXT_MAX_CHARS = 800;
+const RETRY_CONTEXT_SHORT_LABEL = '=== SHORT CONTEXT (GLOBAL) ===';
+const RETRY_CONTEXT_MANUAL_LABEL = '=== PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY, NO FULL CONTEXT) ===';
 
 function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
@@ -38,7 +41,8 @@ function normalizeContextPayload(context) {
       baseAnswer: '',
       baseAnswerIncluded: false,
       fullText: '',
-      shortText: ''
+      shortText: '',
+      manualOutputsNoFull: ''
     };
   }
   if (typeof context === 'string') {
@@ -48,7 +52,8 @@ function normalizeContextPayload(context) {
       baseAnswer: '',
       baseAnswerIncluded: false,
       fullText: '',
-      shortText: ''
+      shortText: '',
+      manualOutputsNoFull: ''
     };
   }
   if (typeof context === 'object') {
@@ -58,7 +63,8 @@ function normalizeContextPayload(context) {
       baseAnswer: context.baseAnswer || '',
       baseAnswerIncluded: Boolean(context.baseAnswerIncluded),
       fullText: context.fullText || context.fullContextText || context.contextFull || '',
-      shortText: context.shortText || context.shortContextText || context.contextShort || ''
+      shortText: context.shortText || context.shortContextText || context.contextShort || '',
+      manualOutputsNoFull: context.manualOutputsNoFull || context.manualOutputs || ''
     };
     if (!normalized.fullText && normalized.mode === 'FULL' && normalized.text) {
       normalized.fullText = normalized.text;
@@ -74,8 +80,53 @@ function normalizeContextPayload(context) {
     baseAnswer: '',
     baseAnswerIncluded: false,
     fullText: '',
-    shortText: ''
+    shortText: '',
+    manualOutputsNoFull: ''
   };
+}
+
+function isRetryOrValidateTrigger(requestMeta) {
+  const trigger = requestMeta?.triggerSource || '';
+  return trigger === 'retry' || trigger === 'validate';
+}
+
+function buildShortContextFallback(context = '') {
+  if (!context) return '';
+  if (context.length <= SHORT_CONTEXT_MAX_CHARS) return context.trim();
+  return context.slice(0, SHORT_CONTEXT_MAX_CHARS).trimEnd();
+}
+
+function resolveShortContextText(normalized) {
+  const candidate =
+    normalized.shortText ||
+    (normalized.mode === 'SHORT' ? normalized.text : '') ||
+    normalized.fullText ||
+    normalized.text ||
+    '';
+  const trimmed = candidate.trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= SHORT_CONTEXT_MAX_CHARS) return trimmed;
+  return buildShortContextFallback(trimmed);
+}
+
+function resolveManualOutputs(normalized) {
+  const manual = typeof normalized.manualOutputsNoFull === 'string' ? normalized.manualOutputsNoFull.trim() : '';
+  return manual || '(no manual outputs found)';
+}
+
+function buildRetryContextSections(normalized, requestMeta) {
+  if (!isRetryOrValidateTrigger(requestMeta)) return '';
+  const shortContextText = resolveShortContextText(normalized) || '(short context unavailable)';
+  const manualOutputsNoFull = resolveManualOutputs(normalized);
+  return [
+    RETRY_CONTEXT_SHORT_LABEL,
+    shortContextText,
+    '',
+    RETRY_CONTEXT_MANUAL_LABEL,
+    manualOutputsNoFull
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function createRequestId() {
@@ -137,6 +188,9 @@ function buildEffectiveContext(contextPayload, requestMeta) {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
     text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+    if (!text && isRetryOrValidateTrigger(requestMeta)) {
+      text = buildShortContextFallback(normalized.fullText || normalized.text || '');
+    }
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -173,13 +227,17 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
+  const shortContextText = resolveShortContextText(normalized);
+  const resolvedShortContext =
+    shortContextText || (isRetryOrValidateTrigger(requestMeta) ? '(short context unavailable)' : '');
   return {
-    text: normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '',
+    text: resolvedShortContext,
     mode: 'SHORT',
     baseAnswer: normalized.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
     fullText: '',
-    shortText: normalized.shortText || ''
+    shortText: resolvedShortContext,
+    manualOutputsNoFull: normalized.manualOutputsNoFull || ''
   };
 }
 
@@ -222,10 +280,11 @@ function createChildRequestMeta(baseMeta, overrides = {}) {
   );
 }
 
-function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload, strictTargetLanguage }) {
+function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload, strictTargetLanguage, requestMeta }) {
   const normalizedContext = normalizeContextPayload(contextPayload);
   const contextText = normalizedContext.text || '';
   const contextMode = normalizedContext.mode === 'SHORT' ? 'SHORT' : 'FULL';
+  const retryContextSections = buildRetryContextSections(normalizedContext, requestMeta);
   const hasContext = Boolean(contextText);
   const baseAnswerText =
     normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer
@@ -269,6 +328,7 @@ function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload
   messages.push({
     role: 'user',
     content: [
+      retryContextSections,
       `Target language: ${targetLanguage}.`,
       `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items in the same order as provided.`,
       'Do not add commentary.',
@@ -477,9 +537,13 @@ async function performTranslationRequest(
         text: effectiveContext.text,
         mode: effectiveContext.mode,
         baseAnswer: effectiveContext.baseAnswer,
-        baseAnswerIncluded: effectiveContext.baseAnswerIncluded
+        baseAnswerIncluded: effectiveContext.baseAnswerIncluded,
+        fullText: normalizedContext.fullText || '',
+        shortText: normalizedContext.shortText || '',
+        manualOutputsNoFull: normalizedContext.manualOutputsNoFull || ''
       },
-      strictTargetLanguage
+      strictTargetLanguage,
+      requestMeta: normalizedRequestMeta
     }),
     apiBaseUrl
   );
@@ -791,8 +855,15 @@ async function performTranslationRepairRequest(
   requestMeta = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'validate' });
-  const contextPayload = { text: context || '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
+  const normalizedContext = normalizeContextPayload(context);
+  const contextPayload = {
+    text: normalizedContext.text || '',
+    mode: normalizedContext.mode || '',
+    baseAnswer: normalizedContext.baseAnswer || '',
+    baseAnswerIncluded: normalizedContext.baseAnswerIncluded
+  };
   const effectiveContext = buildEffectiveContext(contextPayload, normalizedRequestMeta);
+  const retryContextSections = buildRetryContextSections(normalizedContext, normalizedRequestMeta);
   const normalizedItems = items.map((item) => ({
     id: item.id,
     source: applyPunctuationTokens(item.source || ''),
@@ -814,12 +885,13 @@ async function performTranslationRepairRequest(
     {
       role: 'user',
       content: [
+        retryContextSections,
         `Repair the following translations into ${targetLanguage}.`,
-        context
+        normalizedContext.text
           ? [
               'Use the page context only for disambiguation.',
               'Do not translate or include the context in the output.',
-              `Context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
+              `Context (do not translate): <<<CONTEXT_START>>>${normalizedContext.text}<<<CONTEXT_END>>>`
             ].join('\n')
           : '',
         'Return only JSON with a "translations" array matching the input order.',
@@ -978,7 +1050,7 @@ async function repairTranslationsForLanguage(
       targetLanguage,
       model,
       undefined,
-      retryContextPayload.text || '',
+      retryContextPayload,
       apiBaseUrl,
       repairRequestMeta
     );
