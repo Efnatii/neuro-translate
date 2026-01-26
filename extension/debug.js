@@ -25,9 +25,7 @@ let debugReconnectDelay = 500;
 const proofreadUiState = new Map();
 const debugUiState = {
   openKeys: new Set(),
-  scrollTop: 0,
-  loadedFullTextKeys: new Set(),
-  fullTextCache: new Map()
+  scrollTop: 0
 };
 const debugDomState = {
   contextReady: false,
@@ -65,17 +63,13 @@ async function init() {
         clearContext();
         return;
       }
+      const loadButton = target.closest('[data-action="load-raw"]');
+      if (loadButton) {
+        event.preventDefault();
+        handleLoadRawClick(loadButton);
+      }
     });
   }
-
-  addDebugListener(document, 'click', (event) => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    const loadButton = target.closest('[data-action="load-full"]');
-    if (!loadButton) return;
-    event.preventDefault();
-    handleLoadFullClick(loadButton);
-  });
 
   if (entriesEl) {
     addDebugListener(entriesEl, 'click', (event) => {
@@ -114,6 +108,12 @@ async function init() {
         return;
       }
 
+      const loadButton = target.closest('[data-action="load-raw"]');
+      if (loadButton) {
+        event.preventDefault();
+        handleLoadRawClick(loadButton);
+        return;
+      }
     });
   }
 
@@ -333,29 +333,10 @@ async function getRawRecord(rawId) {
   });
 }
 
-function buildFullTextKey(rawRefId, rawField) {
-  if (!rawRefId) return '';
-  return `${rawRefId}:${rawField}`;
-}
-
-function cacheFullText(container, key) {
-  if (!key || !container) return;
-  const text = container.textContent ?? '';
-  debugUiState.loadedFullTextKeys.add(key);
-  debugUiState.fullTextCache.set(key, text);
-  container.setAttribute('data-fulltext-loaded', '1');
-}
-
-function buildFullTextAttributes(fullTextKey, isLoaded) {
-  if (!fullTextKey) return '';
-  return ` data-fulltext-key="${escapeHtml(fullTextKey)}"${isLoaded ? ' data-fulltext-loaded="1"' : ''}`;
-}
-
-async function handleLoadFullClick(button) {
+async function handleLoadRawClick(button) {
   const rawId = button.getAttribute('data-raw-id');
   const rawField = button.getAttribute('data-raw-field') || 'text';
   const targetId = button.getAttribute('data-target-id');
-  const fullTextKey = button.getAttribute('data-fulltext-key') || buildFullTextKey(rawId, rawField);
   if (!rawId || !targetId) return;
   const container = document.querySelector(`[data-raw-target="${CSS.escape(targetId)}"]`);
   if (!container) return;
@@ -364,7 +345,6 @@ async function handleLoadFullClick(button) {
     const payload = record?.value || {};
     const rawValue = payload?.[rawField] ?? payload?.text ?? '';
     container.innerHTML = renderRawResponse(rawValue, 'Нет данных.');
-    cacheFullText(container, fullTextKey);
     button.remove();
   } catch (error) {
     container.innerHTML = `<div class="empty">Не удалось загрузить данные.</div>`;
@@ -925,22 +905,16 @@ function renderInlineRaw(value, options = {}) {
   const rawField = options.rawField || 'text';
   const truncated = Boolean(options.truncated);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
-  const fullTextKey = buildFullTextKey(rawRefId, rawField);
-  const isLoaded = fullTextKey && debugUiState.loadedFullTextKeys.has(fullTextKey);
-  const cachedText = isLoaded ? debugUiState.fullTextCache.get(fullTextKey) : null;
-  const displayValue = isLoaded && cachedText != null ? cachedText : value;
   const loadButton =
-    rawRefId && truncated && !isLoaded
-      ? `<button class="action-button action-button--inline" type="button" data-action="load-full" data-raw-id="${escapeHtml(
+    rawRefId && truncated
+      ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
           rawRefId
-        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}" data-fulltext-key="${escapeHtml(
-          fullTextKey
-        )}">Загрузить полностью</button>`
+        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
   return `
     ${loadButton}
-    <div data-raw-target="${escapeHtml(targetId)}"${buildFullTextAttributes(fullTextKey, isLoaded)}>
-      ${renderRawResponse(displayValue, options.emptyMessage || 'Нет данных.')}
+    <div data-raw-target="${escapeHtml(targetId)}">
+      ${renderRawResponse(value, options.emptyMessage || 'Нет данных.')}
     </div>
   `;
 }
@@ -1175,22 +1149,16 @@ function buildDebugSectionContent(value, options = {}) {
   const rawField = options.rawField || 'text';
   const isTruncated = Boolean(options.truncated);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
-  const fullTextKey = buildFullTextKey(rawRefId, rawField);
-  const isLoaded = fullTextKey && debugUiState.loadedFullTextKeys.has(fullTextKey);
-  const cachedText = isLoaded ? debugUiState.fullTextCache.get(fullTextKey) : null;
-  const displayValue = isLoaded && cachedText != null ? cachedText : value;
   const loadButton =
-    rawRefId && isTruncated && !isLoaded
-      ? `<button class="action-button action-button--inline" type="button" data-action="load-full" data-raw-id="${escapeHtml(
+    rawRefId && isTruncated
+      ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
           rawRefId
-        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}" data-fulltext-key="${escapeHtml(
-          fullTextKey
-        )}">Загрузить полностью</button>`
+        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
   return `
     ${loadButton}
-    <div data-raw-target="${escapeHtml(targetId)}"${buildFullTextAttributes(fullTextKey, isLoaded)}>
-      ${renderRawResponse(displayValue, 'Нет данных.')}
+    <div data-raw-target="${escapeHtml(targetId)}">
+      ${renderRawResponse(value, 'Нет данных.')}
     </div>
   `;
 }
@@ -1347,40 +1315,6 @@ function getProofreadEntryKey(item, index) {
   return `entry-${index}`;
 }
 
-function captureFullTextState() {
-  document.querySelectorAll('[data-fulltext-key]').forEach((container) => {
-    const key = container.getAttribute('data-fulltext-key');
-    if (!key) return;
-    if (!container.hasAttribute('data-fulltext-loaded') && !debugUiState.loadedFullTextKeys.has(key)) {
-      return;
-    }
-    cacheFullText(container, key);
-  });
-}
-
-function restoreFullTextState() {
-  const keys = Array.from(debugUiState.loadedFullTextKeys);
-  keys.forEach((key) => {
-    const container = document.querySelector(`[data-fulltext-key="${CSS.escape(key)}"]`);
-    if (!container) {
-      debugUiState.loadedFullTextKeys.delete(key);
-      debugUiState.fullTextCache.delete(key);
-      return;
-    }
-    const cachedText = debugUiState.fullTextCache.get(key);
-    if (cachedText != null) {
-      container.innerHTML = renderRawResponse(cachedText, 'Нет данных.');
-    }
-    container.setAttribute('data-fulltext-loaded', '1');
-    const button = container.parentElement?.querySelector(
-      `[data-action="load-full"][data-fulltext-key="${CSS.escape(key)}"]`
-    );
-    if (button) {
-      button.remove();
-    }
-  });
-}
-
 function captureUiState() {
   // Сохраняем раскрытые <details> по стабильным data-debug-key, чтобы вложенные секции не сбрасывались.
   const openKeys = new Set();
@@ -1391,7 +1325,6 @@ function captureUiState() {
   debugUiState.openKeys = openKeys;
   const scrollEl = document.scrollingElement;
   debugUiState.scrollTop = scrollEl ? scrollEl.scrollTop : 0;
-  captureFullTextState();
 }
 
 function restoreUiState() {
@@ -1406,7 +1339,6 @@ function restoreUiState() {
   if (scrollEl) {
     scrollEl.scrollTop = debugUiState.scrollTop;
   }
-  restoreFullTextState();
 }
 
 function runDebugRecreationCheck() {
