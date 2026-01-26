@@ -408,6 +408,7 @@ function patchDebug(url, data) {
     }
   }
   restoreUiState();
+  autoLoadRawTargets(document);
 }
 
 function renderSummary(data, fallbackMessage = '') {
@@ -782,15 +783,12 @@ function renderInlineRaw(value, options = {}) {
   const rawField = options.rawField || 'text';
   const truncated = Boolean(options.truncated);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
-  const loadButton =
-    rawRefId && truncated
-      ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
-          rawRefId
-        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
-      : '';
+  const autoLoad = rawRefId && truncated;
+  const autoLoadAttrs = autoLoad
+    ? ` data-raw-auto="true" data-raw-id="${escapeHtml(rawRefId)}" data-raw-field="${escapeHtml(rawField)}"`
+    : '';
   return `
-    ${loadButton}
-    <div data-raw-target="${escapeHtml(targetId)}">
+    <div data-raw-target="${escapeHtml(targetId)}"${autoLoadAttrs}>
       ${renderRawResponse(value, options.emptyMessage || 'Нет данных.')}
     </div>
   `;
@@ -964,18 +962,15 @@ function renderDebugSection(label, value, options = {}) {
   const isTruncated = Boolean(options.truncated);
   const debugKey = options.debugKey ? ` data-debug-key="${escapeHtml(options.debugKey)}"` : '';
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
-  const loadButton =
-    rawRefId && isTruncated
-      ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
-          rawRefId
-        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
-      : '';
+  const autoLoad = rawRefId && isTruncated;
+  const autoLoadAttrs = autoLoad
+    ? ` data-raw-auto="true" data-raw-id="${escapeHtml(rawRefId)}" data-raw-field="${escapeHtml(rawField)}"`
+    : '';
   return `
     <details class="debug-details"${debugKey}>
       <summary>${escapeHtml(label)}</summary>
       <div class="details-content">
-        ${loadButton}
-        <div data-raw-target="${escapeHtml(targetId)}">
+        <div data-raw-target="${escapeHtml(targetId)}"${autoLoadAttrs}>
           ${renderRawResponse(value, 'Нет данных.')}
         </div>
       </div>
@@ -1035,6 +1030,28 @@ function formatRawResponse(value) {
     return { text: JSON.stringify(parsed, null, 2), isJson: true, isEmpty: false };
   } catch (error) {
     return { text: trimmed, isJson: false, isEmpty: false };
+  }
+}
+
+function autoLoadRawTargets(root = document) {
+  const targets = root.querySelectorAll('[data-raw-auto="true"]:not([data-raw-loaded="true"])');
+  targets.forEach((target) => {
+    target.setAttribute('data-raw-loaded', 'true');
+    loadRawTarget(target);
+  });
+}
+
+async function loadRawTarget(target) {
+  const rawId = target.getAttribute('data-raw-id');
+  const rawField = target.getAttribute('data-raw-field') || 'text';
+  if (!rawId) return;
+  try {
+    const record = await getRawRecord(rawId);
+    const payload = record?.value || {};
+    const rawValue = payload?.[rawField] ?? payload?.text ?? '';
+    target.innerHTML = renderRawResponse(rawValue, 'Нет данных.');
+  } catch (error) {
+    target.innerHTML = '<div class="empty">Не удалось загрузить данные.</div>';
   }
 }
 
