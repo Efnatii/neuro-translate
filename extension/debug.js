@@ -119,6 +119,13 @@ function getSourceUrlFromQuery() {
   return source ? decodeURIComponent(source) : '';
 }
 
+function isProofreadSection(sectionKey = '', sectionTitle = '', ancestryKeys = []) {
+  const normalizedTitle = String(sectionTitle || '').trim().toLowerCase();
+  if (normalizedTitle === 'вычитка') return true;
+  const keys = [sectionKey, ...ancestryKeys].filter(Boolean).map((key) => String(key).toLowerCase());
+  return keys.some((key) => key.includes('proofread'));
+}
+
 async function getDebugData(url) {
   if (typeof chrome === 'undefined' || !chrome.storage?.local) {
     return null;
@@ -297,6 +304,34 @@ async function handleLoadRawClick(button) {
   }
 }
 
+async function loadRawIntoContainer(container, rawId, rawField) {
+  if (!rawId || !container) return;
+  try {
+    const record = await getRawRecord(rawId);
+    const payload = record?.value || {};
+    const rawValue = payload?.[rawField] ?? payload?.text ?? '';
+    container.innerHTML = renderRawResponse(rawValue, 'Нет данных.');
+  } catch (error) {
+    container.innerHTML = `<div class="empty">Не удалось загрузить данные.</div>`;
+  } finally {
+    container.setAttribute('data-auto-load-status', 'done');
+    container.removeAttribute('data-auto-load-raw');
+  }
+}
+
+function autoLoadRawTargets(root) {
+  if (!root) return;
+  root.querySelectorAll('[data-auto-load-raw="true"]').forEach((container) => {
+    if (!(container instanceof Element)) return;
+    if (container.getAttribute('data-auto-load-status')) return;
+    const rawId = container.getAttribute('data-raw-id');
+    if (!rawId) return;
+    const rawField = container.getAttribute('data-raw-field') || 'text';
+    container.setAttribute('data-auto-load-status', 'loading');
+    void loadRawIntoContainer(container, rawId, rawField);
+  });
+}
+
 async function refreshDebug() {
   const debugData = await getDebugData(sourceUrl);
   if (!debugData) {
@@ -399,6 +434,7 @@ function patchDebug(url, data) {
     const entryKey = getProofreadEntryKey(item, index);
     const entry = ensureEntryContainer(entryKey);
     entry.innerHTML = renderEntryHtml(item, entryKey);
+    autoLoadRawTargets(entry);
     liveKeys.add(entryKey);
   });
   for (const [entryKey, entryEl] of debugDomState.entriesByKey.entries()) {
@@ -541,18 +577,25 @@ function patchContext(data) {
     ? renderInlineRaw(contextFullText, {
         rawRefId: contextFullRefId,
         rawField: 'text',
-        truncated: contextFullTruncated
+        truncated: contextFullTruncated,
+        sectionKey: 'context:full',
+        sectionTitle: 'FULL контекст',
+        ancestryKeys: ['context']
       })
     : `<div class="empty">FULL контекст ещё не готов.</div>`;
   const shortContextBody = contextShortText
     ? renderInlineRaw(contextShortText, {
         rawRefId: contextShortRefId,
         rawField: 'text',
-        truncated: contextShortTruncated
+        truncated: contextShortTruncated,
+        sectionKey: 'context:short',
+        sectionTitle: 'SHORT контекст',
+        ancestryKeys: ['context']
       })
     : `<div class="empty">SHORT контекст ещё не готов.</div>`;
   if (shortBodyEl) shortBodyEl.innerHTML = shortContextBody;
   if (fullBodyEl) fullBodyEl.innerHTML = fullContextBody;
+  autoLoadRawTargets(contextEl);
 }
 
 function ensureEntryContainer(entryKey) {
@@ -780,17 +823,26 @@ function renderRawResponse(value, emptyMessage) {
 function renderInlineRaw(value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
-  const truncated = Boolean(options.truncated);
+  const sectionKey = options.sectionKey || '';
+  const sectionTitle = options.sectionTitle || '';
+  const ancestryKeys = Array.isArray(options.ancestryKeys) ? options.ancestryKeys : [];
+  // В отладке убираем режим "Показать полностью" везде кроме "Вычитка".
+  const allowTruncate = isProofreadSection(sectionKey, sectionTitle, ancestryKeys);
+  const truncated = allowTruncate ? Boolean(options.truncated) : false;
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
+  const shouldAutoLoad = !allowTruncate && rawRefId && Boolean(options.truncated);
   const loadButton =
     rawRefId && truncated
       ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
           rawRefId
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
+  const autoLoadAttrs = shouldAutoLoad
+    ? ` data-auto-load-raw="true" data-raw-id="${escapeHtml(rawRefId)}" data-raw-field="${escapeHtml(rawField)}"`
+    : '';
   return `
     ${loadButton}
-    <div data-raw-target="${escapeHtml(targetId)}">
+    <div data-raw-target="${escapeHtml(targetId)}"${autoLoadAttrs}>
       ${renderRawResponse(value, options.emptyMessage || 'Нет данных.')}
     </div>
   `;
@@ -913,20 +965,26 @@ function renderDebugPayload(payload, index, baseKey) {
         rawRefId: payload?.rawRefId,
         rawField: 'contextTextSent',
         truncated: payload?.contextTruncated,
-        debugKey: `${payloadKey}:context`
+        debugKey: `${payloadKey}:context`,
+        sectionKey: `${payloadKey}:context`,
+        ancestryKeys: [baseKey]
       })
     : '';
   const requestSection = renderDebugSection('Request (raw)', payload?.request, {
     rawRefId: payload?.rawRefId,
     rawField: 'request',
     truncated: payload?.requestTruncated,
-    debugKey: `${payloadKey}:request`
+    debugKey: `${payloadKey}:request`,
+    sectionKey: `${payloadKey}:request`,
+    ancestryKeys: [baseKey]
   });
   const responseSection = renderDebugSection('Response (raw)', payload?.response, {
     rawRefId: payload?.rawRefId,
     rawField: 'response',
     truncated: payload?.responseTruncated,
-    debugKey: `${payloadKey}:response`
+    debugKey: `${payloadKey}:response`,
+    sectionKey: `${payloadKey}:response`,
+    ancestryKeys: [baseKey]
   });
   const parseSection = renderDebugParseSection(payload?.parseIssues, `${payloadKey}:parse`);
   const tagBadge = tag ? `<span class="debug-tag">${escapeHtml(tag)}</span>` : '';
@@ -961,21 +1019,30 @@ function renderDebugPayload(payload, index, baseKey) {
 function renderDebugSection(label, value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
-  const isTruncated = Boolean(options.truncated);
+  const sectionKey = options.sectionKey || options.debugKey || '';
+  const sectionTitle = options.sectionTitle || label;
+  const ancestryKeys = Array.isArray(options.ancestryKeys) ? options.ancestryKeys : [];
+  // В отладке убираем режим "Показать полностью" везде кроме "Вычитка".
+  const allowTruncate = isProofreadSection(sectionKey, sectionTitle, ancestryKeys);
+  const isTruncated = allowTruncate ? Boolean(options.truncated) : false;
   const debugKey = options.debugKey ? ` data-debug-key="${escapeHtml(options.debugKey)}"` : '';
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
+  const shouldAutoLoad = !allowTruncate && rawRefId && Boolean(options.truncated);
   const loadButton =
     rawRefId && isTruncated
       ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
           rawRefId
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
+  const autoLoadAttrs = shouldAutoLoad
+    ? ` data-auto-load-raw="true" data-raw-id="${escapeHtml(rawRefId)}" data-raw-field="${escapeHtml(rawField)}"`
+    : '';
   return `
     <details class="debug-details"${debugKey}>
       <summary>${escapeHtml(label)}</summary>
       <div class="details-content">
         ${loadButton}
-        <div data-raw-target="${escapeHtml(targetId)}">
+        <div data-raw-target="${escapeHtml(targetId)}"${autoLoadAttrs}>
           ${renderRawResponse(value, 'Нет данных.')}
         </div>
       </div>
