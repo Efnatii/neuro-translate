@@ -29,11 +29,18 @@ const debugUiState = {
 };
 const debugDomState = {
   contextReady: false,
-  entriesByKey: new Map()
+  entriesByKey: new Map(),
+  entryPartsByKey: new Map(),
+  payloadPartsByKey: new Map()
 };
 let latestDebugSnapshot = null;
 let latestDebugUrl = '';
 let debugPatchScheduled = false;
+const debugInstrumentation = {
+  enabled: isDebugInstrumentationEnabled(),
+  lastRefByKey: new Map(),
+  lastUserActionTs: 0
+};
 
 init();
 
@@ -44,8 +51,10 @@ async function init() {
     return;
   }
 
+  setupDebugInstrumentation();
+
   if (contextEl) {
-    contextEl.addEventListener('click', (event) => {
+    addDebugListener(contextEl, 'click', (event) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
       const button = target.closest('[data-action="clear-context"]');
@@ -63,7 +72,7 @@ async function init() {
   }
 
   if (entriesEl) {
-    entriesEl.addEventListener('click', (event) => {
+    addDebugListener(entriesEl, 'click', (event) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
       const viewButton = target.closest('[data-action="set-proofread-view"]');
@@ -111,6 +120,51 @@ async function init() {
   await refreshDebug();
   connectDebugPort();
   startAutoRefresh();
+}
+
+function isDebugInstrumentationEnabled() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('debug') === '1' || params.get('instrument') === '1';
+}
+
+function setupDebugInstrumentation() {
+  if (!debugInstrumentation.enabled) return;
+  const root = document.body;
+  if (!root) return;
+  addDebugListener(root, 'pointerdown', () => {
+    debugInstrumentation.lastUserActionTs = performance.now();
+  });
+  addDebugListener(root, 'keydown', () => {
+    debugInstrumentation.lastUserActionTs = performance.now();
+  });
+  root.addEventListener(
+    'toggle',
+    (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLDetailsElement)) return;
+      const key = target.getAttribute('data-debug-key') || '';
+      if (!key) return;
+      const elapsed = performance.now() - debugInstrumentation.lastUserActionTs;
+      if (elapsed > 400) {
+        console.warn(`[debug] PROGRAMMATIC TOGGLE key=${key} open=${target.open} ts=${Date.now()}`);
+      }
+    },
+    true
+  );
+}
+
+function addDebugListener(element, eventName, handler) {
+  if (debugInstrumentation.enabled) {
+    const existing = element.getAttribute('data-nt-listener') || '';
+    const events = existing.split(',').map((value) => value.trim()).filter(Boolean);
+    if (events.includes(eventName)) {
+      console.warn(`[debug] DUPLICATE LISTENER event=${eventName} el=${element.tagName}`);
+    } else {
+      events.push(eventName);
+      element.setAttribute('data-nt-listener', events.join(','));
+    }
+  }
+  element.addEventListener(eventName, handler);
 }
 
 function getSourceUrlFromQuery() {
@@ -348,6 +402,9 @@ function renderEmpty(message) {
     contextShort: ''
   });
   entriesEl.innerHTML = '';
+  debugDomState.entriesByKey.clear();
+  debugDomState.entryPartsByKey.clear();
+  debugDomState.payloadPartsByKey.clear();
   if (eventsEl) {
     eventsEl.innerHTML = '';
   }
@@ -374,8 +431,8 @@ function scheduleDebugPatch(url, data) {
 }
 
 function patchDebug(url, data) {
-  // Раньше весь блок отладки перерисовывался через innerHTML, что сбрасывало раскрытие <details> и прокрутку.
-  // Теперь сохраняем состояние и патчим только нужные узлы.
+  // Причина моргания: пересоздание <details> через innerHTML сбрасывало open и затем восстанавливалось.
+  // Используем механизм из стабильной части: один раз создаём DOM-скелет и патчим только leaf-контент.
   captureUiState();
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
@@ -398,16 +455,23 @@ function patchDebug(url, data) {
   items.forEach((item, index) => {
     const entryKey = getProofreadEntryKey(item, index);
     const entry = ensureEntryContainer(entryKey);
-    entry.innerHTML = renderEntryHtml(item, entryKey);
+    patchEntry(entry, item, entryKey);
     liveKeys.add(entryKey);
   });
   for (const [entryKey, entryEl] of debugDomState.entriesByKey.entries()) {
     if (!liveKeys.has(entryKey)) {
       entryEl.remove();
       debugDomState.entriesByKey.delete(entryKey);
+      debugDomState.entryPartsByKey.delete(entryKey);
     }
   }
+  debugDomState.payloadPartsByKey.forEach((value, key) => {
+    if (!value.el.isConnected) {
+      debugDomState.payloadPartsByKey.delete(key);
+    }
+  });
   restoreUiState();
+  runDebugRecreationCheck();
 }
 
 function renderSummary(data, fallbackMessage = '') {
@@ -452,6 +516,41 @@ function renderSummary(data, fallbackMessage = '') {
       </div>
     </div>
   `;
+}
+
+function setTextIfChanged(element, value) {
+  if (!element) return;
+  const next = value == null ? '' : String(value);
+  if (element.textContent !== next) {
+    element.textContent = next;
+  }
+}
+
+function setHtmlIfChanged(element, html) {
+  if (!element) return;
+  const next = html == null ? '' : String(html);
+  if (element.innerHTML !== next) {
+    element.innerHTML = next;
+  }
+}
+
+function ensureDetailsElement(parent, debugKey, summaryText, className = '') {
+  if (!parent) return { detailsEl: null, contentEl: null };
+  let details = parent.querySelector(`details[data-debug-key="${CSS.escape(debugKey)}"]`);
+  if (!details) {
+    details = document.createElement('details');
+    details.className = className;
+    details.setAttribute('data-debug-key', debugKey);
+    const summary = document.createElement('summary');
+    summary.textContent = summaryText;
+    const content = document.createElement('div');
+    content.className = 'details-content';
+    details.appendChild(summary);
+    details.appendChild(content);
+    parent.appendChild(details);
+  }
+  const contentEl = details.querySelector('.details-content');
+  return { detailsEl: details, contentEl };
 }
 
 function renderEvents(data) {
@@ -563,55 +662,104 @@ function ensureEntryContainer(entryKey) {
   entry.dataset.entryKey = entryKey;
   entriesEl.appendChild(entry);
   debugDomState.entriesByKey.set(entryKey, entry);
+  debugDomState.entryPartsByKey.set(entryKey, createEntrySkeleton(entry, entryKey));
   return entry;
 }
 
-function renderEntryHtml(item, entryKey) {
-  const translationStatus = normalizeStatus(item.translationStatus, item.translated);
-  const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
-  const proofreadSection = renderProofreadSection(item, entryKey);
-  const translateKey = `entry:${entryKey}:translate`;
-  const translateAiKey = `${translateKey}:ai`;
-  return `
+function createEntrySkeleton(entry, entryKey) {
+  entry.innerHTML = `
     <div class="entry-header">
-      <h2>Блок ${item.index || ''}</h2>
+      <h2 data-role="entry-title"></h2>
       <div class="status-row">
         <div class="status-group">
           <span class="status-label">Перевод</span>
-          ${renderStatusBadge(translationStatus)}
+          <span data-role="translation-status"></span>
         </div>
         <div class="status-group">
           <span class="status-label">Вычитка</span>
-          ${renderStatusBadge(proofreadStatus)}
+          <span data-role="proofread-status"></span>
         </div>
       </div>
     </div>
     <div class="block">
       <div class="label">Оригинал</div>
-      <pre>${escapeHtml(item.original || '')}</pre>
+      <pre data-role="original-text"></pre>
     </div>
     <div class="block">
       <div class="label">Перевод</div>
-      ${
-        item.translated
-          ? `<pre>${escapeHtml(item.translated)}</pre>`
-          : `<div class="empty">Перевод ещё не получен.</div>`
-      }
+      <div data-role="translated-body"></div>
     </div>
-    <div class="block">
-      <details class="ai-response" data-debug-key="${escapeHtml(translateAiKey)}">
-        <summary>Ответ ИИ (перевод)</summary>
-        <div class="details-content">
-          ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
-            rawRefId: item?.translationRawRefId,
-            truncated: item?.translationRawTruncated,
-            baseKey: translateKey
-          })}
-        </div>
-      </details>
-    </div>
-    ${proofreadSection}
+    <div class="block" data-role="translate-ai-block"></div>
+    <div data-role="proofread-section"></div>
   `;
+  const translateKey = `entry:${entryKey}:translate`;
+  const translateAiKey = `${translateKey}:ai`;
+  const translateAiBlock = entry.querySelector('[data-role="translate-ai-block"]');
+  const translateDetails = ensureDetailsElement(translateAiBlock, translateAiKey, 'Ответ ИИ (перевод)', 'ai-response');
+  const proofreadSection = entry.querySelector('[data-role="proofread-section"]');
+  const proofreadBlock = document.createElement('div');
+  proofreadBlock.className = 'block proofread-block';
+  proofreadBlock.dataset.role = 'proofread-block';
+  const proofreadAiBlock = document.createElement('div');
+  proofreadAiBlock.className = 'block';
+  proofreadAiBlock.dataset.role = 'proofread-ai-block';
+  proofreadSection.appendChild(proofreadBlock);
+  proofreadSection.appendChild(proofreadAiBlock);
+  const proofreadAiKey = `entry:${entryKey}:proofread:ai`;
+  const proofreadDetails = ensureDetailsElement(proofreadAiBlock, proofreadAiKey, 'Ответ ИИ (вычитка)', 'ai-response');
+  return {
+    entry,
+    titleEl: entry.querySelector('[data-role="entry-title"]'),
+    translationStatusEl: entry.querySelector('[data-role="translation-status"]'),
+    proofreadStatusEl: entry.querySelector('[data-role="proofread-status"]'),
+    originalEl: entry.querySelector('[data-role="original-text"]'),
+    translatedBodyEl: entry.querySelector('[data-role="translated-body"]'),
+    translateDetailsContentEl: translateDetails.contentEl,
+    proofreadBlockEl: proofreadBlock,
+    proofreadDetailsContentEl: proofreadDetails.contentEl
+  };
+}
+
+function patchEntry(entry, item, entryKey) {
+  const parts = debugDomState.entryPartsByKey.get(entryKey);
+  if (!parts) return;
+  const translationStatus = normalizeStatus(item.translationStatus, item.translated);
+  const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
+  setTextIfChanged(parts.titleEl, `Блок ${item.index || ''}`);
+  setHtmlIfChanged(parts.translationStatusEl, renderStatusBadge(translationStatus));
+  setHtmlIfChanged(parts.proofreadStatusEl, renderStatusBadge(proofreadStatus));
+  setTextIfChanged(parts.originalEl, item.original || '');
+  const translatedHtml = item.translated
+    ? `<pre>${escapeHtml(item.translated)}</pre>`
+    : `<div class="empty">Перевод ещё не получен.</div>`;
+  setHtmlIfChanged(parts.translatedBodyEl, translatedHtml);
+  patchDebugPayloads(parts.translateDetailsContentEl, item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
+    rawRefId: item?.translationRawRefId,
+    truncated: item?.translationRawTruncated,
+    baseKey: `entry:${entryKey}:translate`
+  });
+  patchProofreadBlock(parts.proofreadBlockEl, item, entryKey);
+  if (item?.proofreadApplied === false) {
+    setHtmlIfChanged(parts.proofreadDetailsContentEl, '<div class="empty">Вычитка выключена.</div>');
+  } else {
+    patchDebugPayloads(parts.proofreadDetailsContentEl, item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD', {
+      rawRefId: item?.proofreadRawRefId,
+      truncated: item?.proofreadRawTruncated,
+      baseKey: `entry:${entryKey}:proofread`
+    });
+  }
+}
+
+function patchProofreadBlock(container, item, entryKey) {
+  const defaultView = 'diff';
+  const state = getProofreadState(entryKey, defaultView);
+  const isExpanded = Boolean(state.expanded);
+  const showView = state.view || defaultView;
+  const html = renderProofreadBlockHtml(item, entryKey);
+  setHtmlIfChanged(container, html);
+  container.setAttribute('data-proofread-id', entryKey);
+  container.setAttribute('data-proofread-view', showView);
+  container.classList.toggle('is-expanded', isExpanded);
 }
 
 function getOverallStatus({ completed, inProgress, failed, total, contextFullStatus, contextShortStatus }) {
@@ -630,22 +778,11 @@ function getOverallStatus({ completed, inProgress, failed, total, contextFullSta
 }
 
 
-function renderProofreadSection(item, entryKey) {
+function renderProofreadBlockHtml(item, entryKey) {
   if (item?.proofreadApplied === false) {
-    const proofreadAiKey = `entry:${entryKey}:proofread:ai`;
     return `
-      <div class="block">
-        <div class="label">Вычитка</div>
-        <div class="empty">Вычитка выключена.</div>
-      </div>
-      <div class="block">
-        <details class="ai-response" data-debug-key="${escapeHtml(proofreadAiKey)}">
-          <summary>Ответ ИИ (вычитка)</summary>
-          <div class="details-content">
-            <div class="empty">Вычитка выключена.</div>
-          </div>
-        </details>
-      </div>
+      <div class="label">Вычитка</div>
+      <div class="empty">Вычитка выключена.</div>
     `;
   }
 
@@ -705,30 +842,16 @@ function renderProofreadSection(item, entryKey) {
       `;
 
   return `
-      <div class="block proofread-block${isExpanded ? ' is-expanded' : ''}" data-proofread-id="${escapeHtml(entryKey)}" data-proofread-view="${escapeHtml(showView)}">
-        <div class="proofread-header">
-          <div class="proofread-title">
-            <span class="label">Вычитка</span>
-            <span class="proofread-status ${escapeHtml(statusClass)}">${escapeHtml(statusLabel)}</span>
-            <span class="proofread-metric">${escapeHtml(latency)}</span>
-            <span class="proofread-metric">${escapeHtml(changes)}</span>
-          </div>
-          ${controls}
+      <div class="proofread-header">
+        <div class="proofread-title">
+          <span class="label">Вычитка</span>
+          <span class="proofread-status ${escapeHtml(statusClass)}">${escapeHtml(statusLabel)}</span>
+          <span class="proofread-metric">${escapeHtml(latency)}</span>
+          <span class="proofread-metric">${escapeHtml(changes)}</span>
         </div>
-        ${proofreadBody}
+        ${controls}
       </div>
-      <div class="block">
-        <details class="ai-response" data-debug-key="${escapeHtml(`entry:${entryKey}:proofread:ai`)}">
-          <summary>Ответ ИИ (вычитка)</summary>
-          <div class="details-content">
-            ${renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD', {
-              rawRefId: item?.proofreadRawRefId,
-              truncated: item?.proofreadRawTruncated,
-              baseKey: `entry:${entryKey}:proofread`
-            })}
-          </div>
-        </details>
-      </div>
+      ${proofreadBody}
     `;
 }
 
@@ -820,40 +943,117 @@ function normalizeDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta = {})
   return [];
 }
 
-function formatUsage(usage) {
-  if (!usage) return '—';
-  const total = usage.total_tokens ?? usage.totalTokens;
-  const prompt = usage.prompt_tokens ?? usage.promptTokens;
-  const completion = usage.completion_tokens ?? usage.completionTokens;
-  if (Number.isFinite(prompt) && Number.isFinite(completion)) {
-    return `${prompt} prompt / ${completion} completion`;
-  }
-  if (Number.isFinite(total)) {
-    return `${total} total`;
-  }
-  return '—';
-}
-
-function formatLatency(latencyMs) {
-  if (!Number.isFinite(latencyMs)) return '—';
-  return `${Math.round(latencyMs)} ms`;
-}
-
-function formatCharCount(value) {
-  if (!Number.isFinite(value)) return '—';
-  return `${value} chars`;
-}
-
-function renderDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta = {}) {
+function patchDebugPayloads(container, payloads, fallbackRaw, phase, fallbackMeta = {}) {
+  if (!container) return;
   const normalized = normalizeDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta);
+  const emptyEl = ensurePayloadEmpty(container);
+  const listEl = ensurePayloadList(container);
   if (!normalized.length) {
-    return '<div class="empty">Ответ ИИ ещё не получен.</div>';
+    emptyEl.hidden = false;
+    listEl.innerHTML = '';
+    debugDomState.payloadPartsByKey.forEach((value, key) => {
+      if (!value.el.isConnected) {
+        debugDomState.payloadPartsByKey.delete(key);
+      }
+    });
+    return;
   }
-  const baseKey = fallbackMeta.baseKey || phase.toLowerCase();
-  return normalized.map((payload, index) => renderDebugPayload(payload, index, baseKey)).join('');
+  emptyEl.hidden = true;
+  const liveKeys = new Set();
+  normalized.forEach((payload, index) => {
+    const baseKey = fallbackMeta.baseKey || phase.toLowerCase();
+    const payloadKey = `${baseKey}:payload:${index}`;
+    const payloadEl = ensurePayloadElement(listEl, payloadKey);
+    patchDebugPayload(payloadEl, payload, payloadKey);
+    liveKeys.add(payloadKey);
+  });
+  Array.from(listEl.querySelectorAll('.debug-payload')).forEach((payloadEl) => {
+    const key = payloadEl.getAttribute('data-payload-key') || '';
+    if (key && !liveKeys.has(key)) {
+      payloadEl.remove();
+      debugDomState.payloadPartsByKey.delete(key);
+    }
+  });
 }
 
-function renderDebugPayload(payload, index, baseKey) {
+function ensurePayloadEmpty(container) {
+  let emptyEl = container.querySelector('[data-role="payload-empty"]');
+  if (!emptyEl) {
+    emptyEl = document.createElement('div');
+    emptyEl.className = 'empty';
+    emptyEl.dataset.role = 'payload-empty';
+    emptyEl.textContent = 'Ответ ИИ ещё не получен.';
+    container.appendChild(emptyEl);
+  }
+  return emptyEl;
+}
+
+function ensurePayloadList(container) {
+  let listEl = container.querySelector('[data-role="payload-list"]');
+  if (!listEl) {
+    listEl = document.createElement('div');
+    listEl.dataset.role = 'payload-list';
+    container.appendChild(listEl);
+  }
+  return listEl;
+}
+
+function ensurePayloadElement(container, payloadKey) {
+  let payloadEl = container.querySelector(`[data-payload-key="${CSS.escape(payloadKey)}"]`);
+  if (!payloadEl) {
+    payloadEl = document.createElement('div');
+    payloadEl.className = 'debug-payload';
+    payloadEl.dataset.payloadKey = payloadKey;
+    payloadEl.innerHTML = `
+      <div class="debug-header">
+        <div class="debug-title">
+          <span class="debug-phase" data-role="payload-phase"></span>
+          <span class="debug-model" data-role="payload-model"></span>
+          <span class="debug-tag" data-role="payload-tag"></span>
+        </div>
+        <div class="debug-metrics">
+          <span data-role="payload-latency"></span>
+          <span data-role="payload-usage"></span>
+        </div>
+      </div>
+      <div class="debug-meta" data-role="payload-io"></div>
+      <div class="debug-meta debug-meta--request" data-role="payload-request-meta"></div>
+      <div class="debug-context" data-role="payload-context-meta"></div>
+      <div data-role="payload-sections"></div>
+    `;
+    const sectionsEl = payloadEl.querySelector('[data-role="payload-sections"]');
+    const contextDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:context`, 'Context text sent');
+    const requestDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:request`, 'Request (raw)');
+    const responseDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:response`, 'Response (raw)');
+    const parseDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:parse`, 'Parse/Validation');
+    debugDomState.payloadPartsByKey.set(payloadKey, {
+      el: payloadEl,
+      phaseEl: payloadEl.querySelector('[data-role="payload-phase"]'),
+      modelEl: payloadEl.querySelector('[data-role="payload-model"]'),
+      tagEl: payloadEl.querySelector('[data-role="payload-tag"]'),
+      latencyEl: payloadEl.querySelector('[data-role="payload-latency"]'),
+      usageEl: payloadEl.querySelector('[data-role="payload-usage"]'),
+      ioMetaEl: payloadEl.querySelector('[data-role="payload-io"]'),
+      requestMetaEl: payloadEl.querySelector('[data-role="payload-request-meta"]'),
+      contextMetaEl: payloadEl.querySelector('[data-role="payload-context-meta"]'),
+      contextDetails,
+      requestDetails,
+      responseDetails,
+      parseDetails
+    });
+    container.appendChild(payloadEl);
+  }
+  return payloadEl;
+}
+
+function ensureDebugDetails(container, debugKey, label) {
+  const { detailsEl, contentEl } = ensureDetailsElement(container, debugKey, label, 'debug-details');
+  return { detailsEl, contentEl };
+}
+
+function patchDebugPayload(payloadEl, payload, payloadKey) {
+  const parts = debugDomState.payloadPartsByKey.get(payloadKey);
+  if (!parts) return;
   const phase = payload?.phase || 'UNKNOWN';
   const model = payload?.model || '—';
   const tag = payload?.tag || '';
@@ -875,9 +1075,7 @@ function renderDebugPayload(payload, index, baseKey) {
   const baseBadge = payload?.baseAnswerIncluded
     ? `<span class="context-pill context-pill--base">base included</span>`
     : '';
-  const contextMeta = contextLabel
-    ? `<div class="debug-context">Context used: ${contextBadge}${baseBadge}</div>`
-    : '';
+  const contextMeta = contextLabel ? `Context used: ${contextBadge}${baseBadge}` : '';
   const requestId = payload?.requestId || '';
   const parentRequestId = payload?.parentRequestId || '';
   const blockKey = payload?.blockKey || '';
@@ -904,65 +1102,52 @@ function renderDebugPayload(payload, index, baseKey) {
     Number.isFinite(contextLength) ? `contextLen: ${escapeHtml(String(contextLength))}` : '',
     contextHash ? `contextHash: ${escapeHtml(String(contextHash))}` : ''
   ].filter(Boolean);
-  const requestMetaSection = requestMetaItems.length
-    ? `<div class="debug-meta debug-meta--request">${requestMetaItems.join(' · ')}</div>`
-    : '';
-  const payloadKey = `${baseKey}:payload:${index}`;
-  const contextSection = contextLabel
-    ? renderDebugSection('Context text sent', payload?.contextTextSent, {
+  setTextIfChanged(parts.phaseEl, phase);
+  setTextIfChanged(parts.modelEl, model);
+  setTextIfChanged(parts.tagEl, tag);
+  parts.tagEl.style.display = tag ? '' : 'none';
+  setTextIfChanged(parts.latencyEl, `Latency: ${latency}`);
+  setTextIfChanged(parts.usageEl, `Tokens: ${usage}`);
+  setHtmlIfChanged(parts.ioMetaEl, `<span>Input: ${escapeHtml(inputChars)}</span><span>Output: ${escapeHtml(outputChars)}</span>`);
+  setHtmlIfChanged(parts.requestMetaEl, requestMetaItems.length ? requestMetaItems.join(' · ') : '');
+  parts.requestMetaEl.style.display = requestMetaItems.length ? '' : 'none';
+  setHtmlIfChanged(parts.contextMetaEl, contextMeta);
+  parts.contextMetaEl.style.display = contextMeta ? '' : 'none';
+  const hasContextSection = Boolean(contextLabel);
+  parts.contextDetails.detailsEl.style.display = hasContextSection ? '' : 'none';
+  if (hasContextSection) {
+    setHtmlIfChanged(
+      parts.contextDetails.contentEl,
+      buildDebugSectionContent(payload?.contextTextSent, {
         rawRefId: payload?.rawRefId,
         rawField: 'contextTextSent',
-        truncated: payload?.contextTruncated,
-        debugKey: `${payloadKey}:context`
+        truncated: payload?.contextTruncated
       })
-    : '';
-  const requestSection = renderDebugSection('Request (raw)', payload?.request, {
-    rawRefId: payload?.rawRefId,
-    rawField: 'request',
-    truncated: payload?.requestTruncated,
-    debugKey: `${payloadKey}:request`
-  });
-  const responseSection = renderDebugSection('Response (raw)', payload?.response, {
-    rawRefId: payload?.rawRefId,
-    rawField: 'response',
-    truncated: payload?.responseTruncated,
-    debugKey: `${payloadKey}:response`
-  });
-  const parseSection = renderDebugParseSection(payload?.parseIssues, `${payloadKey}:parse`);
-  const tagBadge = tag ? `<span class="debug-tag">${escapeHtml(tag)}</span>` : '';
-  return `
-    <div class="debug-payload">
-      <div class="debug-header">
-        <div class="debug-title">
-          <span class="debug-phase">${escapeHtml(phase)}</span>
-          <span class="debug-model">${escapeHtml(model)}</span>
-          ${tagBadge}
-        </div>
-        <div class="debug-metrics">
-          <span>Latency: ${escapeHtml(latency)}</span>
-          <span>Tokens: ${escapeHtml(usage)}</span>
-        </div>
-      </div>
-      <div class="debug-meta">
-        <span>Input: ${escapeHtml(inputChars)}</span>
-        <span>Output: ${escapeHtml(outputChars)}</span>
-      </div>
-      ${requestMetaSection}
-      ${contextMeta}
-      ${contextSection}
-      ${requestSection}
-      ${responseSection}
-      ${parseSection}
-    </div>
-  `;
+    );
+  }
+  setHtmlIfChanged(
+    parts.requestDetails.contentEl,
+    buildDebugSectionContent(payload?.request, {
+      rawRefId: payload?.rawRefId,
+      rawField: 'request',
+      truncated: payload?.requestTruncated
+    })
+  );
+  setHtmlIfChanged(
+    parts.responseDetails.contentEl,
+    buildDebugSectionContent(payload?.response, {
+      rawRefId: payload?.rawRefId,
+      rawField: 'response',
+      truncated: payload?.responseTruncated
+    })
+  );
+  setHtmlIfChanged(parts.parseDetails.contentEl, buildDebugParseContent(payload?.parseIssues));
 }
 
-
-function renderDebugSection(label, value, options = {}) {
+function buildDebugSectionContent(value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
   const isTruncated = Boolean(options.truncated);
-  const debugKey = options.debugKey ? ` data-debug-key="${escapeHtml(options.debugKey)}"` : '';
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
   const loadButton =
     rawRefId && isTruncated
@@ -971,32 +1156,42 @@ function renderDebugSection(label, value, options = {}) {
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
   return `
-    <details class="debug-details"${debugKey}>
-      <summary>${escapeHtml(label)}</summary>
-      <div class="details-content">
-        ${loadButton}
-        <div data-raw-target="${escapeHtml(targetId)}">
-          ${renderRawResponse(value, 'Нет данных.')}
-        </div>
-      </div>
-    </details>
+    ${loadButton}
+    <div data-raw-target="${escapeHtml(targetId)}">
+      ${renderRawResponse(value, 'Нет данных.')}
+    </div>
   `;
 }
 
-function renderDebugParseSection(parseIssues, debugKey = '') {
+function buildDebugParseContent(parseIssues) {
   const issues = Array.isArray(parseIssues) ? parseIssues.filter(Boolean) : [];
-  const content = issues.length
+  return issues.length
     ? `<pre class="raw-response">${escapeHtml(issues.join('\n'))}</pre>`
     : `<div class="empty">Ошибок не обнаружено.</div>`;
-  const debugKeyAttr = debugKey ? ` data-debug-key="${escapeHtml(debugKey)}"` : '';
-  return `
-    <details class="debug-details"${debugKeyAttr}>
-      <summary>Parse/Validation</summary>
-      <div class="details-content">
-        ${content}
-      </div>
-    </details>
-  `;
+}
+
+function formatUsage(usage) {
+  if (!usage) return '—';
+  const total = usage.total_tokens ?? usage.totalTokens;
+  const prompt = usage.prompt_tokens ?? usage.promptTokens;
+  const completion = usage.completion_tokens ?? usage.completionTokens;
+  if (Number.isFinite(prompt) && Number.isFinite(completion)) {
+    return `${prompt} prompt / ${completion} completion`;
+  }
+  if (Number.isFinite(total)) {
+    return `${total} total`;
+  }
+  return '—';
+}
+
+function formatLatency(latencyMs) {
+  if (!Number.isFinite(latencyMs)) return '—';
+  return `${Math.round(latencyMs)} ms`;
+}
+
+function formatCharCount(value) {
+  if (!Number.isFinite(value)) return '—';
+  return `${value} chars`;
 }
 
 function formatRawResponse(value) {
@@ -1136,12 +1331,34 @@ function restoreUiState() {
   document.querySelectorAll('details[data-debug-key]').forEach((details) => {
     const key = details.getAttribute('data-debug-key');
     if (!key) return;
+    if (details.hasAttribute('data-open-initialized')) return;
     details.open = debugUiState.openKeys.has(key);
+    details.setAttribute('data-open-initialized', '1');
   });
   const scrollEl = document.scrollingElement;
   if (scrollEl) {
     scrollEl.scrollTop = debugUiState.scrollTop;
   }
+}
+
+function runDebugRecreationCheck() {
+  if (!debugInstrumentation.enabled) return;
+  const nextRefs = new Map();
+  let recreatedCount = 0;
+  document.querySelectorAll('details[data-debug-key]').forEach((details) => {
+    const key = details.getAttribute('data-debug-key');
+    if (!key) return;
+    const prev = debugInstrumentation.lastRefByKey.get(key);
+    if (prev && prev !== details) {
+      console.warn(`[debug] RECREATED key=${key}`);
+      recreatedCount += 1;
+    }
+    nextRefs.set(key, details);
+  });
+  if (recreatedCount > 0) {
+    console.warn(`[debug] RECREATED total=${recreatedCount}`);
+  }
+  debugInstrumentation.lastRefByKey = nextRefs;
 }
 
 function getProofreadState(entryKey, defaultView) {
