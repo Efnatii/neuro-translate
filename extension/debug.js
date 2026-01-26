@@ -1062,7 +1062,7 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   const baseBadge = payload?.baseAnswerIncluded
     ? `<span class="context-pill context-pill--base">base included</span>`
     : '';
-  const contextMeta = contextLabel ? `Context used: ${contextBadge}${baseBadge}` : '';
+  const contextMeta = '';
   const requestId = payload?.requestId || '';
   const parentRequestId = payload?.parentRequestId || '';
   const blockKey = payload?.blockKey || '';
@@ -1100,12 +1100,21 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   parts.requestMetaEl.style.display = requestMetaItems.length ? '' : 'none';
   setHtmlIfChanged(parts.contextMetaEl, contextMeta);
   parts.contextMetaEl.style.display = contextMeta ? '' : 'none';
-  const hasContextSection = Boolean(contextLabel);
+  const hasContextSection = Boolean(contextPolicy);
   parts.contextDetails.detailsEl.style.display = hasContextSection ? '' : 'none';
   if (hasContextSection) {
+    const contextMissing = Boolean(payload?.contextMissing);
+    const contextMissingNote =
+      contextMissing && contextPolicy !== 'none'
+        ? '\n\n⚠️ Контекст должен был быть отправлен, но текст пуст (contextMissing: true).'
+        : '';
+    const contextContent =
+      contextPolicy === 'none'
+        ? 'Контекст не отправлялся (mode: none).'
+        : `${payload?.contextTextSent || '—'}${contextMissingNote}`;
     setHtmlIfChanged(
       parts.contextDetails.contentEl,
-      buildDebugSectionContent(payload?.contextTextSent, {
+      buildDebugSectionContent(contextContent, {
         rawRefId: payload?.rawRefId,
         rawField: 'contextTextSent',
         truncated: payload?.contextTruncated,

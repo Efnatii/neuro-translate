@@ -750,8 +750,15 @@ async function translatePage(settings, options = {}) {
 
   const pageText = settings.contextGenerationEnabled ? buildPageText(nodesWithPath) : '';
 
-  if (settings.contextGenerationEnabled && !latestShortContextSummary) {
-    if (pageText) {
+  const buildContextBundle = async () => {
+    if (!settings.contextGenerationEnabled) return;
+    if (!pageText) {
+      await updateDebugContextShort(latestShortContextSummary, 'done');
+      await updateDebugContextFull(latestContextSummary, 'done');
+      return;
+    }
+
+    if (!latestShortContextSummary) {
       // Guard: reuse ready context for the same signature instead of recomputing on each debug refresh.
       const shortResult = getOrBuildContext({
         state: contextState.short,
@@ -783,13 +790,9 @@ async function translatePage(settings, options = {}) {
             await updateDebugContextShort(latestShortContextSummary, 'failed');
           });
       }
-    } else {
-      await updateDebugContextShort(latestShortContextSummary, 'done');
     }
-  }
 
-  if (settings.contextGenerationEnabled && !latestContextSummary) {
-    if (pageText) {
+    if (!latestContextSummary) {
       const fullResult = getOrBuildContext({
         state: contextState.full,
         signature: contextSignature,
@@ -818,9 +821,11 @@ async function translatePage(settings, options = {}) {
           await updateDebugContextFull(latestContextSummary, 'failed');
         }
       }
-    } else {
-      await updateDebugContextFull(latestContextSummary, 'done');
     }
+  };
+
+  if (settings.contextGenerationEnabled && (!latestShortContextSummary || !latestContextSummary)) {
+    await buildContextBundle();
   }
 
   const buildBaseAnswerPreview = (text) => {
@@ -841,6 +846,8 @@ async function translatePage(settings, options = {}) {
       return {
         contextMode: 'FULL',
         contextText: '',
+        contextFullText: latestContextSummary || '',
+        contextShortText: latestShortContextSummary || '',
         baseAnswer: '',
         baseAnswerIncluded: false,
         baseAnswerPreview: '',
@@ -884,6 +891,8 @@ async function translatePage(settings, options = {}) {
     return {
       contextMode,
       contextText: typeof contextText === 'string' ? contextText : '',
+      contextFullText: latestContextSummary || '',
+      contextShortText: latestShortContextSummary || '',
       baseAnswer,
       baseAnswerIncluded,
       baseAnswerPreview,
@@ -1526,6 +1535,8 @@ async function translate(
       : {
           contextText: typeof contextMeta === 'string' ? contextMeta : '',
           contextMode: 'FULL',
+          contextFullText: typeof contextMeta === 'string' ? contextMeta : '',
+          contextShortText: '',
           baseAnswer: '',
           baseAnswerIncluded: false,
           baseAnswerPreview: '',
@@ -1546,7 +1557,7 @@ async function translate(
 
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
-    const batchContext = index === 0 ? context : '';
+    const batchContext = context;
     const batchRequestMeta = baseRequestMeta
       ? buildRequestMeta(baseRequestMeta, {
           contextText: batchContext,
@@ -1569,6 +1580,8 @@ async function translate(
             context: {
               text: batchContext,
               mode: resolvedContextMeta.contextMode,
+              fullText: resolvedContextMeta.contextFullText || resolvedContextMeta.contextText || '',
+              shortText: resolvedContextMeta.contextShortText || '',
               baseAnswer,
               baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded
             },
@@ -1646,6 +1659,8 @@ async function requestProofreading(payload) {
       : {
           contextText: payload?.context || '',
           contextMode: 'FULL',
+          contextFullText: payload?.context || '',
+          contextShortText: '',
           baseAnswer: '',
           baseAnswerIncluded: false,
           baseAnswerPreview: ''
@@ -1679,6 +1694,8 @@ async function requestProofreading(payload) {
           context: {
             text: context,
             mode: contextMeta.contextMode,
+            fullText: contextMeta.contextFullText || contextMeta.contextText || '',
+            shortText: contextMeta.contextShortText || '',
             baseAnswer,
             baseAnswerIncluded: contextMeta.baseAnswerIncluded
           },
