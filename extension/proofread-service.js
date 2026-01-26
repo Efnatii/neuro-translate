@@ -27,20 +27,50 @@ const PROOFREAD_SYSTEM_PROMPT = [
 
 function normalizeContextPayload(context) {
   if (!context) {
-    return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
+    return {
+      text: '',
+      mode: '',
+      baseAnswer: '',
+      baseAnswerIncluded: false,
+      fullText: '',
+      shortText: ''
+    };
   }
   if (typeof context === 'string') {
-    return { text: context, mode: '', baseAnswer: '', baseAnswerIncluded: false };
+    return {
+      text: context,
+      mode: '',
+      baseAnswer: '',
+      baseAnswerIncluded: false,
+      fullText: '',
+      shortText: ''
+    };
   }
   if (typeof context === 'object') {
-    return {
+    const normalized = {
       text: context.text || context.contextText || '',
       mode: context.mode || context.contextMode || '',
       baseAnswer: context.baseAnswer || '',
-      baseAnswerIncluded: Boolean(context.baseAnswerIncluded)
+      baseAnswerIncluded: Boolean(context.baseAnswerIncluded),
+      fullText: context.fullText || context.fullContextText || context.contextFull || '',
+      shortText: context.shortText || context.shortContextText || context.contextShort || ''
     };
+    if (!normalized.fullText && normalized.mode === 'FULL' && normalized.text) {
+      normalized.fullText = normalized.text;
+    }
+    if (!normalized.shortText && normalized.mode === 'SHORT' && normalized.text) {
+      normalized.shortText = normalized.text;
+    }
+    return normalized;
   }
-  return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
+  return {
+    text: '',
+    mode: '',
+    baseAnswer: '',
+    baseAnswerIncluded: false,
+    fullText: '',
+    shortText: ''
+  };
 }
 
 function createRequestId() {
@@ -82,16 +112,76 @@ function resolveContextPolicy(contextPayload, purpose) {
   return 'full';
 }
 
-function getRetryContextPayload(contextPayload, requestMeta) {
-  if (requestMeta?.forceFullContextOnRetry) {
-    return normalizeContextPayload(contextPayload);
-  }
-  return { text: '', mode: 'NONE', baseAnswer: '', baseAnswerIncluded: false };
+function resolveEffectiveContextMode(requestMeta, normalizedContext) {
+  const triggerSource = requestMeta?.triggerSource || '';
+  const purpose = requestMeta?.purpose || '';
+  if (triggerSource === 'manual') return 'FULL';
+  if (triggerSource === 'retry' || triggerSource === 'validate') return 'SHORT';
+  if (purpose && purpose !== 'main') return 'SHORT';
+  if (normalizedContext?.mode === 'SHORT') return 'SHORT';
+  if (normalizedContext?.mode === 'FULL') return 'FULL';
+  if (normalizedContext?.text) return 'FULL';
+  return 'NONE';
 }
 
-function attachRequestMeta(payload, requestMeta, contextPayload) {
+function buildEffectiveContext(contextPayload, requestMeta) {
+  const normalized = normalizeContextPayload(contextPayload);
+  const mode = resolveEffectiveContextMode(requestMeta, normalized);
+  let text = '';
+  if (mode === 'FULL') {
+    text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
+  } else if (mode === 'SHORT') {
+    text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+  }
+  const baseAnswer = normalized.baseAnswer || '';
+  const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
+  const contextMissing = (mode === 'FULL' || mode === 'SHORT') && !text;
+  if (contextMissing) {
+    console.warn('Context mode requires text but none was provided.', {
+      mode,
+      triggerSource: requestMeta?.triggerSource,
+      purpose: requestMeta?.purpose
+    });
+  }
+  return {
+    mode,
+    text,
+    length: text.length,
+    hash: text ? computeTextHash(text) : 0,
+    baseAnswer,
+    baseAnswerIncluded,
+    contextMissing
+  };
+}
+
+function buildContextPolicy(mode) {
+  if (mode === 'FULL') return 'full';
+  if (mode === 'SHORT') return 'minimal';
+  return 'none';
+}
+
+function buildContextTypeUsed(mode) {
+  if (mode === 'FULL') return 'FULL';
+  if (mode === 'SHORT') return 'SHORT';
+  return '';
+}
+
+function getRetryContextPayload(contextPayload, requestMeta) {
+  const normalized = normalizeContextPayload(contextPayload);
+  return {
+    text: normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '',
+    mode: 'SHORT',
+    baseAnswer: normalized.baseAnswer || '',
+    baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
+    fullText: '',
+    shortText: normalized.shortText || ''
+  };
+}
+
+function attachRequestMeta(payload, requestMeta, effectiveContext) {
   if (!payload || typeof payload !== 'object') return payload;
-  const contextText = contextPayload?.text || '';
+  const contextMode = buildContextPolicy(effectiveContext?.mode);
+  const contextTypeUsed = buildContextTypeUsed(effectiveContext?.mode);
   return {
     ...payload,
     requestId: payload.requestId || requestMeta.requestId,
@@ -101,9 +191,16 @@ function attachRequestMeta(payload, requestMeta, contextPayload) {
     purpose: payload.purpose || requestMeta.purpose || '',
     attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
     triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
-    contextMode: payload.contextMode || resolveContextPolicy(contextPayload, requestMeta.purpose),
-    contextHash: payload.contextHash ?? (contextText ? computeTextHash(contextText) : 0),
-    contextLength: payload.contextLength ?? (contextText ? contextText.length : 0)
+    contextMode: payload.contextMode || contextMode,
+    contextTypeUsed: payload.contextTypeUsed || contextTypeUsed,
+    contextHash: payload.contextHash ?? (effectiveContext?.hash ?? 0),
+    contextLength: payload.contextLength ?? (effectiveContext?.length ?? 0),
+    contextTextSent: payload.contextTextSent ?? effectiveContext?.text,
+    contextMissing: payload.contextMissing ?? effectiveContext?.contextMissing,
+    baseAnswerIncluded: payload.baseAnswerIncluded ?? effectiveContext?.baseAnswerIncluded,
+    manualArtifactsUsed:
+      payload.manualArtifactsUsed ??
+      (effectiveContext?.baseAnswerIncluded ? { baseAnswerIncluded: true } : {})
   };
 }
 
@@ -218,6 +315,7 @@ async function proofreadTranslation(
   const rawProofreadParts = [];
   const debugPayloads = [];
   const normalizedContext = normalizeContextPayload(context);
+  const baseEffectiveContext = buildEffectiveContext(normalizedContext, baseRequestMeta);
   // Proofread retries are distinct LLM calls; avoid full context unless explicitly forced.
   const retryContextPayload = getRetryContextPayload(normalizedContext, baseRequestMeta);
   const appendParseIssue = (issue) => {
@@ -244,7 +342,7 @@ async function proofreadTranslation(
           parseIssues: [issue]
         },
         baseRequestMeta,
-        normalizedContext
+        baseEffectiveContext
       )
     );
   };
@@ -648,17 +746,19 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     purpose: options.purpose || 'main'
   });
   const normalizedContext = normalizeContextPayload(metadata?.context);
-  const effectiveContext =
-    requestMeta.purpose !== 'main' && !requestMeta.forceFullContextOnRetry
-      ? getRetryContextPayload(normalizedContext, requestMeta)
-      : normalizedContext;
+  const effectiveContext = buildEffectiveContext(normalizedContext, requestMeta);
   const prompt = applyPromptCaching(
     buildProofreadPrompt(
       {
         items,
         sourceBlock: metadata?.sourceBlock,
         translatedBlock: metadata?.translatedBlock,
-        context: effectiveContext,
+        context: {
+          text: effectiveContext.text,
+          mode: effectiveContext.mode,
+          baseAnswer: effectiveContext.baseAnswer,
+          baseAnswerIncluded: effectiveContext.baseAnswerIncluded
+        },
         language: metadata?.language,
         proofreadMode: metadata?.proofreadMode
       },
@@ -969,6 +1069,10 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   const content = data?.choices?.[0]?.message?.content || '';
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
+  const effectiveContext = buildEffectiveContext(
+    { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
+    normalizedRequestMeta
+  );
   const debugPayload = attachRequestMeta(
     {
       phase: 'PROOFREAD_FORMAT_REPAIR',
@@ -982,7 +1086,7 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
       parseIssues: []
     },
     normalizedRequestMeta,
-    { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false }
+    effectiveContext
   );
 
   let parsed = null;
@@ -1036,6 +1140,7 @@ async function repairProofreadSegments(
       }
       last.parseIssues.push('fallback:language-repair');
     } else {
+      const validateRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' });
       debugPayloads.push(
         attachRequestMeta(
           {
@@ -1049,8 +1154,11 @@ async function repairProofreadSegments(
             response: null,
             parseIssues: ['fallback:language-repair']
           },
-          normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' }),
-          { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false }
+          validateRequestMeta,
+          buildEffectiveContext(
+            { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
+            validateRequestMeta
+          )
         )
       );
     }
@@ -1129,6 +1237,11 @@ async function repairProofreadSegments(
     const content = data?.choices?.[0]?.message?.content || '';
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
+    const repairRequestMeta = createChildRequestMeta(requestMeta || {}, {
+      purpose: 'validate',
+      attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
+      triggerSource: 'validate'
+    });
     const debugPayload = attachRequestMeta(
       {
         phase: 'PROOFREAD_REPAIR',
@@ -1141,12 +1254,11 @@ async function repairProofreadSegments(
         response: content,
         parseIssues: ['fallback:language-repair']
       },
-      createChildRequestMeta(requestMeta || {}, {
-        purpose: 'validate',
-        attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
-        triggerSource: 'validate'
-      }),
-      { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false }
+      repairRequestMeta,
+      buildEffectiveContext(
+        { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
+        repairRequestMeta
+      )
     );
     if (Array.isArray(debugPayloads)) {
       debugPayloads.push(debugPayload);
