@@ -3,9 +3,6 @@ const PROOFREAD_MAX_CHARS_PER_CHUNK = 4000;
 const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
 const PROOFREAD_MAX_OUTPUT_TOKENS = 4096;
-const SHORT_CONTEXT_MAX_CHARS = 800;
-const RETRY_CONTEXT_SHORT_LABEL = '=== SHORT CONTEXT (GLOBAL) ===';
-const RETRY_CONTEXT_MANUAL_LABEL = '=== PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY, NO FULL CONTEXT) ===';
 const PROOFREAD_SYSTEM_PROMPT = [
   'You are an expert translation proofreader and editor.',
   'Follow the selected PROOFREAD_MODE instructions exactly.',
@@ -36,8 +33,7 @@ function normalizeContextPayload(context) {
       baseAnswer: '',
       baseAnswerIncluded: false,
       fullText: '',
-      shortText: '',
-      manualOutputsNoFull: ''
+      shortText: ''
     };
   }
   if (typeof context === 'string') {
@@ -47,8 +43,7 @@ function normalizeContextPayload(context) {
       baseAnswer: '',
       baseAnswerIncluded: false,
       fullText: '',
-      shortText: '',
-      manualOutputsNoFull: ''
+      shortText: ''
     };
   }
   if (typeof context === 'object') {
@@ -58,8 +53,7 @@ function normalizeContextPayload(context) {
       baseAnswer: context.baseAnswer || '',
       baseAnswerIncluded: Boolean(context.baseAnswerIncluded),
       fullText: context.fullText || context.fullContextText || context.contextFull || '',
-      shortText: context.shortText || context.shortContextText || context.contextShort || '',
-      manualOutputsNoFull: context.manualOutputsNoFull || context.manualOutputs || ''
+      shortText: context.shortText || context.shortContextText || context.contextShort || ''
     };
     if (!normalized.fullText && normalized.mode === 'FULL' && normalized.text) {
       normalized.fullText = normalized.text;
@@ -75,53 +69,8 @@ function normalizeContextPayload(context) {
     baseAnswer: '',
     baseAnswerIncluded: false,
     fullText: '',
-    shortText: '',
-    manualOutputsNoFull: ''
+    shortText: ''
   };
-}
-
-function isRetryOrValidateTrigger(requestMeta) {
-  const trigger = requestMeta?.triggerSource || '';
-  return trigger === 'retry' || trigger === 'validate';
-}
-
-function buildShortContextFallback(context = '') {
-  if (!context) return '';
-  if (context.length <= SHORT_CONTEXT_MAX_CHARS) return context.trim();
-  return context.slice(0, SHORT_CONTEXT_MAX_CHARS).trimEnd();
-}
-
-function resolveShortContextText(normalized) {
-  const candidate =
-    normalized.shortText ||
-    (normalized.mode === 'SHORT' ? normalized.text : '') ||
-    normalized.fullText ||
-    normalized.text ||
-    '';
-  const trimmed = candidate.trim();
-  if (!trimmed) return '';
-  if (trimmed.length <= SHORT_CONTEXT_MAX_CHARS) return trimmed;
-  return buildShortContextFallback(trimmed);
-}
-
-function resolveManualOutputs(normalized) {
-  const manual = typeof normalized.manualOutputsNoFull === 'string' ? normalized.manualOutputsNoFull.trim() : '';
-  return manual || '(no manual outputs found)';
-}
-
-function buildRetryContextSections(normalized, requestMeta) {
-  if (!isRetryOrValidateTrigger(requestMeta)) return '';
-  const shortContextText = resolveShortContextText(normalized) || '(short context unavailable)';
-  const manualOutputsNoFull = resolveManualOutputs(normalized);
-  return [
-    RETRY_CONTEXT_SHORT_LABEL,
-    shortContextText,
-    '',
-    RETRY_CONTEXT_MANUAL_LABEL,
-    manualOutputsNoFull
-  ]
-    .filter(Boolean)
-    .join('\n');
 }
 
 function createRequestId() {
@@ -183,9 +132,6 @@ function buildEffectiveContext(contextPayload, requestMeta) {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
     text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
-    if (!text && isRetryOrValidateTrigger(requestMeta)) {
-      text = buildShortContextFallback(normalized.fullText || normalized.text || '');
-    }
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -222,17 +168,13 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const shortContextText = resolveShortContextText(normalized);
-  const resolvedShortContext =
-    shortContextText || (isRetryOrValidateTrigger(requestMeta) ? '(short context unavailable)' : '');
   return {
-    text: resolvedShortContext,
+    text: normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '',
     mode: 'SHORT',
     baseAnswer: normalized.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
     fullText: '',
-    shortText: resolvedShortContext,
-    manualOutputsNoFull: normalized.manualOutputsNoFull || ''
+    shortText: normalized.shortText || ''
   };
 }
 
@@ -275,7 +217,7 @@ function createChildRequestMeta(baseMeta, overrides = {}) {
   );
 }
 
-function buildProofreadPrompt(input, strict = false, extraReminder = '', requestMeta = null) {
+function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const items = Array.isArray(input?.items) ? input.items : [];
   const sourceBlock = input?.sourceBlock ?? '';
   const translatedBlock = input?.translatedBlock ?? '';
@@ -284,7 +226,6 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '', request
   const normalizedContext = normalizeContextPayload(input?.context);
   const contextText = normalizedContext.text || '';
   const contextMode = normalizedContext.mode === 'SHORT' ? 'SHORT' : 'FULL';
-  const retryContextSections = buildRetryContextSections(normalizedContext, requestMeta);
   const baseAnswerText =
     normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer
       ? `PREVIOUS BASE ANSWER (FULL): <<<BASE_ANSWER_START>>>${normalizedContext.baseAnswer}<<<BASE_ANSWER_END>>>`
@@ -335,7 +276,6 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '', request
   messages.push({
     role: 'user',
     content: [
-      retryContextSections,
       language ? `Target language: ${language}` : '',
       sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
       translatedBlock
@@ -817,17 +757,13 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           text: effectiveContext.text,
           mode: effectiveContext.mode,
           baseAnswer: effectiveContext.baseAnswer,
-          baseAnswerIncluded: effectiveContext.baseAnswerIncluded,
-          fullText: normalizedContext.fullText || '',
-          shortText: normalizedContext.shortText || '',
-          manualOutputsNoFull: normalizedContext.manualOutputsNoFull || ''
+          baseAnswerIncluded: effectiveContext.baseAnswerIncluded
         },
         language: metadata?.language,
         proofreadMode: metadata?.proofreadMode
       },
       strict,
-      extraReminder,
-      requestMeta
+      extraReminder
     ),
     apiBaseUrl
   );
