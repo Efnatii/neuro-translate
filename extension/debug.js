@@ -2,8 +2,13 @@ const metaEl = document.getElementById('meta');
 const contextEl = document.getElementById('context');
 const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
+const eventsEl = document.getElementById('events');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const DEBUG_PORT_NAME = 'debug';
+const DEBUG_DB_NAME = 'nt_debug';
+const DEBUG_DB_VERSION = 1;
+const DEBUG_RAW_STORE = 'raw';
 const STATUS_CONFIG = {
   pending: { label: 'Ожидает', className: 'status-pending' },
   in_progress: { label: 'В работе', className: 'status-in-progress' },
@@ -14,6 +19,9 @@ const STATUS_CONFIG = {
 
 let sourceUrl = '';
 let refreshTimer = null;
+let debugPort = null;
+let debugReconnectTimer = null;
+let debugReconnectDelay = 500;
 const proofreadUiState = new Map();
 
 init();
@@ -33,6 +41,12 @@ async function init() {
       if (button) {
         event.preventDefault();
         clearContext();
+        return;
+      }
+      const loadButton = target.closest('[data-action="load-raw"]');
+      if (loadButton) {
+        event.preventDefault();
+        handleLoadRawClick(loadButton);
       }
     });
   }
@@ -73,10 +87,18 @@ async function init() {
         });
         return;
       }
+
+      const loadButton = target.closest('[data-action="load-raw"]');
+      if (loadButton) {
+        event.preventDefault();
+        handleLoadRawClick(loadButton);
+        return;
+      }
     });
   }
 
   await refreshDebug();
+  connectDebugPort();
   startAutoRefresh();
 }
 
@@ -125,6 +147,10 @@ async function clearContext() {
     contextFullStatus: nextFullStatus,
     contextShort: '',
     contextShortStatus: nextShortStatus,
+    contextFullRefId: '',
+    contextShortRefId: '',
+    contextFullTruncated: false,
+    contextShortTruncated: false,
     updatedAt: Date.now()
   };
   await new Promise((resolve) => {
@@ -137,7 +163,7 @@ function startAutoRefresh() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
   }
-  const canListen = typeof chrome !== 'undefined' && chrome.storage?.onChanged;
+  const canListen = typeof chrome !== 'undefined' && chrome.storage?.onChanged && !debugPort;
   if (canListen) {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'local') return;
@@ -152,6 +178,111 @@ function startAutoRefresh() {
     refreshTimer = setInterval(() => {
       refreshDebug();
     }, 1000);
+  }
+}
+
+function connectDebugPort() {
+  if (typeof chrome === 'undefined' || !chrome.runtime?.connect) {
+    return;
+  }
+  if (debugPort) return;
+  try {
+    debugPort = chrome.runtime.connect({ name: DEBUG_PORT_NAME });
+  } catch (error) {
+    scheduleDebugReconnect();
+    return;
+  }
+  debugReconnectDelay = 500;
+  debugPort.onMessage.addListener(handleDebugPortMessage);
+  debugPort.onDisconnect.addListener(() => {
+    debugPort = null;
+    scheduleDebugReconnect();
+  });
+  if (sourceUrl) {
+    try {
+      debugPort.postMessage({ type: 'DEBUG_GET_SNAPSHOT', sourceUrl });
+    } catch (error) {
+      // ignore
+    }
+  }
+}
+
+function scheduleDebugReconnect() {
+  if (debugReconnectTimer) return;
+  debugReconnectTimer = setTimeout(() => {
+    debugReconnectTimer = null;
+    connectDebugPort();
+    debugReconnectDelay = Math.min(10000, Math.max(500, debugReconnectDelay * 2));
+  }, debugReconnectDelay);
+}
+
+function handleDebugPortMessage(message) {
+  if (!message || typeof message !== 'object') return;
+  if (message.type === 'DEBUG_UPDATED') {
+    if (!sourceUrl || message.sourceUrl !== sourceUrl) return;
+    if (debugPort) {
+      try {
+        debugPort.postMessage({ type: 'DEBUG_GET_SNAPSHOT', sourceUrl });
+      } catch (error) {
+        refreshDebug();
+      }
+      return;
+    }
+    refreshDebug();
+    return;
+  }
+  if (message.type === 'DEBUG_SNAPSHOT') {
+    if (!sourceUrl || message.sourceUrl !== sourceUrl) return;
+    if (!message.snapshot) {
+      renderEmpty('Ожидание отладочных данных...');
+      return;
+    }
+    renderDebug(sourceUrl, message.snapshot);
+  }
+}
+
+function openDebugDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DEBUG_DB_NAME, DEBUG_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DEBUG_RAW_STORE)) {
+        const store = db.createObjectStore(DEBUG_RAW_STORE, { keyPath: 'id' });
+        store.createIndex('ts', 'ts', { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
+  });
+}
+
+async function getRawRecord(rawId) {
+  if (!rawId) return null;
+  const db = await openDebugDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DEBUG_RAW_STORE, 'readonly');
+    const store = tx.objectStore(DEBUG_RAW_STORE);
+    const request = store.get(rawId);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error || new Error('IndexedDB read failed'));
+  });
+}
+
+async function handleLoadRawClick(button) {
+  const rawId = button.getAttribute('data-raw-id');
+  const rawField = button.getAttribute('data-raw-field') || 'text';
+  const targetId = button.getAttribute('data-target-id');
+  if (!rawId || !targetId) return;
+  const container = document.querySelector(`[data-raw-target="${CSS.escape(targetId)}"]`);
+  if (!container) return;
+  try {
+    const record = await getRawRecord(rawId);
+    const payload = record?.value || {};
+    const rawValue = payload?.[rawField] ?? payload?.text ?? '';
+    container.innerHTML = renderRawResponse(rawValue, 'Нет данных.');
+    button.remove();
+  } catch (error) {
+    container.innerHTML = `<div class="empty">Не удалось загрузить данные.</div>`;
   }
 }
 
@@ -198,6 +329,9 @@ function renderEmpty(message) {
   metaEl.textContent = message;
   contextEl.innerHTML = '';
   entriesEl.innerHTML = '';
+  if (eventsEl) {
+    eventsEl.innerHTML = '';
+  }
   renderSummary({
     items: [],
     contextStatus: 'pending',
@@ -209,16 +343,29 @@ function renderDebug(url, data) {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
   renderSummary(data, '');
+  renderEvents(data);
 
   const contextFullText = (data.contextFull || data.context || '').trim();
   const contextShortText = (data.contextShort || '').trim();
+  const contextFullRefId = data.contextFullRefId || '';
+  const contextShortRefId = data.contextShortRefId || '';
+  const contextFullTruncated = Boolean(data.contextFullTruncated);
+  const contextShortTruncated = Boolean(data.contextShortTruncated);
   const contextFullStatus = normalizeStatus(data.contextFullStatus || data.contextStatus, contextFullText);
   const contextShortStatus = normalizeStatus(data.contextShortStatus, contextShortText);
   const fullContextBody = contextFullText
-    ? `<pre>${escapeHtml(contextFullText)}</pre>`
+    ? renderInlineRaw(contextFullText, {
+        rawRefId: contextFullRefId,
+        rawField: 'text',
+        truncated: contextFullTruncated
+      })
     : `<div class="empty">FULL контекст ещё не готов.</div>`;
   const shortContextBody = contextShortText
-    ? `<pre>${escapeHtml(contextShortText)}</pre>`
+    ? renderInlineRaw(contextShortText, {
+        rawRefId: contextShortRefId,
+        rawField: 'text',
+        truncated: contextShortTruncated
+      })
     : `<div class="empty">SHORT контекст ещё не готов.</div>`;
   contextEl.innerHTML = `
       <div class="entry-header">
@@ -295,7 +442,10 @@ function renderDebug(url, data) {
         <details class="ai-response">
           <summary>Ответ ИИ (перевод)</summary>
           <div class="details-content">
-            ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE')}
+            ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
+              rawRefId: item?.translationRawRefId,
+              truncated: item?.translationRawTruncated
+            })}
           </div>
         </details>
       </div>
@@ -345,6 +495,35 @@ function renderSummary(data, fallbackMessage = '') {
           ${renderStatusBadge(overallStatus)}
         </div>
       </div>
+    </div>
+  `;
+}
+
+function renderEvents(data) {
+  if (!eventsEl) return;
+  const events = Array.isArray(data?.events) ? data.events : [];
+  if (!events.length) {
+    eventsEl.innerHTML = '';
+    return;
+  }
+  eventsEl.innerHTML = `
+    <div class="events">
+      <div class="events-title">Warnings</div>
+      ${events
+        .slice(-10)
+        .map((event) => {
+          const ts = event?.timestamp ? new Date(event.timestamp).toLocaleTimeString('ru-RU') : '—';
+          const tag = event?.tag || 'EVENT';
+          const message = event?.message || '';
+          return `
+            <div class="event-row">
+              <span class="event-time">${escapeHtml(ts)}</span>
+              <span class="event-tag">${escapeHtml(tag)}</span>
+              <span class="event-message">${escapeHtml(message)}</span>
+            </div>
+          `;
+        })
+        .join('')}
     </div>
   `;
 }
@@ -455,7 +634,10 @@ function renderProofreadSection(item, entryKey) {
         <details class="ai-response">
           <summary>Ответ ИИ (вычитка)</summary>
           <div class="details-content">
-            ${renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD')}
+            ${renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD', {
+              rawRefId: item?.proofreadRawRefId,
+              truncated: item?.proofreadRawTruncated
+            })}
           </div>
         </details>
       </div>
@@ -507,11 +689,30 @@ function renderRawResponse(value, emptyMessage) {
   return `<pre class="${classes.join(' ')}">${escapeHtml(text)}</pre>`;
 }
 
-function normalizeDebugPayloads(payloads, fallbackRaw, phase) {
+function renderInlineRaw(value, options = {}) {
+  const rawRefId = options.rawRefId || '';
+  const rawField = options.rawField || 'text';
+  const truncated = Boolean(options.truncated);
+  const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
+  const loadButton =
+    rawRefId && truncated
+      ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
+          rawRefId
+        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
+      : '';
+  return `
+    ${loadButton}
+    <div data-raw-target="${escapeHtml(targetId)}">
+      ${renderRawResponse(value, options.emptyMessage || 'Нет данных.')}
+    </div>
+  `;
+}
+
+function normalizeDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta = {}) {
   if (Array.isArray(payloads) && payloads.length) {
     return payloads;
   }
-  if (fallbackRaw) {
+  if (fallbackRaw || fallbackMeta?.rawRefId) {
     return [
       {
         phase,
@@ -522,6 +723,8 @@ function normalizeDebugPayloads(payloads, fallbackRaw, phase) {
         outputChars: typeof fallbackRaw === 'string' ? fallbackRaw.length : null,
         request: null,
         response: fallbackRaw,
+        rawRefId: fallbackMeta?.rawRefId || '',
+        responseTruncated: fallbackMeta?.truncated || false,
         parseIssues: []
       }
     ];
@@ -553,8 +756,8 @@ function formatCharCount(value) {
   return `${value} chars`;
 }
 
-function renderDebugPayloads(payloads, fallbackRaw, phase) {
-  const normalized = normalizeDebugPayloads(payloads, fallbackRaw, phase);
+function renderDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta = {}) {
+  const normalized = normalizeDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta);
   if (!normalized.length) {
     return '<div class="empty">Ответ ИИ ещё не получен.</div>';
   }
@@ -566,6 +769,7 @@ function renderDebugPayloads(payloads, fallbackRaw, phase) {
 function renderDebugPayload(payload, index) {
   const phase = payload?.phase || 'UNKNOWN';
   const model = payload?.model || '—';
+  const tag = payload?.tag || '';
   const usage = formatUsage(payload?.usage);
   const latency = formatLatency(payload?.latencyMs);
   const inputChars = formatCharCount(payload?.inputChars);
@@ -584,17 +788,31 @@ function renderDebugPayload(payload, index) {
     ? `<div class="debug-context">Context used: ${contextBadge}${baseBadge}</div>`
     : '';
   const contextSection = contextLabel
-    ? renderDebugSection('Context text sent', payload?.contextTextSent)
+    ? renderDebugSection('Context text sent', payload?.contextTextSent, {
+        rawRefId: payload?.rawRefId,
+        rawField: 'contextTextSent',
+        truncated: payload?.contextTruncated
+      })
     : '';
-  const requestSection = renderDebugSection('Request (raw)', payload?.request);
-  const responseSection = renderDebugSection('Response (raw)', payload?.response);
+  const requestSection = renderDebugSection('Request (raw)', payload?.request, {
+    rawRefId: payload?.rawRefId,
+    rawField: 'request',
+    truncated: payload?.requestTruncated
+  });
+  const responseSection = renderDebugSection('Response (raw)', payload?.response, {
+    rawRefId: payload?.rawRefId,
+    rawField: 'response',
+    truncated: payload?.responseTruncated
+  });
   const parseSection = renderDebugParseSection(payload?.parseIssues);
+  const tagBadge = tag ? `<span class="debug-tag">${escapeHtml(tag)}</span>` : '';
   return `
     <div class="debug-payload">
       <div class="debug-header">
         <div class="debug-title">
           <span class="debug-phase">${escapeHtml(phase)}</span>
           <span class="debug-model">${escapeHtml(model)}</span>
+          ${tagBadge}
         </div>
         <div class="debug-metrics">
           <span>Latency: ${escapeHtml(latency)}</span>
@@ -615,12 +833,25 @@ function renderDebugPayload(payload, index) {
 }
 
 
-function renderDebugSection(label, value) {
+function renderDebugSection(label, value, options = {}) {
+  const rawRefId = options.rawRefId || '';
+  const rawField = options.rawField || 'text';
+  const isTruncated = Boolean(options.truncated);
+  const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
+  const loadButton =
+    rawRefId && isTruncated
+      ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
+          rawRefId
+        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
+      : '';
   return `
     <details class="debug-details">
       <summary>${escapeHtml(label)}</summary>
       <div class="details-content">
-        ${renderRawResponse(value, 'Нет данных.')}
+        ${loadButton}
+        <div data-raw-target="${escapeHtml(targetId)}">
+          ${renderRawResponse(value, 'Нет данных.')}
+        </div>
       </div>
     </details>
   `;

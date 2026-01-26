@@ -32,12 +32,15 @@ let latestShortContextSummary = '';
 let shortContextPromise = null;
 let debugEntries = [];
 let debugState = null;
+let debugSessionId = '';
 let debugPersistTimer = null;
 let debugPersistInFlight = false;
 let debugPersistDirty = false;
 const DEBUG_PERSIST_DEBOUNCE_MS = 250;
 const DEBUG_PERSIST_MAX_INTERVAL_MS = 2000;
 let debugLastPersistAt = 0;
+let debugBroadcastWarningSentAt = 0;
+let debugStorageWarningSentAt = 0;
 let tpmLimiter = null;
 let tpmSettings = {
   outputRatioByRole: {
@@ -55,6 +58,11 @@ const RATE_LIMIT_RETRY_ATTEMPTS = 2;
 const SHORT_CONTEXT_MAX_CHARS = 800;
 const TRANSLATION_MAX_TOKENS_PER_REQUEST = 2600;
 const PROOFREAD_SUSPICIOUS_RATIO = 0.35;
+const DEBUG_PREVIEW_MAX_CHARS = 2000;
+const DEBUG_RAW_MAX_CHARS = 50000;
+const DEBUG_CALLS_TOTAL_LIMIT = 1200;
+const DEBUG_EVENTS_LIMIT = 200;
+const DEBUG_PAYLOADS_PER_ENTRY_LIMIT = 120;
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
 const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
@@ -85,6 +93,19 @@ const DEFAULT_STATE = {
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
   tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+};
+const CALL_TAGS = {
+  TRANSLATE_BASE_FULL: 'TRANSLATE_BASE_FULL',
+  TRANSLATE_RETRY_FULL: 'TRANSLATE_RETRY_FULL',
+  TRANSLATE_FOLLOWUP_SHORT: 'TRANSLATE_FOLLOWUP_SHORT',
+  TRANSLATE_OVERFLOW_FALLBACK: 'TRANSLATE_OVERFLOW_FALLBACK',
+  PROOFREAD_BASE_FULL: 'PROOFREAD_BASE_FULL',
+  PROOFREAD_RETRY_FULL: 'PROOFREAD_RETRY_FULL',
+  PROOFREAD_REWRITE_SHORT: 'PROOFREAD_REWRITE_SHORT',
+  PROOFREAD_NOISE_SHORT: 'PROOFREAD_NOISE_SHORT',
+  PROOFREAD_OVERFLOW_FALLBACK: 'PROOFREAD_OVERFLOW_FALLBACK',
+  UI_BROADCAST_SKIPPED: 'UI_BROADCAST_SKIPPED',
+  STORAGE_DROPPED: 'STORAGE_DROPPED'
 };
 const SUPPORTED_MODEL_IDS = new Set([
   'gpt-5-nano',
@@ -223,6 +244,83 @@ function getTpmLimitForModel(model, tpmLimitsByModel) {
 
 function buildMissingKeyReason(roleLabel, model) {
   return `Перевод недоступен: укажите OpenAI API ключ для модели ${model} (${roleLabel}).`;
+}
+
+function truncateText(value = '', maxChars = DEBUG_PREVIEW_MAX_CHARS) {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  if (!maxChars || text.length <= maxChars) {
+    return { text, truncated: false };
+  }
+  return { text: `${text.slice(0, maxChars)}…`, truncated: true };
+}
+
+function serializeRawValue(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (error) {
+    return String(value);
+  }
+}
+
+function buildRawPayload(value) {
+  const serialized = serializeRawValue(value);
+  const trimmed = truncateText(serialized, DEBUG_RAW_MAX_CHARS);
+  const preview = truncateText(serialized, DEBUG_PREVIEW_MAX_CHARS);
+  return {
+    rawText: trimmed.text,
+    previewText: preview.text,
+    rawTruncated: trimmed.truncated,
+    previewTruncated: preview.truncated
+  };
+}
+
+function sendBackgroundMessageSafe(message) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { ok: false, error: 'empty-response' });
+      });
+    } catch (error) {
+      resolve({ ok: false, error: error?.message || String(error) });
+    }
+  });
+}
+
+async function storeDebugRawSafe(record) {
+  if (!record?.id) {
+    return { ok: false, error: 'missing-id' };
+  }
+  const response = await sendBackgroundMessageSafe({ type: 'DEBUG_STORE_RAW', record });
+  if (!response?.ok) {
+    appendDebugEvent(CALL_TAGS.STORAGE_DROPPED, response?.error || 'raw-store-failed');
+  }
+  return response;
+}
+
+async function fetchDebugRawSafe(rawId) {
+  if (!rawId) return null;
+  const response = await sendBackgroundMessageSafe({ type: 'DEBUG_GET_RAW', rawId });
+  if (!response?.ok) {
+    return null;
+  }
+  return response.record || null;
+}
+
+async function notifyDebugUpdate() {
+  const response = await sendBackgroundMessageSafe({ type: 'DEBUG_NOTIFY', sourceUrl: location.href });
+  if (!response?.delivered) {
+    const now = Date.now();
+    if (now - debugBroadcastWarningSentAt > 30000) {
+      debugBroadcastWarningSentAt = now;
+      appendDebugEvent(CALL_TAGS.UI_BROADCAST_SKIPPED, 'debug-ui-not-connected');
+    }
+  }
 }
 
 async function readSettingsFromStorage() {
@@ -439,13 +537,13 @@ async function translatePage(settings) {
   const textNodes = collectTextNodes(document.body);
   const existingDebugStore = await getTranslationDebugObject();
   const existingDebugEntry = existingDebugStore?.[location.href];
-  const existingContextFull =
+  const existingContextFullPreview =
     settings.contextGenerationEnabled && typeof existingDebugEntry?.contextFull === 'string'
       ? existingDebugEntry.contextFull.trim()
       : settings.contextGenerationEnabled && typeof existingDebugEntry?.context === 'string'
         ? existingDebugEntry.context.trim()
         : '';
-  const existingContextShort =
+  const existingContextShortPreview =
     settings.contextGenerationEnabled && typeof existingDebugEntry?.contextShort === 'string'
       ? existingDebugEntry.contextShort.trim()
       : '';
@@ -480,8 +578,8 @@ async function translatePage(settings) {
   activeTranslationEntries = [];
   debugEntries = [];
   debugState = null;
-  latestContextSummary = cachedContextFull || existingContextFull;
-  latestShortContextSummary = cachedContextShort || existingContextShort;
+  latestContextSummary = cachedContextFull || '';
+  latestShortContextSummary = cachedContextShort || '';
   shortContextPromise = null;
   await resetTranslationDebugInfo(location.href);
 
@@ -501,9 +599,9 @@ async function translatePage(settings) {
       : 'pending'
     : 'disabled';
   await initializeDebugState(blocks, settings, {
-    initialContextFull: latestContextSummary,
+    initialContextFull: latestContextSummary || existingContextFullPreview,
     initialContextFullStatus,
-    initialContextShort: latestShortContextSummary,
+    initialContextShort: latestShortContextSummary || existingContextShortPreview,
     initialContextShortStatus
   });
   if (latestContextSummary) {
@@ -594,14 +692,15 @@ async function translatePage(settings) {
     return match?.id ?? null;
   };
 
-  const selectContextForBlock = async (entry, kind) => {
+  const selectContextForBlock = async (entry, kind, options = {}) => {
     if (!entry) {
       return {
         contextMode: 'FULL',
         contextText: '',
         baseAnswer: '',
         baseAnswerIncluded: false,
-        baseAnswerPreview: ''
+        baseAnswerPreview: '',
+        tag: kind === 'proofread' ? CALL_TAGS.PROOFREAD_BASE_FULL : CALL_TAGS.TRANSLATE_BASE_FULL
       };
     }
     const attemptKey = kind === 'proofread' ? 'proofreadAttemptCount' : 'translateAttemptCount';
@@ -609,13 +708,30 @@ async function translatePage(settings) {
     const baseAnswerKey = kind === 'proofread' ? 'proofreadBaseFullAnswer' : 'translationBaseFullAnswer';
     const attemptCount = Number.isFinite(entry[attemptKey]) ? entry[attemptKey] : 0;
     const baseAnswer = typeof entry[baseAnswerKey] === 'string' ? entry[baseAnswerKey] : '';
-    const fullSuccess = Boolean(entry[successKey]) || Boolean(baseAnswer);
-    const contextMode = fullSuccess && baseAnswer ? 'SHORT' : 'FULL';
+    const fullSuccess = Boolean(entry[successKey]) && Boolean(baseAnswer);
+    let contextMode = 'FULL';
+    let tag = kind === 'proofread' ? CALL_TAGS.PROOFREAD_BASE_FULL : CALL_TAGS.TRANSLATE_BASE_FULL;
+    if (options.forceShort) {
+      contextMode = 'SHORT';
+      tag = kind === 'proofread' ? CALL_TAGS.PROOFREAD_OVERFLOW_FALLBACK : CALL_TAGS.TRANSLATE_OVERFLOW_FALLBACK;
+    } else if (!fullSuccess) {
+      contextMode = 'FULL';
+      if (attemptCount > 0) {
+        tag = kind === 'proofread' ? CALL_TAGS.PROOFREAD_RETRY_FULL : CALL_TAGS.TRANSLATE_RETRY_FULL;
+      }
+    } else {
+      contextMode = 'SHORT';
+      if (kind === 'proofread') {
+        tag = options.followupTag || CALL_TAGS.PROOFREAD_REWRITE_SHORT;
+      } else {
+        tag = CALL_TAGS.TRANSLATE_FOLLOWUP_SHORT;
+      }
+    }
     if (contextMode === 'SHORT' && shortContextPromise) {
       await shortContextPromise;
     }
     const contextText = contextMode === 'SHORT' ? latestShortContextSummary : latestContextSummary;
-    const baseAnswerIncluded = contextMode === 'SHORT' && Boolean(baseAnswer);
+    const baseAnswerIncluded = contextMode === 'SHORT' && Boolean(baseAnswer) && (!options.forceShort || fullSuccess);
     const baseAnswerPreview = baseAnswerIncluded ? buildBaseAnswerPreview(baseAnswer) : '';
     updateDebugEntry(entry.index, {
       [attemptKey]: attemptCount + 1
@@ -625,7 +741,8 @@ async function translatePage(settings) {
       contextText: typeof contextText === 'string' ? contextText : '',
       baseAnswer,
       baseAnswerIncluded,
-      baseAnswerPreview
+      baseAnswerPreview,
+      tag
     };
   };
 
@@ -701,7 +818,8 @@ async function translatePage(settings) {
             contextMode: primaryContext.contextMode,
             baseAnswer: primaryContext.baseAnswer,
             baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-            baseAnswerPreview: primaryContext.baseAnswerPreview
+            baseAnswerPreview: primaryContext.baseAnswerPreview,
+            tag: primaryContext.tag
           },
           keepPunctuationTokens,
           currentIndex + 1
@@ -716,10 +834,11 @@ async function translatePage(settings) {
               errorMessage: result?.error || 'fullContext overflow/error',
               contextMode: primaryContext.contextMode,
               contextTextSent: primaryContext.contextText,
-              baseAnswerIncluded: primaryContext.baseAnswerIncluded
+              baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+              tag: primaryContext.tag
             })
           );
-          const fallbackContext = await selectContextForBlock(debugEntry, 'translation');
+          const fallbackContext = await selectContextForBlock(debugEntry, 'translation', { forceShort: true });
           result = await translate(
             uniqueTexts,
             settings.targetLanguage || 'ru',
@@ -728,7 +847,8 @@ async function translatePage(settings) {
               contextMode: fallbackContext.contextMode,
               baseAnswer: fallbackContext.baseAnswer,
               baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-              baseAnswerPreview: fallbackContext.baseAnswerPreview
+              baseAnswerPreview: fallbackContext.baseAnswerPreview,
+              tag: fallbackContext.tag
             },
             keepPunctuationTokens,
             currentIndex + 1
@@ -779,12 +899,15 @@ async function translatePage(settings) {
           primaryContext.contextMode === 'FULL' && debugEntry && !debugEntry.translationBaseFullCallId
             ? findFirstFullCallId(debugEntry?.translationCalls)
             : null;
+        const translationRawField = await prepareRawTextField(result.rawTranslation || '', 'translation_raw');
         await updateDebugEntry(currentIndex + 1, {
           translated: formatBlockText(blockTranslations),
           translatedSegments: translatedTexts,
           translationStatus: 'done',
           translationCompletedAt: Date.now(),
-          translationRaw: result.rawTranslation || '',
+          translationRaw: translationRawField.preview,
+          translationRawRefId: translationRawField.refId,
+          translationRawTruncated: translationRawField.truncated || translationRawField.rawTruncated,
           translationDebug: result.debug || [],
           ...(baseTranslationAnswer
             ? { translationBaseFullAnswer: baseTranslationAnswer, translationFullSuccess: true }
@@ -862,7 +985,9 @@ async function translatePage(settings) {
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress', proofreadExecuted: true });
         const debugEntry = debugEntries.find((item) => item.index === task.index + 1);
-        const primaryContext = await selectContextForBlock(debugEntry, 'proofread');
+        const followupTag =
+          task.proofreadMode === 'NOISE_CLEANUP' ? CALL_TAGS.PROOFREAD_NOISE_SHORT : CALL_TAGS.PROOFREAD_REWRITE_SHORT;
+        const primaryContext = await selectContextForBlock(debugEntry, 'proofread', { followupTag });
         let proofreadResult = await requestProofreading({
           segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
           sourceBlock: formatBlockText(task.originalTexts),
@@ -873,7 +998,8 @@ async function translatePage(settings) {
             contextMode: primaryContext.contextMode,
             baseAnswer: primaryContext.baseAnswer,
             baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-            baseAnswerPreview: primaryContext.baseAnswerPreview
+            baseAnswerPreview: primaryContext.baseAnswerPreview,
+            tag: primaryContext.tag
           },
           language: settings.targetLanguage || 'ru',
           debugEntryIndex: task.index + 1
@@ -888,10 +1014,14 @@ async function translatePage(settings) {
               errorMessage: proofreadResult?.error || 'fullContext overflow/error',
               contextMode: primaryContext.contextMode,
               contextTextSent: primaryContext.contextText,
-              baseAnswerIncluded: primaryContext.baseAnswerIncluded
+              baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+              tag: primaryContext.tag
             })
           );
-          const fallbackContext = await selectContextForBlock(debugEntry, 'proofread');
+          const fallbackContext = await selectContextForBlock(debugEntry, 'proofread', {
+            forceShort: true,
+            followupTag
+          });
           proofreadResult = await requestProofreading({
             segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
             sourceBlock: formatBlockText(task.originalTexts),
@@ -902,7 +1032,8 @@ async function translatePage(settings) {
               contextMode: fallbackContext.contextMode,
               baseAnswer: fallbackContext.baseAnswer,
               baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-              baseAnswerPreview: fallbackContext.baseAnswerPreview
+              baseAnswerPreview: fallbackContext.baseAnswerPreview,
+              tag: fallbackContext.tag
             },
             language: settings.targetLanguage || 'ru',
             debugEntryIndex: task.index + 1
@@ -955,6 +1086,7 @@ async function translatePage(settings) {
           typeof rawProofreadPayload === 'string'
             ? rawProofreadPayload
             : JSON.stringify(rawProofreadPayload, null, 2);
+        const proofreadRawField = await prepareRawTextField(rawProofread, 'proofread_raw');
         const proofreadDebugPayloads = normalizeProofreadDebugPayloads(
           proofreadResult.debug || [],
           proofreadWarnings
@@ -977,7 +1109,9 @@ async function translatePage(settings) {
           translatedSegments: finalTranslations,
           proofreadStatus: 'done',
           proofread: proofreadSummary,
-          proofreadRaw: rawProofread,
+          proofreadRaw: proofreadRawField.preview,
+          proofreadRawRefId: proofreadRawField.refId,
+          proofreadRawTruncated: proofreadRawField.truncated || proofreadRawField.rawTruncated,
           proofreadDebug: proofreadDebugPayloads,
           proofreadComparisons,
           proofreadCompletedAt: Date.now(),
@@ -1136,7 +1270,8 @@ async function translate(texts, targetLanguage, contextMeta, keepPunctuationToke
           contextMode: 'FULL',
           baseAnswer: '',
           baseAnswerIncluded: false,
-          baseAnswerPreview: ''
+          baseAnswerPreview: '',
+          tag: CALL_TAGS.TRANSLATE_BASE_FULL
         };
   const context = resolvedContextMeta.contextText || '';
   const baseAnswer = resolvedContextMeta.baseAnswerIncluded ? resolvedContextMeta.baseAnswer || '' : '';
@@ -1210,14 +1345,14 @@ async function translate(texts, targetLanguage, contextMeta, keepPunctuationToke
         contextMode: resolvedContextMeta.contextMode,
         baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded,
         baseAnswerPreview: resolvedContextMeta.baseAnswerPreview,
-        contextTextSent: batchContext
+        contextTextSent: batchContext,
+        tag: resolvedContextMeta.tag
       });
-      debugParts.push(...annotated);
-      if (debugEntryIndex) {
-        annotated.forEach((payload) => {
-          appendCallRecord(debugEntryIndex, 'translation', payload, resolvedContextMeta);
-        });
-      }
+      const summarized = await summarizeDebugPayloads(annotated, {
+        entryIndex: debugEntryIndex,
+        stage: 'translation'
+      });
+      debugParts.push(...summarized);
     }
     recordAiResponseMetrics(batchResult?.debug || []);
   }
@@ -1290,18 +1425,18 @@ async function requestProofreading(payload) {
         contextMode: contextMeta.contextMode,
         baseAnswerIncluded: contextMeta.baseAnswerIncluded,
         baseAnswerPreview: contextMeta.baseAnswerPreview,
-        contextTextSent: context
+        contextTextSent: context,
+        tag: contextMeta.tag
       });
-      if (payload?.debugEntryIndex) {
-        annotated.forEach((payloadEntry) => {
-          appendCallRecord(payload.debugEntryIndex, 'proofreading', payloadEntry, contextMeta);
-        });
-      }
+      const summarized = await summarizeDebugPayloads(annotated, {
+        entryIndex: payload?.debugEntryIndex,
+        stage: 'proofreading'
+      });
       return {
         success: true,
         translations: Array.isArray(response.translations) ? response.translations : [],
         rawProofread: response.rawProofread || '',
-        debug: annotated
+        debug: summarized
       };
     },
     'Proofreading'
@@ -2106,7 +2241,16 @@ async function getContextCacheEntry(key) {
       resolve(data?.[CONTEXT_CACHE_KEY] || {});
     });
   });
-  return store[key] || null;
+  const entry = store[key] || null;
+  if (!entry) return null;
+  const fullRecord = entry.contextFullRefId ? await fetchDebugRawSafe(entry.contextFullRefId) : null;
+  const shortRecord = entry.contextShortRefId ? await fetchDebugRawSafe(entry.contextShortRefId) : null;
+  return {
+    ...entry,
+    contextFull: fullRecord?.value?.text || '',
+    contextShort: shortRecord?.value?.text || '',
+    context: fullRecord?.value?.text || ''
+  };
 }
 
 async function setContextCacheEntry(key, entry) {
@@ -2116,8 +2260,41 @@ async function setContextCacheEntry(key, entry) {
       resolve(data?.[CONTEXT_CACHE_KEY] || {});
     });
   });
-  store[key] = entry;
-  await chrome.storage.local.set({ [CONTEXT_CACHE_KEY]: store });
+  const contextFullText = typeof entry?.contextFull === 'string' ? entry.contextFull : entry?.context || '';
+  const contextShortText = typeof entry?.contextShort === 'string' ? entry.contextShort : '';
+  const fullId = contextFullText ? `context:${key}:full` : '';
+  const shortId = contextShortText ? `context:${key}:short` : '';
+  if (fullId) {
+    await storeDebugRawSafe({
+      id: fullId,
+      ts: Date.now(),
+      value: { type: 'context', text: truncateText(contextFullText, DEBUG_RAW_MAX_CHARS).text }
+    });
+  }
+  if (shortId) {
+    await storeDebugRawSafe({
+      id: shortId,
+      ts: Date.now(),
+      value: { type: 'context', text: truncateText(contextShortText, DEBUG_RAW_MAX_CHARS).text }
+    });
+  }
+  const previewFull = truncateText(contextFullText, DEBUG_PREVIEW_MAX_CHARS);
+  const previewShort = truncateText(contextShortText, DEBUG_PREVIEW_MAX_CHARS);
+  store[key] = {
+    ...entry,
+    contextFull: previewFull.text,
+    contextShort: previewShort.text,
+    context: previewFull.text,
+    contextFullRefId: fullId || entry?.contextFullRefId || '',
+    contextShortRefId: shortId || entry?.contextShortRefId || '',
+    contextFullTruncated: previewFull.truncated,
+    contextShortTruncated: previewShort.truncated
+  };
+  try {
+    await chrome.storage.local.set({ [CONTEXT_CACHE_KEY]: store });
+  } catch (error) {
+    appendDebugEvent(CALL_TAGS.STORAGE_DROPPED, error?.message || 'context-cache-write-failed');
+  }
 }
 
 function formatBlockText(texts) {
@@ -2162,7 +2339,7 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
     totalBlocks: resolvedTotal,
     inProgressBlocks: resolvedInProgress
   };
-  chrome.runtime.sendMessage({
+  void sendBackgroundMessageSafe({
     type: 'TRANSLATION_PROGRESS',
     message,
     completedBlocks: resolvedCompleted,
@@ -2171,7 +2348,7 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
   });
 }
 
-function annotateContextUsage(payloads, { contextMode, baseAnswerIncluded, baseAnswerPreview, contextTextSent }) {
+function annotateContextUsage(payloads, { contextMode, baseAnswerIncluded, baseAnswerPreview, contextTextSent, tag }) {
   return (Array.isArray(payloads) ? payloads : []).map((payload) => {
     if (!payload || typeof payload !== 'object') return payload;
     return {
@@ -2179,12 +2356,13 @@ function annotateContextUsage(payloads, { contextMode, baseAnswerIncluded, baseA
       contextMode: payload.contextMode || contextMode,
       baseAnswerIncluded: payload.baseAnswerIncluded ?? baseAnswerIncluded,
       baseAnswerPreview: payload.baseAnswerPreview ?? baseAnswerPreview,
-      contextTextSent: payload.contextTextSent ?? contextTextSent
+      contextTextSent: payload.contextTextSent ?? contextTextSent,
+      tag: payload.tag || tag
     };
   });
 }
 
-function buildContextOverflowDebugPayload({ phase, model, errorMessage, contextMode, contextTextSent, baseAnswerIncluded }) {
+function buildContextOverflowDebugPayload({ phase, model, errorMessage, contextMode, contextTextSent, baseAnswerIncluded, tag }) {
   return {
     phase,
     model: model || '—',
@@ -2197,8 +2375,78 @@ function buildContextOverflowDebugPayload({ phase, model, errorMessage, contextM
     parseIssues: ['fullContext overflow/error'],
     contextMode,
     baseAnswerIncluded,
-    contextTextSent
+    contextTextSent,
+    tag
   };
+}
+
+async function createDebugPayloadSummary(payload, options = {}) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const entryIndex = Number.isFinite(options.entryIndex) ? options.entryIndex : null;
+  const stage = options.stage === 'proofreading' ? 'proofreading' : 'translation';
+  const callId = `${debugSessionId || 'session'}:${stage}:${entryIndex ?? 'unknown'}:${Date.now()}_${Math.random()
+    .toString(16)
+    .slice(2)}`;
+  const requestPayload = buildRawPayload(payload.request);
+  const responsePayload = buildRawPayload(payload.response);
+  const contextPayload = buildRawPayload(payload.contextTextSent);
+  const hasRaw = Boolean(requestPayload.rawText || responsePayload.rawText || contextPayload.rawText);
+  if (hasRaw) {
+    await storeDebugRawSafe({
+      id: callId,
+      ts: Date.now(),
+      value: {
+        type: 'call',
+        request: requestPayload.rawText,
+        response: responsePayload.rawText,
+        contextTextSent: contextPayload.rawText
+      }
+    });
+  }
+  const summary = {
+    ...payload,
+    request: requestPayload.previewText,
+    response: responsePayload.previewText,
+    contextTextSent: contextPayload.previewText,
+    rawRefId: hasRaw ? callId : '',
+    requestTruncated: requestPayload.previewTruncated,
+    responseTruncated: responsePayload.previewTruncated,
+    contextTruncated: contextPayload.previewTruncated,
+    rawTruncated: requestPayload.rawTruncated || responsePayload.rawTruncated || contextPayload.rawTruncated
+  };
+  if (entryIndex) {
+    appendCallRecord(entryIndex, stage, summary);
+  }
+  return summary;
+}
+
+async function prepareRawTextField(value, type) {
+  const serialized = serializeRawValue(value);
+  if (!serialized) {
+    return { preview: '', refId: '', truncated: false, rawTruncated: false };
+  }
+  const payload = buildRawPayload(serialized);
+  const refId = `${debugSessionId || 'session'}:${type}:${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  await storeDebugRawSafe({
+    id: refId,
+    ts: Date.now(),
+    value: { type, response: payload.rawText }
+  });
+  return {
+    preview: payload.previewText,
+    refId,
+    truncated: payload.previewTruncated,
+    rawTruncated: payload.rawTruncated
+  };
+}
+
+async function summarizeDebugPayloads(payloads, { entryIndex, stage } = {}) {
+  const list = Array.isArray(payloads) ? payloads : [];
+  const summarized = [];
+  for (const payload of list) {
+    summarized.push(await createDebugPayloadSummary(payload, { entryIndex, stage }));
+  }
+  return summarized;
 }
 
 function getProgressSnapshot() {
@@ -2437,7 +2685,11 @@ async function saveTranslationsToMemory(entries) {
   const filtered = entries.filter(({ translated }) => translated && translated.trim());
   const existing = await getTranslationsObject();
   existing[location.href] = filtered;
-  await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+  } catch (error) {
+    console.warn('Failed to persist translations to storage.', error);
+  }
 }
 
 async function getStoredTranslations(url) {
@@ -2448,20 +2700,36 @@ async function getStoredTranslations(url) {
 async function clearStoredTranslations(url) {
   const existing = await getTranslationsObject();
   delete existing[url];
-  await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEY]: existing });
+  } catch (error) {
+    console.warn('Failed to clear stored translations.', error);
+  }
 }
 
 async function saveTranslationDebugInfo(url, data) {
   if (!url) return;
   const existing = await getTranslationDebugObject();
   existing[url] = data;
-  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  try {
+    await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  } catch (error) {
+    const now = Date.now();
+    if (now - debugStorageWarningSentAt > 30000) {
+      debugStorageWarningSentAt = now;
+      appendDebugEvent(CALL_TAGS.STORAGE_DROPPED, error?.message || 'debug-storage-write-failed');
+    }
+  }
 }
 
 async function clearTranslationDebugInfo(url) {
   const existing = await getTranslationDebugObject();
   delete existing[url];
-  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  try {
+    await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  } catch (error) {
+    appendDebugEvent(CALL_TAGS.STORAGE_DROPPED, error?.message || 'debug-storage-clear-failed');
+  }
 }
 
 async function resetTranslationDebugInfo(url) {
@@ -2485,18 +2753,29 @@ async function resetTranslationDebugInfo(url) {
     contextFullStatus,
     contextShort,
     contextShortStatus,
+    contextFullRefId: entry.contextFullRefId || '',
+    contextShortRefId: entry.contextShortRefId || '',
+    contextFullTruncated: entry.contextFullTruncated || false,
+    contextShortTruncated: entry.contextShortTruncated || false,
     items: [],
     aiRequestCount: 0,
     aiResponseCount: 0,
     sessionStartTime: entry.sessionStartTime ?? null,
     sessionEndTime: entry.sessionEndTime ?? null,
+    events: Array.isArray(entry.events) ? entry.events : [],
+    callHistory: Array.isArray(entry.callHistory) ? entry.callHistory : [],
     updatedAt: Date.now()
   };
-  await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  try {
+    await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+  } catch (error) {
+    appendDebugEvent(CALL_TAGS.STORAGE_DROPPED, error?.message || 'debug-storage-reset-failed');
+  }
 }
 
 async function initializeDebugState(blocks, settings = {}, initial = {}) {
   const proofreadEnabled = Boolean(settings.proofreadEnabled);
+  debugSessionId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const initialContextFull = typeof initial.initialContextFull === 'string' ? initial.initialContextFull : '';
   const initialContextShort = typeof initial.initialContextShort === 'string' ? initial.initialContextShort : '';
   const initialContextFullStatus =
@@ -2512,9 +2791,13 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     translated: '',
     translatedSegments: [],
     translationRaw: '',
+    translationRawRefId: '',
+    translationRawTruncated: false,
     translationDebug: [],
     proofread: [],
     proofreadRaw: '',
+    proofreadRawRefId: '',
+    proofreadRawTruncated: false,
     proofreadDebug: [],
     proofreadComparisons: [],
     proofreadExecuted: false,
@@ -2537,18 +2820,42 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     translateAttemptCount: 0,
     proofreadAttemptCount: 0
   }));
+  const contextFullPreview = truncateText(initialContextFull, DEBUG_PREVIEW_MAX_CHARS);
+  const contextShortPreview = truncateText(initialContextShort, DEBUG_PREVIEW_MAX_CHARS);
+  const contextFullRefId = initialContextFull ? `${debugSessionId}:context:full` : '';
+  const contextShortRefId = initialContextShort ? `${debugSessionId}:context:short` : '';
+  if (contextFullRefId) {
+    await storeDebugRawSafe({
+      id: contextFullRefId,
+      ts: Date.now(),
+      value: { type: 'context', text: truncateText(initialContextFull, DEBUG_RAW_MAX_CHARS).text }
+    });
+  }
+  if (contextShortRefId) {
+    await storeDebugRawSafe({
+      id: contextShortRefId,
+      ts: Date.now(),
+      value: { type: 'context', text: truncateText(initialContextShort, DEBUG_RAW_MAX_CHARS).text }
+    });
+  }
   debugState = {
-    context: initialContextFull || '',
+    context: contextFullPreview.text || '',
     contextStatus: initialContextFullStatus,
-    contextFull: initialContextFull || '',
+    contextFull: contextFullPreview.text || '',
     contextFullStatus: initialContextFullStatus,
-    contextShort: initialContextShort || '',
+    contextShort: contextShortPreview.text || '',
     contextShortStatus: initialContextShortStatus,
+    contextFullRefId,
+    contextShortRefId,
+    contextFullTruncated: contextFullPreview.truncated,
+    contextShortTruncated: contextShortPreview.truncated,
     items: debugEntries,
     aiRequestCount: 0,
     aiResponseCount: 0,
     sessionStartTime: Math.floor(Date.now() / 1000),
     sessionEndTime: null,
+    events: [],
+    callHistory: [],
     updatedAt: Date.now()
   };
   await saveTranslationDebugInfo(location.href, debugState);
@@ -2589,6 +2896,7 @@ async function flushPersistDebugState(reason = '') {
   debugState.items = debugEntries;
   try {
     await saveTranslationDebugInfo(location.href, debugState);
+    await notifyDebugUpdate();
   } finally {
     debugPersistInFlight = false;
     debugLastPersistAt = Date.now();
@@ -2602,8 +2910,19 @@ async function flushPersistDebugState(reason = '') {
 function updateDebugContextFull(context, status) {
   if (!debugState) return;
   const value = typeof context === 'string' ? context : debugState.contextFull || '';
-  debugState.contextFull = value;
-  debugState.context = value;
+  const preview = truncateText(value, DEBUG_PREVIEW_MAX_CHARS);
+  debugState.contextFull = preview.text;
+  debugState.context = preview.text;
+  debugState.contextFullTruncated = preview.truncated;
+  if (value) {
+    const refId = debugState.contextFullRefId || `${debugSessionId || 'session'}:context:full`;
+    debugState.contextFullRefId = refId;
+    void storeDebugRawSafe({
+      id: refId,
+      ts: Date.now(),
+      value: { type: 'context', text: truncateText(value, DEBUG_RAW_MAX_CHARS).text }
+    });
+  }
   if (status) {
     debugState.contextFullStatus = status;
     debugState.contextStatus = status;
@@ -2613,7 +2932,19 @@ function updateDebugContextFull(context, status) {
 
 function updateDebugContextShort(context, status) {
   if (!debugState) return;
-  debugState.contextShort = typeof context === 'string' ? context : debugState.contextShort || '';
+  const value = typeof context === 'string' ? context : debugState.contextShort || '';
+  const preview = truncateText(value, DEBUG_PREVIEW_MAX_CHARS);
+  debugState.contextShort = preview.text;
+  debugState.contextShortTruncated = preview.truncated;
+  if (value) {
+    const refId = debugState.contextShortRefId || `${debugSessionId || 'session'}:context:short`;
+    debugState.contextShortRefId = refId;
+    void storeDebugRawSafe({
+      id: refId,
+      ts: Date.now(),
+      value: { type: 'context', text: truncateText(value, DEBUG_RAW_MAX_CHARS).text }
+    });
+  }
   if (status) {
     debugState.contextShortStatus = status;
   }
@@ -2650,11 +2981,54 @@ function updateDebugSessionEndTime() {
 function updateDebugEntry(index, updates = {}) {
   const entry = debugEntries.find((item) => item.index === index);
   if (!entry) return;
+  if (Array.isArray(updates.translationDebug) && updates.translationDebug.length > DEBUG_PAYLOADS_PER_ENTRY_LIMIT) {
+    updates.translationDebug = updates.translationDebug.slice(-DEBUG_PAYLOADS_PER_ENTRY_LIMIT);
+  }
+  if (Array.isArray(updates.proofreadDebug) && updates.proofreadDebug.length > DEBUG_PAYLOADS_PER_ENTRY_LIMIT) {
+    updates.proofreadDebug = updates.proofreadDebug.slice(-DEBUG_PAYLOADS_PER_ENTRY_LIMIT);
+  }
   Object.assign(entry, updates);
   schedulePersistDebugState('updateDebugEntry');
 }
 
-function appendCallRecord(index, stage, payload, contextMeta) {
+function appendDebugEvent(tag, message) {
+  if (!debugState) return;
+  if (!Array.isArray(debugState.events)) {
+    debugState.events = [];
+  }
+  debugState.events.push({
+    id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    tag,
+    message: message || '',
+    timestamp: Date.now()
+  });
+  if (debugState.events.length > DEBUG_EVENTS_LIMIT) {
+    debugState.events = debugState.events.slice(debugState.events.length - DEBUG_EVENTS_LIMIT);
+  }
+  schedulePersistDebugState('appendDebugEvent');
+}
+
+function registerCallHistory(entry, record) {
+  if (!debugState || !entry || !record) return;
+  if (!Array.isArray(debugState.callHistory)) {
+    debugState.callHistory = [];
+  }
+  debugState.callHistory.push({
+    id: record.id,
+    entryIndex: entry.index,
+    stage: record.stage
+  });
+  while (debugState.callHistory.length > DEBUG_CALLS_TOTAL_LIMIT) {
+    const oldest = debugState.callHistory.shift();
+    if (!oldest) break;
+    const targetEntry = debugEntries.find((item) => item.index === oldest.entryIndex);
+    if (!targetEntry) continue;
+    const callsKey = oldest.stage === 'proofreading' ? 'proofreadCalls' : 'translationCalls';
+    targetEntry[callsKey] = (targetEntry[callsKey] || []).filter((call) => call.id !== oldest.id);
+  }
+}
+
+function appendCallRecord(index, stage, payload) {
   const entry = debugEntries.find((item) => item.index === index);
   if (!entry) return;
   const callsKey = stage === 'proofreading' ? 'proofreadCalls' : 'translationCalls';
@@ -2667,14 +3041,15 @@ function appendCallRecord(index, stage, payload, contextMeta) {
     stage: stage === 'proofreading' ? 'proofreading' : 'translation',
     attemptIndex: callId,
     timestamp: Date.now(),
-    contextMode: contextMeta?.contextMode || 'FULL',
-    baseAnswerIncluded: Boolean(contextMeta?.baseAnswerIncluded),
-    baseAnswerPreview: contextMeta?.baseAnswerPreview || '',
-    requestRaw: payload?.request ?? null,
-    responseRaw: payload?.response ?? null
+    tag: payload?.tag || '',
+    contextMode: payload?.contextMode || 'FULL',
+    baseAnswerIncluded: Boolean(payload?.baseAnswerIncluded),
+    baseAnswerPreview: payload?.baseAnswerPreview || '',
+    rawRefId: payload?.rawRefId || ''
   };
   const existing = Array.isArray(entry[callsKey]) ? entry[callsKey] : [];
   entry[callsKey] = [...existing, record];
+  registerCallHistory(entry, record);
   schedulePersistDebugState('appendCallRecord');
 }
 
@@ -2682,7 +3057,12 @@ function appendDebugPayload(index, key, payload) {
   const entry = debugEntries.find((item) => item.index === index);
   if (!entry) return;
   const existing = Array.isArray(entry[key]) ? entry[key] : [];
-  entry[key] = [...existing, payload];
+  const next = [...existing, payload];
+  if (next.length > DEBUG_PAYLOADS_PER_ENTRY_LIMIT) {
+    entry[key] = next.slice(next.length - DEBUG_PAYLOADS_PER_ENTRY_LIMIT);
+  } else {
+    entry[key] = next;
+  }
   schedulePersistDebugState('appendDebugPayload');
 }
 
@@ -2761,7 +3141,7 @@ async function cancelTranslation() {
   notifyVisibilityChange();
   reportProgress('Перевод отменён', 0, 0, 0);
   const tabId = await getActiveTabId();
-  chrome.runtime.sendMessage({ type: 'TRANSLATION_CANCELLED', tabId });
+  void sendBackgroundMessageSafe({ type: 'TRANSLATION_CANCELLED', tabId });
 }
 
 function getActiveTabId() {
@@ -2868,6 +3248,6 @@ async function restoreTranslations() {
 }
 
 function notifyVisibilityChange() {
-  chrome.runtime.sendMessage({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible });
+  void sendBackgroundMessageSafe({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible });
 }
 })();
