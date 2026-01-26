@@ -25,8 +25,7 @@ let debugReconnectDelay = 500;
 const proofreadUiState = new Map();
 const debugUiState = {
   openKeys: new Set(),
-  scrollTop: 0,
-  loadedRawByKey: new Map()
+  scrollTop: 0
 };
 const debugDomState = {
   contextReady: false,
@@ -334,18 +333,6 @@ async function getRawRecord(rawId) {
   });
 }
 
-function getLoadedRaw(rawId, rawField) {
-  if (!rawId) return null;
-  const key = `${rawId}:${rawField || 'text'}`;
-  return debugUiState.loadedRawByKey.get(key) || null;
-}
-
-function rememberLoadedRaw(rawId, rawField, value) {
-  if (!rawId) return;
-  const key = `${rawId}:${rawField || 'text'}`;
-  debugUiState.loadedRawByKey.set(key, value ?? '');
-}
-
 async function handleLoadRawClick(button) {
   const rawId = button.getAttribute('data-raw-id');
   const rawField = button.getAttribute('data-raw-field') || 'text';
@@ -357,7 +344,6 @@ async function handleLoadRawClick(button) {
     const record = await getRawRecord(rawId);
     const payload = record?.value || {};
     const rawValue = payload?.[rawField] ?? payload?.text ?? '';
-    rememberLoadedRaw(rawId, rawField, rawValue);
     container.innerHTML = renderRawResponse(rawValue, 'Нет данных.');
     button.remove();
   } catch (error) {
@@ -917,9 +903,7 @@ function renderRawResponse(value, emptyMessage) {
 function renderInlineRaw(value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
-  const cachedRaw = getLoadedRaw(rawRefId, rawField);
-  const truncated = Boolean(options.truncated) && !cachedRaw;
-  const renderValue = cachedRaw ?? value;
+  const truncated = Boolean(options.truncated);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
   const loadButton =
     rawRefId && truncated
@@ -930,7 +914,7 @@ function renderInlineRaw(value, options = {}) {
   return `
     ${loadButton}
     <div data-raw-target="${escapeHtml(targetId)}">
-      ${renderRawResponse(renderValue, options.emptyMessage || 'Нет данных.')}
+      ${renderRawResponse(value, options.emptyMessage || 'Нет данных.')}
     </div>
   `;
 }
@@ -1163,9 +1147,7 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
 function buildDebugSectionContent(value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
-  const cachedRaw = getLoadedRaw(rawRefId, rawField);
-  const isTruncated = Boolean(options.truncated) && !cachedRaw;
-  const renderValue = cachedRaw ?? value;
+  const isTruncated = Boolean(options.truncated);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
   const loadButton =
     rawRefId && isTruncated
@@ -1176,7 +1158,7 @@ function buildDebugSectionContent(value, options = {}) {
   return `
     ${loadButton}
     <div data-raw-target="${escapeHtml(targetId)}">
-      ${renderRawResponse(renderValue, 'Нет данных.')}
+      ${renderRawResponse(value, 'Нет данных.')}
     </div>
   `;
 }
