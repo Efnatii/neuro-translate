@@ -29,9 +29,7 @@ const debugUiState = {
 };
 const debugDomState = {
   contextReady: false,
-  entriesByKey: new Map(),
-  sectionNodes: new Map(),
-  sectionOpenState: new Map()
+  entriesByKey: new Map()
 };
 let latestDebugSnapshot = null;
 let latestDebugUrl = '';
@@ -119,13 +117,6 @@ function getSourceUrlFromQuery() {
   const params = new URLSearchParams(window.location.search);
   const source = params.get('source');
   return source ? decodeURIComponent(source) : '';
-}
-
-function isProofreadSection(sectionKey = '', sectionTitle = '', ancestryKeys = []) {
-  const normalizedTitle = String(sectionTitle || '').trim().toLowerCase();
-  if (normalizedTitle === 'вычитка') return true;
-  const keys = [sectionKey, ...ancestryKeys].filter(Boolean).map((key) => String(key).toLowerCase());
-  return keys.some((key) => key.includes('proofread'));
 }
 
 async function getDebugData(url) {
@@ -306,34 +297,6 @@ async function handleLoadRawClick(button) {
   }
 }
 
-async function loadRawIntoContainer(container, rawId, rawField) {
-  if (!rawId || !container) return;
-  try {
-    const record = await getRawRecord(rawId);
-    const payload = record?.value || {};
-    const rawValue = payload?.[rawField] ?? payload?.text ?? '';
-    container.innerHTML = renderRawResponse(rawValue, 'Нет данных.');
-  } catch (error) {
-    container.innerHTML = `<div class="empty">Не удалось загрузить данные.</div>`;
-  } finally {
-    container.setAttribute('data-auto-load-status', 'done');
-    container.removeAttribute('data-auto-load-raw');
-  }
-}
-
-function autoLoadRawTargets(root) {
-  if (!root) return;
-  root.querySelectorAll('[data-auto-load-raw="true"]').forEach((container) => {
-    if (!(container instanceof Element)) return;
-    if (container.getAttribute('data-auto-load-status')) return;
-    const rawId = container.getAttribute('data-raw-id');
-    if (!rawId) return;
-    const rawField = container.getAttribute('data-raw-field') || 'text';
-    container.setAttribute('data-auto-load-status', 'loading');
-    void loadRawIntoContainer(container, rawId, rawField);
-  });
-}
-
 async function refreshDebug() {
   const debugData = await getDebugData(sourceUrl);
   if (!debugData) {
@@ -435,8 +398,7 @@ function patchDebug(url, data) {
   items.forEach((item, index) => {
     const entryKey = getProofreadEntryKey(item, index);
     const entry = ensureEntryContainer(entryKey);
-    patchEntry(entry, item, entryKey);
-    autoLoadRawTargets(entry);
+    entry.innerHTML = renderEntryHtml(item, entryKey);
     liveKeys.add(entryKey);
   });
   for (const [entryKey, entryEl] of debugDomState.entriesByKey.entries()) {
@@ -446,28 +408,6 @@ function patchDebug(url, data) {
     }
   }
   restoreUiState();
-  logDebugSectionChanges();
-}
-
-function logDebugSectionChanges() {
-  const nextNodes = new Map();
-  const nextOpenState = new Map();
-  document.querySelectorAll('details[data-debug-key]').forEach((details) => {
-    const key = details.getAttribute('data-debug-key');
-    if (!key) return;
-    const previousNode = debugDomState.sectionNodes.get(key);
-    if (previousNode && previousNode !== details) {
-      console.debug('[debug] section node replaced', key);
-    }
-    const previousOpen = debugDomState.sectionOpenState.get(key);
-    if (typeof previousOpen === 'boolean' && previousOpen !== details.open) {
-      console.debug('[debug] section open changed', key, { from: previousOpen, to: details.open });
-    }
-    nextNodes.set(key, details);
-    nextOpenState.set(key, details.open);
-  });
-  debugDomState.sectionNodes = nextNodes;
-  debugDomState.sectionOpenState = nextOpenState;
 }
 
 function renderSummary(data, fallbackMessage = '') {
@@ -601,25 +541,18 @@ function patchContext(data) {
     ? renderInlineRaw(contextFullText, {
         rawRefId: contextFullRefId,
         rawField: 'text',
-        truncated: contextFullTruncated,
-        sectionKey: 'context:full',
-        sectionTitle: 'FULL контекст',
-        ancestryKeys: ['context']
+        truncated: contextFullTruncated
       })
     : `<div class="empty">FULL контекст ещё не готов.</div>`;
   const shortContextBody = contextShortText
     ? renderInlineRaw(contextShortText, {
         rawRefId: contextShortRefId,
         rawField: 'text',
-        truncated: contextShortTruncated,
-        sectionKey: 'context:short',
-        sectionTitle: 'SHORT контекст',
-        ancestryKeys: ['context']
+        truncated: contextShortTruncated
       })
     : `<div class="empty">SHORT контекст ещё не готов.</div>`;
   if (shortBodyEl) shortBodyEl.innerHTML = shortContextBody;
   if (fullBodyEl) fullBodyEl.innerHTML = fullContextBody;
-  autoLoadRawTargets(contextEl);
 }
 
 function ensureEntryContainer(entryKey) {
@@ -636,6 +569,7 @@ function ensureEntryContainer(entryKey) {
 function renderEntryHtml(item, entryKey) {
   const translationStatus = normalizeStatus(item.translationStatus, item.translated);
   const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
+  const proofreadSection = renderProofreadSection(item, entryKey);
   const translateKey = `entry:${entryKey}:translate`;
   const translateAiKey = `${translateKey}:ai`;
   return `
@@ -644,32 +578,30 @@ function renderEntryHtml(item, entryKey) {
       <div class="status-row">
         <div class="status-group">
           <span class="status-label">Перевод</span>
-          <span data-role="translation-status">${renderStatusBadge(translationStatus)}</span>
+          ${renderStatusBadge(translationStatus)}
         </div>
         <div class="status-group">
           <span class="status-label">Вычитка</span>
-          <span data-role="proofread-status">${renderStatusBadge(proofreadStatus)}</span>
+          ${renderStatusBadge(proofreadStatus)}
         </div>
       </div>
     </div>
     <div class="block">
       <div class="label">Оригинал</div>
-      <pre data-role="original-text">${escapeHtml(item.original || '')}</pre>
+      <pre>${escapeHtml(item.original || '')}</pre>
     </div>
     <div class="block">
       <div class="label">Перевод</div>
-      <div data-role="translated-container">
-        ${
-          item.translated
-            ? `<pre data-role="translated-text">${escapeHtml(item.translated)}</pre>`
-            : `<div class="empty">Перевод ещё не получен.</div>`
-        }
-      </div>
+      ${
+        item.translated
+          ? `<pre>${escapeHtml(item.translated)}</pre>`
+          : `<div class="empty">Перевод ещё не получен.</div>`
+      }
     </div>
     <div class="block">
       <details class="ai-response" data-debug-key="${escapeHtml(translateAiKey)}">
         <summary>Ответ ИИ (перевод)</summary>
-        <div class="details-content" data-role="translation-ai-content">
+        <div class="details-content">
           ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
             rawRefId: item?.translationRawRefId,
             truncated: item?.translationRawTruncated,
@@ -678,92 +610,8 @@ function renderEntryHtml(item, entryKey) {
         </div>
       </details>
     </div>
-    ${renderProofreadBlock(item, entryKey)}
-    ${renderProofreadAi(item, entryKey)}
+    ${proofreadSection}
   `;
-}
-
-function patchEntry(entry, item, entryKey) {
-  if (!entry.hasChildNodes()) {
-    entry.innerHTML = renderEntryHtml(item, entryKey);
-    return;
-  }
-  // Моргание происходило из-за пересоздания секций при каждом апдейте.
-  // Теперь патчим только содержимое внутри существующих узлов.
-  const translationStatus = normalizeStatus(item.translationStatus, item.translated);
-  const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
-  const translationStatusEl = entry.querySelector('[data-role="translation-status"]');
-  if (translationStatusEl) translationStatusEl.innerHTML = renderStatusBadge(translationStatus);
-  const proofreadStatusEl = entry.querySelector('[data-role="proofread-status"]');
-  if (proofreadStatusEl) proofreadStatusEl.innerHTML = renderStatusBadge(proofreadStatus);
-  const originalEl = entry.querySelector('[data-role="original-text"]');
-  if (originalEl) originalEl.textContent = item.original || '';
-  const translatedContainer = entry.querySelector('[data-role="translated-container"]');
-  if (translatedContainer) {
-    translatedContainer.innerHTML = item.translated
-      ? `<pre data-role="translated-text">${escapeHtml(item.translated)}</pre>`
-      : `<div class="empty">Перевод ещё не получен.</div>`;
-  }
-  const translateKey = `entry:${entryKey}:translate`;
-  const translationDetails = entry.querySelector(
-    `details.ai-response[data-debug-key="${CSS.escape(`${translateKey}:ai`)}"]`
-  );
-  const translationContent = translationDetails?.querySelector('[data-role="translation-ai-content"]');
-  if (translationContent) {
-    translationContent.innerHTML = renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
-      rawRefId: item?.translationRawRefId,
-      truncated: item?.translationRawTruncated,
-      baseKey: translateKey
-    });
-  }
-  patchProofreadBlock(entry, item, entryKey);
-  patchProofreadAi(entry, item, entryKey);
-}
-
-function renderProofreadBlock(item, entryKey) {
-  return renderProofreadSection(item, entryKey, { includeAi: false });
-}
-
-function renderProofreadAi(item, entryKey) {
-  return renderProofreadSection(item, entryKey, { includeBlock: false });
-}
-
-function patchProofreadBlock(entry, item, entryKey) {
-  const existing = entry.querySelector(`.proofread-block[data-proofread-id="${CSS.escape(entryKey)}"]`);
-  const wrapper = document.createElement('div');
-  wrapper.innerHTML = renderProofreadBlock(item, entryKey).trim();
-  const nextBlock = wrapper.querySelector('.proofread-block');
-  if (!nextBlock) return;
-  if (!existing) {
-    const translationDetails = entry.querySelector(`details.ai-response[data-debug-key="${CSS.escape(`entry:${entryKey}:translate:ai`)}"]`);
-    if (translationDetails?.parentElement) {
-      translationDetails.parentElement.insertAdjacentElement('afterend', nextBlock.closest('.block') || nextBlock);
-    } else {
-      entry.appendChild(nextBlock.closest('.block') || nextBlock);
-    }
-    return;
-  }
-  existing.className = nextBlock.className;
-  existing.setAttribute('data-proofread-view', nextBlock.getAttribute('data-proofread-view') || '');
-  existing.innerHTML = nextBlock.innerHTML;
-}
-
-function patchProofreadAi(entry, item, entryKey) {
-  const proofreadDetailsKey = `entry:${entryKey}:proofread:ai`;
-  const existing = entry.querySelector(`details.ai-response[data-debug-key="${CSS.escape(proofreadDetailsKey)}"]`);
-  const wrapper = document.createElement('div');
-  wrapper.innerHTML = renderProofreadAi(item, entryKey).trim();
-  const nextDetails = wrapper.querySelector(`details.ai-response[data-debug-key="${CSS.escape(proofreadDetailsKey)}"]`);
-  if (!nextDetails) return;
-  if (!existing) {
-    entry.appendChild(nextDetails.closest('.block') || nextDetails);
-    return;
-  }
-  const nextContent = nextDetails.querySelector('.details-content');
-  const existingContent = existing.querySelector('.details-content');
-  if (nextContent && existingContent) {
-    existingContent.innerHTML = nextContent.innerHTML;
-  }
 }
 
 function getOverallStatus({ completed, inProgress, failed, total, contextFullStatus, contextShortStatus }) {
@@ -782,19 +630,14 @@ function getOverallStatus({ completed, inProgress, failed, total, contextFullSta
 }
 
 
-function renderProofreadSection(item, entryKey, options = {}) {
-  const includeBlock = options.includeBlock !== false;
-  const includeAi = options.includeAi !== false;
+function renderProofreadSection(item, entryKey) {
   if (item?.proofreadApplied === false) {
     const proofreadAiKey = `entry:${entryKey}:proofread:ai`;
     return `
-      ${includeBlock ? `
-      <div class="block proofread-block" data-proofread-id="${escapeHtml(entryKey)}" data-proofread-view="diff">
+      <div class="block">
         <div class="label">Вычитка</div>
         <div class="empty">Вычитка выключена.</div>
       </div>
-      ` : ''}
-      ${includeAi ? `
       <div class="block">
         <details class="ai-response" data-debug-key="${escapeHtml(proofreadAiKey)}">
           <summary>Ответ ИИ (вычитка)</summary>
@@ -803,7 +646,6 @@ function renderProofreadSection(item, entryKey, options = {}) {
           </div>
         </details>
       </div>
-      ` : ''}
     `;
   }
 
@@ -863,7 +705,6 @@ function renderProofreadSection(item, entryKey, options = {}) {
       `;
 
   return `
-      ${includeBlock ? `
       <div class="block proofread-block${isExpanded ? ' is-expanded' : ''}" data-proofread-id="${escapeHtml(entryKey)}" data-proofread-view="${escapeHtml(showView)}">
         <div class="proofread-header">
           <div class="proofread-title">
@@ -876,8 +717,6 @@ function renderProofreadSection(item, entryKey, options = {}) {
         </div>
         ${proofreadBody}
       </div>
-      ` : ''}
-      ${includeAi ? `
       <div class="block">
         <details class="ai-response" data-debug-key="${escapeHtml(`entry:${entryKey}:proofread:ai`)}">
           <summary>Ответ ИИ (вычитка)</summary>
@@ -890,7 +729,6 @@ function renderProofreadSection(item, entryKey, options = {}) {
           </div>
         </details>
       </div>
-      ` : ''}
     `;
 }
 
@@ -942,26 +780,17 @@ function renderRawResponse(value, emptyMessage) {
 function renderInlineRaw(value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
-  const sectionKey = options.sectionKey || '';
-  const sectionTitle = options.sectionTitle || '';
-  const ancestryKeys = Array.isArray(options.ancestryKeys) ? options.ancestryKeys : [];
-  // В отладке убираем режим "Показать полностью" везде кроме "Вычитка".
-  const allowTruncate = isProofreadSection(sectionKey, sectionTitle, ancestryKeys);
-  const truncated = allowTruncate ? Boolean(options.truncated) : false;
+  const truncated = Boolean(options.truncated);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
-  const shouldAutoLoad = !allowTruncate && rawRefId && Boolean(options.truncated);
   const loadButton =
     rawRefId && truncated
       ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
           rawRefId
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
-  const autoLoadAttrs = shouldAutoLoad
-    ? ` data-auto-load-raw="true" data-raw-id="${escapeHtml(rawRefId)}" data-raw-field="${escapeHtml(rawField)}"`
-    : '';
   return `
     ${loadButton}
-    <div data-raw-target="${escapeHtml(targetId)}"${autoLoadAttrs}>
+    <div data-raw-target="${escapeHtml(targetId)}">
       ${renderRawResponse(value, options.emptyMessage || 'Нет данных.')}
     </div>
   `;
@@ -1084,26 +913,20 @@ function renderDebugPayload(payload, index, baseKey) {
         rawRefId: payload?.rawRefId,
         rawField: 'contextTextSent',
         truncated: payload?.contextTruncated,
-        debugKey: `${payloadKey}:context`,
-        sectionKey: `${payloadKey}:context`,
-        ancestryKeys: [baseKey]
+        debugKey: `${payloadKey}:context`
       })
     : '';
   const requestSection = renderDebugSection('Request (raw)', payload?.request, {
     rawRefId: payload?.rawRefId,
     rawField: 'request',
     truncated: payload?.requestTruncated,
-    debugKey: `${payloadKey}:request`,
-    sectionKey: `${payloadKey}:request`,
-    ancestryKeys: [baseKey]
+    debugKey: `${payloadKey}:request`
   });
   const responseSection = renderDebugSection('Response (raw)', payload?.response, {
     rawRefId: payload?.rawRefId,
     rawField: 'response',
     truncated: payload?.responseTruncated,
-    debugKey: `${payloadKey}:response`,
-    sectionKey: `${payloadKey}:response`,
-    ancestryKeys: [baseKey]
+    debugKey: `${payloadKey}:response`
   });
   const parseSection = renderDebugParseSection(payload?.parseIssues, `${payloadKey}:parse`);
   const tagBadge = tag ? `<span class="debug-tag">${escapeHtml(tag)}</span>` : '';
@@ -1138,30 +961,21 @@ function renderDebugPayload(payload, index, baseKey) {
 function renderDebugSection(label, value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
-  const sectionKey = options.sectionKey || options.debugKey || '';
-  const sectionTitle = options.sectionTitle || label;
-  const ancestryKeys = Array.isArray(options.ancestryKeys) ? options.ancestryKeys : [];
-  // В отладке убираем режим "Показать полностью" везде кроме "Вычитка".
-  const allowTruncate = isProofreadSection(sectionKey, sectionTitle, ancestryKeys);
-  const isTruncated = allowTruncate ? Boolean(options.truncated) : false;
+  const isTruncated = Boolean(options.truncated);
   const debugKey = options.debugKey ? ` data-debug-key="${escapeHtml(options.debugKey)}"` : '';
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
-  const shouldAutoLoad = !allowTruncate && rawRefId && Boolean(options.truncated);
   const loadButton =
     rawRefId && isTruncated
       ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
           rawRefId
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
-  const autoLoadAttrs = shouldAutoLoad
-    ? ` data-auto-load-raw="true" data-raw-id="${escapeHtml(rawRefId)}" data-raw-field="${escapeHtml(rawField)}"`
-    : '';
   return `
     <details class="debug-details"${debugKey}>
       <summary>${escapeHtml(label)}</summary>
       <div class="details-content">
         ${loadButton}
-        <div data-raw-target="${escapeHtml(targetId)}"${autoLoadAttrs}>
+        <div data-raw-target="${escapeHtml(targetId)}">
           ${renderRawResponse(value, 'Нет данных.')}
         </div>
       </div>
