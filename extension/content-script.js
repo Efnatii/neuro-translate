@@ -284,12 +284,11 @@ function serializeRawValue(value) {
 function buildRawPayload(value) {
   const serialized = serializeRawValue(value);
   const trimmed = truncateText(serialized, DEBUG_RAW_MAX_CHARS);
-  const preview = truncateText(serialized, DEBUG_PREVIEW_MAX_CHARS);
   return {
     rawText: trimmed.text,
-    previewText: preview.text,
+    previewText: serialized,
     rawTruncated: trimmed.truncated,
-    previewTruncated: preview.truncated
+    previewTruncated: false
   };
 }
 
@@ -2609,8 +2608,8 @@ async function setContextCacheEntry(key, entry) {
       value: { type: 'context', text: truncateText(contextShortText, DEBUG_RAW_MAX_CHARS).text }
     });
   }
-  const previewFull = truncateText(contextFullText, DEBUG_PREVIEW_MAX_CHARS);
-  const previewShort = truncateText(contextShortText, DEBUG_PREVIEW_MAX_CHARS);
+  const previewFull = { text: contextFullText, truncated: false };
+  const previewShort = { text: contextShortText, truncated: false };
   store[key] = {
     ...entry,
     contextFull: previewFull.text,
@@ -3171,8 +3170,8 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
     translateAttemptCount: 0,
     proofreadAttemptCount: 0
   }));
-  const contextFullPreview = truncateText(initialContextFull, DEBUG_PREVIEW_MAX_CHARS);
-  const contextShortPreview = truncateText(initialContextShort, DEBUG_PREVIEW_MAX_CHARS);
+  const contextFullPreview = { text: initialContextFull, truncated: false };
+  const contextShortPreview = { text: initialContextShort, truncated: false };
   const contextFullRefId = initialContextFull ? `${debugSessionId}:context:full` : '';
   const contextShortRefId = initialContextShort ? `${debugSessionId}:context:short` : '';
   if (contextFullRefId) {
@@ -3261,7 +3260,7 @@ async function flushPersistDebugState(reason = '') {
 function updateDebugContextFull(context, status) {
   if (!debugState) return;
   const value = typeof context === 'string' ? context : debugState.contextFull || '';
-  const preview = truncateText(value, DEBUG_PREVIEW_MAX_CHARS);
+  const preview = { text: value, truncated: false };
   debugState.contextFull = preview.text;
   debugState.context = preview.text;
   debugState.contextFullTruncated = preview.truncated;
@@ -3284,7 +3283,7 @@ function updateDebugContextFull(context, status) {
 function updateDebugContextShort(context, status) {
   if (!debugState) return;
   const value = typeof context === 'string' ? context : debugState.contextShort || '';
-  const preview = truncateText(value, DEBUG_PREVIEW_MAX_CHARS);
+  const preview = { text: value, truncated: false };
   debugState.contextShort = preview.text;
   debugState.contextShortTruncated = preview.truncated;
   if (value) {
