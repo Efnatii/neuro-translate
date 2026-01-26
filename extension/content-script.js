@@ -30,6 +30,20 @@ let translationVisible = false;
 let latestContextSummary = '';
 let latestShortContextSummary = '';
 let shortContextPromise = null;
+const contextState = {
+  full: {
+    status: 'empty',
+    signature: '',
+    text: '',
+    promise: null
+  },
+  short: {
+    status: 'empty',
+    signature: '',
+    text: '',
+    promise: null
+  }
+};
 let debugEntries = [];
 let debugState = null;
 let debugSessionId = '';
@@ -570,6 +584,21 @@ async function translatePage(settings) {
         : '';
   const cachedContextShort =
     typeof cachedContextEntry?.contextShort === 'string' ? cachedContextEntry.contextShort.trim() : '';
+  const existingContextFullRefId = existingDebugEntry?.contextFullRefId || '';
+  const existingContextShortRefId = existingDebugEntry?.contextShortRefId || '';
+  const existingContextFullRecord = existingContextFullRefId ? await fetchDebugRawSafe(existingContextFullRefId) : null;
+  const existingContextShortRecord = existingContextShortRefId
+    ? await fetchDebugRawSafe(existingContextShortRefId)
+    : null;
+  const existingContextFullText =
+    cachedContextFull ||
+    existingContextFullRecord?.value?.text ||
+    existingContextFullPreview;
+  const existingContextShortText =
+    cachedContextShort ||
+    existingContextShortRecord?.value?.text ||
+    existingContextShortPreview;
+  const contextSignature = buildContextStateSignature(contextCacheSignature, settings);
   originalSnapshot = nodesWithPath.map(({ path, original, originalHash }) => ({
     path,
     original,
@@ -578,8 +607,10 @@ async function translatePage(settings) {
   activeTranslationEntries = [];
   debugEntries = [];
   debugState = null;
-  latestContextSummary = cachedContextFull || '';
-  latestShortContextSummary = cachedContextShort || '';
+  primeContextState(contextState.full, contextSignature, existingContextFullText);
+  primeContextState(contextState.short, contextSignature, existingContextShortText);
+  latestContextSummary = contextState.full.text || '';
+  latestShortContextSummary = contextState.short.text || '';
   shortContextPromise = null;
   await resetTranslationDebugInfo(location.href);
 
@@ -623,56 +654,72 @@ async function translatePage(settings) {
   const pageText = settings.contextGenerationEnabled ? buildPageText(nodesWithPath) : '';
 
   if (settings.contextGenerationEnabled && !latestShortContextSummary) {
-    await updateDebugContextShortStatus('in_progress');
-    reportProgress('Генерация SHORT контекста', 0, blocks.length, 0);
     if (pageText) {
-      shortContextPromise = requestShortContext(pageText, settings.targetLanguage || 'ru')
-        .then(async (shortContext) => {
-          latestShortContextSummary = shortContext;
-          if (latestShortContextSummary && contextCacheKey) {
-            const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
-            await setContextCacheEntry(contextCacheKey, {
-              ...currentEntry,
-              contextShort: latestShortContextSummary,
-              contextFull: currentEntry.contextFull || currentEntry.context || '',
-              signature: contextCacheSignature,
-              updatedAt: Date.now()
-            });
-          }
-          await updateDebugContextShort(latestShortContextSummary, 'done');
-        })
-        .catch(async (error) => {
-          console.warn('Short context generation failed, continuing without it.', error);
-          await updateDebugContextShort(latestShortContextSummary, 'failed');
-        });
+      // Guard: reuse ready context for the same signature instead of recomputing on each debug refresh.
+      const shortResult = getOrBuildContext({
+        state: contextState.short,
+        signature: contextSignature,
+        build: () => requestShortContext(pageText, settings.targetLanguage || 'ru')
+      });
+      if (shortResult.started || contextState.short.status === 'building') {
+        await updateDebugContextShortStatus('in_progress');
+        reportProgress('Генерация SHORT контекста', 0, blocks.length, 0);
+      }
+      if (shortResult.promise) {
+        shortContextPromise = shortResult.promise
+          .then(async (shortContext) => {
+            latestShortContextSummary = shortContext;
+            if (latestShortContextSummary && contextCacheKey) {
+              const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
+              await setContextCacheEntry(contextCacheKey, {
+                ...currentEntry,
+                contextShort: latestShortContextSummary,
+                contextFull: currentEntry.contextFull || currentEntry.context || '',
+                signature: contextCacheSignature,
+                updatedAt: Date.now()
+              });
+            }
+            await updateDebugContextShort(latestShortContextSummary, 'done');
+          })
+          .catch(async (error) => {
+            console.warn('Short context generation failed, continuing without it.', error);
+            await updateDebugContextShort(latestShortContextSummary, 'failed');
+          });
+      }
     } else {
       await updateDebugContextShort(latestShortContextSummary, 'done');
     }
   }
 
   if (settings.contextGenerationEnabled && !latestContextSummary) {
-    await updateDebugContextFullStatus('in_progress');
-    reportProgress('Генерация FULL контекста', 0, blocks.length, 0);
     if (pageText) {
-      try {
-        latestContextSummary = await requestTranslationContext(
-          pageText,
-          settings.targetLanguage || 'ru'
-        );
-        if (latestContextSummary && contextCacheKey) {
-          const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
-          await setContextCacheEntry(contextCacheKey, {
-            ...currentEntry,
-            contextFull: latestContextSummary,
-            contextShort: currentEntry.contextShort || '',
-            signature: contextCacheSignature,
-            updatedAt: Date.now()
-          });
+      const fullResult = getOrBuildContext({
+        state: contextState.full,
+        signature: contextSignature,
+        build: () => requestTranslationContext(pageText, settings.targetLanguage || 'ru')
+      });
+      if (fullResult.started || contextState.full.status === 'building') {
+        await updateDebugContextFullStatus('in_progress');
+        reportProgress('Генерация FULL контекста', 0, blocks.length, 0);
+      }
+      if (fullResult.promise) {
+        try {
+          latestContextSummary = await fullResult.promise;
+          if (latestContextSummary && contextCacheKey) {
+            const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
+            await setContextCacheEntry(contextCacheKey, {
+              ...currentEntry,
+              contextFull: latestContextSummary,
+              contextShort: currentEntry.contextShort || '',
+              signature: contextCacheSignature,
+              updatedAt: Date.now()
+            });
+          }
+          await updateDebugContextFull(latestContextSummary, 'done');
+        } catch (error) {
+          console.warn('Context generation failed, continuing without it.', error);
+          await updateDebugContextFull(latestContextSummary, 'failed');
         }
-        await updateDebugContextFull(latestContextSummary, 'done');
-      } catch (error) {
-        console.warn('Context generation failed, continuing without it.', error);
-        await updateDebugContextFull(latestContextSummary, 'failed');
       }
     } else {
       await updateDebugContextFull(latestContextSummary, 'done');
@@ -2232,6 +2279,59 @@ function buildContextCacheSignature(nodesWithPath) {
   const pageSample = buildPageText(nodesWithPath, 2000);
   const signatureSource = [location.href, document.title || '', headingText, pageSample].join('||');
   return computeTextHash(signatureSource);
+}
+
+function buildContextStateSignature(contextCacheSignature, settings) {
+  return JSON.stringify({
+    cache: contextCacheSignature,
+    contextModel: settings?.contextModel || '',
+    targetLanguage: settings?.targetLanguage || '',
+    contextGenerationEnabled: Boolean(settings?.contextGenerationEnabled)
+  });
+}
+
+function primeContextState(state, signature, text) {
+  if (state.signature !== signature) {
+    state.signature = signature;
+    state.status = 'empty';
+    state.text = '';
+    state.promise = null;
+  }
+  if (text) {
+    state.status = 'ready';
+    state.text = text;
+    state.promise = null;
+  }
+}
+
+function getOrBuildContext({ state, signature, build }) {
+  if (state.signature !== signature) {
+    state.signature = signature;
+    state.status = 'empty';
+    state.text = '';
+    state.promise = null;
+  }
+  if (state.status === 'ready') {
+    return { started: false, promise: Promise.resolve(state.text), text: state.text };
+  }
+  if (state.status === 'building' && state.promise) {
+    return { started: false, promise: state.promise, text: state.text };
+  }
+  state.status = 'building';
+  state.promise = Promise.resolve()
+    .then(() => build())
+    .then((text) => {
+      state.text = text || '';
+      state.status = 'ready';
+      state.promise = null;
+      return state.text;
+    })
+    .catch((error) => {
+      state.status = 'error';
+      state.promise = null;
+      throw error;
+    });
+  return { started: true, promise: state.promise, text: state.text };
 }
 
 async function getContextCacheEntry(key) {
