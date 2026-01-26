@@ -882,7 +882,11 @@ async function translatePage(settings, options = {}) {
     if (contextMode === 'SHORT' && shortContextPromise) {
       await shortContextPromise;
     }
-    const contextText = contextMode === 'SHORT' ? latestShortContextSummary : latestContextSummary;
+    const resolvedShortContext =
+      typeof latestShortContextSummary === 'string' && latestShortContextSummary.trim()
+        ? latestShortContextSummary
+        : buildShortContextFallback(latestContextSummary || '');
+    const contextText = contextMode === 'SHORT' ? resolvedShortContext : latestContextSummary;
     const baseAnswerIncluded = contextMode === 'SHORT' && Boolean(baseAnswer) && (!options.forceShort || fullSuccess);
     const baseAnswerPreview = baseAnswerIncluded ? buildBaseAnswerPreview(baseAnswer) : '';
     updateDebugEntry(entry.index, {
@@ -892,7 +896,7 @@ async function translatePage(settings, options = {}) {
       contextMode,
       contextText: typeof contextText === 'string' ? contextText : '',
       contextFullText: latestContextSummary || '',
-      contextShortText: latestShortContextSummary || '',
+      contextShortText: resolvedShortContext || '',
       baseAnswer,
       baseAnswerIncluded,
       baseAnswerPreview,
@@ -1529,6 +1533,13 @@ async function translate(
   debugEntryIndex = null,
   requestMeta = null
 ) {
+  const triggerSource = requestMeta?.triggerSource || '';
+  const includeManualOutputs = triggerSource === 'retry' || triggerSource === 'validate';
+  const debugEntry =
+    Number.isFinite(debugEntryIndex) && debugEntryIndex > 0
+      ? debugEntries.find((item) => item.index === debugEntryIndex)
+      : null;
+  const manualOutputsNoFull = includeManualOutputs ? buildManualOutputsNoFull(debugEntry, 'translation') : '';
   const resolvedContextMeta =
     contextMeta && typeof contextMeta === 'object'
       ? contextMeta
@@ -1583,7 +1594,8 @@ async function translate(
               fullText: resolvedContextMeta.contextFullText || resolvedContextMeta.contextText || '',
               shortText: resolvedContextMeta.contextShortText || '',
               baseAnswer,
-              baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded
+              baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded,
+              manualOutputsNoFull
             },
             keepPunctuationTokens,
             requestMeta: batchRequestMeta || undefined
@@ -1669,6 +1681,13 @@ async function requestProofreading(payload) {
   const baseAnswer = contextMeta.baseAnswerIncluded ? contextMeta.baseAnswer || '' : '';
   const requestMeta =
     payload?.requestMeta && typeof payload.requestMeta === 'object' ? payload.requestMeta : null;
+  const triggerSource = requestMeta?.triggerSource || '';
+  const includeManualOutputs = triggerSource === 'retry' || triggerSource === 'validate';
+  const debugEntry =
+    Number.isFinite(payload?.debugEntryIndex) && payload.debugEntryIndex > 0
+      ? debugEntries.find((item) => item.index === payload.debugEntryIndex)
+      : null;
+  const manualOutputsNoFull = includeManualOutputs ? buildManualOutputsNoFull(debugEntry, 'proofreading') : '';
   const resolvedRequestMeta = requestMeta
     ? buildRequestMeta(requestMeta, {
         contextText: context,
@@ -1697,7 +1716,8 @@ async function requestProofreading(payload) {
             fullText: contextMeta.contextFullText || contextMeta.contextText || '',
             shortText: contextMeta.contextShortText || '',
             baseAnswer,
-            baseAnswerIncluded: contextMeta.baseAnswerIncluded
+            baseAnswerIncluded: contextMeta.baseAnswerIncluded,
+            manualOutputsNoFull
           },
           language: payload?.language || '',
           requestMeta: resolvedRequestMeta || undefined
@@ -2670,6 +2690,44 @@ function buildShortContextFallback(context = '') {
     return compact;
   }
   return context.slice(0, SHORT_CONTEXT_MAX_CHARS).trimEnd();
+}
+
+function buildManualOutputsNoFull(entry, stage) {
+  if (!entry) return '(no manual outputs found)';
+  const payloads = stage === 'proofreading' ? entry.proofreadDebug : entry.translationDebug;
+  const list = Array.isArray(payloads) ? payloads : [];
+  const manualPayloads = list.filter((payload) => (payload?.triggerSource || '') === 'manual');
+  if (!manualPayloads.length) {
+    return '(no manual outputs found)';
+  }
+  const formatValue = (value) => {
+    if (value == null) return '';
+    if (typeof value === 'string') return value.trim();
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      return String(value);
+    }
+  };
+  return manualPayloads
+    .map((payload, index) => {
+      const responseText = formatValue(payload?.response);
+      const parseIssues = Array.isArray(payload?.parseIssues) && payload.parseIssues.length
+        ? `Parse issues: ${payload.parseIssues.join(', ')}`
+        : '';
+      const phase = payload?.phase ? `Phase: ${payload.phase}` : '';
+      const attempt = Number.isFinite(payload?.attempt) ? `Attempt: ${payload.attempt}` : '';
+      return [
+        `--- Manual attempt ${index + 1} ---`,
+        phase,
+        attempt,
+        responseText ? `Output: ${responseText}` : 'Output: (empty)',
+        parseIssues
+      ]
+        .filter(Boolean)
+        .join('\n');
+    })
+    .join('\n\n');
 }
 
 function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0) {
