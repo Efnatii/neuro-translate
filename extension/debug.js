@@ -23,6 +23,17 @@ let debugPort = null;
 let debugReconnectTimer = null;
 let debugReconnectDelay = 500;
 const proofreadUiState = new Map();
+const debugUiState = {
+  openKeys: new Set(),
+  scrollTop: 0
+};
+const debugDomState = {
+  contextReady: false,
+  entriesByKey: new Map()
+};
+let latestDebugSnapshot = null;
+let latestDebugUrl = '';
+let debugPatchScheduled = false;
 
 init();
 
@@ -237,7 +248,7 @@ function handleDebugPortMessage(message) {
       renderEmpty('Ожидание отладочных данных...');
       return;
     }
-    renderDebug(sourceUrl, message.snapshot);
+    scheduleDebugPatch(sourceUrl, message.snapshot);
   }
 }
 
@@ -292,7 +303,7 @@ async function refreshDebug() {
     renderEmpty('Ожидание отладочных данных...');
     return;
   }
-  renderDebug(sourceUrl, debugData);
+  scheduleDebugPatch(sourceUrl, debugData);
 }
 
 function extractTokensFromUsage(usage) {
@@ -327,7 +338,15 @@ function collectTokensFromPayloads(payloads) {
 
 function renderEmpty(message) {
   metaEl.textContent = message;
-  contextEl.innerHTML = '';
+  ensureContextSkeleton();
+  patchContext({
+    contextStatus: 'pending',
+    context: '',
+    contextFullStatus: 'pending',
+    contextShortStatus: 'pending',
+    contextFull: '',
+    contextShort: ''
+  });
   entriesEl.innerHTML = '';
   if (eventsEl) {
     eventsEl.innerHTML = '';
@@ -339,120 +358,56 @@ function renderEmpty(message) {
   }, message);
 }
 
-function renderDebug(url, data) {
+function scheduleDebugPatch(url, data) {
+  latestDebugSnapshot = data;
+  latestDebugUrl = url;
+  if (debugPatchScheduled) return;
+  debugPatchScheduled = true;
+  requestAnimationFrame(() => {
+    debugPatchScheduled = false;
+    if (!latestDebugSnapshot) return;
+    const snapshot = latestDebugSnapshot;
+    const snapshotUrl = latestDebugUrl;
+    latestDebugSnapshot = null;
+    patchDebug(snapshotUrl, snapshot);
+  });
+}
+
+function patchDebug(url, data) {
+  // Раньше весь блок отладки перерисовывался через innerHTML, что сбрасывало раскрытие <details> и прокрутку.
+  // Теперь сохраняем состояние и патчим только нужные узлы.
+  captureUiState();
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
   renderSummary(data, '');
   renderEvents(data);
-
-  const contextFullText = (data.contextFull || data.context || '').trim();
-  const contextShortText = (data.contextShort || '').trim();
-  const contextFullRefId = data.contextFullRefId || '';
-  const contextShortRefId = data.contextShortRefId || '';
-  const contextFullTruncated = Boolean(data.contextFullTruncated);
-  const contextShortTruncated = Boolean(data.contextShortTruncated);
-  const contextFullStatus = normalizeStatus(data.contextFullStatus || data.contextStatus, contextFullText);
-  const contextShortStatus = normalizeStatus(data.contextShortStatus, contextShortText);
-  const fullContextBody = contextFullText
-    ? renderInlineRaw(contextFullText, {
-        rawRefId: contextFullRefId,
-        rawField: 'text',
-        truncated: contextFullTruncated
-      })
-    : `<div class="empty">FULL контекст ещё не готов.</div>`;
-  const shortContextBody = contextShortText
-    ? renderInlineRaw(contextShortText, {
-        rawRefId: contextShortRefId,
-        rawField: 'text',
-        truncated: contextShortTruncated
-      })
-    : `<div class="empty">SHORT контекст ещё не готов.</div>`;
-  contextEl.innerHTML = `
-      <div class="entry-header">
-        <h2>Контекст</h2>
-        <div class="status-row">
-          <div class="status-group">
-            <span class="status-label">SHORT</span>
-            ${renderStatusBadge(contextShortStatus)}
-          </div>
-          <div class="status-group">
-            <span class="status-label">FULL</span>
-            ${renderStatusBadge(contextFullStatus)}
-          </div>
-          <div class="context-actions">
-            <button class="action-button" type="button" data-action="clear-context">Сбросить</button>
-          </div>
-        </div>
-      </div>
-      <div class="context-body">
-        <div class="context-section">
-          <div class="label">SHORT контекст</div>
-          ${shortContextBody}
-        </div>
-        <details class="context-card context-card--full">
-          <summary>FULL контекст</summary>
-          <div class="details-content">
-            ${fullContextBody}
-          </div>
-        </details>
-      </div>
-    `;
+  patchContext(data);
 
   const items = Array.isArray(data.items) ? data.items : [];
   if (!items.length) {
     entriesEl.innerHTML = '<div class="empty">Нет данных о блоках перевода.</div>';
+    debugDomState.entriesByKey.clear();
+    restoreUiState();
     return;
   }
 
-  entriesEl.innerHTML = '';
+  if (!debugDomState.entriesByKey.size && entriesEl.querySelector('.entry') === null) {
+    entriesEl.innerHTML = '';
+  }
+  const liveKeys = new Set();
   items.forEach((item, index) => {
-    const entry = document.createElement('div');
-    entry.className = 'entry';
-    const translationStatus = normalizeStatus(item.translationStatus, item.translated);
-    const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
     const entryKey = getProofreadEntryKey(item, index);
-    const proofreadSection = renderProofreadSection(item, entryKey);
-    entry.innerHTML = `
-      <div class="entry-header">
-        <h2>Блок ${item.index || ''}</h2>
-        <div class="status-row">
-          <div class="status-group">
-            <span class="status-label">Перевод</span>
-            ${renderStatusBadge(translationStatus)}
-          </div>
-          <div class="status-group">
-            <span class="status-label">Вычитка</span>
-            ${renderStatusBadge(proofreadStatus)}
-          </div>
-        </div>
-      </div>
-      <div class="block">
-        <div class="label">Оригинал</div>
-        <pre>${escapeHtml(item.original || '')}</pre>
-      </div>
-      <div class="block">
-        <div class="label">Перевод</div>
-        ${
-          item.translated
-            ? `<pre>${escapeHtml(item.translated)}</pre>`
-            : `<div class="empty">Перевод ещё не получен.</div>`
-        }
-      </div>
-      <div class="block">
-        <details class="ai-response">
-          <summary>Ответ ИИ (перевод)</summary>
-          <div class="details-content">
-            ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
-              rawRefId: item?.translationRawRefId,
-              truncated: item?.translationRawTruncated
-            })}
-          </div>
-        </details>
-      </div>
-      ${proofreadSection}
-    `;
-    entriesEl.appendChild(entry);
+    const entry = ensureEntryContainer(entryKey);
+    entry.innerHTML = renderEntryHtml(item, entryKey);
+    liveKeys.add(entryKey);
   });
+  for (const [entryKey, entryEl] of debugDomState.entriesByKey.entries()) {
+    if (!liveKeys.has(entryKey)) {
+      entryEl.remove();
+      debugDomState.entriesByKey.delete(entryKey);
+    }
+  }
+  restoreUiState();
 }
 
 function renderSummary(data, fallbackMessage = '') {
@@ -528,6 +483,137 @@ function renderEvents(data) {
   `;
 }
 
+function ensureContextSkeleton() {
+  if (!contextEl || debugDomState.contextReady) return;
+  contextEl.innerHTML = `
+    <div class="entry-header">
+      <h2>Контекст</h2>
+      <div class="status-row">
+        <div class="status-group">
+          <span class="status-label">SHORT</span>
+          <span data-role="context-short-status"></span>
+        </div>
+        <div class="status-group">
+          <span class="status-label">FULL</span>
+          <span data-role="context-full-status"></span>
+        </div>
+        <div class="context-actions">
+          <button class="action-button" type="button" data-action="clear-context">Сбросить</button>
+        </div>
+      </div>
+    </div>
+    <div class="context-body">
+      <div class="context-section">
+        <div class="label">SHORT контекст</div>
+        <div data-role="context-short-body"></div>
+      </div>
+      <details class="context-card context-card--full" data-debug-key="context:full">
+        <summary>FULL контекст</summary>
+        <div class="details-content" data-role="context-full-body"></div>
+      </details>
+    </div>
+  `;
+  debugDomState.contextReady = true;
+}
+
+function patchContext(data) {
+  ensureContextSkeleton();
+  if (!contextEl) return;
+  const contextFullText = (data.contextFull || data.context || '').trim();
+  const contextShortText = (data.contextShort || '').trim();
+  const contextFullRefId = data.contextFullRefId || '';
+  const contextShortRefId = data.contextShortRefId || '';
+  const contextFullTruncated = Boolean(data.contextFullTruncated);
+  const contextShortTruncated = Boolean(data.contextShortTruncated);
+  const contextFullStatus = normalizeStatus(data.contextFullStatus || data.contextStatus, contextFullText);
+  const contextShortStatus = normalizeStatus(data.contextShortStatus, contextShortText);
+  const shortStatusEl = contextEl.querySelector('[data-role="context-short-status"]');
+  const fullStatusEl = contextEl.querySelector('[data-role="context-full-status"]');
+  if (shortStatusEl) {
+    shortStatusEl.innerHTML = renderStatusBadge(contextShortStatus);
+  }
+  if (fullStatusEl) {
+    fullStatusEl.innerHTML = renderStatusBadge(contextFullStatus);
+  }
+  const shortBodyEl = contextEl.querySelector('[data-role="context-short-body"]');
+  const fullBodyEl = contextEl.querySelector('[data-role="context-full-body"]');
+  const fullContextBody = contextFullText
+    ? renderInlineRaw(contextFullText, {
+        rawRefId: contextFullRefId,
+        rawField: 'text',
+        truncated: contextFullTruncated
+      })
+    : `<div class="empty">FULL контекст ещё не готов.</div>`;
+  const shortContextBody = contextShortText
+    ? renderInlineRaw(contextShortText, {
+        rawRefId: contextShortRefId,
+        rawField: 'text',
+        truncated: contextShortTruncated
+      })
+    : `<div class="empty">SHORT контекст ещё не готов.</div>`;
+  if (shortBodyEl) shortBodyEl.innerHTML = shortContextBody;
+  if (fullBodyEl) fullBodyEl.innerHTML = fullContextBody;
+}
+
+function ensureEntryContainer(entryKey) {
+  const existing = debugDomState.entriesByKey.get(entryKey);
+  if (existing) return existing;
+  const entry = document.createElement('div');
+  entry.className = 'entry';
+  entry.dataset.entryKey = entryKey;
+  entriesEl.appendChild(entry);
+  debugDomState.entriesByKey.set(entryKey, entry);
+  return entry;
+}
+
+function renderEntryHtml(item, entryKey) {
+  const translationStatus = normalizeStatus(item.translationStatus, item.translated);
+  const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
+  const proofreadSection = renderProofreadSection(item, entryKey);
+  const translateKey = `entry:${entryKey}:translate`;
+  const translateAiKey = `${translateKey}:ai`;
+  return `
+    <div class="entry-header">
+      <h2>Блок ${item.index || ''}</h2>
+      <div class="status-row">
+        <div class="status-group">
+          <span class="status-label">Перевод</span>
+          ${renderStatusBadge(translationStatus)}
+        </div>
+        <div class="status-group">
+          <span class="status-label">Вычитка</span>
+          ${renderStatusBadge(proofreadStatus)}
+        </div>
+      </div>
+    </div>
+    <div class="block">
+      <div class="label">Оригинал</div>
+      <pre>${escapeHtml(item.original || '')}</pre>
+    </div>
+    <div class="block">
+      <div class="label">Перевод</div>
+      ${
+        item.translated
+          ? `<pre>${escapeHtml(item.translated)}</pre>`
+          : `<div class="empty">Перевод ещё не получен.</div>`
+      }
+    </div>
+    <div class="block">
+      <details class="ai-response" data-debug-key="${escapeHtml(translateAiKey)}">
+        <summary>Ответ ИИ (перевод)</summary>
+        <div class="details-content">
+          ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
+            rawRefId: item?.translationRawRefId,
+            truncated: item?.translationRawTruncated,
+            baseKey: translateKey
+          })}
+        </div>
+      </details>
+    </div>
+    ${proofreadSection}
+  `;
+}
+
 function getOverallStatus({ completed, inProgress, failed, total, contextFullStatus, contextShortStatus }) {
   const hasFailedContext = contextFullStatus === 'failed' || contextShortStatus === 'failed';
   if (failed > 0 || hasFailedContext) return 'failed';
@@ -546,13 +632,14 @@ function getOverallStatus({ completed, inProgress, failed, total, contextFullSta
 
 function renderProofreadSection(item, entryKey) {
   if (item?.proofreadApplied === false) {
+    const proofreadAiKey = `entry:${entryKey}:proofread:ai`;
     return `
       <div class="block">
         <div class="label">Вычитка</div>
         <div class="empty">Вычитка выключена.</div>
       </div>
       <div class="block">
-        <details class="ai-response">
+        <details class="ai-response" data-debug-key="${escapeHtml(proofreadAiKey)}">
           <summary>Ответ ИИ (вычитка)</summary>
           <div class="details-content">
             <div class="empty">Вычитка выключена.</div>
@@ -631,12 +718,13 @@ function renderProofreadSection(item, entryKey) {
         ${proofreadBody}
       </div>
       <div class="block">
-        <details class="ai-response">
+        <details class="ai-response" data-debug-key="${escapeHtml(`entry:${entryKey}:proofread:ai`)}">
           <summary>Ответ ИИ (вычитка)</summary>
           <div class="details-content">
             ${renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD', {
               rawRefId: item?.proofreadRawRefId,
-              truncated: item?.proofreadRawTruncated
+              truncated: item?.proofreadRawTruncated,
+              baseKey: `entry:${entryKey}:proofread`
             })}
           </div>
         </details>
@@ -761,12 +849,11 @@ function renderDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta = {}) {
   if (!normalized.length) {
     return '<div class="empty">Ответ ИИ ещё не получен.</div>';
   }
-  return normalized
-    .map((payload, index) => renderDebugPayload(payload, index))
-    .join('');
+  const baseKey = fallbackMeta.baseKey || phase.toLowerCase();
+  return normalized.map((payload, index) => renderDebugPayload(payload, index, baseKey)).join('');
 }
 
-function renderDebugPayload(payload, index) {
+function renderDebugPayload(payload, index, baseKey) {
   const phase = payload?.phase || 'UNKNOWN';
   const model = payload?.model || '—';
   const tag = payload?.tag || '';
@@ -787,24 +874,28 @@ function renderDebugPayload(payload, index) {
   const contextMeta = contextLabel
     ? `<div class="debug-context">Context used: ${contextBadge}${baseBadge}</div>`
     : '';
+  const payloadKey = `${baseKey}:payload:${index}`;
   const contextSection = contextLabel
     ? renderDebugSection('Context text sent', payload?.contextTextSent, {
         rawRefId: payload?.rawRefId,
         rawField: 'contextTextSent',
-        truncated: payload?.contextTruncated
+        truncated: payload?.contextTruncated,
+        debugKey: `${payloadKey}:context`
       })
     : '';
   const requestSection = renderDebugSection('Request (raw)', payload?.request, {
     rawRefId: payload?.rawRefId,
     rawField: 'request',
-    truncated: payload?.requestTruncated
+    truncated: payload?.requestTruncated,
+    debugKey: `${payloadKey}:request`
   });
   const responseSection = renderDebugSection('Response (raw)', payload?.response, {
     rawRefId: payload?.rawRefId,
     rawField: 'response',
-    truncated: payload?.responseTruncated
+    truncated: payload?.responseTruncated,
+    debugKey: `${payloadKey}:response`
   });
-  const parseSection = renderDebugParseSection(payload?.parseIssues);
+  const parseSection = renderDebugParseSection(payload?.parseIssues, `${payloadKey}:parse`);
   const tagBadge = tag ? `<span class="debug-tag">${escapeHtml(tag)}</span>` : '';
   return `
     <div class="debug-payload">
@@ -837,6 +928,7 @@ function renderDebugSection(label, value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
   const isTruncated = Boolean(options.truncated);
+  const debugKey = options.debugKey ? ` data-debug-key="${escapeHtml(options.debugKey)}"` : '';
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
   const loadButton =
     rawRefId && isTruncated
@@ -845,7 +937,7 @@ function renderDebugSection(label, value, options = {}) {
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
   return `
-    <details class="debug-details">
+    <details class="debug-details"${debugKey}>
       <summary>${escapeHtml(label)}</summary>
       <div class="details-content">
         ${loadButton}
@@ -857,13 +949,14 @@ function renderDebugSection(label, value, options = {}) {
   `;
 }
 
-function renderDebugParseSection(parseIssues) {
+function renderDebugParseSection(parseIssues, debugKey = '') {
   const issues = Array.isArray(parseIssues) ? parseIssues.filter(Boolean) : [];
   const content = issues.length
     ? `<pre class="raw-response">${escapeHtml(issues.join('\n'))}</pre>`
     : `<div class="empty">Ошибок не обнаружено.</div>`;
+  const debugKeyAttr = debugKey ? ` data-debug-key="${escapeHtml(debugKey)}"` : '';
   return `
-    <details class="debug-details">
+    <details class="debug-details"${debugKeyAttr}>
       <summary>Parse/Validation</summary>
       <div class="details-content">
         ${content}
@@ -991,6 +1084,30 @@ function getProofreadEntryKey(item, index) {
   if (item?.id) return String(item.id);
   if (item?.index != null) return String(item.index);
   return `entry-${index}`;
+}
+
+function captureUiState() {
+  // Сохраняем раскрытые <details> по стабильным data-debug-key, чтобы вложенные секции не сбрасывались.
+  const openKeys = new Set();
+  document.querySelectorAll('details[open][data-debug-key]').forEach((details) => {
+    const key = details.getAttribute('data-debug-key');
+    if (key) openKeys.add(key);
+  });
+  debugUiState.openKeys = openKeys;
+  const scrollEl = document.scrollingElement;
+  debugUiState.scrollTop = scrollEl ? scrollEl.scrollTop : 0;
+}
+
+function restoreUiState() {
+  document.querySelectorAll('details[data-debug-key]').forEach((details) => {
+    const key = details.getAttribute('data-debug-key');
+    if (!key) return;
+    details.open = debugUiState.openKeys.has(key);
+  });
+  const scrollEl = document.scrollingElement;
+  if (scrollEl) {
+    scrollEl.scrollTop = debugUiState.scrollTop;
+  }
 }
 
 function getProofreadState(entryKey, defaultView) {
