@@ -79,6 +79,9 @@ const DEBUG_EVENTS_LIMIT = 200;
 const DEBUG_PAYLOADS_PER_ENTRY_LIMIT = 120;
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
 const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
+const BLOCK_KEY_ATTR = 'data-nt-block-key';
+const TRANSLATED_ATTR = 'data-nt-translated';
+const PROOFREAD_ATTR = 'data-nt-proofread';
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
   'gpt-4.1-mini': 200000,
@@ -435,7 +438,7 @@ function buildSettingsFromState(state) {
   };
 }
 
-async function startTranslation() {
+async function startTranslation(triggerSource = 'manual') {
   if (translationInProgress) {
     reportProgress('Перевод уже выполняется', translationProgress.completedBlocks, translationProgress.totalBlocks);
     return;
@@ -463,7 +466,7 @@ async function startTranslation() {
   translationInProgress = true;
   try {
     startRpcHeartbeat();
-    await translatePage(settings);
+    await translatePage(settings, { triggerSource });
   } finally {
     translationInProgress = false;
     stopRpcHeartbeat();
@@ -547,7 +550,83 @@ async function requestSettings() {
   }
 }
 
-async function translatePage(settings) {
+function createRequestId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function computeContextHash(contextText = '') {
+  if (!contextText) return 0;
+  return computeTextHash(contextText);
+}
+
+function deriveContextPolicy(contextMode, contextText, purpose) {
+  if (!contextText) {
+    return purpose && purpose !== 'main' ? 'minimal' : 'none';
+  }
+  if (contextMode === 'SHORT') return 'minimal';
+  return 'full';
+}
+
+function buildRequestMeta(base = {}, overrides = {}) {
+  const requestId = overrides.requestId || base.requestId || createRequestId();
+  const parentRequestId = overrides.parentRequestId || base.parentRequestId || '';
+  const blockKey = overrides.blockKey || base.blockKey || '';
+  const stage = overrides.stage || base.stage || '';
+  const purpose = overrides.purpose || base.purpose || 'main';
+  const attempt = Number.isFinite(overrides.attempt)
+    ? overrides.attempt
+    : Number.isFinite(base.attempt)
+      ? base.attempt
+      : 0;
+  const triggerSource = overrides.triggerSource || base.triggerSource || '';
+  const contextText = overrides.contextText ?? base.contextText ?? '';
+  const contextMode = overrides.contextMode || base.contextMode || '';
+  const contextPolicy = deriveContextPolicy(contextMode, contextText, purpose);
+  return {
+    requestId,
+    parentRequestId,
+    blockKey,
+    stage,
+    purpose,
+    attempt,
+    triggerSource,
+    contextMode: contextPolicy,
+    contextHash: computeContextHash(contextText),
+    contextLength: contextText ? contextText.length : 0
+  };
+}
+
+function annotateRequestMetadata(payloads, meta = {}) {
+  if (!Array.isArray(payloads) || !meta) return payloads;
+  return payloads.map((payload) => {
+    if (!payload || typeof payload !== 'object') return payload;
+    return {
+      ...payload,
+      requestId: payload.requestId || meta.requestId,
+      parentRequestId: payload.parentRequestId || meta.parentRequestId || '',
+      blockKey: payload.blockKey || meta.blockKey || '',
+      stage: payload.stage || meta.stage || '',
+      purpose: payload.purpose || meta.purpose || '',
+      attempt: Number.isFinite(payload.attempt) ? payload.attempt : meta.attempt,
+      triggerSource: payload.triggerSource || meta.triggerSource || '',
+      contextMode: payload.contextMode || meta.contextMode || '',
+      contextHash: payload.contextHash ?? meta.contextHash ?? null,
+      contextLength: payload.contextLength ?? meta.contextLength ?? null
+    };
+  });
+}
+
+function traceRequestInitiator(meta) {
+  if (!debugState) return;
+  console.debug('Neuro Translate request initiated', meta);
+  console.trace('Neuro Translate request trace');
+}
+
+async function translatePage(settings, options = {}) {
+  const translationTriggerSource = options?.triggerSource || 'manual';
   const textNodes = collectTextNodes(document.body);
   const existingDebugStore = await getTranslationDebugObject();
   const existingDebugEntry = existingDebugStore?.[location.href];
@@ -618,6 +697,25 @@ async function translatePage(settings) {
   const maxBlockLength = normalizeBlockLength(settings.blockLengthLimit, textStats.averageNodeLength);
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
   const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
+  // Stable block key prevents duplicate jobs when the same block is rescanned.
+  const getBlockKey = (block) => {
+    const blockElement = block?.[0]?.blockElement;
+    const existing = blockElement?.getAttribute?.(BLOCK_KEY_ATTR);
+    if (existing) return existing;
+    const anchorPath = blockElement ? JSON.stringify(getNodePath(blockElement)) : 'no-anchor';
+    const signature = block
+      .map(({ path, original, originalHash }) => {
+        const hashValue = getOriginalHash(original, originalHash);
+        return `${JSON.stringify(path)}::${original}::${hashValue ?? 'nohash'}`;
+      })
+      .join('||');
+    const blockKey = `block_${computeTextHash(`${anchorPath}::${signature}`)}`;
+    if (blockElement?.setAttribute) {
+      blockElement.setAttribute(BLOCK_KEY_ATTR, blockKey);
+    }
+    return blockKey;
+  };
+  const blockKeys = blocks.map((block) => getBlockKey(block));
   translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
   const initialContextFullStatus = settings.contextGenerationEnabled
     ? latestContextSummary
@@ -634,7 +732,7 @@ async function translatePage(settings) {
     initialContextFullStatus,
     initialContextShort: latestShortContextSummary || existingContextShortPreview,
     initialContextShortStatus
-  });
+  }, { blockKeys });
   if (latestContextSummary) {
     await updateDebugContextFull(latestContextSummary, 'done');
   }
@@ -747,7 +845,8 @@ async function translatePage(settings) {
         baseAnswer: '',
         baseAnswerIncluded: false,
         baseAnswerPreview: '',
-        tag: kind === 'proofread' ? CALL_TAGS.PROOFREAD_BASE_FULL : CALL_TAGS.TRANSLATE_BASE_FULL
+        tag: kind === 'proofread' ? CALL_TAGS.PROOFREAD_BASE_FULL : CALL_TAGS.TRANSLATE_BASE_FULL,
+        attemptIndex: 0
       };
     }
     const attemptKey = kind === 'proofread' ? 'proofreadAttemptCount' : 'translateAttemptCount';
@@ -789,7 +888,8 @@ async function translatePage(settings) {
       baseAnswer,
       baseAnswerIncluded,
       baseAnswerPreview,
-      tag
+      tag,
+      attemptIndex: attemptCount
     };
   };
 
@@ -803,27 +903,57 @@ async function translatePage(settings) {
   const translationQueueKeys = new Set();
   const proofreadQueueKeys = new Set();
   let proofreadConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(4, blocks.length));
+  // Duplicate translate/proofread requests could be triggered for the same block; dedupe by jobKey.
+  const jobInFlight = new Map();
+  const jobCompleted = new Map();
 
-  const getBlockKey = (block) =>
-    block
-      .map(({ path, original, originalHash }) => {
-        const hashValue = getOriginalHash(original, originalHash);
-        return `${JSON.stringify(path)}::${original}::${hashValue ?? 'nohash'}`;
+  const isBlockProcessed = (blockElement, stage) => {
+    if (!blockElement?.getAttribute) return false;
+    const attr = stage === 'proofread' ? PROOFREAD_ATTR : TRANSLATED_ATTR;
+    return blockElement.getAttribute(attr) === debugSessionId;
+  };
+
+  const markBlockProcessed = (blockElement, stage) => {
+    if (!blockElement?.setAttribute) return;
+    const attr = stage === 'proofread' ? PROOFREAD_ATTR : TRANSLATED_ATTR;
+    blockElement.setAttribute(attr, debugSessionId);
+  };
+
+  const runJobOnce = (jobKey, execute, isValid) => {
+    if (jobCompleted.has(jobKey)) {
+      return Promise.resolve(jobCompleted.get(jobKey));
+    }
+    if (jobInFlight.has(jobKey)) {
+      return jobInFlight.get(jobKey);
+    }
+    const promise = Promise.resolve()
+      .then(() => execute())
+      .then((result) => {
+        if (isValid?.(result)) {
+          jobCompleted.set(jobKey, result);
+        }
+        return result;
       })
-      .join('||');
+      .finally(() => {
+        jobInFlight.delete(jobKey);
+      });
+    jobInFlight.set(jobKey, promise);
+    return promise;
+  };
 
   const enqueueTranslationBlock = (block, index) => {
     const key = getBlockKey(block);
-    if (translationQueueKeys.has(key)) {
+    const blockElement = block?.[0]?.blockElement;
+    if (translationQueueKeys.has(key) || isBlockProcessed(blockElement, 'translate')) {
       return false;
     }
     translationQueueKeys.add(key);
-    translationQueue.push({ block, index, key });
+    translationQueue.push({ block, index, key, blockElement });
     return true;
   };
 
   const enqueueProofreadTask = (task) => {
-    if (!task?.key || proofreadQueueKeys.has(task.key)) {
+    if (!task?.key || proofreadQueueKeys.has(task.key) || isBlockProcessed(task.blockElement, 'proofread')) {
       return false;
     }
     proofreadQueueKeys.add(task.key);
@@ -857,19 +987,38 @@ async function translatePage(settings) {
         const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
         const debugEntry = debugEntries.find((item) => item.index === currentIndex + 1);
         const primaryContext = await selectContextForBlock(debugEntry, 'translation');
-        let result = await translate(
-          uniqueTexts,
-          settings.targetLanguage || 'ru',
-          {
-            contextText: primaryContext.contextText,
-            contextMode: primaryContext.contextMode,
-            baseAnswer: primaryContext.baseAnswer,
-            baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-            baseAnswerPreview: primaryContext.baseAnswerPreview,
-            tag: primaryContext.tag
-          },
-          keepPunctuationTokens,
-          currentIndex + 1
+        const baseRequestMeta = {
+          blockKey: queuedItem.key,
+          stage: 'translate',
+          purpose: 'main',
+          attempt: primaryContext.attemptIndex,
+          triggerSource: translationTriggerSource
+        };
+        const mainRequestMeta = buildRequestMeta(baseRequestMeta, {
+          contextText: primaryContext.contextText,
+          contextMode: primaryContext.contextMode
+        });
+        traceRequestInitiator(mainRequestMeta);
+        const translateJobKey = `${queuedItem.key}:translate`;
+        let result = await runJobOnce(
+          translateJobKey,
+          () =>
+            translate(
+              uniqueTexts,
+              settings.targetLanguage || 'ru',
+              {
+                contextText: primaryContext.contextText,
+                contextMode: primaryContext.contextMode,
+                baseAnswer: primaryContext.baseAnswer,
+                baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+                baseAnswerPreview: primaryContext.baseAnswerPreview,
+                tag: primaryContext.tag
+              },
+              keepPunctuationTokens,
+              currentIndex + 1,
+              mainRequestMeta
+            ),
+          (resolved) => resolved?.success
         );
         if (!result?.success && result?.contextOverflow && primaryContext.contextMode === 'FULL') {
           appendDebugPayload(
@@ -882,23 +1031,40 @@ async function translatePage(settings) {
               contextMode: primaryContext.contextMode,
               contextTextSent: primaryContext.contextText,
               baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-              tag: primaryContext.tag
+              tag: primaryContext.tag,
+              requestMeta: mainRequestMeta
             })
           );
           const fallbackContext = await selectContextForBlock(debugEntry, 'translation', { forceShort: true });
-          result = await translate(
-            uniqueTexts,
-            settings.targetLanguage || 'ru',
-            {
-              contextText: fallbackContext.contextText,
-              contextMode: fallbackContext.contextMode,
-              baseAnswer: fallbackContext.baseAnswer,
-              baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-              baseAnswerPreview: fallbackContext.baseAnswerPreview,
-              tag: fallbackContext.tag
-            },
-            keepPunctuationTokens,
-            currentIndex + 1
+          const retryRequestMeta = buildRequestMeta(baseRequestMeta, {
+            requestId: createRequestId(),
+            parentRequestId: mainRequestMeta.requestId,
+            purpose: 'retry',
+            attempt: fallbackContext.attemptIndex,
+            triggerSource: 'retry',
+            contextText: fallbackContext.contextText,
+            contextMode: fallbackContext.contextMode
+          });
+          traceRequestInitiator(retryRequestMeta);
+          result = await runJobOnce(
+            translateJobKey,
+            () =>
+              translate(
+                uniqueTexts,
+                settings.targetLanguage || 'ru',
+                {
+                  contextText: fallbackContext.contextText,
+                  contextMode: fallbackContext.contextMode,
+                  baseAnswer: fallbackContext.baseAnswer,
+                  baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
+                  baseAnswerPreview: fallbackContext.baseAnswerPreview,
+                  tag: fallbackContext.tag
+                },
+                keepPunctuationTokens,
+                currentIndex + 1,
+                retryRequestMeta
+              ),
+            (resolved) => resolved?.success
           );
         }
         if (!result?.success) {
@@ -938,6 +1104,7 @@ async function translatePage(settings) {
           blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
+        markBlockProcessed(queuedItem.blockElement, 'translate');
         const baseTranslationAnswer =
           primaryContext.contextMode === 'FULL' && debugEntry && !debugEntry.translationBaseFullAnswer
             ? formatBlockText(finalTranslations)
@@ -978,6 +1145,7 @@ async function translatePage(settings) {
               block,
               index: currentIndex,
               key: queuedItem.key,
+              blockElement: queuedItem.blockElement,
               translatedTexts,
               originalTexts: block.map(({ original }) => original),
               proofreadSegments,
@@ -1035,22 +1203,41 @@ async function translatePage(settings) {
         const followupTag =
           task.proofreadMode === 'NOISE_CLEANUP' ? CALL_TAGS.PROOFREAD_NOISE_SHORT : CALL_TAGS.PROOFREAD_REWRITE_SHORT;
         const primaryContext = await selectContextForBlock(debugEntry, 'proofread', { followupTag });
-        let proofreadResult = await requestProofreading({
-          segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
-          sourceBlock: formatBlockText(task.originalTexts),
-          translatedBlock: formatBlockText(task.translatedTexts),
-          proofreadMode: task.proofreadMode,
-          contextMeta: {
-            contextText: primaryContext.contextText,
-            contextMode: primaryContext.contextMode,
-            baseAnswer: primaryContext.baseAnswer,
-            baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-            baseAnswerPreview: primaryContext.baseAnswerPreview,
-            tag: primaryContext.tag
-          },
-          language: settings.targetLanguage || 'ru',
-          debugEntryIndex: task.index + 1
+        const baseRequestMeta = {
+          blockKey: task.key,
+          stage: 'proofread',
+          purpose: 'main',
+          attempt: primaryContext.attemptIndex,
+          triggerSource: translationTriggerSource
+        };
+        const mainRequestMeta = buildRequestMeta(baseRequestMeta, {
+          contextText: primaryContext.contextText,
+          contextMode: primaryContext.contextMode
         });
+        traceRequestInitiator(mainRequestMeta);
+        const proofreadJobKey = `${task.key}:proofread`;
+        let proofreadResult = await runJobOnce(
+          proofreadJobKey,
+          () =>
+            requestProofreading({
+              segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
+              sourceBlock: formatBlockText(task.originalTexts),
+              translatedBlock: formatBlockText(task.translatedTexts),
+              proofreadMode: task.proofreadMode,
+              contextMeta: {
+                contextText: primaryContext.contextText,
+                contextMode: primaryContext.contextMode,
+                baseAnswer: primaryContext.baseAnswer,
+                baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+                baseAnswerPreview: primaryContext.baseAnswerPreview,
+                tag: primaryContext.tag
+              },
+              language: settings.targetLanguage || 'ru',
+              debugEntryIndex: task.index + 1,
+              requestMeta: mainRequestMeta
+            }),
+          (resolved) => resolved?.success
+        );
         if (!proofreadResult?.success && proofreadResult?.contextOverflow && primaryContext.contextMode === 'FULL') {
           appendDebugPayload(
             task.index + 1,
@@ -1062,29 +1249,46 @@ async function translatePage(settings) {
               contextMode: primaryContext.contextMode,
               contextTextSent: primaryContext.contextText,
               baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-              tag: primaryContext.tag
+              tag: primaryContext.tag,
+              requestMeta: mainRequestMeta
             })
           );
           const fallbackContext = await selectContextForBlock(debugEntry, 'proofread', {
             forceShort: true,
             followupTag
           });
-          proofreadResult = await requestProofreading({
-            segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
-            sourceBlock: formatBlockText(task.originalTexts),
-            translatedBlock: formatBlockText(task.translatedTexts),
-            proofreadMode: task.proofreadMode,
-            contextMeta: {
-              contextText: fallbackContext.contextText,
-              contextMode: fallbackContext.contextMode,
-              baseAnswer: fallbackContext.baseAnswer,
-              baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-              baseAnswerPreview: fallbackContext.baseAnswerPreview,
-              tag: fallbackContext.tag
-            },
-            language: settings.targetLanguage || 'ru',
-            debugEntryIndex: task.index + 1
+          const retryRequestMeta = buildRequestMeta(baseRequestMeta, {
+            requestId: createRequestId(),
+            parentRequestId: mainRequestMeta.requestId,
+            purpose: 'retry',
+            attempt: fallbackContext.attemptIndex,
+            triggerSource: 'retry',
+            contextText: fallbackContext.contextText,
+            contextMode: fallbackContext.contextMode
           });
+          traceRequestInitiator(retryRequestMeta);
+          proofreadResult = await runJobOnce(
+            proofreadJobKey,
+            () =>
+              requestProofreading({
+                segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
+                sourceBlock: formatBlockText(task.originalTexts),
+                translatedBlock: formatBlockText(task.translatedTexts),
+                proofreadMode: task.proofreadMode,
+                contextMeta: {
+                  contextText: fallbackContext.contextText,
+                  contextMode: fallbackContext.contextMode,
+                  baseAnswer: fallbackContext.baseAnswer,
+                  baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
+                  baseAnswerPreview: fallbackContext.baseAnswerPreview,
+                  tag: fallbackContext.tag
+                },
+                language: settings.targetLanguage || 'ru',
+                debugEntryIndex: task.index + 1,
+                requestMeta: retryRequestMeta
+              }),
+            (resolved) => resolved?.success
+          );
         }
         if (!proofreadResult?.success) {
           throw new Error(proofreadResult?.error || 'Не удалось выполнить вычитку.');
@@ -1127,6 +1331,7 @@ async function translatePage(settings) {
         }
 
         updatePageWithProofreading(task, finalTranslations);
+        markBlockProcessed(task.blockElement, 'proofread');
 
         const rawProofreadPayload = proofreadResult.rawProofread || '';
         const rawProofread =
@@ -1308,7 +1513,14 @@ async function translatePage(settings) {
   await saveTranslationsToMemory(activeTranslationEntries);
 }
 
-async function translate(texts, targetLanguage, contextMeta, keepPunctuationTokens = false, debugEntryIndex = null) {
+async function translate(
+  texts,
+  targetLanguage,
+  contextMeta,
+  keepPunctuationTokens = false,
+  debugEntryIndex = null,
+  requestMeta = null
+) {
   const resolvedContextMeta =
     contextMeta && typeof contextMeta === 'object'
       ? contextMeta
@@ -1331,10 +1543,17 @@ async function translate(texts, targetLanguage, contextMeta, keepPunctuationToke
   const translations = [];
   const rawParts = [];
   const debugParts = [];
+  const baseRequestMeta = requestMeta && typeof requestMeta === 'object' ? requestMeta : null;
 
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
     const batchContext = index === 0 ? context : '';
+    const batchRequestMeta = baseRequestMeta
+      ? buildRequestMeta(baseRequestMeta, {
+          contextText: batchContext,
+          contextMode: resolvedContextMeta.contextMode
+        })
+      : null;
     const estimatedTokens = estimateTokensForRole('translation', {
       texts: batch,
       context: [batchContext, baseAnswer].filter(Boolean).join('\n')
@@ -1354,7 +1573,8 @@ async function translate(texts, targetLanguage, contextMeta, keepPunctuationToke
               baseAnswer,
               baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded
             },
-            keepPunctuationTokens
+            keepPunctuationTokens,
+            requestMeta: batchRequestMeta || undefined
           },
           'Не удалось выполнить перевод.'
         );
@@ -1395,7 +1615,8 @@ async function translate(texts, targetLanguage, contextMeta, keepPunctuationToke
         contextTextSent: batchContext,
         tag: resolvedContextMeta.tag
       });
-      const summarized = await summarizeDebugPayloads(annotated, {
+      const withRequestMeta = annotateRequestMetadata(annotated, batchRequestMeta);
+      const summarized = await summarizeDebugPayloads(withRequestMeta, {
         entryIndex: debugEntryIndex,
         stage: 'translation'
       });
@@ -1432,6 +1653,14 @@ async function requestProofreading(payload) {
         };
   const context = contextMeta.contextText || '';
   const baseAnswer = contextMeta.baseAnswerIncluded ? contextMeta.baseAnswer || '' : '';
+  const requestMeta =
+    payload?.requestMeta && typeof payload.requestMeta === 'object' ? payload.requestMeta : null;
+  const resolvedRequestMeta = requestMeta
+    ? buildRequestMeta(requestMeta, {
+        contextText: context,
+        contextMode: contextMeta.contextMode
+      })
+    : null;
   const estimatedTokens = estimateTokensForRole('proofread', {
     texts: segmentTexts,
     context: [context, baseAnswer].filter(Boolean).join('\n'),
@@ -1454,7 +1683,8 @@ async function requestProofreading(payload) {
             baseAnswer,
             baseAnswerIncluded: contextMeta.baseAnswerIncluded
           },
-          language: payload?.language || ''
+          language: payload?.language || '',
+          requestMeta: resolvedRequestMeta || undefined
         },
         'Не удалось выполнить вычитку.'
       );
@@ -1475,7 +1705,8 @@ async function requestProofreading(payload) {
         contextTextSent: context,
         tag: contextMeta.tag
       });
-      const summarized = await summarizeDebugPayloads(annotated, {
+      const withRequestMeta = annotateRequestMetadata(annotated, resolvedRequestMeta);
+      const summarized = await summarizeDebugPayloads(withRequestMeta, {
         entryIndex: payload?.debugEntryIndex,
         stage: 'proofreading'
       });
@@ -2451,9 +2682,16 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
 function annotateContextUsage(payloads, { contextMode, baseAnswerIncluded, baseAnswerPreview, contextTextSent, tag }) {
   return (Array.isArray(payloads) ? payloads : []).map((payload) => {
     if (!payload || typeof payload !== 'object') return payload;
+    const existingContextMode = payload.contextMode;
+    const contextTypeUsed =
+      payload.contextTypeUsed ||
+      (typeof existingContextMode === 'string' && ['FULL', 'SHORT'].includes(existingContextMode.toUpperCase())
+        ? existingContextMode
+        : '') ||
+      contextMode;
     return {
       ...payload,
-      contextMode: payload.contextMode || contextMode,
+      contextTypeUsed,
       baseAnswerIncluded: payload.baseAnswerIncluded ?? baseAnswerIncluded,
       baseAnswerPreview: payload.baseAnswerPreview ?? baseAnswerPreview,
       contextTextSent: payload.contextTextSent ?? contextTextSent,
@@ -2462,8 +2700,17 @@ function annotateContextUsage(payloads, { contextMode, baseAnswerIncluded, baseA
   });
 }
 
-function buildContextOverflowDebugPayload({ phase, model, errorMessage, contextMode, contextTextSent, baseAnswerIncluded, tag }) {
-  return {
+function buildContextOverflowDebugPayload({
+  phase,
+  model,
+  errorMessage,
+  contextMode,
+  contextTextSent,
+  baseAnswerIncluded,
+  tag,
+  requestMeta
+}) {
+  const payload = {
     phase,
     model: model || '—',
     latencyMs: null,
@@ -2473,11 +2720,13 @@ function buildContextOverflowDebugPayload({ phase, model, errorMessage, contextM
     request: null,
     response: errorMessage || 'fullContext overflow/error',
     parseIssues: ['fullContext overflow/error'],
-    contextMode,
+    contextTypeUsed: contextMode,
     baseAnswerIncluded,
     contextTextSent,
     tag
   };
+  const [annotated] = annotateRequestMetadata([payload], requestMeta || {});
+  return annotated || payload;
 }
 
 async function createDebugPayloadSummary(payload, options = {}) {
@@ -2873,9 +3122,10 @@ async function resetTranslationDebugInfo(url) {
   }
 }
 
-async function initializeDebugState(blocks, settings = {}, initial = {}) {
+async function initializeDebugState(blocks, settings = {}, initial = {}, options = {}) {
   const proofreadEnabled = Boolean(settings.proofreadEnabled);
   debugSessionId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const blockKeys = Array.isArray(options?.blockKeys) ? options.blockKeys : [];
   const initialContextFull = typeof initial.initialContextFull === 'string' ? initial.initialContextFull : '';
   const initialContextShort = typeof initial.initialContextShort === 'string' ? initial.initialContextShort : '';
   const initialContextFullStatus =
@@ -2886,6 +3136,7 @@ async function initializeDebugState(blocks, settings = {}, initial = {}) {
     (settings.contextGenerationEnabled ? 'pending' : 'disabled');
   debugEntries = blocks.map((block, index) => ({
     index: index + 1,
+    blockKey: blockKeys[index] || '',
     original: formatBlockText(block.map(({ original }) => original)),
     originalSegments: block.map(({ original }) => original),
     translated: '',
@@ -3136,13 +3387,18 @@ function appendCallRecord(index, stage, payload) {
   const currentCount = Number.isFinite(entry[counterKey]) ? entry[counterKey] : 0;
   const callId = currentCount + 1;
   entry[counterKey] = callId;
+  const contextTypeUsed =
+    payload?.contextTypeUsed ||
+    (typeof payload?.contextMode === 'string' && ['FULL', 'SHORT'].includes(payload.contextMode.toUpperCase())
+      ? payload.contextMode
+      : 'FULL');
   const record = {
     id: callId,
     stage: stage === 'proofreading' ? 'proofreading' : 'translation',
     attemptIndex: callId,
     timestamp: Date.now(),
     tag: payload?.tag || '',
-    contextMode: payload?.contextMode || 'FULL',
+    contextMode: contextTypeUsed,
     baseAnswerIncluded: Boolean(payload?.baseAnswerIncluded),
     baseAnswerPreview: payload?.baseAnswerPreview || '',
     rawRefId: payload?.rawRefId || ''

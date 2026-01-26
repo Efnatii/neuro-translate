@@ -43,6 +43,83 @@ function normalizeContextPayload(context) {
   return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
 }
 
+function createRequestId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function computeTextHash(text = '') {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) + hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash >>> 0;
+}
+
+function normalizeRequestMeta(meta = {}, overrides = {}) {
+  const merged = { ...(meta || {}), ...(overrides || {}) };
+  return {
+    requestId: merged.requestId || createRequestId(),
+    parentRequestId: merged.parentRequestId || '',
+    blockKey: merged.blockKey || '',
+    stage: merged.stage || '',
+    purpose: merged.purpose || 'main',
+    attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
+    triggerSource: merged.triggerSource || '',
+    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry)
+  };
+}
+
+function resolveContextPolicy(contextPayload, purpose) {
+  const normalized = normalizeContextPayload(contextPayload);
+  if (!normalized.text) {
+    return purpose && purpose !== 'main' ? 'minimal' : 'none';
+  }
+  if (normalized.mode === 'SHORT') return 'minimal';
+  return 'full';
+}
+
+function getRetryContextPayload(contextPayload, requestMeta) {
+  if (requestMeta?.forceFullContextOnRetry) {
+    return normalizeContextPayload(contextPayload);
+  }
+  return { text: '', mode: 'NONE', baseAnswer: '', baseAnswerIncluded: false };
+}
+
+function attachRequestMeta(payload, requestMeta, contextPayload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const contextText = contextPayload?.text || '';
+  return {
+    ...payload,
+    requestId: payload.requestId || requestMeta.requestId,
+    parentRequestId: payload.parentRequestId || requestMeta.parentRequestId || '',
+    blockKey: payload.blockKey || requestMeta.blockKey || '',
+    stage: payload.stage || requestMeta.stage || '',
+    purpose: payload.purpose || requestMeta.purpose || '',
+    attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
+    triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
+    contextMode: payload.contextMode || resolveContextPolicy(contextPayload, requestMeta.purpose),
+    contextHash: payload.contextHash ?? (contextText ? computeTextHash(contextText) : 0),
+    contextLength: payload.contextLength ?? (contextText ? contextText.length : 0)
+  };
+}
+
+function createChildRequestMeta(baseMeta, overrides = {}) {
+  const parentRequestId = overrides.parentRequestId || baseMeta?.requestId || '';
+  return normalizeRequestMeta(
+    {
+      ...(baseMeta || {}),
+      ...overrides,
+      parentRequestId,
+      requestId: overrides.requestId || ''
+    },
+    { stage: baseMeta?.stage }
+  );
+}
+
 function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const items = Array.isArray(input?.items) ? input.items : [];
   const sourceBlock = input?.sourceBlock ?? '';
@@ -127,17 +204,22 @@ async function proofreadTranslation(
   language,
   apiKey,
   model,
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  requestMeta = null
 ) {
   if (!Array.isArray(segments) || !segments.length) {
     return { translations: [], rawProofread: '' };
   }
 
+  const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'main' });
   const { items, originalById } = normalizeProofreadSegments(segments);
   const chunks = chunkProofreadItems(items);
   const revisionsById = new Map();
   const rawProofreadParts = [];
   const debugPayloads = [];
+  const normalizedContext = normalizeContextPayload(context);
+  // Proofread retries are distinct LLM calls; avoid full context unless explicitly forced.
+  const retryContextPayload = getRetryContextPayload(normalizedContext, baseRequestMeta);
   const appendParseIssue = (issue) => {
     if (!issue) return;
     const last = debugPayloads[debugPayloads.length - 1];
@@ -148,28 +230,34 @@ async function proofreadTranslation(
       last.parseIssues.push(issue);
       return;
     }
-    debugPayloads.push({
-      phase: 'PROOFREAD',
-      model,
-      latencyMs: null,
-      usage: null,
-      inputChars: null,
-      outputChars: null,
-      request: null,
-      response: null,
-      parseIssues: [issue]
-    });
+    debugPayloads.push(
+      attachRequestMeta(
+        {
+          phase: 'PROOFREAD',
+          model,
+          latencyMs: null,
+          usage: null,
+          inputChars: null,
+          outputChars: null,
+          request: null,
+          response: null,
+          parseIssues: [issue]
+        },
+        baseRequestMeta,
+        normalizedContext
+      )
+    );
   };
 
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
     let result = await requestProofreadChunk(
       chunk,
-      { sourceBlock, translatedBlock, context, language, proofreadMode },
+      { sourceBlock, translatedBlock, context: normalizedContext, language, proofreadMode },
       apiKey,
       model,
       apiBaseUrl,
-      { strict: false }
+      { strict: false, requestMeta: baseRequestMeta, purpose: 'main' }
     );
     rawProofreadParts.push(result.rawProofread);
     if (Array.isArray(result.debug)) {
@@ -186,11 +274,19 @@ async function proofreadTranslation(
       appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
-        { sourceBlock, translatedBlock, context, language, proofreadMode },
+        { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
         apiKey,
         model,
         apiBaseUrl,
-        { strict: true }
+        {
+          strict: true,
+          requestMeta: createChildRequestMeta(baseRequestMeta, {
+            purpose: 'retry',
+            attempt: baseRequestMeta.attempt + 1,
+            triggerSource: 'retry'
+          }),
+          purpose: 'retry'
+        }
       );
       rawProofreadParts.push(result.rawProofread);
       if (Array.isArray(result.debug)) {
@@ -210,14 +306,20 @@ async function proofreadTranslation(
       appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
-        { sourceBlock, translatedBlock, context, language, proofreadMode },
+        { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
         apiKey,
         model,
         apiBaseUrl,
         {
           strict: true,
           maxTokensOverride: 1.5,
-          extraReminder: 'Return every input id exactly once. Do not omit any ids.'
+          extraReminder: 'Return every input id exactly once. Do not omit any ids.',
+          requestMeta: createChildRequestMeta(baseRequestMeta, {
+            purpose: 'retry',
+            attempt: baseRequestMeta.attempt + 2,
+            triggerSource: 'retry'
+          }),
+          purpose: 'retry'
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -239,11 +341,19 @@ async function proofreadTranslation(
       for (const item of chunk) {
         const singleResult = await requestProofreadChunk(
           [item],
-          { sourceBlock, translatedBlock, context, language, proofreadMode },
+          { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
           apiKey,
           model,
           apiBaseUrl,
-          { strict: true }
+          {
+            strict: true,
+            requestMeta: createChildRequestMeta(baseRequestMeta, {
+              purpose: 'retry',
+              attempt: baseRequestMeta.attempt + 3,
+              triggerSource: 'retry'
+            }),
+            purpose: 'retry'
+          }
         );
         rawProofreadParts.push(singleResult.rawProofread);
         if (Array.isArray(singleResult.debug)) {
@@ -290,7 +400,8 @@ async function proofreadTranslation(
     model,
     apiBaseUrl,
     language,
-    debugPayloads
+    debugPayloads,
+    baseRequestMeta
   );
 
   const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
@@ -532,13 +643,22 @@ function buildProofreadBodyPreview(payload, maxLength = 800) {
 
 async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
   const { strict = false, maxTokensOverride = null, extraReminder = '' } = options;
+  const requestMeta = normalizeRequestMeta(options.requestMeta, {
+    stage: 'proofread',
+    purpose: options.purpose || 'main'
+  });
+  const normalizedContext = normalizeContextPayload(metadata?.context);
+  const effectiveContext =
+    requestMeta.purpose !== 'main' && !requestMeta.forceFullContextOnRetry
+      ? getRetryContextPayload(normalizedContext, requestMeta)
+      : normalizedContext;
   const prompt = applyPromptCaching(
     buildProofreadPrompt(
       {
         items,
         sourceBlock: metadata?.sourceBlock,
         translatedBlock: metadata?.translatedBlock,
-        context: metadata?.context,
+        context: effectiveContext,
         language: metadata?.language,
         proofreadMode: metadata?.proofreadMode
       },
@@ -550,7 +670,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const itemsChars = items.reduce((sum, item) => sum + (item?.text?.length || 0), 0);
   const inputChars =
     itemsChars +
-    (metadata?.context?.length || 0) +
+    (effectiveContext?.text?.length || 0) +
     (metadata?.sourceBlock?.length || 0) +
     (metadata?.translatedBlock?.length || 0);
   const approxOut =
@@ -656,21 +776,25 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       error.retryAfterMs = retryAfterMs;
       error.isRateLimit = response.status === 429 || response.status === 503;
       error.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
-      error.debugPayload = {
-        phase: 'PROOFREAD',
-        model,
-        latencyMs: Date.now() - startedAt,
-        usage: null,
-        inputChars,
-        outputChars: 0,
-        request: requestPayload,
-        response: {
-          status: response.status,
-          statusText: response.statusText,
-          error: errorMessage
+      error.debugPayload = attachRequestMeta(
+        {
+          phase: 'PROOFREAD',
+          model,
+          latencyMs: Date.now() - startedAt,
+          usage: null,
+          inputChars,
+          outputChars: 0,
+          request: requestPayload,
+          response: {
+            status: response.status,
+            statusText: response.statusText,
+            error: errorMessage
+          },
+          parseIssues: ['request-failed']
         },
-        parseIssues: ['request-failed']
-      };
+        requestMeta,
+        effectiveContext
+      );
       throw error;
     }
   }
@@ -680,24 +804,28 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   if (!content) {
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
-    const emptyDebugPayload = {
-      phase: 'PROOFREAD',
-      model,
-      latencyMs,
-      usage,
-      inputChars,
-      outputChars: 0,
-      request: requestPayload,
-      response: {
-        id: data?.id ?? null,
-        status: response.status,
-        statusText: response.statusText,
-        model: data?.model ?? model,
-        emptyContent: true,
-        bodyPreview: buildProofreadBodyPreview(data)
+    const emptyDebugPayload = attachRequestMeta(
+      {
+        phase: 'PROOFREAD',
+        model,
+        latencyMs,
+        usage,
+        inputChars,
+        outputChars: 0,
+        request: requestPayload,
+        response: {
+          id: data?.id ?? null,
+          status: response.status,
+          statusText: response.statusText,
+          model: data?.model ?? model,
+          emptyContent: true,
+          bodyPreview: buildProofreadBodyPreview(data)
+        },
+        parseIssues: ['no-content', 'api-empty-content']
       },
-      parseIssues: ['no-content', 'api-empty-content']
-    };
+      requestMeta,
+      effectiveContext
+    );
     const rawProofread =
       '[no-content] Модель вернула пустой message.content. Проверь модель/response_format. См. debug.';
     return {
@@ -709,17 +837,21 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const debugPayload = {
-    phase: 'PROOFREAD',
-    model,
-    latencyMs,
-    usage,
-    inputChars,
-    outputChars: content?.length || 0,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
+  const debugPayload = attachRequestMeta(
+    {
+      phase: 'PROOFREAD',
+      model,
+      latencyMs,
+      usage,
+      inputChars,
+      outputChars: content?.length || 0,
+      request: requestPayload,
+      response: content,
+      parseIssues: []
+    },
+    requestMeta,
+    effectiveContext
+  );
   const debugPayloads = [debugPayload];
 
   let parsed = null;
@@ -739,7 +871,12 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       items,
       apiKey,
       model,
-      apiBaseUrl
+      apiBaseUrl,
+      createChildRequestMeta(requestMeta, {
+        purpose: 'validate',
+        attempt: requestMeta.attempt + 1,
+        triggerSource: 'validate'
+      })
     );
     rawProofread = repaired.rawProofread;
     if (Array.isArray(repaired.debug)) {
@@ -760,7 +897,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   return { itemsById, rawProofread, parseError, debug: debugPayloads };
 }
 
-async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, apiBaseUrl) {
+async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, apiBaseUrl, requestMeta = null) {
+  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' });
   const prompt = applyPromptCaching([
     {
       role: 'system',
@@ -831,17 +969,21 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   const content = data?.choices?.[0]?.message?.content || '';
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const debugPayload = {
-    phase: 'PROOFREAD_FORMAT_REPAIR',
-    model,
-    latencyMs,
-    usage,
-    inputChars: rawResponse?.length || 0,
-    outputChars: content?.length || 0,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
+  const debugPayload = attachRequestMeta(
+    {
+      phase: 'PROOFREAD_FORMAT_REPAIR',
+      model,
+      latencyMs,
+      usage,
+      inputChars: rawResponse?.length || 0,
+      outputChars: content?.length || 0,
+      request: requestPayload,
+      response: content,
+      parseIssues: []
+    },
+    normalizedRequestMeta,
+    { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false }
+  );
 
   let parsed = null;
   let parseError = null;
@@ -868,7 +1010,8 @@ async function repairProofreadSegments(
   model,
   apiBaseUrl,
   language,
-  debugPayloads
+  debugPayloads,
+  requestMeta
 ) {
   const repairItems = [];
   const repairIndices = [];
@@ -893,17 +1036,23 @@ async function repairProofreadSegments(
       }
       last.parseIssues.push('fallback:language-repair');
     } else {
-      debugPayloads.push({
-        phase: 'PROOFREAD',
-        model,
-        latencyMs: null,
-        usage: null,
-        inputChars: null,
-        outputChars: null,
-        request: null,
-        response: null,
-        parseIssues: ['fallback:language-repair']
-      });
+      debugPayloads.push(
+        attachRequestMeta(
+          {
+            phase: 'PROOFREAD',
+            model,
+            latencyMs: null,
+            usage: null,
+            inputChars: null,
+            outputChars: null,
+            request: null,
+            response: null,
+            parseIssues: ['fallback:language-repair']
+          },
+          normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' }),
+          { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false }
+        )
+      );
     }
   }
 
@@ -980,17 +1129,25 @@ async function repairProofreadSegments(
     const content = data?.choices?.[0]?.message?.content || '';
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
-    const debugPayload = {
-      phase: 'PROOFREAD_REPAIR',
-      model,
-      latencyMs,
-      usage,
-      inputChars: repairItems.reduce((sum, item) => sum + (item?.draft?.length || 0), 0),
-      outputChars: content?.length || 0,
-      request: requestPayload,
-      response: content,
-      parseIssues: ['fallback:language-repair']
-    };
+    const debugPayload = attachRequestMeta(
+      {
+        phase: 'PROOFREAD_REPAIR',
+        model,
+        latencyMs,
+        usage,
+        inputChars: repairItems.reduce((sum, item) => sum + (item?.draft?.length || 0), 0),
+        outputChars: content?.length || 0,
+        request: requestPayload,
+        response: content,
+        parseIssues: ['fallback:language-repair']
+      },
+      createChildRequestMeta(requestMeta || {}, {
+        purpose: 'validate',
+        attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
+        triggerSource: 'validate'
+      }),
+      { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false }
+    );
     if (Array.isArray(debugPayloads)) {
       debugPayloads.push(debugPayload);
     }

@@ -969,7 +969,8 @@ async function handleTranslateText(message, sendResponse) {
       state.translationModel,
       message.context,
       apiBaseUrl,
-      message.keepPunctuationTokens
+      message.keepPunctuationTokens,
+      message.requestMeta
     );
     sendResponse({ success: true, translations, rawTranslation, debug });
   } catch (error) {
@@ -1046,7 +1047,8 @@ async function handleProofreadText(message, sendResponse) {
       message.language,
       apiKey,
       state.proofreadModel,
-      apiBaseUrl
+      apiBaseUrl,
+      message.requestMeta
     );
     sendResponse({ success: true, translations, rawProofread, debug });
   } catch (error) {
