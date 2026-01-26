@@ -9,6 +9,7 @@ const DEBUG_PORT_NAME = 'debug';
 const DEBUG_DB_NAME = 'nt_debug';
 const DEBUG_DB_VERSION = 1;
 const DEBUG_RAW_STORE = 'raw';
+const DEBUG_UI_STATE_KEY = 'neuroTranslate.debugUIState';
 const STATUS_CONFIG = {
   pending: { label: 'Ожидает', className: 'status-pending' },
   in_progress: { label: 'В работе', className: 'status-in-progress' },
@@ -23,10 +24,17 @@ let debugPort = null;
 let debugReconnectTimer = null;
 let debugReconnectDelay = 500;
 const proofreadUiState = new Map();
+let latestDebugData = null;
+let debugPatchScheduled = false;
+let uiStatePersistTimer = null;
+let contextUi = null;
+let entriesEmptyEl = null;
+const debugEntryUis = new Map();
 
 init();
 
 async function init() {
+  loadDebugUiState();
   sourceUrl = getSourceUrlFromQuery();
   if (!sourceUrl) {
     renderEmpty('Не удалось определить страницу для отладки.');
@@ -65,6 +73,7 @@ async function init() {
         const entryKey = container.getAttribute('data-proofread-id') || '';
         const state = proofreadUiState.get(entryKey) || {};
         proofreadUiState.set(entryKey, { ...state, view });
+        schedulePersistUiState();
         container.setAttribute('data-proofread-view', view);
         container.querySelectorAll('[data-action="set-proofread-view"]').forEach((node) => {
           node.classList.toggle('is-active', node.getAttribute('data-view') === view);
@@ -81,6 +90,7 @@ async function init() {
         const isExpanded = container.classList.toggle('is-expanded');
         const state = proofreadUiState.get(entryKey) || {};
         proofreadUiState.set(entryKey, { ...state, expanded: isExpanded });
+        schedulePersistUiState();
         container.querySelectorAll('.proofread-expand').forEach((button) => {
           button.setAttribute('aria-expanded', String(isExpanded));
           button.textContent = isExpanded ? 'Свернуть' : 'Развернуть';
@@ -237,7 +247,7 @@ function handleDebugPortMessage(message) {
       renderEmpty('Ожидание отладочных данных...');
       return;
     }
-    renderDebug(sourceUrl, message.snapshot);
+    scheduleDebugPatch(sourceUrl, message.snapshot);
   }
 }
 
@@ -292,7 +302,7 @@ async function refreshDebug() {
     renderEmpty('Ожидание отладочных данных...');
     return;
   }
-  renderDebug(sourceUrl, debugData);
+  scheduleDebugPatch(sourceUrl, debugData);
 }
 
 function extractTokensFromUsage(usage) {
@@ -327,8 +337,6 @@ function collectTokensFromPayloads(payloads) {
 
 function renderEmpty(message) {
   metaEl.textContent = message;
-  contextEl.innerHTML = '';
-  entriesEl.innerHTML = '';
   if (eventsEl) {
     eventsEl.innerHTML = '';
   }
@@ -337,122 +345,42 @@ function renderEmpty(message) {
     contextStatus: 'pending',
     context: ''
   }, message);
+  ensureContextSkeleton();
+  updateContext({
+    context: '',
+    contextFull: '',
+    contextShort: '',
+    contextFullStatus: 'pending',
+    contextShortStatus: 'pending',
+    contextStatus: 'pending',
+    contextFullTruncated: false,
+    contextShortTruncated: false,
+    contextFullRefId: '',
+    contextShortRefId: ''
+  });
+  updateEntries([]);
 }
 
-function renderDebug(url, data) {
+function scheduleDebugPatch(url, data) {
+  latestDebugData = { url, data };
+  if (debugPatchScheduled) return;
+  debugPatchScheduled = true;
+  requestAnimationFrame(() => {
+    debugPatchScheduled = false;
+    if (!latestDebugData) return;
+    patchDebugUI(latestDebugData.url, latestDebugData.data);
+  });
+}
+
+function patchDebugUI(url, data) {
+  const snapshot = captureUiSnapshot();
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
   renderSummary(data, '');
   renderEvents(data);
-
-  const contextFullText = (data.contextFull || data.context || '').trim();
-  const contextShortText = (data.contextShort || '').trim();
-  const contextFullRefId = data.contextFullRefId || '';
-  const contextShortRefId = data.contextShortRefId || '';
-  const contextFullTruncated = Boolean(data.contextFullTruncated);
-  const contextShortTruncated = Boolean(data.contextShortTruncated);
-  const contextFullStatus = normalizeStatus(data.contextFullStatus || data.contextStatus, contextFullText);
-  const contextShortStatus = normalizeStatus(data.contextShortStatus, contextShortText);
-  const fullContextBody = contextFullText
-    ? renderInlineRaw(contextFullText, {
-        rawRefId: contextFullRefId,
-        rawField: 'text',
-        truncated: contextFullTruncated
-      })
-    : `<div class="empty">FULL контекст ещё не готов.</div>`;
-  const shortContextBody = contextShortText
-    ? renderInlineRaw(contextShortText, {
-        rawRefId: contextShortRefId,
-        rawField: 'text',
-        truncated: contextShortTruncated
-      })
-    : `<div class="empty">SHORT контекст ещё не готов.</div>`;
-  contextEl.innerHTML = `
-      <div class="entry-header">
-        <h2>Контекст</h2>
-        <div class="status-row">
-          <div class="status-group">
-            <span class="status-label">SHORT</span>
-            ${renderStatusBadge(contextShortStatus)}
-          </div>
-          <div class="status-group">
-            <span class="status-label">FULL</span>
-            ${renderStatusBadge(contextFullStatus)}
-          </div>
-          <div class="context-actions">
-            <button class="action-button" type="button" data-action="clear-context">Сбросить</button>
-          </div>
-        </div>
-      </div>
-      <div class="context-body">
-        <div class="context-section">
-          <div class="label">SHORT контекст</div>
-          ${shortContextBody}
-        </div>
-        <details class="context-card context-card--full">
-          <summary>FULL контекст</summary>
-          <div class="details-content">
-            ${fullContextBody}
-          </div>
-        </details>
-      </div>
-    `;
-
-  const items = Array.isArray(data.items) ? data.items : [];
-  if (!items.length) {
-    entriesEl.innerHTML = '<div class="empty">Нет данных о блоках перевода.</div>';
-    return;
-  }
-
-  entriesEl.innerHTML = '';
-  items.forEach((item, index) => {
-    const entry = document.createElement('div');
-    entry.className = 'entry';
-    const translationStatus = normalizeStatus(item.translationStatus, item.translated);
-    const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
-    const entryKey = getProofreadEntryKey(item, index);
-    const proofreadSection = renderProofreadSection(item, entryKey);
-    entry.innerHTML = `
-      <div class="entry-header">
-        <h2>Блок ${item.index || ''}</h2>
-        <div class="status-row">
-          <div class="status-group">
-            <span class="status-label">Перевод</span>
-            ${renderStatusBadge(translationStatus)}
-          </div>
-          <div class="status-group">
-            <span class="status-label">Вычитка</span>
-            ${renderStatusBadge(proofreadStatus)}
-          </div>
-        </div>
-      </div>
-      <div class="block">
-        <div class="label">Оригинал</div>
-        <pre>${escapeHtml(item.original || '')}</pre>
-      </div>
-      <div class="block">
-        <div class="label">Перевод</div>
-        ${
-          item.translated
-            ? `<pre>${escapeHtml(item.translated)}</pre>`
-            : `<div class="empty">Перевод ещё не получен.</div>`
-        }
-      </div>
-      <div class="block">
-        <details class="ai-response">
-          <summary>Ответ ИИ (перевод)</summary>
-          <div class="details-content">
-            ${renderDebugPayloads(item?.translationDebug, item?.translationRaw, 'TRANSLATE', {
-              rawRefId: item?.translationRawRefId,
-              truncated: item?.translationRawTruncated
-            })}
-          </div>
-        </details>
-      </div>
-      ${proofreadSection}
-    `;
-    entriesEl.appendChild(entry);
-  });
+  updateContext(data);
+  updateEntries(Array.isArray(data.items) ? data.items : []);
+  restoreUiSnapshot(snapshot);
 }
 
 function renderSummary(data, fallbackMessage = '') {
@@ -528,6 +456,517 @@ function renderEvents(data) {
   `;
 }
 
+function ensureContextSkeleton() {
+  if (contextUi) return;
+  contextEl.innerHTML = '';
+
+  const header = document.createElement('div');
+  header.className = 'entry-header';
+
+  const title = document.createElement('h2');
+  title.textContent = 'Контекст';
+
+  const statusRow = document.createElement('div');
+  statusRow.className = 'status-row';
+
+  const shortGroup = document.createElement('div');
+  shortGroup.className = 'status-group';
+  const shortLabel = document.createElement('span');
+  shortLabel.className = 'status-label';
+  shortLabel.textContent = 'SHORT';
+  const shortBadge = document.createElement('span');
+  shortBadge.className = 'status-badge';
+  shortGroup.append(shortLabel, shortBadge);
+
+  const fullGroup = document.createElement('div');
+  fullGroup.className = 'status-group';
+  const fullLabel = document.createElement('span');
+  fullLabel.className = 'status-label';
+  fullLabel.textContent = 'FULL';
+  const fullBadge = document.createElement('span');
+  fullBadge.className = 'status-badge';
+  fullGroup.append(fullLabel, fullBadge);
+
+  const actions = document.createElement('div');
+  actions.className = 'context-actions';
+  const clearButton = document.createElement('button');
+  clearButton.className = 'action-button';
+  clearButton.type = 'button';
+  clearButton.setAttribute('data-action', 'clear-context');
+  clearButton.textContent = 'Сбросить';
+  actions.appendChild(clearButton);
+
+  statusRow.append(shortGroup, fullGroup, actions);
+  header.append(title, statusRow);
+
+  const body = document.createElement('div');
+  body.className = 'context-body';
+
+  const shortSection = document.createElement('div');
+  shortSection.className = 'context-section';
+  const shortSectionLabel = document.createElement('div');
+  shortSectionLabel.className = 'label';
+  shortSectionLabel.textContent = 'SHORT контекст';
+  const shortBody = document.createElement('div');
+  shortSection.append(shortSectionLabel, shortBody);
+
+  const fullDetails = document.createElement('details');
+  fullDetails.className = 'context-card context-card--full';
+  const fullSummary = document.createElement('summary');
+  fullSummary.textContent = 'FULL контекст';
+  const fullContent = document.createElement('div');
+  fullContent.className = 'details-content';
+  fullDetails.append(fullSummary, fullContent);
+
+  body.append(shortSection, fullDetails);
+
+  contextEl.append(header, body);
+
+  contextUi = {
+    shortBadge,
+    fullBadge,
+    shortBody,
+    fullContent
+  };
+}
+
+function updateContext(data) {
+  ensureContextSkeleton();
+  const contextFullText = (data.contextFull || data.context || '').trim();
+  const contextShortText = (data.contextShort || '').trim();
+  const contextFullRefId = data.contextFullRefId || '';
+  const contextShortRefId = data.contextShortRefId || '';
+  const contextFullTruncated = Boolean(data.contextFullTruncated);
+  const contextShortTruncated = Boolean(data.contextShortTruncated);
+  const contextFullStatus = normalizeStatus(data.contextFullStatus || data.contextStatus, contextFullText);
+  const contextShortStatus = normalizeStatus(data.contextShortStatus, contextShortText);
+
+  const fullContextBody = contextFullText
+    ? renderInlineRaw(contextFullText, {
+        rawRefId: contextFullRefId,
+        rawField: 'text',
+        truncated: contextFullTruncated
+      })
+    : `<div class="empty">FULL контекст ещё не готов.</div>`;
+  const shortContextBody = contextShortText
+    ? renderInlineRaw(contextShortText, {
+        rawRefId: contextShortRefId,
+        rawField: 'text',
+        truncated: contextShortTruncated
+      })
+    : `<div class="empty">SHORT контекст ещё не готов.</div>`;
+
+  updateStatusBadge(contextUi.shortBadge, contextShortStatus);
+  updateStatusBadge(contextUi.fullBadge, contextFullStatus);
+  contextUi.shortBody.innerHTML = shortContextBody;
+  contextUi.fullContent.innerHTML = fullContextBody;
+}
+
+function ensureEntriesSkeleton() {
+  if (entriesEmptyEl) return;
+  entriesEmptyEl = document.createElement('div');
+  entriesEmptyEl.className = 'empty';
+  entriesEmptyEl.textContent = 'Нет данных о блоках перевода.';
+  entriesEl.appendChild(entriesEmptyEl);
+}
+
+function updateEntries(items) {
+  ensureEntriesSkeleton();
+  const normalizedItems = Array.isArray(items) ? items : [];
+  const activeKeys = new Set();
+
+  entriesEl.appendChild(entriesEmptyEl);
+  entriesEmptyEl.hidden = normalizedItems.length > 0;
+
+  normalizedItems.forEach((item, index) => {
+    const entryKey = getProofreadEntryKey(item, index);
+    activeKeys.add(entryKey);
+    let entryUi = debugEntryUis.get(entryKey);
+    if (!entryUi) {
+      entryUi = createEntryUi(entryKey);
+      debugEntryUis.set(entryKey, entryUi);
+    }
+    updateEntryUi(entryUi, item, index, entryKey);
+    entriesEl.appendChild(entryUi.root);
+  });
+
+  Array.from(debugEntryUis.entries()).forEach(([entryKey, entryUi]) => {
+    if (activeKeys.has(entryKey)) return;
+    entryUi.root.remove();
+    debugEntryUis.delete(entryKey);
+  });
+}
+
+function createEntryUi(entryKey) {
+  const entry = document.createElement('div');
+  entry.className = 'entry';
+
+  const header = document.createElement('div');
+  header.className = 'entry-header';
+  const title = document.createElement('h2');
+
+  const statusRow = document.createElement('div');
+  statusRow.className = 'status-row';
+
+  const translationGroup = document.createElement('div');
+  translationGroup.className = 'status-group';
+  const translationLabel = document.createElement('span');
+  translationLabel.className = 'status-label';
+  translationLabel.textContent = 'Перевод';
+  const translationBadge = document.createElement('span');
+  translationBadge.className = 'status-badge';
+  translationGroup.append(translationLabel, translationBadge);
+
+  const proofreadGroup = document.createElement('div');
+  proofreadGroup.className = 'status-group';
+  const proofreadLabel = document.createElement('span');
+  proofreadLabel.className = 'status-label';
+  proofreadLabel.textContent = 'Вычитка';
+  const proofreadBadge = document.createElement('span');
+  proofreadBadge.className = 'status-badge';
+  proofreadGroup.append(proofreadLabel, proofreadBadge);
+
+  statusRow.append(translationGroup, proofreadGroup);
+  header.append(title, statusRow);
+
+  const originalBlock = document.createElement('div');
+  originalBlock.className = 'block';
+  const originalLabel = document.createElement('div');
+  originalLabel.className = 'label';
+  originalLabel.textContent = 'Оригинал';
+  const originalPre = document.createElement('pre');
+  originalBlock.append(originalLabel, originalPre);
+
+  const translatedBlock = document.createElement('div');
+  translatedBlock.className = 'block';
+  const translatedLabel = document.createElement('div');
+  translatedLabel.className = 'label';
+  translatedLabel.textContent = 'Перевод';
+  const translatedPre = document.createElement('pre');
+  const translatedEmpty = document.createElement('div');
+  translatedEmpty.className = 'empty';
+  translatedEmpty.textContent = 'Перевод ещё не получен.';
+  translatedBlock.append(translatedLabel, translatedPre, translatedEmpty);
+
+  const translationDetailsBlock = document.createElement('div');
+  translationDetailsBlock.className = 'block';
+  const translationDetails = document.createElement('details');
+  translationDetails.className = 'ai-response';
+  const translationSummary = document.createElement('summary');
+  translationSummary.textContent = 'Ответ ИИ (перевод)';
+  const translationDetailsContent = document.createElement('div');
+  translationDetailsContent.className = 'details-content';
+  translationDetails.append(translationSummary, translationDetailsContent);
+  translationDetailsBlock.appendChild(translationDetails);
+
+  const proofreadSection = createProofreadSection(entryKey);
+
+  entry.append(
+    header,
+    originalBlock,
+    translatedBlock,
+    translationDetailsBlock,
+    proofreadSection.block,
+    proofreadSection.debugBlock
+  );
+
+  return {
+    root: entry,
+    title,
+    translationBadge,
+    proofreadBadge,
+    originalPre,
+    translatedPre,
+    translatedEmpty,
+    translationDetailsContent,
+    proofread: proofreadSection
+  };
+}
+
+function createProofreadSection(entryKey) {
+  const block = document.createElement('div');
+  block.className = 'block proofread-block';
+  block.setAttribute('data-proofread-id', entryKey);
+
+  const header = document.createElement('div');
+  header.className = 'proofread-header';
+
+  const title = document.createElement('div');
+  title.className = 'proofread-title';
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = 'Вычитка';
+  const status = document.createElement('span');
+  status.className = 'proofread-status';
+  const latency = document.createElement('span');
+  latency.className = 'proofread-metric';
+  const changes = document.createElement('span');
+  changes.className = 'proofread-metric';
+  title.append(label, status, latency, changes);
+
+  const controls = document.createElement('div');
+  controls.className = 'proofread-controls';
+  const toggle = document.createElement('div');
+  toggle.className = 'proofread-toggle';
+  const diffButton = document.createElement('button');
+  diffButton.className = 'toggle-button';
+  diffButton.type = 'button';
+  diffButton.setAttribute('data-action', 'set-proofread-view');
+  diffButton.setAttribute('data-view', 'diff');
+  diffButton.textContent = 'Diff';
+  const sideButton = document.createElement('button');
+  sideButton.className = 'toggle-button';
+  sideButton.type = 'button';
+  sideButton.setAttribute('data-action', 'set-proofread-view');
+  sideButton.setAttribute('data-view', 'side');
+  sideButton.textContent = 'Side-by-side';
+  const finalButton = document.createElement('button');
+  finalButton.className = 'toggle-button';
+  finalButton.type = 'button';
+  finalButton.setAttribute('data-action', 'set-proofread-view');
+  finalButton.setAttribute('data-view', 'final');
+  finalButton.textContent = 'Final';
+  toggle.append(diffButton, sideButton, finalButton);
+
+  const expandButton = document.createElement('button');
+  expandButton.className = 'proofread-expand';
+  expandButton.type = 'button';
+  expandButton.setAttribute('data-action', 'toggle-proofread-expand');
+  expandButton.setAttribute('aria-expanded', 'false');
+  expandButton.textContent = 'Развернуть';
+
+  controls.append(toggle, expandButton);
+  header.append(title, controls);
+
+  const body = document.createElement('div');
+  body.className = 'proofread-body';
+
+  const viewsContainer = document.createElement('div');
+  const diffView = document.createElement('div');
+  diffView.className = 'proofread-view proofread-view--diff';
+  const sideView = document.createElement('div');
+  sideView.className = 'proofread-view proofread-view--side';
+  const finalView = document.createElement('div');
+  finalView.className = 'proofread-view proofread-view--final';
+  const previewOverlay = document.createElement('div');
+  previewOverlay.className = 'proofread-preview-overlay';
+  const previewButton = document.createElement('button');
+  previewButton.className = 'proofread-preview-button';
+  previewButton.type = 'button';
+  previewButton.setAttribute('data-action', 'toggle-proofread-expand');
+  previewButton.textContent = 'Показать полностью';
+  previewOverlay.appendChild(previewButton);
+  viewsContainer.append(diffView, sideView, finalView, previewOverlay);
+
+  const emptyMessage = document.createElement('div');
+  emptyMessage.className = 'empty';
+  emptyMessage.textContent = 'Нет правок.';
+
+  body.append(viewsContainer, emptyMessage);
+
+  block.append(header, body);
+
+  const debugBlock = document.createElement('div');
+  debugBlock.className = 'block';
+  const debugDetails = document.createElement('details');
+  debugDetails.className = 'ai-response';
+  const debugSummary = document.createElement('summary');
+  debugSummary.textContent = 'Ответ ИИ (вычитка)';
+  const debugContent = document.createElement('div');
+  debugContent.className = 'details-content';
+  debugDetails.append(debugSummary, debugContent);
+  debugBlock.appendChild(debugDetails);
+
+  return {
+    block,
+    status,
+    latency,
+    changes,
+    controls,
+    diffButton,
+    sideButton,
+    finalButton,
+    expandButton,
+    viewsContainer,
+    emptyMessage,
+    diffView,
+    sideView,
+    finalView,
+    debugContent
+  };
+}
+
+function updateEntryUi(entryUi, item, index, entryKey) {
+  entryUi.title.textContent = `Блок ${item.index || ''}`;
+  const translationStatus = normalizeStatus(item.translationStatus, item.translated);
+  const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
+  updateStatusBadge(entryUi.translationBadge, translationStatus);
+  updateStatusBadge(entryUi.proofreadBadge, proofreadStatus);
+
+  entryUi.originalPre.textContent = item.original || '';
+
+  if (item.translated) {
+    entryUi.translatedPre.textContent = item.translated;
+    entryUi.translatedPre.hidden = false;
+    entryUi.translatedEmpty.hidden = true;
+  } else {
+    entryUi.translatedPre.textContent = '';
+    entryUi.translatedPre.hidden = true;
+    entryUi.translatedEmpty.hidden = false;
+  }
+
+  entryUi.translationDetailsContent.innerHTML = renderDebugPayloads(
+    item?.translationDebug,
+    item?.translationRaw,
+    'TRANSLATE',
+    {
+      rawRefId: item?.translationRawRefId,
+      truncated: item?.translationRawTruncated
+    }
+  );
+
+  updateProofreadUi(entryUi.proofread, item, entryKey);
+}
+
+function updateProofreadUi(ui, item, entryKey) {
+  const defaultView = 'diff';
+  const comparisonsAll = Array.isArray(item?.proofreadComparisons) ? item.proofreadComparisons : [];
+  const comparisons = comparisonsAll.filter((comparison) => comparison?.changed);
+  const hasComparisons = comparisons.length > 0;
+  const proofreadApplied = item?.proofreadApplied !== false;
+  const state = getProofreadState(entryKey, defaultView);
+  const showView = state.view || defaultView;
+  const isExpanded = Boolean(state.expanded);
+
+  const statusLabel = getProofreadStatusLabel(item, hasComparisons);
+  const statusClass = getProofreadStatusClass(item, hasComparisons);
+  const latency = getProofreadLatency(item);
+  const changes = getProofreadChangesSummary(comparisons);
+
+  ui.status.textContent = statusLabel;
+  ui.status.className = `proofread-status ${statusClass}`;
+  ui.latency.textContent = latency;
+  ui.changes.textContent = changes;
+
+  ui.controls.hidden = !hasComparisons || !proofreadApplied;
+
+  if (!proofreadApplied) {
+    proofreadUiState.set(entryKey, { ...state, expanded: false });
+    ui.block.classList.remove('is-expanded');
+    ui.block.setAttribute('data-proofread-view', defaultView);
+    ui.emptyMessage.textContent = 'Вычитка выключена.';
+    ui.viewsContainer.hidden = true;
+    ui.emptyMessage.hidden = false;
+    ui.debugContent.innerHTML = '<div class="empty">Вычитка выключена.</div>';
+    return;
+  }
+
+  ui.block.classList.toggle('is-expanded', isExpanded);
+  ui.block.setAttribute('data-proofread-view', showView);
+  ui.expandButton.setAttribute('aria-expanded', String(isExpanded));
+  ui.expandButton.textContent = isExpanded ? 'Свернуть' : 'Развернуть';
+
+  ui.diffButton.classList.toggle('is-active', showView === 'diff');
+  ui.sideButton.classList.toggle('is-active', showView === 'side');
+  ui.finalButton.classList.toggle('is-active', showView === 'final');
+
+  if (hasComparisons) {
+    ui.viewsContainer.hidden = false;
+    ui.emptyMessage.hidden = true;
+    ui.diffView.innerHTML = renderProofreadDiffView(comparisons);
+    ui.sideView.innerHTML = renderProofreadSideBySideView(comparisons);
+    ui.finalView.innerHTML = renderProofreadFinalView(comparisons);
+  } else {
+    ui.viewsContainer.hidden = true;
+    ui.emptyMessage.hidden = false;
+    ui.emptyMessage.textContent = 'Нет правок.';
+    ui.diffView.innerHTML = '';
+    ui.sideView.innerHTML = '';
+    ui.finalView.innerHTML = '';
+  }
+
+  ui.debugContent.innerHTML = renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD', {
+    rawRefId: item?.proofreadRawRefId,
+    truncated: item?.proofreadRawTruncated
+  });
+}
+
+function updateStatusBadge(node, status) {
+  const config = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
+  node.className = `status-badge ${config.className}`;
+  node.textContent = config.label;
+}
+
+function captureUiSnapshot() {
+  const scrollEl = document.scrollingElement || document.documentElement;
+  const activeEl = document.activeElement;
+  const snapshot = {
+    scrollEl,
+    scrollTop: scrollEl ? scrollEl.scrollTop : 0,
+    activeEl: null,
+    selectionStart: null,
+    selectionEnd: null
+  };
+
+  if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
+    snapshot.activeEl = activeEl;
+    snapshot.selectionStart = activeEl.selectionStart;
+    snapshot.selectionEnd = activeEl.selectionEnd;
+  }
+
+  return snapshot;
+}
+
+function restoreUiSnapshot(snapshot) {
+  if (!snapshot) return;
+  if (snapshot.scrollEl) {
+    snapshot.scrollEl.scrollTop = snapshot.scrollTop;
+  }
+  if (snapshot.activeEl && document.contains(snapshot.activeEl)) {
+    snapshot.activeEl.focus();
+    if (snapshot.selectionStart != null && snapshot.selectionEnd != null) {
+      snapshot.activeEl.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+    }
+  }
+}
+
+function loadDebugUiState() {
+  try {
+    const raw = sessionStorage.getItem(DEBUG_UI_STATE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return;
+    const stored = parsed.proofread;
+    if (!stored || typeof stored !== 'object') return;
+    Object.entries(stored).forEach(([key, value]) => {
+      if (!key) return;
+      proofreadUiState.set(key, value || {});
+    });
+  } catch (error) {
+    // ignore
+  }
+}
+
+function schedulePersistUiState() {
+  if (uiStatePersistTimer) return;
+  uiStatePersistTimer = setTimeout(() => {
+    uiStatePersistTimer = null;
+    persistUiState();
+  }, 400);
+}
+
+function persistUiState() {
+  try {
+    const proofread = {};
+    proofreadUiState.forEach((value, key) => {
+      proofread[key] = value;
+    });
+    sessionStorage.setItem(DEBUG_UI_STATE_KEY, JSON.stringify({ proofread }));
+  } catch (error) {
+    // ignore
+  }
+}
+
 function getOverallStatus({ completed, inProgress, failed, total, contextFullStatus, contextShortStatus }) {
   const hasFailedContext = contextFullStatus === 'failed' || contextShortStatus === 'failed';
   if (failed > 0 || hasFailedContext) return 'failed';
@@ -541,107 +980,6 @@ function getOverallStatus({ completed, inProgress, failed, total, contextFullSta
   }
   if (contextFullStatus === 'disabled' && contextShortStatus === 'disabled') return 'disabled';
   return 'pending';
-}
-
-
-function renderProofreadSection(item, entryKey) {
-  if (item?.proofreadApplied === false) {
-    return `
-      <div class="block">
-        <div class="label">Вычитка</div>
-        <div class="empty">Вычитка выключена.</div>
-      </div>
-      <div class="block">
-        <details class="ai-response">
-          <summary>Ответ ИИ (вычитка)</summary>
-          <div class="details-content">
-            <div class="empty">Вычитка выключена.</div>
-          </div>
-        </details>
-      </div>
-    `;
-  }
-
-  const comparisonsAll = Array.isArray(item?.proofreadComparisons) ? item.proofreadComparisons : [];
-  const comparisons = comparisonsAll.filter((comparison) => comparison?.changed);
-  const hasComparisons = comparisons.length > 0;
-  const diffView = hasComparisons ? renderProofreadDiffView(comparisons) : '<div class="empty">Нет правок.</div>';
-  const sideBySideView = hasComparisons
-    ? renderProofreadSideBySideView(comparisons)
-    : '<div class="empty">Нет правок.</div>';
-  const finalView = hasComparisons ? renderProofreadFinalView(comparisons) : '<div class="empty">Нет правок.</div>';
-  const defaultView = 'diff';
-  const state = getProofreadState(entryKey, defaultView);
-  const statusLabel = getProofreadStatusLabel(item, hasComparisons);
-  const statusClass = getProofreadStatusClass(item, hasComparisons);
-  const latency = getProofreadLatency(item);
-  const changes = getProofreadChangesSummary(comparisons);
-  const isExpanded = Boolean(state.expanded);
-  const showView = state.view || defaultView;
-  const controls = hasComparisons
-    ? `
-          <div class="proofread-controls">
-            <div class="proofread-toggle">
-              <button class="toggle-button${showView === 'diff' ? ' is-active' : ''}" type="button" data-action="set-proofread-view" data-view="diff">
-                Diff
-              </button>
-              <button class="toggle-button${showView === 'side' ? ' is-active' : ''}" type="button" data-action="set-proofread-view" data-view="side">
-                Side-by-side
-              </button>
-              <button class="toggle-button${showView === 'final' ? ' is-active' : ''}" type="button" data-action="set-proofread-view" data-view="final">
-                Final
-              </button>
-            </div>
-            <button class="proofread-expand" type="button" data-action="toggle-proofread-expand" aria-expanded="${isExpanded}">
-              ${isExpanded ? 'Свернуть' : 'Развернуть'}
-            </button>
-          </div>
-        `
-    : '';
-  const proofreadBody = hasComparisons
-    ? `
-        <div class="proofread-body">
-          <div class="proofread-view proofread-view--diff">${diffView}</div>
-          <div class="proofread-view proofread-view--side">${sideBySideView}</div>
-          <div class="proofread-view proofread-view--final">${finalView}</div>
-          <div class="proofread-preview-overlay">
-            <button class="proofread-preview-button" type="button" data-action="toggle-proofread-expand">
-              Показать полностью
-            </button>
-          </div>
-        </div>
-      `
-    : `
-        <div class="proofread-body">
-          <div class="empty">Нет правок.</div>
-        </div>
-      `;
-
-  return `
-      <div class="block proofread-block${isExpanded ? ' is-expanded' : ''}" data-proofread-id="${escapeHtml(entryKey)}" data-proofread-view="${escapeHtml(showView)}">
-        <div class="proofread-header">
-          <div class="proofread-title">
-            <span class="label">Вычитка</span>
-            <span class="proofread-status ${escapeHtml(statusClass)}">${escapeHtml(statusLabel)}</span>
-            <span class="proofread-metric">${escapeHtml(latency)}</span>
-            <span class="proofread-metric">${escapeHtml(changes)}</span>
-          </div>
-          ${controls}
-        </div>
-        ${proofreadBody}
-      </div>
-      <div class="block">
-        <details class="ai-response">
-          <summary>Ответ ИИ (вычитка)</summary>
-          <div class="details-content">
-            ${renderDebugPayloads(item?.proofreadDebug, item?.proofreadRaw, 'PROOFREAD', {
-              rawRefId: item?.proofreadRawRefId,
-              truncated: item?.proofreadRawTruncated
-            })}
-          </div>
-        </details>
-      </div>
-    `;
 }
 
 
