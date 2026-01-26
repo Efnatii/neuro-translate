@@ -61,12 +61,6 @@ async function init() {
       if (button) {
         event.preventDefault();
         clearContext();
-        return;
-      }
-      const loadButton = target.closest('[data-action="load-raw"]');
-      if (loadButton) {
-        event.preventDefault();
-        handleLoadRawClick(loadButton);
       }
     });
   }
@@ -110,6 +104,7 @@ async function init() {
 
       const loadButton = target.closest('[data-action="load-raw"]');
       if (loadButton) {
+        if (!loadButton.closest('[data-role="proofread-section"]')) return;
         event.preventDefault();
         handleLoadRawClick(loadButton);
         return;
@@ -902,17 +897,8 @@ function renderRawResponse(value, emptyMessage) {
 
 function renderInlineRaw(value, options = {}) {
   const rawRefId = options.rawRefId || '';
-  const rawField = options.rawField || 'text';
-  const truncated = Boolean(options.truncated);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
-  const loadButton =
-    rawRefId && truncated
-      ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
-          rawRefId
-        )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
-      : '';
   return `
-    ${loadButton}
     <div data-raw-target="${escapeHtml(targetId)}">
       ${renderRawResponse(value, options.emptyMessage || 'Нет данных.')}
     </div>
@@ -1055,6 +1041,7 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   const parts = debugDomState.payloadPartsByKey.get(payloadKey);
   if (!parts) return;
   const phase = payload?.phase || 'UNKNOWN';
+  const allowRawLoad = phase === 'PROOFREAD';
   const model = payload?.model || '—';
   const tag = payload?.tag || '';
   const usage = formatUsage(payload?.usage);
@@ -1121,7 +1108,8 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
       buildDebugSectionContent(payload?.contextTextSent, {
         rawRefId: payload?.rawRefId,
         rawField: 'contextTextSent',
-        truncated: payload?.contextTruncated
+        truncated: payload?.contextTruncated,
+        allowLoad: allowRawLoad
       })
     );
   }
@@ -1130,7 +1118,8 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
     buildDebugSectionContent(payload?.request, {
       rawRefId: payload?.rawRefId,
       rawField: 'request',
-      truncated: payload?.requestTruncated
+      truncated: payload?.requestTruncated,
+      allowLoad: allowRawLoad
     })
   );
   setHtmlIfChanged(
@@ -1138,7 +1127,8 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
     buildDebugSectionContent(payload?.response, {
       rawRefId: payload?.rawRefId,
       rawField: 'response',
-      truncated: payload?.responseTruncated
+      truncated: payload?.responseTruncated,
+      allowLoad: allowRawLoad
     })
   );
   setHtmlIfChanged(parts.parseDetails.contentEl, buildDebugParseContent(payload?.parseIssues));
@@ -1148,9 +1138,10 @@ function buildDebugSectionContent(value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
   const isTruncated = Boolean(options.truncated);
+  const allowLoad = Boolean(options.allowLoad);
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
   const loadButton =
-    rawRefId && isTruncated
+    allowLoad && rawRefId && isTruncated
       ? `<button class="action-button action-button--inline" type="button" data-action="load-raw" data-raw-id="${escapeHtml(
           rawRefId
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
