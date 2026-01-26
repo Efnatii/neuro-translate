@@ -25,9 +25,96 @@ const PUNCTUATION_TOKENS = new Map([
   ['"', '⟦PUNC_DQUOTE⟧']
 ]);
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526]);
+const RETRY_VALIDATE_ENVELOPE_START = '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----';
+const RETRY_VALIDATE_ENVELOPE_END = '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----';
 
 function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
+}
+
+function isRetryValidateTrigger(requestMeta) {
+  const triggerSource = requestMeta?.triggerSource || '';
+  return triggerSource === 'retry' || triggerSource === 'validate';
+}
+
+function normalizeManualOutputs(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim();
+  try {
+    const serialized = JSON.stringify(value, null, 2);
+    return serialized ? serialized.trim() : '';
+  } catch (error) {
+    return String(value).trim();
+  }
+}
+
+function buildManualOutputsNoFull({ rawResponse, parsedResult, parseIssues, note }) {
+  const sections = [];
+  const rawText = normalizeManualOutputs(rawResponse);
+  if (rawText) {
+    sections.push(`[RAW RESPONSE]\n${rawText}`);
+  }
+  if (parsedResult !== undefined && parsedResult !== null) {
+    sections.push(`[PARSED OUTPUT]\n${normalizeManualOutputs(parsedResult)}`);
+  }
+  if (Array.isArray(parseIssues) && parseIssues.length) {
+    sections.push(`[PARSE/VALIDATION ISSUES]\n${parseIssues.join('\n')}`);
+  }
+  if (note) {
+    sections.push(String(note));
+  }
+  return sections.join('\n\n');
+}
+
+function resolveManualOutputsNoFull(requestMeta, normalizedContext) {
+  const fromMeta = normalizeManualOutputs(requestMeta?.manualOutputsNoFull);
+  if (fromMeta) return fromMeta;
+  if (normalizedContext?.baseAnswerIncluded && normalizedContext?.baseAnswer) {
+    return `[PREVIOUS OUTPUT]\n${normalizedContext.baseAnswer}`;
+  }
+  return '(no manual outputs found)';
+}
+
+function buildRetryValidateEnvelope(shortContextText, manualOutputsNoFull) {
+  return [
+    RETRY_VALIDATE_ENVELOPE_START,
+    '[SHORT CONTEXT (GLOBAL)]',
+    shortContextText,
+    '',
+    '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
+    manualOutputsNoFull || '(no manual outputs found)',
+    RETRY_VALIDATE_ENVELOPE_END
+  ].join('\n');
+}
+
+function prependRetryValidateEnvelope(messages, envelope) {
+  if (!Array.isArray(messages)) return messages;
+  const envelopeMessage = { role: 'user', content: envelope };
+  const next = [...messages];
+  const systemIndex = next.findIndex((message) => message?.role === 'system');
+  if (systemIndex === -1) {
+    next.unshift(envelopeMessage);
+    return next;
+  }
+  next.splice(systemIndex + 1, 0, envelopeMessage);
+  return next;
+}
+
+function ensureRetryValidateEnvelope(messages, requestMeta, normalizedContext, effectiveContext) {
+  if (!isRetryValidateTrigger(requestMeta)) return messages;
+  const shortContextText = (effectiveContext?.text || normalizedContext?.shortText || normalizedContext?.text || '')
+    .trim();
+  if (!shortContextText) {
+    console.error('Retry/validate request missing short context text; aborting request.', {
+      triggerSource: requestMeta?.triggerSource,
+      stage: requestMeta?.stage,
+      purpose: requestMeta?.purpose
+    });
+    throw new Error('Retry/validate request requires short context text.');
+  }
+  const manualOutputsNoFull = resolveManualOutputsNoFull(requestMeta, normalizedContext);
+  const envelope = buildRetryValidateEnvelope(shortContextText, manualOutputsNoFull);
+  return prependRetryValidateEnvelope(messages, envelope);
 }
 
 function normalizeContextPayload(context) {
@@ -104,7 +191,8 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
     purpose: merged.purpose || 'main',
     attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
     triggerSource: merged.triggerSource || '',
-    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry)
+    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry),
+    manualOutputsNoFull: merged.manualOutputsNoFull || ''
   };
 }
 
@@ -136,7 +224,7 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+    text = normalized.shortText || normalized.text || '';
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -173,13 +261,14 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
+  const shortText = normalized.shortText || normalized.text || '';
   return {
-    text: normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '',
+    text: shortText,
     mode: 'SHORT',
     baseAnswer: normalized.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
     fullText: '',
-    shortText: normalized.shortText || ''
+    shortText
   };
 }
 
@@ -347,7 +436,11 @@ async function translateTexts(
               purpose: 'retry',
               attempt: baseRequestMeta.attempt + timeoutAttempts + retryableRetries,
               triggerSource: 'retry',
-              forceFullContextOnRetry: true
+              forceFullContextOnRetry: true,
+              manualOutputsNoFull: buildManualOutputsNoFull({
+                rawResponse: lastRawTranslation,
+                parseIssues: debugPayloads[debugPayloads.length - 1]?.parseIssues || []
+              })
             })
           : baseRequestMeta;
       const result = await performTranslationRequest(
@@ -410,7 +503,11 @@ async function translateTexts(
         const retryMeta = createChildRequestMeta(baseRequestMeta, {
           purpose: 'retry',
           attempt: baseRequestMeta.attempt + 1,
-          triggerSource: 'retry'
+          triggerSource: 'retry',
+          manualOutputsNoFull: buildManualOutputsNoFull({
+            rawResponse: lastRawTranslation,
+            parseIssues: debugPayloads[debugPayloads.length - 1]?.parseIssues || []
+          })
         });
         const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), retryMeta);
         const translations = await translateIndividually(
@@ -470,17 +567,22 @@ async function performTranslationRequest(
   const retryContextPayload = getRetryContextPayload(normalizedContext, normalizedRequestMeta);
 
   const prompt = applyPromptCaching(
-    buildTranslationPrompt({
-      tokenizedTexts,
-      targetLanguage,
-      contextPayload: {
-        text: effectiveContext.text,
-        mode: effectiveContext.mode,
-        baseAnswer: effectiveContext.baseAnswer,
-        baseAnswerIncluded: effectiveContext.baseAnswerIncluded
-      },
-      strictTargetLanguage
-    }),
+    ensureRetryValidateEnvelope(
+      buildTranslationPrompt({
+        tokenizedTexts,
+        targetLanguage,
+        contextPayload: {
+          text: effectiveContext.text,
+          mode: effectiveContext.mode,
+          baseAnswer: effectiveContext.baseAnswer,
+          baseAnswerIncluded: effectiveContext.baseAnswerIncluded
+        },
+        strictTargetLanguage
+      }),
+      normalizedRequestMeta,
+      normalizedContext,
+      effectiveContext
+    ),
     apiBaseUrl
   );
 
@@ -646,7 +748,11 @@ async function performTranslationRequest(
     const retryMeta = createChildRequestMeta(normalizedRequestMeta, {
       purpose: 'retry',
       attempt: normalizedRequestMeta.attempt + 1,
-      triggerSource: 'retry'
+      triggerSource: 'retry',
+      manualOutputsNoFull: buildManualOutputsNoFull({
+        rawResponse: content,
+        parsedResult: translations
+      })
     });
     const retryResults = await translateIndividually(
       retryTexts,
@@ -702,7 +808,11 @@ async function performTranslationRequest(
         createChildRequestMeta(normalizedRequestMeta, {
           purpose: 'retry',
           attempt: normalizedRequestMeta.attempt + 1,
-          triggerSource: 'retry'
+          triggerSource: 'retry',
+          manualOutputsNoFull: buildManualOutputsNoFull({
+            rawResponse: content,
+            parsedResult: translations
+          })
         })
       );
       const retryTranslations = retryResults?.translations || [];
@@ -744,7 +854,11 @@ async function performTranslationRequest(
         createChildRequestMeta(normalizedRequestMeta, {
           purpose: 'retry',
           attempt: normalizedRequestMeta.attempt + 1,
-          triggerSource: 'retry'
+          triggerSource: 'retry',
+          manualOutputsNoFull: buildManualOutputsNoFull({
+            rawResponse: content,
+            parsedResult: translations
+          })
         })
       );
       lengthRetryIndices.forEach((index, retryPosition) => {
@@ -792,44 +906,53 @@ async function performTranslationRepairRequest(
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'validate' });
   const contextPayload = { text: context || '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
-  const effectiveContext = buildEffectiveContext(contextPayload, normalizedRequestMeta);
+  const normalizedContext = normalizeContextPayload(contextPayload);
+  const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const normalizedItems = items.map((item) => ({
     id: item.id,
     source: applyPunctuationTokens(item.source || ''),
     draft: applyPunctuationTokens(item.draft || '')
   }));
-  const prompt = applyPromptCaching([
-    {
-      role: 'system',
-      content: [
-        'You are a professional translator.',
-        'You receive source text and a draft translation that may contain untranslated fragments.',
-        'Fix the draft so the output is fully in the target language with no source-language fragments.',
-        'Preserve meaning, formatting, punctuation tokens, placeholders, markup, code, numbers, units, and links.',
-        'Do not add or remove information. Do not add commentary.',
-        `Target language: ${targetLanguage}.`,
-        PUNCTUATION_TOKEN_HINT
-      ].join(' ')
-    },
-    {
-      role: 'user',
-      content: [
-        `Repair the following translations into ${targetLanguage}.`,
-        context
-          ? [
-              'Use the page context only for disambiguation.',
-              'Do not translate or include the context in the output.',
-              `Context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
-            ].join('\n')
-          : '',
-        'Return only JSON with a "translations" array matching the input order.',
-        'Items: (JSON array of {id, source, draft})',
-        JSON.stringify(normalizedItems)
-      ]
-        .filter(Boolean)
-        .join('\n')
-    }
-  ], apiBaseUrl);
+  const prompt = applyPromptCaching(
+    ensureRetryValidateEnvelope(
+      [
+        {
+          role: 'system',
+          content: [
+            'You are a professional translator.',
+            'You receive source text and a draft translation that may contain untranslated fragments.',
+            'Fix the draft so the output is fully in the target language with no source-language fragments.',
+            'Preserve meaning, formatting, punctuation tokens, placeholders, markup, code, numbers, units, and links.',
+            'Do not add or remove information. Do not add commentary.',
+            `Target language: ${targetLanguage}.`,
+            PUNCTUATION_TOKEN_HINT
+          ].join(' ')
+        },
+        {
+          role: 'user',
+          content: [
+            `Repair the following translations into ${targetLanguage}.`,
+            context
+              ? [
+                  'Use the page context only for disambiguation.',
+                  'Do not translate or include the context in the output.',
+                  `Context (do not translate): <<<CONTEXT_START>>>${context}<<<CONTEXT_END>>>`
+                ].join('\n')
+              : '',
+            'Return only JSON with a "translations" array matching the input order.',
+            'Items: (JSON array of {id, source, draft})',
+            JSON.stringify(normalizedItems)
+          ]
+            .filter(Boolean)
+            .join('\n')
+        }
+      ],
+      normalizedRequestMeta,
+      normalizedContext,
+      effectiveContext
+    ),
+    apiBaseUrl
+  );
 
   const requestPayload = {
     model,
@@ -970,7 +1093,11 @@ async function repairTranslationsForLanguage(
     const repairRequestMeta = createChildRequestMeta(requestMeta, {
       purpose: 'validate',
       attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
-      triggerSource: 'validate'
+      triggerSource: 'validate',
+      manualOutputsNoFull: buildManualOutputsNoFull({
+        parsedResult: translations,
+        note: 'Detected target-language mismatch; running validation repair.'
+      })
     });
     const repairResult = await performTranslationRepairRequest(
       repairItems,
