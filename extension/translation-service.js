@@ -48,6 +48,83 @@ function normalizeContextPayload(context) {
   return { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
 }
 
+function createRequestId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function computeTextHash(text = '') {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) + hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash >>> 0;
+}
+
+function normalizeRequestMeta(meta = {}, overrides = {}) {
+  const merged = { ...(meta || {}), ...(overrides || {}) };
+  return {
+    requestId: merged.requestId || createRequestId(),
+    parentRequestId: merged.parentRequestId || '',
+    blockKey: merged.blockKey || '',
+    stage: merged.stage || '',
+    purpose: merged.purpose || 'main',
+    attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
+    triggerSource: merged.triggerSource || '',
+    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry)
+  };
+}
+
+function resolveContextPolicy(contextPayload, purpose) {
+  const normalized = normalizeContextPayload(contextPayload);
+  if (!normalized.text) {
+    return purpose && purpose !== 'main' ? 'minimal' : 'none';
+  }
+  if (normalized.mode === 'SHORT') return 'minimal';
+  return 'full';
+}
+
+function getRetryContextPayload(contextPayload, requestMeta) {
+  if (requestMeta?.forceFullContextOnRetry) {
+    return normalizeContextPayload(contextPayload);
+  }
+  return { text: '', mode: 'NONE', baseAnswer: '', baseAnswerIncluded: false };
+}
+
+function attachRequestMeta(payload, requestMeta, contextPayload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const contextText = contextPayload?.text || '';
+  return {
+    ...payload,
+    requestId: payload.requestId || requestMeta.requestId,
+    parentRequestId: payload.parentRequestId || requestMeta.parentRequestId || '',
+    blockKey: payload.blockKey || requestMeta.blockKey || '',
+    stage: payload.stage || requestMeta.stage || '',
+    purpose: payload.purpose || requestMeta.purpose || '',
+    attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
+    triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
+    contextMode: payload.contextMode || resolveContextPolicy(contextPayload, requestMeta.purpose),
+    contextHash: payload.contextHash ?? (contextText ? computeTextHash(contextText) : 0),
+    contextLength: payload.contextLength ?? (contextText ? contextText.length : 0)
+  };
+}
+
+function createChildRequestMeta(baseMeta, overrides = {}) {
+  const parentRequestId = overrides.parentRequestId || baseMeta?.requestId || '';
+  return normalizeRequestMeta(
+    {
+      ...(baseMeta || {}),
+      ...overrides,
+      parentRequestId,
+      requestId: overrides.requestId || ''
+    },
+    { stage: baseMeta?.stage }
+  );
+}
+
 function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload, strictTargetLanguage }) {
   const normalizedContext = normalizeContextPayload(contextPayload);
   const contextText = normalizedContext.text || '';
@@ -117,10 +194,12 @@ async function translateTexts(
   model,
   context = '',
   apiBaseUrl = OPENAI_API_URL,
-  keepPunctuationTokens = false
+  keepPunctuationTokens = false,
+  requestMeta = null
 ) {
   if (!Array.isArray(texts) || !texts.length) return { translations: [], rawTranslation: '' };
 
+  const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'main' });
   const maxTimeoutAttempts = 2;
   const maxRetryableRetries = 3;
   let timeoutAttempts = 0;
@@ -139,17 +218,23 @@ async function translateTexts(
       last.parseIssues.push(issue);
       return;
     }
-    debugPayloads.push({
-      phase: 'TRANSLATE',
-      model,
-      latencyMs: null,
-      usage: null,
-      inputChars: null,
-      outputChars: null,
-      request: null,
-      response: null,
-      parseIssues: [issue]
-    });
+    debugPayloads.push(
+      attachRequestMeta(
+        {
+          phase: 'TRANSLATE',
+          model,
+          latencyMs: null,
+          usage: null,
+          inputChars: null,
+          outputChars: null,
+          request: null,
+          response: null,
+          parseIssues: [issue]
+        },
+        baseRequestMeta,
+        normalizeContextPayload(context)
+      )
+    );
   };
   const timeoutMs = DEFAULT_TRANSLATION_TIMEOUT_MS;
 
@@ -158,6 +243,15 @@ async function translateTexts(
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
+      const attemptMeta =
+        timeoutAttempts > 0 || retryableRetries > 0
+          ? createChildRequestMeta(baseRequestMeta, {
+              purpose: 'retry',
+              attempt: baseRequestMeta.attempt + timeoutAttempts + retryableRetries,
+              triggerSource: 'retry',
+              forceFullContextOnRetry: true
+            })
+          : baseRequestMeta;
       const result = await performTranslationRequest(
         texts,
         apiKey,
@@ -166,7 +260,11 @@ async function translateTexts(
         controller.signal,
         context,
         apiBaseUrl,
-        !keepPunctuationTokens
+        !keepPunctuationTokens,
+        false,
+        true,
+        true,
+        attemptMeta
       );
       lastRawTranslation = result.rawTranslation;
       if (Array.isArray(result?.debug)) {
@@ -211,15 +309,24 @@ async function translateTexts(
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
         appendParseIssue('fallback:per-item');
+        const retryMeta = createChildRequestMeta(baseRequestMeta, {
+          purpose: 'retry',
+          attempt: baseRequestMeta.attempt + 1,
+          triggerSource: 'retry'
+        });
+        const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), retryMeta);
         const translations = await translateIndividually(
           texts,
           apiKey,
           targetLanguage,
           model,
-          context,
+          retryContextPayload,
           apiBaseUrl,
           keepPunctuationTokens,
-          debugPayloads
+          true,
+          true,
+          debugPayloads,
+          retryMeta
         );
         return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
       }
@@ -247,23 +354,31 @@ async function performTranslationRequest(
   restorePunctuation = true,
   strictTargetLanguage = false,
   allowRefusalRetry = true,
-  allowLengthRetry = true
+  allowLengthRetry = true,
+  requestMeta = null
 ) {
+  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'main' });
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const normalizedContext = normalizeContextPayload(context);
-  const contextText = normalizedContext.text || '';
+  const effectiveContext =
+    normalizedRequestMeta.purpose !== 'main' && !normalizedRequestMeta.forceFullContextOnRetry
+      ? getRetryContextPayload(normalizedContext, normalizedRequestMeta)
+      : normalizedContext;
+  const contextText = effectiveContext.text || '';
   const baseAnswerText =
-    normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer ? normalizedContext.baseAnswer : '';
+    effectiveContext.baseAnswerIncluded && effectiveContext.baseAnswer ? effectiveContext.baseAnswer : '';
   const inputChars =
     tokenizedTexts.reduce((sum, text) => sum + (text?.length || 0), 0) +
     (contextText?.length || 0) +
     (baseAnswerText?.length || 0);
+  // Retries/repairs are separate LLM calls; keep context minimal unless explicitly forced.
+  const retryContextPayload = getRetryContextPayload(normalizedContext, normalizedRequestMeta);
 
   const prompt = applyPromptCaching(
     buildTranslationPrompt({
       tokenizedTexts,
       targetLanguage,
-      contextPayload: normalizedContext,
+      contextPayload: effectiveContext,
       strictTargetLanguage
     }),
     apiBaseUrl
@@ -355,21 +470,25 @@ async function performTranslationRequest(
       error.isRateLimit = response.status === 429 || response.status === 503;
       error.isRetryable = isRetryableStatus(response.status);
       error.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
-      error.debugPayload = {
-        phase: 'TRANSLATE',
-        model,
-        latencyMs: Date.now() - startedAt,
-        usage: null,
-        inputChars,
-        outputChars: 0,
-        request: requestPayload,
-        response: {
-          status: response.status,
-          statusText: response.statusText,
-          error: errorMessage
+      error.debugPayload = attachRequestMeta(
+        {
+          phase: 'TRANSLATE',
+          model,
+          latencyMs: Date.now() - startedAt,
+          usage: null,
+          inputChars,
+          outputChars: 0,
+          request: requestPayload,
+          response: {
+            status: response.status,
+            statusText: response.statusText,
+            error: errorMessage
+          },
+          parseIssues: ['request-failed']
         },
-        parseIssues: ['request-failed']
-      };
+        normalizedRequestMeta,
+        effectiveContext
+      );
       throw error;
     }
   }
@@ -381,17 +500,21 @@ async function performTranslationRequest(
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const debugPayload = {
-    phase: 'TRANSLATE',
-    model,
-    latencyMs,
-    usage,
-    inputChars,
-    outputChars: content?.length || 0,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
+  const debugPayload = attachRequestMeta(
+    {
+      phase: 'TRANSLATE',
+      model,
+      latencyMs,
+      usage,
+      inputChars,
+      outputChars: content?.length || 0,
+      request: requestPayload,
+      response: content,
+      parseIssues: []
+    },
+    normalizedRequestMeta,
+    effectiveContext
+  );
   const debugPayloads = [debugPayload];
 
   let translations;
@@ -420,17 +543,23 @@ async function performTranslationRequest(
     });
 
     const retryTexts = refusalIndices.map((index) => texts[index]);
+    const retryMeta = createChildRequestMeta(normalizedRequestMeta, {
+      purpose: 'retry',
+      attempt: normalizedRequestMeta.attempt + 1,
+      triggerSource: 'retry'
+    });
     const retryResults = await translateIndividually(
       retryTexts,
       apiKey,
       targetLanguage,
       model,
-      context,
+      retryContextPayload,
       apiBaseUrl,
       !restorePunctuation,
       false,
       true,
-      debugPayloads
+      debugPayloads,
+      retryMeta
     );
 
     refusalIndices.forEach((index, retryPosition) => {
@@ -464,11 +593,17 @@ async function performTranslationRequest(
         targetLanguage,
         model,
         signal,
-        context,
+        retryContextPayload,
         apiBaseUrl,
         restorePunctuation,
         true,
-        allowRefusalRetry
+        allowRefusalRetry,
+        true,
+        createChildRequestMeta(normalizedRequestMeta, {
+          purpose: 'retry',
+          attempt: normalizedRequestMeta.attempt + 1,
+          triggerSource: 'retry'
+        })
       );
       const retryTranslations = retryResults?.translations || [];
       if (Array.isArray(retryResults?.debug)) {
@@ -500,12 +635,17 @@ async function performTranslationRequest(
         apiKey,
         targetLanguage,
         model,
-        context,
+        retryContextPayload,
         apiBaseUrl,
         !restorePunctuation,
         allowRefusalRetry,
         false,
-        debugPayloads
+        debugPayloads,
+        createChildRequestMeta(normalizedRequestMeta, {
+          purpose: 'retry',
+          attempt: normalizedRequestMeta.attempt + 1,
+          triggerSource: 'retry'
+        })
       );
       lengthRetryIndices.forEach((index, retryPosition) => {
         if (retryResults?.[retryPosition]) {
@@ -523,7 +663,8 @@ async function performTranslationRequest(
     model,
     context,
     apiBaseUrl,
-    debugPayloads
+    debugPayloads,
+    normalizedRequestMeta
   );
 
   return {
@@ -546,8 +687,11 @@ async function performTranslationRepairRequest(
   model,
   signal,
   context = '',
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  requestMeta = null
 ) {
+  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'validate' });
+  const contextPayload = { text: context || '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
   const normalizedItems = items.map((item) => ({
     id: item.id,
     source: applyPunctuationTokens(item.source || ''),
@@ -634,20 +778,24 @@ async function performTranslationRepairRequest(
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const debugPayload = {
-    phase: 'TRANSLATE_REPAIR',
-    model,
-    latencyMs,
-    usage,
-    inputChars: normalizedItems.reduce(
-      (sum, item) => sum + (item.source?.length || 0) + (item.draft?.length || 0),
-      0
-    ),
-    outputChars: content?.length || 0,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
+  const debugPayload = attachRequestMeta(
+    {
+      phase: 'TRANSLATE_REPAIR',
+      model,
+      latencyMs,
+      usage,
+      inputChars: normalizedItems.reduce(
+        (sum, item) => sum + (item.source?.length || 0) + (item.draft?.length || 0),
+        0
+      ),
+      outputChars: content?.length || 0,
+      request: requestPayload,
+      response: content,
+      parseIssues: []
+    },
+    normalizedRequestMeta,
+    contextPayload
+  );
 
   let translations = null;
   try {
@@ -672,7 +820,8 @@ async function repairTranslationsForLanguage(
   model,
   context,
   apiBaseUrl,
-  debugPayloads
+  debugPayloads,
+  requestMeta
 ) {
   const repairItems = [];
   const repairIndices = [];
@@ -694,29 +843,42 @@ async function repairTranslationsForLanguage(
       }
       last.parseIssues.push('fallback:language-repair');
     } else {
-      debugPayloads.push({
-        phase: 'TRANSLATE',
-        model,
-        latencyMs: null,
-        usage: null,
-        inputChars: null,
-        outputChars: null,
-        request: null,
-        response: null,
-        parseIssues: ['fallback:language-repair']
-      });
+      debugPayloads.push(
+        attachRequestMeta(
+          {
+            phase: 'TRANSLATE',
+            model,
+            latencyMs: null,
+            usage: null,
+            inputChars: null,
+            outputChars: null,
+            request: null,
+            response: null,
+            parseIssues: ['fallback:language-repair']
+          },
+          normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'validate' }),
+          normalizeContextPayload(context)
+        )
+      );
     }
   }
 
   try {
+    const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), requestMeta);
+    const repairRequestMeta = createChildRequestMeta(requestMeta, {
+      purpose: 'validate',
+      attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
+      triggerSource: 'validate'
+    });
     const repairResult = await performTranslationRepairRequest(
       repairItems,
       apiKey,
       targetLanguage,
       model,
       undefined,
-      context,
-      apiBaseUrl
+      retryContextPayload.text || '',
+      apiBaseUrl,
+      repairRequestMeta
     );
     if (repairResult?.debug && Array.isArray(debugPayloads)) {
       if (!Array.isArray(repairResult.debug.parseIssues)) {
@@ -748,8 +910,10 @@ async function translateIndividually(
   keepPunctuationTokens = false,
   allowRefusalRetry = true,
   allowLengthRetry = true,
-  debugPayloads = null
+  debugPayloads = null,
+  requestMeta = null
 ) {
+  const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'retry' });
   const results = [];
   const maxRetryableRetries = 3;
 
@@ -758,6 +922,12 @@ async function translateIndividually(
 
     while (true) {
       try {
+        const attemptRequestMeta = createChildRequestMeta(baseRequestMeta, {
+          requestId: '',
+          purpose: baseRequestMeta.purpose || 'retry',
+          attempt: baseRequestMeta.attempt,
+          triggerSource: baseRequestMeta.triggerSource || 'retry'
+        });
         const result = await performTranslationRequest(
           [text],
           apiKey,
@@ -769,7 +939,8 @@ async function translateIndividually(
           !keepPunctuationTokens,
           false,
           allowRefusalRetry,
-          allowLengthRetry
+          allowLengthRetry,
+          attemptRequestMeta
         );
         if (Array.isArray(result?.debug) && Array.isArray(debugPayloads)) {
           debugPayloads.push(...result.debug);

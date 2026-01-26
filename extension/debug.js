@@ -861,8 +861,12 @@ function renderDebugPayload(payload, index, baseKey) {
   const latency = formatLatency(payload?.latencyMs);
   const inputChars = formatCharCount(payload?.inputChars);
   const outputChars = formatCharCount(payload?.outputChars);
-  const contextModeRaw = payload?.contextMode || payload?.contextTypeUsed || '';
-  const contextMode = typeof contextModeRaw === 'string' ? contextModeRaw.toUpperCase() : '';
+  const contextTypeRaw =
+    payload?.contextTypeUsed ||
+    (typeof payload?.contextMode === 'string' && ['FULL', 'SHORT'].includes(payload.contextMode.toUpperCase())
+      ? payload.contextMode
+      : '');
+  const contextMode = typeof contextTypeRaw === 'string' ? contextTypeRaw.toUpperCase() : '';
   const contextLabel = contextMode === 'FULL' ? 'FULL' : contextMode === 'SHORT' ? 'SHORT' : '';
   const contextTypeClass = contextMode === 'SHORT' ? 'short' : contextMode === 'FULL' ? 'full' : '';
   const contextBadge = contextLabel
@@ -873,6 +877,35 @@ function renderDebugPayload(payload, index, baseKey) {
     : '';
   const contextMeta = contextLabel
     ? `<div class="debug-context">Context used: ${contextBadge}${baseBadge}</div>`
+    : '';
+  const requestId = payload?.requestId || '';
+  const parentRequestId = payload?.parentRequestId || '';
+  const blockKey = payload?.blockKey || '';
+  const stage = payload?.stage || '';
+  const purpose = payload?.purpose || '';
+  const attempt = Number.isFinite(payload?.attempt) ? payload.attempt : null;
+  const triggerSource = payload?.triggerSource || '';
+  const contextPolicyRaw = payload?.contextMode || payload?.contextPolicy || '';
+  const contextPolicy =
+    typeof contextPolicyRaw === 'string' && ['full', 'minimal', 'none'].includes(contextPolicyRaw.toLowerCase())
+      ? contextPolicyRaw.toLowerCase()
+      : '';
+  const contextHash = payload?.contextHash ?? null;
+  const contextLength = payload?.contextLength ?? null;
+  const requestMetaItems = [
+    requestId ? `requestId: ${escapeHtml(requestId)}` : '',
+    parentRequestId ? `parentRequestId: ${escapeHtml(parentRequestId)}` : '',
+    blockKey ? `blockKey: ${escapeHtml(blockKey)}` : '',
+    stage ? `stage: ${escapeHtml(stage)}` : '',
+    purpose ? `purpose: ${escapeHtml(purpose)}` : '',
+    Number.isFinite(attempt) ? `attempt: ${escapeHtml(String(attempt))}` : '',
+    triggerSource ? `triggerSource: ${escapeHtml(triggerSource)}` : '',
+    contextPolicy ? `contextMode: ${escapeHtml(contextPolicy)}` : '',
+    Number.isFinite(contextLength) ? `contextLen: ${escapeHtml(String(contextLength))}` : '',
+    contextHash ? `contextHash: ${escapeHtml(String(contextHash))}` : ''
+  ].filter(Boolean);
+  const requestMetaSection = requestMetaItems.length
+    ? `<div class="debug-meta debug-meta--request">${requestMetaItems.join(' · ')}</div>`
     : '';
   const payloadKey = `${baseKey}:payload:${index}`;
   const contextSection = contextLabel
@@ -914,6 +947,7 @@ function renderDebugPayload(payload, index, baseKey) {
         <span>Input: ${escapeHtml(inputChars)}</span>
         <span>Output: ${escapeHtml(outputChars)}</span>
       </div>
+      ${requestMetaSection}
       ${contextMeta}
       ${contextSection}
       ${requestSection}
