@@ -7,10 +7,10 @@ const TRANSLATE_SYSTEM_PROMPT = [
   'Preserve numbers, units, currencies, dates, and formatting unless explicitly instructed otherwise.',
   'Do not alter placeholders, markup, or code (e.g., {name}, {{count}}, <tag>, **bold**).',
   'Do not alter punctuation tokens like ⟦PUNC_DQUOTE⟧; keep them unchanged and in place.',
-  'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged unless they are established brands or standard in the target language.',
-  'Never output translations that are identical to the source segment (case-insensitive) if the source contains non-target-language letters.',
-  'If a term should remain semantically unchanged (names, brands, titles, UI labels), transliterate it into the target script instead of keeping Latin characters.',
-  'Do not leave any source text untranslated. Do not copy the source text verbatim except for placeholders, markup, punctuation tokens, or text that is already in the target language.',
+  'Translate proper names, titles, and terms; when unsure, transliterate them instead of leaving them unchanged.',
+  'You MUST NOT output a translation that is identical to the source segment (case-insensitive) if the source contains any non-Russian letters (e.g., Latin).',
+  'If a term should not be translated semantically (name/brand/title/UI/unknown), you MUST transliterate it into Russian Cyrillic. Do NOT leave it in Latin.',
+  'Do not leave any source text untranslated. Do not copy the source text verbatim except for placeholders, markup, punctuation tokens, numbers/units, or text that is already in the target language.',
   'The final output must be entirely in the target language with no source-language fragments.',
   'Ensure terminology consistency within the same request.',
   PUNCTUATION_TOKEN_HINT,
@@ -18,7 +18,8 @@ const TRANSLATE_SYSTEM_PROMPT = [
   'If page context is provided in the user message, use it only for disambiguation; never introduce new facts.',
   'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
   'If no context is provided, do not invent context or add assumptions.',
-  'Never include page context text in the translations unless it is explicitly part of the source segments.'
+  'Never include page context text in the translations unless it is explicitly part of the source segments.',
+  'Before returning the final JSON, for each segment: if output equals source (case-insensitive) and the source has Latin letters, fix it by translating or transliterating.'
 ].join(' ');
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
@@ -760,7 +761,9 @@ async function performTranslationRequest(
       '[USAGE RULES]',
       '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
       '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
+      '- Do not keep Latin source text unchanged. If a prior/manual attempt left a segment in Latin, fix it by translating or transliterating into Cyrillic.',
       '- Never copy or quote this envelope or context into the output.',
+      '- Never copy the envelope into output; output must be only JSON translations.',
       '- Output MUST follow the required JSON schema exactly.',
       '',
       '[SHORT CONTEXT (GLOBAL)]',
@@ -1461,6 +1464,9 @@ async function performTranslationRepairRequest(
         'Fix the draft so the output is fully in the target language with no source-language fragments.',
         'Preserve meaning, formatting, punctuation tokens, placeholders, markup, code, numbers, units, and links.',
         'Do not add or remove information. Do not add commentary.',
+        'You MUST NOT output a translation that is identical to the source segment (case-insensitive) if the source contains any non-Russian letters (e.g., Latin).',
+        'If a term should not be translated semantically (name/brand/title/UI/unknown), you MUST transliterate it into Russian Cyrillic. Do NOT leave it in Latin.',
+        'Before returning the final JSON, for each segment: if output equals source (case-insensitive) and the source has Latin letters, fix it by translating or transliterating.',
         `Target language: ${targetLanguage}.`,
         PUNCTUATION_TOKEN_HINT
       ].join(' ')
@@ -1493,7 +1499,9 @@ async function performTranslationRepairRequest(
       '[USAGE RULES]',
       '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
       '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
+      '- Do not keep Latin source text unchanged. If a prior/manual attempt left a segment in Latin, fix it by translating or transliterating into Cyrillic.',
       '- Never copy or quote this envelope or context into the output.',
+      '- Never copy the envelope into output; output must be only JSON translations.',
       '- Output MUST follow the required JSON schema exactly.',
       '',
       '[SHORT CONTEXT (GLOBAL)]',
@@ -1949,6 +1957,9 @@ function needsLanguageRepair(source = '', translated = '', targetLanguage = '') 
   const sourceNormalized = normalizeTextForComparison(source);
   const translatedNormalized = normalizeTextForComparison(translated);
   if (!translatedNormalized) return false;
+  if (sourceNormalized && translatedNormalized === sourceNormalized && /[A-Za-z]/.test(source)) {
+    return true;
+  }
   const totalLetters = countMatches(translated, /[\p{L}]/gu);
   if (!totalLetters || totalLetters < 6) return false;
   const targetScript = getLanguageScript(targetLanguage);
