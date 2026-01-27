@@ -145,9 +145,6 @@ function buildStoredContextRecord(normalizedContext) {
   if (!fullText && text && mode !== 'SHORT') {
     fullText = text;
   }
-  if (!shortText && text && mode !== 'FULL') {
-    shortText = text;
-  }
   if (!fullText && !shortText) return null;
   return {
     fullText,
@@ -190,6 +187,29 @@ async function readContextFromStorage(cacheKey) {
     }
   }
   return null;
+}
+
+function getStoredContextText(record, mode) {
+  if (!record) return '';
+  if (mode === 'SHORT') return record.shortText || '';
+  if (mode === 'FULL') return record.fullText || '';
+  return record.fullText || record.shortText || '';
+}
+
+async function readContextText(cacheKey, mode) {
+  if (!cacheKey) return { text: '', source: '' };
+  let lookup = readContextFromMemory(cacheKey);
+  let text = getStoredContextText(lookup?.record, mode);
+  if (!text) {
+    lookup = await readContextFromStorage(cacheKey);
+    text = getStoredContextText(lookup?.record, mode);
+  }
+  return { text, source: lookup?.source || '' };
+}
+
+async function getContextText(cacheKey, mode) {
+  const result = await readContextText(cacheKey, mode);
+  return result.text;
 }
 
 async function writeContextToStorage(cacheKey, record) {
@@ -246,10 +266,10 @@ async function resolveContextForRequest(contextPayload, requestMeta) {
       }
     }
     if (lookup?.record) {
-      if (!normalized.fullText) normalized.fullText = lookup.record.fullText || '';
-      if (!normalized.shortText) normalized.shortText = lookup.record.shortText || '';
+      if (!normalized.fullText) normalized.fullText = getStoredContextText(lookup.record, 'FULL');
+      if (!normalized.shortText) normalized.shortText = getStoredContextText(lookup.record, 'SHORT');
       if (!normalized.text) {
-        normalized.text = lookup.record.fullText || lookup.record.shortText || '';
+        normalized.text = getStoredContextText(lookup.record, '');
       }
       if (!normalized.baseAnswer && lookup.record.baseAnswer) {
         normalized.baseAnswer = lookup.record.baseAnswer;
@@ -285,9 +305,9 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
 function resolveContextPolicy(contextPayload, purpose) {
   const normalized = normalizeContextPayload(contextPayload);
   if (!normalized.text) {
-    return purpose && purpose !== 'main' ? 'minimal' : 'none';
+    return purpose && purpose !== 'main' ? 'short' : 'none';
   }
-  if (normalized.mode === 'SHORT') return 'minimal';
+  if (normalized.mode === 'SHORT') return 'short';
   return 'full';
 }
 
@@ -315,6 +335,13 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
   const contextMissing = (mode === 'FULL' || mode === 'SHORT') && !text;
+  const contextMissingReason = contextMissing
+    ? mode === 'SHORT'
+      ? 'short context missing'
+      : mode === 'FULL'
+        ? 'full context missing'
+        : ''
+    : '';
   if (contextMissing) {
     console.warn('Context mode requires text but none was provided.', {
       mode,
@@ -329,13 +356,14 @@ function buildEffectiveContext(contextPayload, requestMeta) {
     hash: text ? computeTextHash(text) : 0,
     baseAnswer,
     baseAnswerIncluded,
-    contextMissing
+    contextMissing,
+    contextMissingReason
   };
 }
 
 function buildContextPolicy(mode) {
   if (mode === 'FULL') return 'full';
-  if (mode === 'SHORT') return 'minimal';
+  if (mode === 'SHORT') return 'short';
   return 'none';
 }
 
@@ -376,6 +404,7 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     contextLength: payload.contextLength ?? (effectiveContext?.length ?? 0),
     contextTextSent: payload.contextTextSent ?? effectiveContext?.text,
     contextMissing: payload.contextMissing ?? effectiveContext?.contextMissing,
+    contextMissingReason: payload.contextMissingReason ?? effectiveContext?.contextMissingReason ?? '',
     contextSource: payload.contextSource ?? effectiveContext?.contextSource ?? '',
     contextId: payload.contextId ?? effectiveContext?.contextId ?? '',
     baseAnswerIncluded: payload.baseAnswerIncluded ?? effectiveContext?.baseAnswerIncluded,
@@ -715,6 +744,15 @@ async function performTranslationRequest(
         contextSource = 'localStorage';
       }
     }
+    if (!resolvedShortContextText && contextId) {
+      const rehydrated = await readContextText(contextId, 'SHORT');
+      if (rehydrated.text) {
+        resolvedShortContextText = rehydrated.text;
+        if (!contextSource || contextSource === 'none') {
+          contextSource = rehydrated.source || contextSource;
+        }
+      }
+    }
     let manualOutputsSource = '';
     let storedManualOutputs = [];
     let manualOutputsFoundCount = 0;
@@ -885,21 +923,23 @@ async function performTranslationRequest(
       manualOutputsCount: manualOutputsFoundCount || 0
     });
     if (!resolvedShortContextText) {
-      resolvedShortContextText = '(short context missing: bundle not found)';
-      console.warn('Retry/validate short context missing; using placeholder.', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey
-      });
+      effectiveContext.contextMissing = true;
+      effectiveContext.contextMissingReason = 'short context missing';
     }
-    if (resolvedShortContextText !== effectiveContext.text) {
+    if (resolvedShortContextText && resolvedShortContextText !== effectiveContext.text) {
       effectiveContext.text = resolvedShortContextText;
       effectiveContext.length = resolvedShortContextText.length;
       effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
       effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
         ? !resolvedShortContextText
         : false;
+      effectiveContext.contextMissingReason = effectiveContext.contextMissing
+        ? effectiveContext.mode === 'SHORT'
+          ? 'short context missing'
+          : effectiveContext.mode === 'FULL'
+            ? 'full context missing'
+            : ''
+        : '';
       effectiveContext.contextSource = contextSource || effectiveContext.contextSource || 'none';
     }
   }
@@ -969,7 +1009,7 @@ async function performTranslationRequest(
       '- Output MUST follow the required JSON schema exactly.',
       '',
       '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText || '(short context missing: bundle not found)',
+      resolvedShortContextText,
       '',
       '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
       manualOutputsText,
@@ -1472,6 +1512,15 @@ async function performTranslationRepairRequest(
         contextSource = 'localStorage';
       }
     }
+    if (!resolvedShortContextText && contextId) {
+      const rehydrated = await readContextText(contextId, 'SHORT');
+      if (rehydrated.text) {
+        resolvedShortContextText = rehydrated.text;
+        if (!contextSource || contextSource === 'none') {
+          contextSource = rehydrated.source || contextSource;
+        }
+      }
+    }
     let manualOutputsSource = '';
     let storedManualOutputs = [];
     let manualOutputsFoundCount = 0;
@@ -1642,21 +1691,23 @@ async function performTranslationRepairRequest(
       manualOutputsCount: manualOutputsFoundCount || 0
     });
     if (!resolvedShortContextText) {
-      resolvedShortContextText = '(short context missing: bundle not found)';
-      console.warn('Retry/validate short context missing; using placeholder.', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey
-      });
+      effectiveContext.contextMissing = true;
+      effectiveContext.contextMissingReason = 'short context missing';
     }
-    if (resolvedShortContextText !== effectiveContext.text) {
+    if (resolvedShortContextText && resolvedShortContextText !== effectiveContext.text) {
       effectiveContext.text = resolvedShortContextText;
       effectiveContext.length = resolvedShortContextText.length;
       effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
       effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
         ? !resolvedShortContextText
         : false;
+      effectiveContext.contextMissingReason = effectiveContext.contextMissing
+        ? effectiveContext.mode === 'SHORT'
+          ? 'short context missing'
+          : effectiveContext.mode === 'FULL'
+            ? 'full context missing'
+            : ''
+        : '';
       effectiveContext.contextSource = contextSource || effectiveContext.contextSource || 'none';
     }
   }
@@ -1738,7 +1789,7 @@ async function performTranslationRepairRequest(
       '- Output MUST follow the required JSON schema exactly.',
       '',
       '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText || '(short context missing: bundle not found)',
+      resolvedShortContextText,
       '',
       '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
       manualOutputsText,

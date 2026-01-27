@@ -1064,11 +1064,6 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
     : '';
   const contextSource = payload?.contextSource || '';
   const contextId = payload?.contextId || '';
-  const contextMetaItems = [
-    contextSource ? `contextSource: ${escapeHtml(contextSource)}` : '',
-    contextId ? `contextId: ${escapeHtml(contextId)}` : ''
-  ].filter(Boolean);
-  const contextMeta = contextMetaItems.length ? contextMetaItems.join(' · ') : '';
   const requestId = payload?.requestId || '';
   const parentRequestId = payload?.parentRequestId || '';
   const blockKey = payload?.blockKey || '';
@@ -1077,10 +1072,13 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   const attempt = Number.isFinite(payload?.attempt) ? payload.attempt : null;
   const triggerSource = payload?.triggerSource || '';
   const contextPolicyRaw = payload?.contextMode || payload?.contextPolicy || '';
-  const contextPolicy =
-    typeof contextPolicyRaw === 'string' && ['full', 'minimal', 'none'].includes(contextPolicyRaw.toLowerCase())
-      ? contextPolicyRaw.toLowerCase()
-      : '';
+  let contextPolicy = '';
+  if (typeof contextPolicyRaw === 'string') {
+    const normalizedPolicy = contextPolicyRaw.toLowerCase();
+    if (['full', 'short', 'minimal', 'none'].includes(normalizedPolicy)) {
+      contextPolicy = normalizedPolicy === 'minimal' ? 'short' : normalizedPolicy;
+    }
+  }
   const contextHash = payload?.contextHash ?? null;
   const contextLength = payload?.contextLength ?? null;
   const requestMetaItems = [
@@ -1095,6 +1093,12 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
     Number.isFinite(contextLength) ? `contextLen: ${escapeHtml(String(contextLength))}` : '',
     contextHash ? `contextHash: ${escapeHtml(String(contextHash))}` : ''
   ].filter(Boolean);
+  const contextMetaItems = [
+    contextSource ? `contextSource: ${escapeHtml(contextSource)}` : '',
+    contextId ? `contextId: ${escapeHtml(contextId)}` : '',
+    contextPolicy ? `contextMode: ${escapeHtml(contextPolicy)}` : ''
+  ].filter(Boolean);
+  const contextMeta = contextMetaItems.length ? contextMetaItems.join(' · ') : '';
   setTextIfChanged(parts.phaseEl, phase);
   setTextIfChanged(parts.modelEl, model);
   setTextIfChanged(parts.tagEl, tag);
@@ -1110,9 +1114,10 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   parts.contextDetails.detailsEl.style.display = hasContextSection ? '' : 'none';
   if (hasContextSection) {
     const contextMissing = Boolean(payload?.contextMissing);
+    const contextMissingReason = payload?.contextMissingReason || '';
     const contextMissingNote =
       contextMissing && contextPolicy !== 'none'
-        ? '\n\n⚠️ Контекст должен был быть отправлен, но текст пуст (contextMissing: true).'
+        ? `\n\n⚠️ Контекст должен был быть отправлен, но текст пуст.${contextMissingReason ? ` Причина: ${contextMissingReason}.` : ''}`
         : '';
     const contextContent =
       contextPolicy === 'none'
