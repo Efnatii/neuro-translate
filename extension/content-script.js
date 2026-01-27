@@ -2705,15 +2705,33 @@ function annotateContextUsage(payloads, { contextMode, baseAnswerIncluded, baseA
         ? existingContextMode
         : '') ||
       contextMode;
+    const sentContextText = payload.contextTextSent ?? contextTextSent;
+    const sentContextMetrics = buildSentContextMetrics(contextTypeUsed, sentContextText);
     return {
       ...payload,
       contextTypeUsed,
       baseAnswerIncluded: payload.baseAnswerIncluded ?? baseAnswerIncluded,
       baseAnswerPreview: payload.baseAnswerPreview ?? baseAnswerPreview,
-      contextTextSent: payload.contextTextSent ?? contextTextSent,
+      contextTextSent: sentContextText,
+      sentContextMode: payload.sentContextMode ?? sentContextMetrics.sentContextMode,
+      sentContextLen: payload.sentContextLen ?? sentContextMetrics.sentContextLen,
+      sentContextPreview: payload.sentContextPreview ?? sentContextMetrics.sentContextPreview,
       tag: payload.tag || tag
     };
   });
+}
+
+function buildSentContextMetrics(mode, text) {
+  const resolvedMode = typeof mode === 'string' ? mode.toUpperCase() : '';
+  const resolvedText = typeof text === 'string' ? text : '';
+  const limit = 200;
+  const trimmed = resolvedText.trim();
+  const preview = trimmed.length > limit ? `${trimmed.slice(0, limit)}…` : trimmed;
+  return {
+    sentContextMode: resolvedMode === 'SHORT' ? 'SHORT' : resolvedMode === 'FULL' ? 'FULL' : '',
+    sentContextLen: resolvedText.length,
+    sentContextPreview: preview
+  };
 }
 
 function buildContextOverflowDebugPayload({
@@ -2726,6 +2744,7 @@ function buildContextOverflowDebugPayload({
   tag,
   requestMeta
 }) {
+  const sentContextMetrics = buildSentContextMetrics(contextMode, contextTextSent);
   const payload = {
     phase,
     model: model || '—',
@@ -2739,6 +2758,9 @@ function buildContextOverflowDebugPayload({
     contextTypeUsed: contextMode,
     baseAnswerIncluded,
     contextTextSent,
+    sentContextMode: sentContextMetrics.sentContextMode,
+    sentContextLen: sentContextMetrics.sentContextLen,
+    sentContextPreview: sentContextMetrics.sentContextPreview,
     tag
   };
   const [annotated] = annotateRequestMetadata([payload], requestMeta || {});
