@@ -82,6 +82,42 @@ function normalizeContextPayload(context) {
   };
 }
 
+function buildShortContextFallback(context = '') {
+  if (!context) return '';
+  if (context.length <= 800) return context.trim();
+  const lines = context.split(/\r?\n/);
+  const preferredSections = new Set(['1)', '6)', '8)']);
+  let include = false;
+  const selected = [];
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    const headerMatch = trimmed.match(/^(\d+)\)/);
+    if (headerMatch) {
+      include = preferredSections.has(`${headerMatch[1]})`);
+    }
+    if (include) {
+      selected.push(line);
+    }
+  });
+  const compact = selected.join('\n').trim();
+  if (compact && compact.length <= 800) {
+    return compact;
+  }
+  return context.slice(0, 800).trimEnd();
+}
+
+function buildShortContextFromNormalized(normalized) {
+  if (!normalized) return '';
+  const directShort =
+    normalized.shortText ||
+    (normalized.mode === 'SHORT' ? normalized.text : '') ||
+    '';
+  const shortCandidate = directShort ? buildShortContextFallback(directShort) : '';
+  if (shortCandidate) return shortCandidate.trim();
+  const fallbackSource = normalized.text || normalized.fullText || '';
+  return buildShortContextFallback(fallbackSource).trim();
+}
+
 function createRequestId() {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
@@ -135,15 +171,18 @@ function resolveEffectiveContextMode(requestMeta, normalizedContext) {
 
 function buildEffectiveContext(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const mode = resolveEffectiveContextMode(requestMeta, normalized);
+  let mode = resolveEffectiveContextMode(requestMeta, normalized);
   let text = '';
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+    text = buildShortContextFromNormalized(normalized);
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
+  if (mode === 'SHORT' && !text) {
+    mode = 'NONE';
+  }
   const contextMissing = (mode === 'FULL' || mode === 'SHORT') && !text;
   if (contextMissing) {
     console.warn('Context mode requires text but none was provided.', {
@@ -177,14 +216,93 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
+  const shortText = buildShortContextFromNormalized(normalized).trim();
   return {
-    text: normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '',
+    text: shortText,
     mode: 'SHORT',
     baseAnswer: normalized.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
     fullText: '',
-    shortText: normalized.shortText || ''
+    shortText: shortText
   };
+}
+
+function getShortContextStorageKey(requestMeta) {
+  return requestMeta?.blockKey || requestMeta?.parentRequestId || '';
+}
+
+async function loadStoredShortContext(requestMeta) {
+  const key = getShortContextStorageKey(requestMeta);
+  if (!key) return '';
+  const storageKey = 'translationShortContextByBlock';
+  const fetchFromArea = (area) =>
+    new Promise((resolve) => {
+      if (!area?.get) {
+        resolve({});
+        return;
+      }
+      try {
+        area.get({ [storageKey]: {} }, (data) => resolve(data?.[storageKey] || {}));
+      } catch (error) {
+        resolve({});
+      }
+    });
+  let store = {};
+  try {
+    store = await fetchFromArea(chrome?.storage?.session);
+  } catch (error) {
+    store = {};
+  }
+  if (!store || typeof store !== 'object') {
+    store = {};
+  }
+  if (!store[key]) {
+    try {
+      store = await fetchFromArea(chrome?.storage?.local);
+    } catch (error) {
+      store = {};
+    }
+  }
+  const record = store && typeof store === 'object' ? store[key] : null;
+  const text = typeof record?.text === 'string' ? record.text : '';
+  return buildShortContextFallback(text).trim();
+}
+
+async function persistShortContext(requestMeta, shortText) {
+  const key = getShortContextStorageKey(requestMeta);
+  if (!key || !shortText) return;
+  const storageKey = 'translationShortContextByBlock';
+  const trimmed = buildShortContextFallback(shortText).trim();
+  if (!trimmed) return;
+  const saveToArea = (area) =>
+    new Promise((resolve) => {
+      if (!area?.get || !area?.set) {
+        resolve(false);
+        return;
+      }
+      try {
+        area.get({ [storageKey]: {} }, (data) => {
+          const store = data?.[storageKey] && typeof data[storageKey] === 'object' ? data[storageKey] : {};
+          store[key] = { text: trimmed, updatedAt: Date.now() };
+          area.set({ [storageKey]: store }, () => resolve(true));
+        });
+      } catch (error) {
+        resolve(false);
+      }
+    });
+  let saved = false;
+  try {
+    saved = await saveToArea(chrome?.storage?.session);
+  } catch (error) {
+    saved = false;
+  }
+  if (!saved) {
+    try {
+      await saveToArea(chrome?.storage?.local);
+    } catch (error) {
+      // ignore fallback errors
+    }
+  }
 }
 
 function attachRequestMeta(payload, requestMeta, effectiveContext) {
@@ -465,12 +583,20 @@ async function performTranslationRequest(
   const normalizedContext = normalizeContextPayload(context);
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
+  if (triggerSource !== 'retry' && triggerSource !== 'validate') {
+    const shortCandidate = buildShortContextFromNormalized(normalizedContext);
+    if (shortCandidate) {
+      await persistShortContext(normalizedRequestMeta, shortCandidate);
+    }
+  }
   let resolvedShortContextText = effectiveContext.text || '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     if (!resolvedShortContextText) {
-      resolvedShortContextText =
-        normalizedContext.shortText || (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') || '';
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
+    }
+    if (!resolvedShortContextText) {
+      resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
     let matchedEntry = null;
     let matchedState = null;
@@ -704,15 +830,6 @@ async function performTranslationRequest(
       manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
       manualOutputsCount: manualOutputsFoundCount || 0
     });
-    if (!resolvedShortContextText) {
-      resolvedShortContextText = '(short context missing: bundle not found)';
-      console.warn('Retry/validate short context missing; using placeholder.', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey
-      });
-    }
     if (resolvedShortContextText !== effectiveContext.text) {
       effectiveContext.text = resolvedShortContextText;
       effectiveContext.length = resolvedShortContextText.length;
@@ -756,31 +873,33 @@ async function performTranslationRequest(
   );
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
-    const envelope = [
-      '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
-      '[USAGE RULES]',
-      '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
-      '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
-      '- Do not keep any non-target language/script text unchanged. If a prior/manual attempt left a segment in the source script, fix it by translating or transliterating into the target script.',
-      '- Allow verbatim copies only for allowlisted tokens (placeholders, markup, code, URLs, IDs, numbers/units, punctuation tokens) or text already in the target language.',
-      '- If any manual output says "same as source" or copies the source text while it is not in target language/script, correct it.',
-      '- Never copy or quote this envelope or context into the output.',
-      '- Never copy the envelope into output; output must be only JSON translations.',
-      '- Output MUST follow the required JSON schema exactly.',
-      '',
-      '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText || '(short context missing: bundle not found)',
-      '',
-      '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-      manualOutputsText,
-      '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
-    ].join('\n');
-    if (Array.isArray(prompt)) {
-      const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
-      if (firstUserIndex >= 0) {
-        prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
-      } else {
-        prompt.push({ role: 'user', content: envelope });
+    if (resolvedShortContextText) {
+      const envelope = [
+        '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
+        '[USAGE RULES]',
+        '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
+        '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
+        '- Do not keep any non-target language/script text unchanged. If a prior/manual attempt left a segment in the source script, fix it by translating or transliterating into the target script.',
+        '- Allow verbatim copies only for allowlisted tokens (placeholders, markup, code, URLs, IDs, numbers/units, punctuation tokens) or text already in the target language.',
+        '- If any manual output says "same as source" or copies the source text while it is not in target language/script, correct it.',
+        '- Never copy or quote this envelope or context into the output.',
+        '- Never copy the envelope into output; output must be only JSON translations.',
+        '- Output MUST follow the required JSON schema exactly.',
+        '',
+        '[SHORT CONTEXT (GLOBAL)]',
+        resolvedShortContextText,
+        '',
+        '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
+        manualOutputsText,
+        '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
+      ].join('\n');
+      if (Array.isArray(prompt)) {
+        const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
+        if (firstUserIndex >= 0) {
+          prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
+        } else {
+          prompt.push({ role: 'user', content: envelope });
+        }
       }
     }
   }
@@ -1190,16 +1309,23 @@ async function performTranslationRepairRequest(
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'validate' });
   const operationType = 'neuro-translate:translate:v1';
-  const contextPayload = { text: context || '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
-  const normalizedContext = normalizeContextPayload(contextPayload);
+  const normalizedContext = normalizeContextPayload(context);
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
+  if (triggerSource !== 'retry' && triggerSource !== 'validate') {
+    const shortCandidate = buildShortContextFromNormalized(normalizedContext);
+    if (shortCandidate) {
+      await persistShortContext(normalizedRequestMeta, shortCandidate);
+    }
+  }
   let resolvedShortContextText = effectiveContext.text || '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     if (!resolvedShortContextText) {
-      resolvedShortContextText =
-        normalizedContext.shortText || (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') || '';
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
+    }
+    if (!resolvedShortContextText) {
+      resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
     let matchedEntry = null;
     let matchedState = null;
@@ -1433,15 +1559,6 @@ async function performTranslationRepairRequest(
       manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
       manualOutputsCount: manualOutputsFoundCount || 0
     });
-    if (!resolvedShortContextText) {
-      resolvedShortContextText = '(short context missing: bundle not found)';
-      console.warn('Retry/validate short context missing; using placeholder.', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey
-      });
-    }
     if (resolvedShortContextText !== effectiveContext.text) {
       effectiveContext.text = resolvedShortContextText;
       effectiveContext.length = resolvedShortContextText.length;
@@ -1497,31 +1614,33 @@ async function performTranslationRepairRequest(
   ], apiBaseUrl);
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
-    const envelope = [
-      '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
-      '[USAGE RULES]',
-      '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
-      '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
-      '- Do not keep any non-target language/script text unchanged. If a prior/manual attempt left a segment in the source script, fix it by translating or transliterating into the target script.',
-      '- Allow verbatim copies only for allowlisted tokens (placeholders, markup, code, URLs, IDs, numbers/units, punctuation tokens) or text already in the target language.',
-      '- If any manual output says "same as source" or copies the source text while it is not in target language/script, correct it.',
-      '- Never copy or quote this envelope or context into the output.',
-      '- Never copy the envelope into output; output must be only JSON translations.',
-      '- Output MUST follow the required JSON schema exactly.',
-      '',
-      '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText || '(short context missing: bundle not found)',
-      '',
-      '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-      manualOutputsText,
-      '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
-    ].join('\n');
-    if (Array.isArray(prompt)) {
-      const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
-      if (firstUserIndex >= 0) {
-        prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
-      } else {
-        prompt.push({ role: 'user', content: envelope });
+    if (resolvedShortContextText) {
+      const envelope = [
+        '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
+        '[USAGE RULES]',
+        '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
+        '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
+        '- Do not keep any non-target language/script text unchanged. If a prior/manual attempt left a segment in the source script, fix it by translating or transliterating into the target script.',
+        '- Allow verbatim copies only for allowlisted tokens (placeholders, markup, code, URLs, IDs, numbers/units, punctuation tokens) or text already in the target language.',
+        '- If any manual output says "same as source" or copies the source text while it is not in target language/script, correct it.',
+        '- Never copy or quote this envelope or context into the output.',
+        '- Never copy the envelope into output; output must be only JSON translations.',
+        '- Output MUST follow the required JSON schema exactly.',
+        '',
+        '[SHORT CONTEXT (GLOBAL)]',
+        resolvedShortContextText,
+        '',
+        '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
+        manualOutputsText,
+        '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
+      ].join('\n');
+      if (Array.isArray(prompt)) {
+        const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
+        if (firstUserIndex >= 0) {
+          prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
+        } else {
+          prompt.push({ role: 'user', content: envelope });
+        }
       }
     }
   }
@@ -1673,7 +1792,7 @@ async function repairTranslationsForLanguage(
       targetLanguage,
       model,
       undefined,
-      retryContextPayload.text || '',
+      retryContextPayload,
       apiBaseUrl,
       repairRequestMeta
     );
