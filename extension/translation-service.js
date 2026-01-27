@@ -516,10 +516,48 @@ async function performTranslationRequest(
         }
       }
     }
-    if (matchedEntry) {
-      const debugList = Array.isArray(matchedEntry.translationDebug) ? matchedEntry.translationDebug : [];
-      const manualPayloads = debugList.filter((payload) => payload?.triggerSource === 'manual');
+    if (matchedEntry || matchedState) {
+      const debugList = [];
+      const debugSources = [];
+      if (Array.isArray(matchedEntry?.translationDebug)) {
+        debugList.push(...matchedEntry.translationDebug);
+        debugSources.push('matchedEntry.translationDebug');
+      }
+      if (Array.isArray(matchedState?.translationDebug)) {
+        debugList.push(...matchedState.translationDebug);
+        debugSources.push('matchedState.translationDebug');
+      }
+      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.blockKey) {
+        matchedState.items.forEach((item) => {
+          if (item?.blockKey === normalizedRequestMeta.blockKey && Array.isArray(item.translationDebug)) {
+            debugList.push(...item.translationDebug);
+            debugSources.push(`matchedState.items[${item.blockKey}].translationDebug`);
+          }
+        });
+      }
+      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.parentRequestId) {
+        matchedState.items.forEach((item) => {
+          const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
+          if (list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId)) {
+            debugList.push(...list);
+            debugSources.push(`matchedState.items[parent:${normalizedRequestMeta.parentRequestId}].translationDebug`);
+          }
+        });
+      }
+      const manualPayloads = debugList.filter((payload) => {
+        const trigger = typeof payload?.triggerSource === 'string' ? payload.triggerSource : '';
+        if (!trigger) return false;
+        if (trigger === 'retry' || trigger === 'validate') return false;
+        return /manual/i.test(trigger) || trigger === 'manual_translate' || trigger === 'manualTranslate';
+      });
       const manualParts = manualPayloads.map((payload, index) => {
+        const headerParts = [
+          `Manual attempt ${index + 1}`,
+          payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+          payload?.phase ? `phase=${payload.phase}` : '',
+          payload?.model ? `model=${payload.model}` : '',
+          payload?.timestamp ? `ts=${payload.timestamp}` : ''
+        ].filter(Boolean);
         let responseText = '';
         if (payload?.response != null) {
           try {
@@ -528,17 +566,49 @@ async function performTranslationRequest(
             responseText = String(payload.response);
           }
         }
+        const extracted =
+          payload?.extractedResult ??
+          payload?.translations ??
+          payload?.parsed ??
+          payload?.result ??
+          payload?.extracted ??
+          '';
+        let extractedText = '';
+        if (extracted) {
+          try {
+            extractedText = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
+          } catch (error) {
+            extractedText = String(extracted);
+          }
+        }
         const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
-        const header = `Manual attempt ${index + 1}${payload?.phase ? ` (${payload.phase})` : ''}`;
+        const validationErrors = Array.isArray(payload?.validationErrors)
+          ? payload.validationErrors.join(', ')
+          : payload?.validationErrors || '';
+        const payloadError = payload?.error ? String(payload.error) : '';
         return [
-          header,
-          responseText ? `Response: ${responseText}` : 'Response: (empty)',
-          parseIssues ? `Parse issues: ${parseIssues}` : ''
+          headerParts.join(' | '),
+          responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
+          extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
+          parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
+          validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
+          payloadError ? `ERROR: ${payloadError}` : ''
         ]
           .filter(Boolean)
           .join('\n');
       });
       resolvedManualOutputs = manualParts.join('\n\n');
+      if (!resolvedManualOutputs) {
+        const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
+        console.warn('Retry/validate manual outputs not found.', {
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          debugSources,
+          observedTriggers
+        });
+      }
     }
     if (!resolvedManualOutputs) {
       resolvedManualOutputs = '(no manual outputs found)';
@@ -575,12 +645,20 @@ async function performTranslationRequest(
     buildTranslationPrompt({
       tokenizedTexts,
       targetLanguage,
-      contextPayload: {
-        text: effectiveContext.text,
-        mode: effectiveContext.mode,
-        baseAnswer: effectiveContext.baseAnswer,
-        baseAnswerIncluded: effectiveContext.baseAnswerIncluded
-      },
+      contextPayload:
+        triggerSource === 'retry' || triggerSource === 'validate'
+          ? {
+              text: '',
+              mode: '',
+              baseAnswer: effectiveContext.baseAnswer,
+              baseAnswerIncluded: effectiveContext.baseAnswerIncluded
+            }
+          : {
+              text: effectiveContext.text,
+              mode: effectiveContext.mode,
+              baseAnswer: effectiveContext.baseAnswer,
+              baseAnswerIncluded: effectiveContext.baseAnswerIncluded
+            },
       strictTargetLanguage
     }),
     apiBaseUrl
@@ -589,6 +667,12 @@ async function performTranslationRequest(
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
     const envelope = [
       '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
+      '[USAGE RULES]',
+      '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
+      '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
+      '- Never copy or quote this envelope or context into the output.',
+      '- Output MUST follow the required JSON schema exactly.',
+      '',
       '[SHORT CONTEXT (GLOBAL)]',
       resolvedShortContextText || '(short context missing: bundle not found)',
       '',
@@ -973,10 +1057,48 @@ async function performTranslationRepairRequest(
         }
       }
     }
-    if (matchedEntry) {
-      const debugList = Array.isArray(matchedEntry.translationDebug) ? matchedEntry.translationDebug : [];
-      const manualPayloads = debugList.filter((payload) => payload?.triggerSource === 'manual');
+    if (matchedEntry || matchedState) {
+      const debugList = [];
+      const debugSources = [];
+      if (Array.isArray(matchedEntry?.translationDebug)) {
+        debugList.push(...matchedEntry.translationDebug);
+        debugSources.push('matchedEntry.translationDebug');
+      }
+      if (Array.isArray(matchedState?.translationDebug)) {
+        debugList.push(...matchedState.translationDebug);
+        debugSources.push('matchedState.translationDebug');
+      }
+      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.blockKey) {
+        matchedState.items.forEach((item) => {
+          if (item?.blockKey === normalizedRequestMeta.blockKey && Array.isArray(item.translationDebug)) {
+            debugList.push(...item.translationDebug);
+            debugSources.push(`matchedState.items[${item.blockKey}].translationDebug`);
+          }
+        });
+      }
+      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.parentRequestId) {
+        matchedState.items.forEach((item) => {
+          const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
+          if (list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId)) {
+            debugList.push(...list);
+            debugSources.push(`matchedState.items[parent:${normalizedRequestMeta.parentRequestId}].translationDebug`);
+          }
+        });
+      }
+      const manualPayloads = debugList.filter((payload) => {
+        const trigger = typeof payload?.triggerSource === 'string' ? payload.triggerSource : '';
+        if (!trigger) return false;
+        if (trigger === 'retry' || trigger === 'validate') return false;
+        return /manual/i.test(trigger) || trigger === 'manual_translate' || trigger === 'manualTranslate';
+      });
       const manualParts = manualPayloads.map((payload, index) => {
+        const headerParts = [
+          `Manual attempt ${index + 1}`,
+          payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+          payload?.phase ? `phase=${payload.phase}` : '',
+          payload?.model ? `model=${payload.model}` : '',
+          payload?.timestamp ? `ts=${payload.timestamp}` : ''
+        ].filter(Boolean);
         let responseText = '';
         if (payload?.response != null) {
           try {
@@ -985,17 +1107,49 @@ async function performTranslationRepairRequest(
             responseText = String(payload.response);
           }
         }
+        const extracted =
+          payload?.extractedResult ??
+          payload?.translations ??
+          payload?.parsed ??
+          payload?.result ??
+          payload?.extracted ??
+          '';
+        let extractedText = '';
+        if (extracted) {
+          try {
+            extractedText = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
+          } catch (error) {
+            extractedText = String(extracted);
+          }
+        }
         const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
-        const header = `Manual attempt ${index + 1}${payload?.phase ? ` (${payload.phase})` : ''}`;
+        const validationErrors = Array.isArray(payload?.validationErrors)
+          ? payload.validationErrors.join(', ')
+          : payload?.validationErrors || '';
+        const payloadError = payload?.error ? String(payload.error) : '';
         return [
-          header,
-          responseText ? `Response: ${responseText}` : 'Response: (empty)',
-          parseIssues ? `Parse issues: ${parseIssues}` : ''
+          headerParts.join(' | '),
+          responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
+          extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
+          parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
+          validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
+          payloadError ? `ERROR: ${payloadError}` : ''
         ]
           .filter(Boolean)
           .join('\n');
       });
       resolvedManualOutputs = manualParts.join('\n\n');
+      if (!resolvedManualOutputs) {
+        const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
+        console.warn('Retry/validate manual outputs not found.', {
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          debugSources,
+          observedTriggers
+        });
+      }
     }
     if (!resolvedManualOutputs) {
       resolvedManualOutputs = '(no manual outputs found)';
@@ -1041,13 +1195,15 @@ async function performTranslationRepairRequest(
       role: 'user',
       content: [
         `Repair the following translations into ${targetLanguage}.`,
-        contextText
-          ? [
-              'Use the page context only for disambiguation.',
-              'Do not translate or include the context in the output.',
-              `Context (do not translate): <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
-            ].join('\n')
-          : '',
+        (triggerSource === 'retry' || triggerSource === 'validate') && contextText
+          ? ''
+          : contextText
+            ? [
+                'Use the page context only for disambiguation.',
+                'Do not translate or include the context in the output.',
+                `Context (do not translate): <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
+              ].join('\n')
+            : '',
         'Return only JSON with a "translations" array matching the input order.',
         'Items: (JSON array of {id, source, draft})',
         JSON.stringify(normalizedItems)
@@ -1060,6 +1216,12 @@ async function performTranslationRepairRequest(
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
     const envelope = [
       '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
+      '[USAGE RULES]',
+      '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
+      '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
+      '- Never copy or quote this envelope or context into the output.',
+      '- Output MUST follow the required JSON schema exactly.',
+      '',
       '[SHORT CONTEXT (GLOBAL)]',
       resolvedShortContextText || '(short context missing: bundle not found)',
       '',
