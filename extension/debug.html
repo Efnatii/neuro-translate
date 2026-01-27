@@ -268,13 +268,17 @@
       border: 1px solid #dbeafe;
       background: #eff6ff;
       color: #0f172a;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      max-width: 100%;
+      box-sizing: border-box;
+      overflow-x: hidden;
     }
     pre.raw-response.raw-json {
       background: #0f172a;
       color: #e2e8f0;
       border-color: #1e293b;
-      white-space: pre;
-      overflow-x: auto;
     }
     .debug-payload {
       border: 1px solid #e2e8f0;
