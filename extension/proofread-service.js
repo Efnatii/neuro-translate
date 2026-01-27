@@ -124,14 +124,171 @@ function resolveEffectiveContextMode(requestMeta, normalizedContext) {
   return 'NONE';
 }
 
+function trimToShortContext(text, limit = 800) {
+  const normalized = typeof text === 'string' ? text.trim() : String(text ?? '').trim();
+  if (!normalized) return '';
+  if (normalized.length <= limit) return normalized;
+  return normalized.slice(0, limit);
+}
+
+function formatManualOutputs(payloads) {
+  if (!Array.isArray(payloads) || !payloads.length) return '';
+  const manualPayloads = payloads.filter((payload) => payload?.triggerSource === 'manual');
+  if (!manualPayloads.length) return '';
+  return manualPayloads
+    .map((payload, index) => {
+      let responseText = '';
+      if (payload?.response != null) {
+        try {
+          responseText = typeof payload.response === 'string' ? payload.response : JSON.stringify(payload.response);
+        } catch (error) {
+          responseText = String(payload.response);
+        }
+      }
+      const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
+      const header = `Manual attempt ${index + 1}${payload?.phase ? ` (${payload.phase})` : ''}`;
+      return [
+        header,
+        responseText ? `Response: ${responseText}` : 'Response: (empty)',
+        parseIssues ? `Parse issues: ${parseIssues}` : ''
+      ]
+        .filter(Boolean)
+        .join('\n');
+    })
+    .join('\n\n');
+}
+
+function buildRetryValidateEnvelope(shortText, manualOutputsText) {
+  return [
+    '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
+    '[USAGE RULES]',
+    '- SHORT CONTEXT is minimal global context; use it only for terminology, disambiguation, style/tone consistency.',
+    '- PREVIOUS MANUAL ATTEMPTS are hints only: keep good fixes, but correct any mistakes or rule violations.',
+    '- Do NOT copy the envelope, context, source block, or translated block into the output.',
+    '- Preserve placeholders, markup/code, numbers/units, URLs, and punctuation tokens exactly.',
+    '- Output MUST be valid JSON that matches the required schema exactly.',
+    '- Keep ids unchanged. Do not add/remove/reorder items.',
+    '[SHORT CONTEXT (GLOBAL)]',
+    shortText,
+    '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
+    manualOutputsText,
+    '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
+  ].join('\n');
+}
+
+async function resolveRetryValidateBundle({ requestMeta, debugPayloadsOptional, normalizedContext, effectiveContext }) {
+  let shortText = '';
+  let shortSource = '';
+  let manualOutputsText = '';
+  let matchedEntry = null;
+  let matchedState = null;
+  let matchedUpdatedAt = -1;
+
+  if (effectiveContext?.mode === 'SHORT' && effectiveContext.text) {
+    shortText = trimToShortContext(effectiveContext.text);
+    shortSource = 'effective-context';
+  }
+
+  if (!shortText && normalizedContext) {
+    const candidate = normalizedContext.shortText || (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') || '';
+    shortText = trimToShortContext(candidate);
+    if (shortText) {
+      shortSource = 'normalized-context';
+    }
+  }
+
+  manualOutputsText = formatManualOutputs(debugPayloadsOptional);
+
+  if (!shortText || !manualOutputsText) {
+    try {
+      const debugByUrl = await new Promise((resolve) => {
+        try {
+          chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
+            resolve(data?.translationDebugByUrl || {});
+          });
+        } catch (error) {
+          resolve({});
+        }
+      });
+      const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
+      for (const state of states) {
+        const items = Array.isArray(state?.items) ? state.items : [];
+        let entry = null;
+        if (requestMeta?.parentRequestId) {
+          entry = items.find((item) => {
+            const list = Array.isArray(item?.proofreadDebug) ? item.proofreadDebug : [];
+            return list.some((payload) => payload?.requestId === requestMeta.parentRequestId);
+          });
+        }
+        if (!entry && requestMeta?.blockKey) {
+          entry = items.find((item) => item?.blockKey === requestMeta.blockKey);
+        }
+        if (!entry) continue;
+        const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
+        if (!matchedState || updatedAt >= matchedUpdatedAt) {
+          matchedState = state;
+          matchedEntry = entry;
+          matchedUpdatedAt = updatedAt;
+        }
+      }
+    } catch (error) {
+      matchedEntry = null;
+      matchedState = null;
+    }
+  }
+
+  if (!shortText && matchedState) {
+    shortText =
+      trimToShortContext(typeof matchedState?.contextShort === 'string' ? matchedState.contextShort : '') || '';
+    if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
+      try {
+        const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
+        shortText = trimToShortContext(rawRecord?.value?.text || rawRecord?.value?.response || '');
+      } catch (error) {
+        shortText = '';
+      }
+    }
+    if (shortText) {
+      shortSource = 'debug-scan';
+    }
+  }
+
+  if (!manualOutputsText && matchedEntry) {
+    const debugList = Array.isArray(matchedEntry.proofreadDebug) ? matchedEntry.proofreadDebug : [];
+    manualOutputsText = formatManualOutputs(debugList);
+  }
+
+  if (!shortText && normalizedContext) {
+    const fallbackSource = normalizedContext.text || normalizedContext.fullText || '';
+    shortText = trimToShortContext(fallbackSource);
+    if (shortText) {
+      shortSource = 'fallback-context';
+    }
+  }
+
+  if (!manualOutputsText) {
+    manualOutputsText = '(no manual outputs found)';
+  }
+
+  return { shortText, manualOutputsText, shortSource };
+}
+
 function buildEffectiveContext(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const mode = resolveEffectiveContextMode(requestMeta, normalized);
+  let mode = resolveEffectiveContextMode(requestMeta, normalized);
   let text = '';
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+    const candidate = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+    text = trimToShortContext(candidate);
+    if (!text) {
+      const fallbackSource = normalized.text || normalized.fullText || '';
+      text = trimToShortContext(fallbackSource);
+    }
+    if (!text) {
+      mode = 'NONE';
+    }
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -168,13 +325,17 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
+  let shortText = trimToShortContext(normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '');
+  if (!shortText) {
+    shortText = trimToShortContext(normalized.text || normalized.fullText || '');
+  }
   return {
-    text: normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '',
+    text: shortText,
     mode: 'SHORT',
     baseAnswer: normalized.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
     fullText: '',
-    shortText: normalized.shortText || ''
+    shortText
   };
 }
 
@@ -355,7 +516,7 @@ async function proofreadTranslation(
       apiKey,
       model,
       apiBaseUrl,
-      { strict: false, requestMeta: baseRequestMeta, purpose: 'main' }
+      { strict: false, requestMeta: baseRequestMeta, purpose: 'main', debugPayloads }
     );
     rawProofreadParts.push(result.rawProofread);
     if (Array.isArray(result.debug)) {
@@ -383,7 +544,8 @@ async function proofreadTranslation(
             attempt: baseRequestMeta.attempt + 1,
             triggerSource: 'retry'
           }),
-          purpose: 'retry'
+          purpose: 'retry',
+          debugPayloads
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -417,7 +579,8 @@ async function proofreadTranslation(
             attempt: baseRequestMeta.attempt + 2,
             triggerSource: 'retry'
           }),
-          purpose: 'retry'
+          purpose: 'retry',
+          debugPayloads
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -450,7 +613,8 @@ async function proofreadTranslation(
               attempt: baseRequestMeta.attempt + 3,
               triggerSource: 'retry'
             }),
-            purpose: 'retry'
+            purpose: 'retry',
+            debugPayloads
           }
         );
         rawProofreadParts.push(singleResult.rawProofread);
@@ -746,108 +910,28 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     purpose: options.purpose || 'main'
   });
   const normalizedContext = normalizeContextPayload(metadata?.context);
-  const effectiveContext = buildEffectiveContext(normalizedContext, requestMeta);
+  let effectiveContext = buildEffectiveContext(normalizedContext, requestMeta);
   const triggerSource = requestMeta?.triggerSource || '';
   let resolvedShortContextText = effectiveContext.text || '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    if (!resolvedShortContextText) {
-      resolvedShortContextText =
-        normalizedContext.shortText || (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') || '';
-    }
-    let matchedEntry = null;
-    let matchedState = null;
-    let matchedUpdatedAt = -1;
-    try {
-      const debugByUrl = await new Promise((resolve) => {
-        try {
-          chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
-            resolve(data?.translationDebugByUrl || {});
-          });
-        } catch (error) {
-          resolve({});
-        }
-      });
-      const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
-      for (const state of states) {
-        const items = Array.isArray(state?.items) ? state.items : [];
-        let entry = null;
-        if (requestMeta.parentRequestId) {
-          entry = items.find((item) => {
-            const list = Array.isArray(item?.proofreadDebug) ? item.proofreadDebug : [];
-            return list.some((payload) => payload?.requestId === requestMeta.parentRequestId);
-          });
-        }
-        if (!entry && requestMeta.blockKey) {
-          entry = items.find((item) => item?.blockKey === requestMeta.blockKey);
-        }
-        if (!entry) continue;
-        const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
-        if (!matchedState || updatedAt >= matchedUpdatedAt) {
-          matchedState = state;
-          matchedEntry = entry;
-          matchedUpdatedAt = updatedAt;
-        }
-      }
-    } catch (error) {
-      // ignore lookup errors
-    }
-    if (!resolvedShortContextText && matchedState) {
-      resolvedShortContextText =
-        (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
-      if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
-        try {
-          const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-          resolvedShortContextText = rawRecord?.value?.text || rawRecord?.value?.response || '';
-        } catch (error) {
-          resolvedShortContextText = '';
-        }
-      }
-    }
-    if (matchedEntry) {
-      const debugList = Array.isArray(matchedEntry.proofreadDebug) ? matchedEntry.proofreadDebug : [];
-      const manualPayloads = debugList.filter((payload) => payload?.triggerSource === 'manual');
-      const manualParts = manualPayloads.map((payload, index) => {
-        let responseText = '';
-        if (payload?.response != null) {
-          try {
-            responseText = typeof payload.response === 'string' ? payload.response : JSON.stringify(payload.response);
-          } catch (error) {
-            responseText = String(payload.response);
-          }
-        }
-        const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
-        const header = `Manual attempt ${index + 1}${payload?.phase ? ` (${payload.phase})` : ''}`;
-        return [
-          header,
-          responseText ? `Response: ${responseText}` : 'Response: (empty)',
-          parseIssues ? `Parse issues: ${parseIssues}` : ''
-        ]
-          .filter(Boolean)
-          .join('\n');
-      });
-      resolvedManualOutputs = manualParts.join('\n\n');
-    }
-    if (!resolvedManualOutputs) {
-      resolvedManualOutputs = '(no manual outputs found)';
-    }
-    if (!resolvedShortContextText) {
-      resolvedShortContextText = '(short context missing: bundle not found)';
-      console.warn('Retry/validate short context missing; using placeholder.', {
-        triggerSource,
-        requestId: requestMeta.requestId,
-        parentRequestId: requestMeta.parentRequestId,
-        blockKey: requestMeta.blockKey
-      });
-    }
-    if (resolvedShortContextText !== effectiveContext.text) {
-      effectiveContext.text = resolvedShortContextText;
-      effectiveContext.length = resolvedShortContextText.length;
-      effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
-      effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
-        ? !resolvedShortContextText
-        : false;
-    }
+    const bundle = await resolveRetryValidateBundle({
+      requestMeta,
+      debugPayloadsOptional: options.debugPayloads,
+      normalizedContext,
+      effectiveContext
+    });
+    resolvedShortContextText = bundle.shortText || '';
+    resolvedManualOutputs = bundle.manualOutputsText || '(no manual outputs found)';
+    effectiveContext = buildEffectiveContext(
+      {
+        text: resolvedShortContextText,
+        mode: resolvedShortContextText ? 'SHORT' : '',
+        baseAnswer: effectiveContext.baseAnswer,
+        baseAnswerIncluded: effectiveContext.baseAnswerIncluded
+      },
+      requestMeta
+    );
   }
   const prompt = applyPromptCaching(
     buildProofreadPrompt(
@@ -856,8 +940,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         sourceBlock: metadata?.sourceBlock,
         translatedBlock: metadata?.translatedBlock,
         context: {
-          text: effectiveContext.text,
-          mode: effectiveContext.mode,
+          text: triggerSource === 'retry' || triggerSource === 'validate' ? '' : effectiveContext.text,
+          mode: triggerSource === 'retry' || triggerSource === 'validate' ? '' : effectiveContext.mode,
           baseAnswer: effectiveContext.baseAnswer,
           baseAnswerIncluded: effectiveContext.baseAnswerIncluded
         },
@@ -871,21 +955,15 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   );
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
-    const envelope = [
-      '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
-      '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText || '(short context missing: bundle not found)',
-      '',
-      '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-      manualOutputsText,
-      '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
-    ].join('\n');
-    if (Array.isArray(prompt)) {
-      const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
-      if (firstUserIndex >= 0) {
-        prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
-      } else {
-        prompt.push({ role: 'user', content: envelope });
+    if (resolvedShortContextText) {
+      const envelope = buildRetryValidateEnvelope(resolvedShortContextText, manualOutputsText);
+      if (Array.isArray(prompt)) {
+        const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
+        if (firstUserIndex >= 0) {
+          prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
+        } else {
+          prompt.push({ role: 'user', content: envelope });
+        }
       }
     }
   }
@@ -1125,91 +1203,14 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   let resolvedShortContextText = '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    let matchedEntry = null;
-    let matchedState = null;
-    let matchedUpdatedAt = -1;
-    try {
-      const debugByUrl = await new Promise((resolve) => {
-        try {
-          chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
-            resolve(data?.translationDebugByUrl || {});
-          });
-        } catch (error) {
-          resolve({});
-        }
-      });
-      const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
-      for (const state of states) {
-        const itemsList = Array.isArray(state?.items) ? state.items : [];
-        let entry = null;
-        if (normalizedRequestMeta.parentRequestId) {
-          entry = itemsList.find((item) => {
-            const list = Array.isArray(item?.proofreadDebug) ? item.proofreadDebug : [];
-            return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
-          });
-        }
-        if (!entry && normalizedRequestMeta.blockKey) {
-          entry = itemsList.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
-        }
-        if (!entry) continue;
-        const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
-        if (!matchedState || updatedAt >= matchedUpdatedAt) {
-          matchedState = state;
-          matchedEntry = entry;
-          matchedUpdatedAt = updatedAt;
-        }
-      }
-    } catch (error) {
-      // ignore lookup errors
-    }
-    if (matchedState) {
-      resolvedShortContextText =
-        (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
-      if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
-        try {
-          const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-          resolvedShortContextText = rawRecord?.value?.text || rawRecord?.value?.response || '';
-        } catch (error) {
-          resolvedShortContextText = '';
-        }
-      }
-    }
-    if (matchedEntry) {
-      const debugList = Array.isArray(matchedEntry.proofreadDebug) ? matchedEntry.proofreadDebug : [];
-      const manualPayloads = debugList.filter((payload) => payload?.triggerSource === 'manual');
-      const manualParts = manualPayloads.map((payload, index) => {
-        let responseText = '';
-        if (payload?.response != null) {
-          try {
-            responseText = typeof payload.response === 'string' ? payload.response : JSON.stringify(payload.response);
-          } catch (error) {
-            responseText = String(payload.response);
-          }
-        }
-        const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
-        const header = `Manual attempt ${index + 1}${payload?.phase ? ` (${payload.phase})` : ''}`;
-        return [
-          header,
-          responseText ? `Response: ${responseText}` : 'Response: (empty)',
-          parseIssues ? `Parse issues: ${parseIssues}` : ''
-        ]
-          .filter(Boolean)
-          .join('\n');
-      });
-      resolvedManualOutputs = manualParts.join('\n\n');
-    }
-    if (!resolvedManualOutputs) {
-      resolvedManualOutputs = '(no manual outputs found)';
-    }
-    if (!resolvedShortContextText) {
-      resolvedShortContextText = '(short context missing: bundle not found)';
-      console.warn('Retry/validate short context missing; using placeholder.', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey
-      });
-    }
+    const bundle = await resolveRetryValidateBundle({
+      requestMeta: normalizedRequestMeta,
+      debugPayloadsOptional: null,
+      normalizedContext: normalizeContextPayload(null),
+      effectiveContext: null
+    });
+    resolvedShortContextText = bundle.shortText || '';
+    resolvedManualOutputs = bundle.manualOutputsText || '(no manual outputs found)';
   }
   const prompt = applyPromptCaching([
     {
@@ -1234,21 +1235,15 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   ], apiBaseUrl);
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
-    const envelope = [
-      '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
-      '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText || '(short context missing: bundle not found)',
-      '',
-      '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-      manualOutputsText,
-      '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
-    ].join('\n');
-    if (Array.isArray(prompt)) {
-      const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
-      if (firstUserIndex >= 0) {
-        prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
-      } else {
-        prompt.push({ role: 'user', content: envelope });
+    if (resolvedShortContextText) {
+      const envelope = buildRetryValidateEnvelope(resolvedShortContextText, manualOutputsText);
+      if (Array.isArray(prompt)) {
+        const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
+        if (firstUserIndex >= 0) {
+          prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
+        } else {
+          prompt.push({ role: 'user', content: envelope });
+        }
       }
     }
   }
@@ -1401,6 +1396,24 @@ async function repairProofreadSegments(
     }
   }
 
+  const repairRequestMeta = createChildRequestMeta(requestMeta || {}, {
+    purpose: 'validate',
+    attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
+    triggerSource: 'validate'
+  });
+  let resolvedShortContextText = '';
+  let resolvedManualOutputs = '';
+  if (repairRequestMeta.triggerSource === 'retry' || repairRequestMeta.triggerSource === 'validate') {
+    const bundle = await resolveRetryValidateBundle({
+      requestMeta: repairRequestMeta,
+      debugPayloadsOptional: debugPayloads,
+      normalizedContext: normalizeContextPayload(null),
+      effectiveContext: null
+    });
+    resolvedShortContextText = bundle.shortText || '';
+    resolvedManualOutputs = bundle.manualOutputsText || '(no manual outputs found)';
+  }
+
   const prompt = applyPromptCaching([
     {
       role: 'system',
@@ -1425,6 +1438,20 @@ async function repairProofreadSegments(
         .join('\n')
     }
   ], apiBaseUrl);
+  if (repairRequestMeta.triggerSource === 'retry' || repairRequestMeta.triggerSource === 'validate') {
+    const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
+    if (resolvedShortContextText) {
+      const envelope = buildRetryValidateEnvelope(resolvedShortContextText, manualOutputsText);
+      if (Array.isArray(prompt)) {
+        const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
+        if (firstUserIndex >= 0) {
+          prompt.splice(firstUserIndex, 0, { role: 'user', content: envelope });
+        } else {
+          prompt.push({ role: 'user', content: envelope });
+        }
+      }
+    }
+  }
 
   const requestPayload = {
     model,
@@ -1474,11 +1501,6 @@ async function repairProofreadSegments(
     const content = data?.choices?.[0]?.message?.content || '';
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
-    const repairRequestMeta = createChildRequestMeta(requestMeta || {}, {
-      purpose: 'validate',
-      attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
-      triggerSource: 'validate'
-    });
     const debugPayload = attachRequestMeta(
       {
         phase: 'PROOFREAD_REPAIR',
@@ -1493,7 +1515,12 @@ async function repairProofreadSegments(
       },
       repairRequestMeta,
       buildEffectiveContext(
-        { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
+        {
+          text: resolvedShortContextText || '',
+          mode: resolvedShortContextText ? 'SHORT' : '',
+          baseAnswer: '',
+          baseAnswerIncluded: false
+        },
         repairRequestMeta
       )
     );
