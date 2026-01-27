@@ -89,6 +89,176 @@ function computeTextHash(text = '') {
   return hash >>> 0;
 }
 
+function getContextCacheState() {
+  if (!globalThis.__NT__) {
+    globalThis.__NT__ = {};
+  }
+  if (!globalThis.__NT__.contextCache) {
+    globalThis.__NT__.contextCache = { memory: {} };
+  }
+  return globalThis.__NT__.contextCache;
+}
+
+function getContextCacheKey(requestMeta) {
+  const blockKey = requestMeta?.blockKey || '';
+  const parentRequestId = requestMeta?.parentRequestId || '';
+  const requestId = requestMeta?.requestId || '';
+  const baseKey = blockKey || parentRequestId || requestId;
+  if (!baseKey) return '';
+  return `context:${baseKey}`;
+}
+
+function readContextFromMemory(cacheKey) {
+  if (!cacheKey) return null;
+  const state = getContextCacheState();
+  const record = state?.memory?.[cacheKey];
+  return record ? { record, source: 'memory' } : null;
+}
+
+function writeContextToMemory(cacheKey, record) {
+  if (!cacheKey || !record) return;
+  const state = getContextCacheState();
+  state.memory[cacheKey] = record;
+}
+
+function buildStoredContextRecord(normalizedContext) {
+  if (!normalizedContext || typeof normalizedContext !== 'object') return null;
+  let fullText = normalizedContext.fullText || '';
+  let shortText = normalizedContext.shortText || '';
+  const mode = normalizedContext.mode || '';
+  if (!fullText && mode === 'FULL' && normalizedContext.text) {
+    fullText = normalizedContext.text;
+  }
+  if (!shortText && mode === 'SHORT' && normalizedContext.text) {
+    shortText = normalizedContext.text;
+  }
+  const text = normalizedContext.text || fullText || shortText || '';
+  if (!fullText && text && mode !== 'SHORT') {
+    fullText = text;
+  }
+  if (!shortText && text && mode !== 'FULL') {
+    shortText = text;
+  }
+  if (!fullText && !shortText) return null;
+  return {
+    fullText,
+    shortText,
+    baseAnswer: normalizedContext.baseAnswer || '',
+    baseAnswerIncluded: Boolean(normalizedContext.baseAnswerIncluded),
+    length: text.length,
+    updatedAt: Date.now(),
+    version: 1
+  };
+}
+
+async function readContextFromStorage(cacheKey) {
+  if (!cacheKey) return null;
+  const session = chrome?.storage?.session || null;
+  const local = chrome?.storage?.local || null;
+  const storageKey = 'ntContextCacheByRun';
+  if (session) {
+    const record = await new Promise((resolve) => {
+      try {
+        session.get([storageKey], (data) => resolve(data?.[storageKey]?.[cacheKey] || null));
+      } catch (error) {
+        resolve(null);
+      }
+    });
+    if (record) {
+      return { record, source: 'sessionStorage' };
+    }
+  }
+  if (local) {
+    const record = await new Promise((resolve) => {
+      try {
+        local.get([storageKey], (data) => resolve(data?.[storageKey]?.[cacheKey] || null));
+      } catch (error) {
+        resolve(null);
+      }
+    });
+    if (record) {
+      return { record, source: 'localStorage' };
+    }
+  }
+  return null;
+}
+
+async function writeContextToStorage(cacheKey, record) {
+  if (!cacheKey || !record) return false;
+  const session = chrome?.storage?.session || null;
+  const local = chrome?.storage?.local || null;
+  const storage = session || local;
+  if (!storage) return false;
+  const storageKey = 'ntContextCacheByRun';
+  const store = await new Promise((resolve) => {
+    try {
+      storage.get([storageKey], (data) => resolve(data?.[storageKey] || {}));
+    } catch (error) {
+      resolve({});
+    }
+  });
+  store[cacheKey] = record;
+  return new Promise((resolve) => {
+    try {
+      storage.set({ [storageKey]: store }, () => resolve(true));
+    } catch (error) {
+      resolve(false);
+    }
+  });
+}
+
+async function persistContextRecord(cacheKey, normalizedContext) {
+  if (!cacheKey) return null;
+  const record = buildStoredContextRecord(normalizedContext);
+  if (!record) return null;
+  writeContextToMemory(cacheKey, record);
+  await writeContextToStorage(cacheKey, record);
+  return record;
+}
+
+async function resolveContextForRequest(contextPayload, requestMeta) {
+  const normalized = normalizeContextPayload(contextPayload);
+  const contextKey = getContextCacheKey(requestMeta);
+  const hadText =
+    Boolean(normalized.text) ||
+    Boolean(normalized.fullText) ||
+    Boolean(normalized.shortText);
+  let contextSource = hadText ? 'memory' : 'none';
+  let lookup = null;
+  if (contextKey) {
+    lookup = readContextFromMemory(contextKey);
+    if (!lookup) {
+      lookup = await readContextFromStorage(contextKey);
+    }
+    if (!lookup && !hadText && (requestMeta?.triggerSource === 'retry' || requestMeta?.triggerSource === 'validate')) {
+      for (let attempt = 0; attempt < 3 && !lookup; attempt += 1) {
+        await sleep(120);
+        lookup = await readContextFromStorage(contextKey);
+      }
+    }
+    if (lookup?.record) {
+      if (!normalized.fullText) normalized.fullText = lookup.record.fullText || '';
+      if (!normalized.shortText) normalized.shortText = lookup.record.shortText || '';
+      if (!normalized.text) {
+        normalized.text = lookup.record.fullText || lookup.record.shortText || '';
+      }
+      if (!normalized.baseAnswer && lookup.record.baseAnswer) {
+        normalized.baseAnswer = lookup.record.baseAnswer;
+      }
+      if (!normalized.baseAnswerIncluded && lookup.record.baseAnswerIncluded) {
+        normalized.baseAnswerIncluded = true;
+      }
+      if (!hadText) {
+        contextSource = lookup.source || contextSource;
+      }
+    }
+    if (hadText || normalized.text || normalized.fullText || normalized.shortText) {
+      await persistContextRecord(contextKey, normalized);
+    }
+  }
+  return { normalized, contextKey, contextSource };
+}
+
 function normalizeRequestMeta(meta = {}, overrides = {}) {
   const merged = { ...(meta || {}), ...(overrides || {}) };
   return {
@@ -197,6 +367,8 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     contextLength: payload.contextLength ?? (effectiveContext?.length ?? 0),
     contextTextSent: payload.contextTextSent ?? effectiveContext?.text,
     contextMissing: payload.contextMissing ?? effectiveContext?.contextMissing,
+    contextSource: payload.contextSource ?? effectiveContext?.contextSource ?? '',
+    contextId: payload.contextId ?? effectiveContext?.contextId ?? '',
     baseAnswerIncluded: payload.baseAnswerIncluded ?? effectiveContext?.baseAnswerIncluded,
     manualArtifactsUsed:
       payload.manualArtifactsUsed ??
@@ -745,8 +917,13 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     stage: 'proofread',
     purpose: options.purpose || 'main'
   });
-  const normalizedContext = normalizeContextPayload(metadata?.context);
+  const resolvedContext = await resolveContextForRequest(metadata?.context, requestMeta);
+  const normalizedContext = resolvedContext.normalized;
+  let contextSource = resolvedContext.contextSource || '';
+  const contextId = resolvedContext.contextKey || '';
   const effectiveContext = buildEffectiveContext(normalizedContext, requestMeta);
+  effectiveContext.contextSource = contextSource;
+  effectiveContext.contextId = contextId;
   const triggerSource = requestMeta?.triggerSource || '';
   let resolvedShortContextText = effectiveContext.text || '';
   let resolvedManualOutputs = '';
@@ -803,6 +980,9 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           resolvedShortContextText = '';
         }
       }
+      if (resolvedShortContextText && (!contextSource || contextSource === 'none')) {
+        contextSource = 'localStorage';
+      }
     }
     if (matchedEntry) {
       const debugList = Array.isArray(matchedEntry.proofreadDebug) ? matchedEntry.proofreadDebug : [];
@@ -847,7 +1027,27 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
         ? !resolvedShortContextText
         : false;
+      effectiveContext.contextSource = contextSource || effectiveContext.contextSource || 'none';
     }
+  }
+  if (effectiveContext.contextMissing && (triggerSource === 'retry' || triggerSource === 'validate')) {
+    const error = new Error('Context unavailable: required context could not be resolved.');
+    error.debugPayload = attachRequestMeta(
+      {
+        phase: 'PROOFREAD',
+        model,
+        latencyMs: null,
+        usage: null,
+        inputChars: null,
+        outputChars: null,
+        request: null,
+        response: null,
+        parseIssues: ['context-unavailable']
+      },
+      requestMeta,
+      effectiveContext
+    );
+    throw error;
   }
   const prompt = applyPromptCaching(
     buildProofreadPrompt(

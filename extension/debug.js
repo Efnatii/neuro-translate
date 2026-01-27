@@ -1062,7 +1062,13 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   const baseBadge = payload?.baseAnswerIncluded
     ? `<span class="context-pill context-pill--base">base included</span>`
     : '';
-  const contextMeta = '';
+  const contextSource = payload?.contextSource || '';
+  const contextId = payload?.contextId || '';
+  const contextMetaItems = [
+    contextSource ? `contextSource: ${escapeHtml(contextSource)}` : '',
+    contextId ? `contextId: ${escapeHtml(contextId)}` : ''
+  ].filter(Boolean);
+  const contextMeta = contextMetaItems.length ? contextMetaItems.join(' · ') : '';
   const requestId = payload?.requestId || '';
   const parentRequestId = payload?.parentRequestId || '';
   const blockKey = payload?.blockKey || '';
