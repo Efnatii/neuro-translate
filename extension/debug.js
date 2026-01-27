@@ -1081,6 +1081,11 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   }
   const contextHash = payload?.contextHash ?? null;
   const contextLength = payload?.contextLength ?? null;
+  const sentContextMode = payload?.sentContextMode || '';
+  const sentContextLen = Number.isFinite(payload?.sentContextLen) ? payload.sentContextLen : null;
+  const sentContextPreview = payload?.sentContextPreview || '';
+  const contextMismatch = Boolean(payload?.contextMismatch);
+  const contextMismatchReason = payload?.contextMismatchReason || '';
   const requestMetaItems = [
     requestId ? `requestId: ${escapeHtml(requestId)}` : '',
     parentRequestId ? `parentRequestId: ${escapeHtml(parentRequestId)}` : '',
@@ -1096,7 +1101,10 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   const contextMetaItems = [
     contextSource ? `contextSource: ${escapeHtml(contextSource)}` : '',
     contextId ? `contextId: ${escapeHtml(contextId)}` : '',
-    contextPolicy ? `contextMode: ${escapeHtml(contextPolicy)}` : ''
+    contextPolicy ? `contextMode: ${escapeHtml(contextPolicy)}` : '',
+    sentContextMode ? `sentContextMode: ${escapeHtml(sentContextMode)}` : '',
+    Number.isFinite(sentContextLen) ? `sentContextLen: ${escapeHtml(String(sentContextLen))}` : '',
+    contextMismatch ? `contextMismatch: ${escapeHtml(contextMismatchReason || 'true')}` : ''
   ].filter(Boolean);
   const contextMeta = contextMetaItems.length ? contextMetaItems.join(' · ') : '';
   setTextIfChanged(parts.phaseEl, phase);
@@ -1119,10 +1127,17 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
       contextMissing && contextPolicy !== 'none'
         ? `\n\n⚠️ Контекст должен был быть отправлен, но текст пуст.${contextMissingReason ? ` Причина: ${contextMissingReason}.` : ''}`
         : '';
+    const sentPreviewNote = sentContextPreview
+      ? `\n\nSent preview (${sentContextLen ?? 0} chars):\n${sentContextPreview}`
+      : '';
+    const mismatchNote =
+      contextMismatch && contextMismatchReason
+        ? `\n\n⚠️ Контекст отклонён: ${contextMismatchReason}.`
+        : '';
     const contextContent =
       contextPolicy === 'none'
         ? 'Контекст не отправлялся (mode: none).'
-        : `${payload?.contextTextSent || '—'}${contextMissingNote}`;
+        : `${payload?.contextTextSent || '—'}${contextMissingNote}${sentPreviewNote}${mismatchNote}`;
     setHtmlIfChanged(
       parts.contextDetails.contentEl,
       buildDebugSectionContent(contextContent, {

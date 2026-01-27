@@ -146,9 +146,13 @@ function buildStoredContextRecord(normalizedContext) {
     fullText = text;
   }
   if (!fullText && !shortText) return null;
+  const fullLength = fullText.length;
+  const shortLength = shortText.length;
   return {
     fullText,
     shortText,
+    fullLength,
+    shortLength,
     baseAnswer: normalizedContext.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalizedContext.baseAnswerIncluded),
     length: text.length,
@@ -245,6 +249,47 @@ async function persistContextRecord(cacheKey, normalizedContext) {
   return record;
 }
 
+function resolveContextModeForRequest(requestMeta, normalizedContext) {
+  const triggerSource = requestMeta?.triggerSource || '';
+  const purpose = requestMeta?.purpose || '';
+  if (triggerSource === 'retry' || triggerSource === 'validate') return 'SHORT';
+  if (purpose && purpose !== 'main') return 'SHORT';
+  if (normalizedContext?.mode === 'SHORT') return 'SHORT';
+  if (normalizedContext?.mode === 'FULL') return 'FULL';
+  if (normalizedContext?.text) return 'FULL';
+  return 'NONE';
+}
+
+function buildSentContextPreview(text, maxLength = 200) {
+  if (!text) return '';
+  const trimmed = String(text).trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= maxLength) return trimmed;
+  return `${trimmed.slice(0, maxLength)}…`;
+}
+
+function resolveSentContextMetrics(mode, text) {
+  const resolvedText = typeof text === 'string' ? text : '';
+  const length = resolvedText.length;
+  return {
+    sentContextMode: mode === 'SHORT' ? 'SHORT' : mode === 'FULL' ? 'FULL' : '',
+    sentContextLen: length,
+    sentContextPreview: buildSentContextPreview(resolvedText)
+  };
+}
+
+function detectShortContextMismatch(text, normalizedContext, maxLength) {
+  if (!text) return '';
+  const trimmed = String(text).trim();
+  const limit = Number.isFinite(maxLength) ? maxLength : 25000;
+  if (trimmed.length > limit) return 'shortTooLong';
+  const fullText = typeof normalizedContext?.fullText === 'string' ? normalizedContext.fullText.trim() : '';
+  if (fullText && fullText === trimmed) return 'shortEqualsFull';
+  const markerRegex = /(full\s*context|context:\s*full|полный\s+контекст|контекст\s*full)/i;
+  if (markerRegex.test(trimmed)) return 'shortContainsFullMarker';
+  return '';
+}
+
 async function resolveContextForRequest(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
   const contextKey = getContextCacheKey(requestMeta);
@@ -285,7 +330,29 @@ async function resolveContextForRequest(contextPayload, requestMeta) {
       await persistContextRecord(contextKey, normalized);
     }
   }
-  return { normalized, contextKey, contextSource };
+  const mode = resolveContextModeForRequest(requestMeta, normalized);
+  let text = '';
+  if (mode === 'FULL') {
+    text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
+  } else if (mode === 'SHORT') {
+    text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+  }
+  const reasonIfMissing =
+    (mode === 'FULL' || mode === 'SHORT') && !text
+      ? mode === 'SHORT'
+        ? 'short context missing'
+        : 'full context missing'
+      : '';
+  return {
+    normalized,
+    contextKey,
+    contextSource,
+    mode,
+    text,
+    source: contextSource,
+    id: contextKey,
+    reasonIfMissing
+  };
 }
 
 function normalizeRequestMeta(meta = {}, overrides = {}) {
@@ -361,6 +428,38 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   };
 }
 
+function buildEffectiveContextFromResolved(normalizedContext, resolvedContext, requestMeta) {
+  const mode = resolvedContext?.mode || 'NONE';
+  const text = resolvedContext?.text || '';
+  const baseAnswer = normalizedContext?.baseAnswer || '';
+  const baseAnswerIncluded = Boolean(normalizedContext?.baseAnswerIncluded);
+  const contextMissing = (mode === 'FULL' || mode === 'SHORT') && !text;
+  const contextMissingReason = contextMissing
+    ? mode === 'SHORT'
+      ? 'short context missing'
+      : mode === 'FULL'
+        ? 'full context missing'
+        : ''
+    : '';
+  if (contextMissing) {
+    console.warn('Context mode requires text but none was provided.', {
+      mode,
+      triggerSource: requestMeta?.triggerSource,
+      purpose: requestMeta?.purpose
+    });
+  }
+  return {
+    mode,
+    text,
+    length: text.length,
+    hash: text ? computeTextHash(text) : 0,
+    baseAnswer,
+    baseAnswerIncluded,
+    contextMissing,
+    contextMissingReason
+  };
+}
+
 function buildContextPolicy(mode) {
   if (mode === 'FULL') return 'full';
   if (mode === 'SHORT') return 'short';
@@ -405,6 +504,11 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     contextTextSent: payload.contextTextSent ?? effectiveContext?.text,
     contextMissing: payload.contextMissing ?? effectiveContext?.contextMissing,
     contextMissingReason: payload.contextMissingReason ?? effectiveContext?.contextMissingReason ?? '',
+    sentContextMode: payload.sentContextMode ?? effectiveContext?.sentContextMode ?? '',
+    sentContextLen: payload.sentContextLen ?? effectiveContext?.sentContextLen ?? 0,
+    sentContextPreview: payload.sentContextPreview ?? effectiveContext?.sentContextPreview ?? '',
+    contextMismatch: payload.contextMismatch ?? effectiveContext?.contextMismatch ?? false,
+    contextMismatchReason: payload.contextMismatchReason ?? effectiveContext?.contextMismatchReason ?? '',
     contextSource: payload.contextSource ?? effectiveContext?.contextSource ?? '',
     contextId: payload.contextId ?? effectiveContext?.contextId ?? '',
     baseAnswerIncluded: payload.baseAnswerIncluded ?? effectiveContext?.baseAnswerIncluded,
@@ -665,9 +769,9 @@ async function performTranslationRequest(
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const resolvedContext = await resolveContextForRequest(context, normalizedRequestMeta);
   const normalizedContext = resolvedContext.normalized;
-  let contextSource = resolvedContext.contextSource || '';
-  const contextId = resolvedContext.contextKey || '';
-  const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
+  let contextSource = resolvedContext.source || '';
+  const contextId = resolvedContext.id || '';
+  const effectiveContext = buildEffectiveContextFromResolved(normalizedContext, resolvedContext, normalizedRequestMeta);
   effectiveContext.contextSource = contextSource;
   effectiveContext.contextId = contextId;
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
@@ -943,6 +1047,10 @@ async function performTranslationRequest(
       effectiveContext.contextSource = contextSource || effectiveContext.contextSource || 'none';
     }
   }
+  const sentContextMetrics = resolveSentContextMetrics(effectiveContext.mode, effectiveContext.text || '');
+  effectiveContext.sentContextMode = sentContextMetrics.sentContextMode;
+  effectiveContext.sentContextLen = sentContextMetrics.sentContextLen;
+  effectiveContext.sentContextPreview = sentContextMetrics.sentContextPreview;
   if (effectiveContext.contextMissing && (triggerSource === 'retry' || triggerSource === 'validate')) {
     const error = new Error('Context unavailable: required context could not be resolved.');
     error.debugPayload = attachRequestMeta(
@@ -961,6 +1069,36 @@ async function performTranslationRequest(
       effectiveContext
     );
     throw error;
+  }
+  if (effectiveContext.mode === 'SHORT') {
+    const mismatchReason = detectShortContextMismatch(
+      effectiveContext.text,
+      normalizedContext,
+      null
+    );
+    if (mismatchReason) {
+      effectiveContext.contextMismatch = true;
+      effectiveContext.contextMismatchReason = mismatchReason;
+      const error = new Error('Short context mismatch detected; request blocked.');
+      error.debugPayload = attachRequestMeta(
+        {
+          phase: 'TRANSLATE',
+          model,
+          latencyMs: null,
+          usage: null,
+          inputChars: null,
+          outputChars: null,
+          request: null,
+          response: null,
+          parseIssues: [`context-mismatch:${mismatchReason}`],
+          contextMismatch: true,
+          contextMismatchReason: mismatchReason
+        },
+        normalizedRequestMeta,
+        effectiveContext
+      );
+      throw error;
+    }
   }
   const contextText = effectiveContext.text || '';
   const baseAnswerText =
@@ -1009,7 +1147,7 @@ async function performTranslationRequest(
       '- Output MUST follow the required JSON schema exactly.',
       '',
       '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText,
+      effectiveContext.text || '',
       '',
       '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
       manualOutputsText,
@@ -1433,9 +1571,9 @@ async function performTranslationRepairRequest(
   const contextPayload = { text: context || '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
   const resolvedContext = await resolveContextForRequest(contextPayload, normalizedRequestMeta);
   const normalizedContext = resolvedContext.normalized;
-  let contextSource = resolvedContext.contextSource || '';
-  const contextId = resolvedContext.contextKey || '';
-  const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
+  let contextSource = resolvedContext.source || '';
+  const contextId = resolvedContext.id || '';
+  const effectiveContext = buildEffectiveContextFromResolved(normalizedContext, resolvedContext, normalizedRequestMeta);
   effectiveContext.contextSource = contextSource;
   effectiveContext.contextId = contextId;
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
@@ -1711,6 +1849,10 @@ async function performTranslationRepairRequest(
       effectiveContext.contextSource = contextSource || effectiveContext.contextSource || 'none';
     }
   }
+  const repairSentContextMetrics = resolveSentContextMetrics(effectiveContext.mode, effectiveContext.text || '');
+  effectiveContext.sentContextMode = repairSentContextMetrics.sentContextMode;
+  effectiveContext.sentContextLen = repairSentContextMetrics.sentContextLen;
+  effectiveContext.sentContextPreview = repairSentContextMetrics.sentContextPreview;
   if (effectiveContext.contextMissing && (triggerSource === 'retry' || triggerSource === 'validate')) {
     const error = new Error('Context unavailable: required context could not be resolved.');
     error.debugPayload = attachRequestMeta(
@@ -1729,6 +1871,36 @@ async function performTranslationRepairRequest(
       effectiveContext
     );
     throw error;
+  }
+  if (effectiveContext.mode === 'SHORT') {
+    const mismatchReason = detectShortContextMismatch(
+      effectiveContext.text,
+      normalizedContext,
+      null
+    );
+    if (mismatchReason) {
+      effectiveContext.contextMismatch = true;
+      effectiveContext.contextMismatchReason = mismatchReason;
+      const error = new Error('Short context mismatch detected; request blocked.');
+      error.debugPayload = attachRequestMeta(
+        {
+          phase: 'TRANSLATE_REPAIR',
+          model,
+          latencyMs: null,
+          usage: null,
+          inputChars: null,
+          outputChars: null,
+          request: null,
+          response: null,
+          parseIssues: [`context-mismatch:${mismatchReason}`],
+          contextMismatch: true,
+          contextMismatchReason: mismatchReason
+        },
+        normalizedRequestMeta,
+        effectiveContext
+      );
+      throw error;
+    }
   }
   const contextText = effectiveContext.text || '';
   const normalizedItems = items.map((item) => ({
@@ -1789,7 +1961,7 @@ async function performTranslationRepairRequest(
       '- Output MUST follow the required JSON schema exactly.',
       '',
       '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText,
+      effectiveContext.text || '',
       '',
       '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
       manualOutputsText,

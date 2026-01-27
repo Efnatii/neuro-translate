@@ -137,9 +137,13 @@ function buildStoredContextRecord(normalizedContext) {
     fullText = text;
   }
   if (!fullText && !shortText) return null;
+  const fullLength = fullText.length;
+  const shortLength = shortText.length;
   return {
     fullText,
     shortText,
+    fullLength,
+    shortLength,
     baseAnswer: normalizedContext.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalizedContext.baseAnswerIncluded),
     length: text.length,
@@ -236,6 +240,47 @@ async function persistContextRecord(cacheKey, normalizedContext) {
   return record;
 }
 
+function resolveContextModeForRequest(requestMeta, normalizedContext) {
+  const triggerSource = requestMeta?.triggerSource || '';
+  const purpose = requestMeta?.purpose || '';
+  if (triggerSource === 'retry' || triggerSource === 'validate') return 'SHORT';
+  if (purpose && purpose !== 'main') return 'SHORT';
+  if (normalizedContext?.mode === 'SHORT') return 'SHORT';
+  if (normalizedContext?.mode === 'FULL') return 'FULL';
+  if (normalizedContext?.text) return 'FULL';
+  return 'NONE';
+}
+
+function buildSentContextPreview(text, maxLength = 200) {
+  if (!text) return '';
+  const trimmed = String(text).trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= maxLength) return trimmed;
+  return `${trimmed.slice(0, maxLength)}…`;
+}
+
+function resolveSentContextMetrics(mode, text) {
+  const resolvedText = typeof text === 'string' ? text : '';
+  const length = resolvedText.length;
+  return {
+    sentContextMode: mode === 'SHORT' ? 'SHORT' : mode === 'FULL' ? 'FULL' : '',
+    sentContextLen: length,
+    sentContextPreview: buildSentContextPreview(resolvedText)
+  };
+}
+
+function detectShortContextMismatch(text, normalizedContext, maxLength) {
+  if (!text) return '';
+  const trimmed = String(text).trim();
+  const limit = Number.isFinite(maxLength) ? maxLength : 25000;
+  if (trimmed.length > limit) return 'shortTooLong';
+  const fullText = typeof normalizedContext?.fullText === 'string' ? normalizedContext.fullText.trim() : '';
+  if (fullText && fullText === trimmed) return 'shortEqualsFull';
+  const markerRegex = /(full\s*context|context:\s*full|полный\s+контекст|контекст\s*full)/i;
+  if (markerRegex.test(trimmed)) return 'shortContainsFullMarker';
+  return '';
+}
+
 async function resolveContextForRequest(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
   const contextKey = getContextCacheKey(requestMeta);
@@ -276,7 +321,29 @@ async function resolveContextForRequest(contextPayload, requestMeta) {
       await persistContextRecord(contextKey, normalized);
     }
   }
-  return { normalized, contextKey, contextSource };
+  const mode = resolveContextModeForRequest(requestMeta, normalized);
+  let text = '';
+  if (mode === 'FULL') {
+    text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
+  } else if (mode === 'SHORT') {
+    text = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
+  }
+  const reasonIfMissing =
+    (mode === 'FULL' || mode === 'SHORT') && !text
+      ? mode === 'SHORT'
+        ? 'short context missing'
+        : 'full context missing'
+      : '';
+  return {
+    normalized,
+    contextKey,
+    contextSource,
+    mode,
+    text,
+    source: contextSource,
+    id: contextKey,
+    reasonIfMissing
+  };
 }
 
 function normalizeRequestMeta(meta = {}, overrides = {}) {
@@ -352,6 +419,38 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   };
 }
 
+function buildEffectiveContextFromResolved(normalizedContext, resolvedContext, requestMeta) {
+  const mode = resolvedContext?.mode || 'NONE';
+  const text = resolvedContext?.text || '';
+  const baseAnswer = normalizedContext?.baseAnswer || '';
+  const baseAnswerIncluded = Boolean(normalizedContext?.baseAnswerIncluded);
+  const contextMissing = (mode === 'FULL' || mode === 'SHORT') && !text;
+  const contextMissingReason = contextMissing
+    ? mode === 'SHORT'
+      ? 'short context missing'
+      : mode === 'FULL'
+        ? 'full context missing'
+        : ''
+    : '';
+  if (contextMissing) {
+    console.warn('Context mode requires text but none was provided.', {
+      mode,
+      triggerSource: requestMeta?.triggerSource,
+      purpose: requestMeta?.purpose
+    });
+  }
+  return {
+    mode,
+    text,
+    length: text.length,
+    hash: text ? computeTextHash(text) : 0,
+    baseAnswer,
+    baseAnswerIncluded,
+    contextMissing,
+    contextMissingReason
+  };
+}
+
 function buildContextPolicy(mode) {
   if (mode === 'FULL') return 'full';
   if (mode === 'SHORT') return 'short';
@@ -396,6 +495,11 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     contextTextSent: payload.contextTextSent ?? effectiveContext?.text,
     contextMissing: payload.contextMissing ?? effectiveContext?.contextMissing,
     contextMissingReason: payload.contextMissingReason ?? effectiveContext?.contextMissingReason ?? '',
+    sentContextMode: payload.sentContextMode ?? effectiveContext?.sentContextMode ?? '',
+    sentContextLen: payload.sentContextLen ?? effectiveContext?.sentContextLen ?? 0,
+    sentContextPreview: payload.sentContextPreview ?? effectiveContext?.sentContextPreview ?? '',
+    contextMismatch: payload.contextMismatch ?? effectiveContext?.contextMismatch ?? false,
+    contextMismatchReason: payload.contextMismatchReason ?? effectiveContext?.contextMismatchReason ?? '',
     contextSource: payload.contextSource ?? effectiveContext?.contextSource ?? '',
     contextId: payload.contextId ?? effectiveContext?.contextId ?? '',
     baseAnswerIncluded: payload.baseAnswerIncluded ?? effectiveContext?.baseAnswerIncluded,
@@ -948,9 +1052,9 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   });
   const resolvedContext = await resolveContextForRequest(metadata?.context, requestMeta);
   const normalizedContext = resolvedContext.normalized;
-  let contextSource = resolvedContext.contextSource || '';
-  const contextId = resolvedContext.contextKey || '';
-  const effectiveContext = buildEffectiveContext(normalizedContext, requestMeta);
+  let contextSource = resolvedContext.source || '';
+  const contextId = resolvedContext.id || '';
+  const effectiveContext = buildEffectiveContextFromResolved(normalizedContext, resolvedContext, requestMeta);
   effectiveContext.contextSource = contextSource;
   effectiveContext.contextId = contextId;
   const triggerSource = requestMeta?.triggerSource || '';
@@ -1070,6 +1174,10 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       effectiveContext.contextSource = contextSource || effectiveContext.contextSource || 'none';
     }
   }
+  const sentContextMetrics = resolveSentContextMetrics(effectiveContext.mode, effectiveContext.text || '');
+  effectiveContext.sentContextMode = sentContextMetrics.sentContextMode;
+  effectiveContext.sentContextLen = sentContextMetrics.sentContextLen;
+  effectiveContext.sentContextPreview = sentContextMetrics.sentContextPreview;
   if (effectiveContext.contextMissing && (triggerSource === 'retry' || triggerSource === 'validate')) {
     const error = new Error('Context unavailable: required context could not be resolved.');
     error.debugPayload = attachRequestMeta(
@@ -1088,6 +1196,36 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       effectiveContext
     );
     throw error;
+  }
+  if (effectiveContext.mode === 'SHORT') {
+    const mismatchReason = detectShortContextMismatch(
+      effectiveContext.text,
+      normalizedContext,
+      null
+    );
+    if (mismatchReason) {
+      effectiveContext.contextMismatch = true;
+      effectiveContext.contextMismatchReason = mismatchReason;
+      const error = new Error('Short context mismatch detected; request blocked.');
+      error.debugPayload = attachRequestMeta(
+        {
+          phase: 'PROOFREAD',
+          model,
+          latencyMs: null,
+          usage: null,
+          inputChars: null,
+          outputChars: null,
+          request: null,
+          response: null,
+          parseIssues: [`context-mismatch:${mismatchReason}`],
+          contextMismatch: true,
+          contextMismatchReason: mismatchReason
+        },
+        requestMeta,
+        effectiveContext
+      );
+      throw error;
+    }
   }
   const prompt = applyPromptCaching(
     buildProofreadPrompt(
@@ -1114,7 +1252,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     const envelope = [
       '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
       '[SHORT CONTEXT (GLOBAL)]',
-      resolvedShortContextText,
+      effectiveContext.text || '',
       '',
       '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
       manualOutputsText,
@@ -1364,6 +1502,7 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   let resolvedShortContextText = '';
   let resolvedManualOutputs = '';
+  let effectiveContext = null;
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     let matchedEntry = null;
     let matchedState = null;
@@ -1460,7 +1599,67 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
               parseIssues: ['short-context-missing']
             },
             normalizedRequestMeta,
-            { mode: 'SHORT', text: '', length: 0, hash: 0, baseAnswer: '', baseAnswerIncluded: false, contextMissing: true, contextMissingReason: 'short context missing' }
+            {
+              mode: 'SHORT',
+              text: '',
+              length: 0,
+              hash: 0,
+              baseAnswer: '',
+              baseAnswerIncluded: false,
+              contextMissing: true,
+              contextMissingReason: 'short context missing',
+              sentContextMode: 'SHORT',
+              sentContextLen: 0,
+              sentContextPreview: ''
+            }
+          )
+        ]
+      };
+    }
+  }
+  effectiveContext = buildEffectiveContext(
+    {
+      text: resolvedShortContextText || '',
+      mode: resolvedShortContextText ? 'SHORT' : '',
+      baseAnswer: '',
+      baseAnswerIncluded: false
+    },
+    normalizedRequestMeta
+  );
+  const formatSentContextMetrics = resolveSentContextMetrics(effectiveContext.mode, effectiveContext.text || '');
+  effectiveContext.sentContextMode = formatSentContextMetrics.sentContextMode;
+  effectiveContext.sentContextLen = formatSentContextMetrics.sentContextLen;
+  effectiveContext.sentContextPreview = formatSentContextMetrics.sentContextPreview;
+  if (effectiveContext.mode === 'SHORT') {
+    const mismatchReason = detectShortContextMismatch(
+      effectiveContext.text,
+      { fullText: '' },
+      null
+    );
+    if (mismatchReason) {
+      effectiveContext.contextMismatch = true;
+      effectiveContext.contextMismatchReason = mismatchReason;
+      return {
+        parsed: null,
+        rawProofread: rawResponse,
+        parseError: `context-mismatch:${mismatchReason}`,
+        debug: [
+          attachRequestMeta(
+            {
+              phase: 'PROOFREAD_FORMAT_REPAIR',
+              model,
+              latencyMs: null,
+              usage: null,
+              inputChars: rawResponse?.length || 0,
+              outputChars: 0,
+              request: null,
+              response: null,
+              parseIssues: [`context-mismatch:${mismatchReason}`],
+              contextMismatch: true,
+              contextMismatchReason: mismatchReason
+            },
+            normalizedRequestMeta,
+            effectiveContext
           )
         ]
       };
@@ -1556,15 +1755,6 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   const content = data?.choices?.[0]?.message?.content || '';
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const effectiveContext = buildEffectiveContext(
-    {
-      text: resolvedShortContextText || '',
-      mode: resolvedShortContextText ? 'SHORT' : '',
-      baseAnswer: '',
-      baseAnswerIncluded: false
-    },
-    normalizedRequestMeta
-  );
   const debugPayload = attachRequestMeta(
     {
       phase: 'PROOFREAD_FORMAT_REPAIR',
