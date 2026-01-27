@@ -456,6 +456,7 @@ async function performTranslationRequest(
   requestMeta = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'main' });
+  const operationType = 'neuro-translate:translate:v1';
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const normalizedContext = normalizeContextPayload(context);
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
@@ -470,6 +471,20 @@ async function performTranslationRequest(
     let matchedEntry = null;
     let matchedState = null;
     let matchedUpdatedAt = -1;
+    let manualOutputsByBlock = {};
+    try {
+      manualOutputsByBlock = await new Promise((resolve) => {
+        try {
+          chrome.storage.local.get({ manualTranslateOutputsByBlock: {} }, (data) => {
+            resolve(data?.manualTranslateOutputsByBlock || {});
+          });
+        } catch (error) {
+          resolve({});
+        }
+      });
+    } catch (error) {
+      manualOutputsByBlock = {};
+    }
     try {
       const debugByUrl = await new Promise((resolve) => {
         try {
@@ -516,7 +531,55 @@ async function performTranslationRequest(
         }
       }
     }
-    if (matchedEntry || matchedState) {
+    let manualOutputsSource = '';
+    let storedManualOutputs = [];
+    let manualOutputsFoundCount = 0;
+    const canonicalKey = normalizedRequestMeta.blockKey || normalizedRequestMeta.parentRequestId || '';
+    if (canonicalKey && Array.isArray(manualOutputsByBlock[canonicalKey])) {
+      storedManualOutputs = manualOutputsByBlock[canonicalKey];
+      manualOutputsSource = `manualTranslateOutputsByBlock:${canonicalKey}`;
+    }
+    if (!storedManualOutputs.length && normalizedRequestMeta.parentRequestId) {
+      const fallbackList = Object.values(manualOutputsByBlock).find((list) => {
+        if (!Array.isArray(list)) return false;
+        return list.some((entry) => entry?.parentRequestId === normalizedRequestMeta.parentRequestId);
+      });
+      if (Array.isArray(fallbackList)) {
+        storedManualOutputs = fallbackList;
+        manualOutputsSource = 'manualTranslateOutputsByBlock:parentRequestId';
+      }
+    }
+    if (Array.isArray(storedManualOutputs) && storedManualOutputs.length) {
+      const manualParts = storedManualOutputs
+        .filter((payload) => payload?.op === 'translate')
+        .map((payload, index) => {
+          const headerParts = [
+            `Manual attempt ${index + 1}`,
+            payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+            payload?.model ? `model=${payload.model}` : '',
+            payload?.createdAt ? `ts=${payload.createdAt}` : ''
+          ].filter(Boolean);
+          const responseText = payload?.rawResponse ? `RESPONSE (raw): ${payload.rawResponse}` : '';
+          const extractedText = payload?.extractedResult ? `EXTRACTED/PARSED: ${payload.extractedResult}` : '';
+          const payloadError = payload?.errors ? `ERRORS: ${payload.errors}` : '';
+          return [headerParts.join(' | '), responseText, extractedText, payloadError].filter(Boolean).join('\n');
+        });
+      resolvedManualOutputs = manualParts.join('\n\n');
+      manualOutputsFoundCount = storedManualOutputs.length;
+      if (!resolvedManualOutputs) {
+        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
+        console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType,
+          storedCount: storedManualOutputs.length,
+          manualOutputsSource
+        });
+      }
+    }
+    if (!resolvedManualOutputs && (matchedEntry || matchedState)) {
       const debugList = [];
       const debugSources = [];
       if (Array.isArray(matchedEntry?.translationDebug)) {
@@ -598,21 +661,45 @@ async function performTranslationRequest(
           .join('\n');
       });
       resolvedManualOutputs = manualParts.join('\n\n');
-      if (!resolvedManualOutputs) {
+      if (!manualOutputsFoundCount) {
+        manualOutputsFoundCount = manualPayloads.length;
+      }
+      if (!resolvedManualOutputs && manualPayloads.length) {
+        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but were not persisted/read)';
+        if (!manualOutputsFoundCount) {
+          manualOutputsFoundCount = manualPayloads.length;
+        }
         const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
-        console.warn('Retry/validate manual outputs not found.', {
+        const missingFields = manualPayloads.map((payload) => ({
+          hasResponse: payload?.response != null,
+          hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
+          hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
+        }));
+        console.warn('Retry/validate manual outputs missing despite manual attempts.', {
           triggerSource,
           requestId: normalizedRequestMeta.requestId,
           parentRequestId: normalizedRequestMeta.parentRequestId,
           blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType,
           debugSources,
-          observedTriggers
+          observedTriggers,
+          manualPayloadCount: manualPayloads.length,
+          missingFields
         });
       }
     }
     if (!resolvedManualOutputs) {
       resolvedManualOutputs = '(no manual outputs found)';
     }
+    console.warn('Retry/validate manual outputs lookup.', {
+      triggerSource,
+      requestId: normalizedRequestMeta.requestId,
+      parentRequestId: normalizedRequestMeta.parentRequestId,
+      blockKey: normalizedRequestMeta.blockKey,
+      prompt_cache_key: operationType,
+      manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
+      manualOutputsCount: manualOutputsFoundCount || 0
+    });
     if (!resolvedShortContextText) {
       resolvedShortContextText = '(short context missing: bundle not found)';
       console.warn('Retry/validate short context missing; using placeholder.', {
@@ -822,6 +909,89 @@ async function performTranslationRequest(
     effectiveContext
   );
   const debugPayloads = [debugPayload];
+  const triggerSourceLabel = normalizedRequestMeta?.triggerSource || '';
+  const shouldPersistManualOutputs =
+    triggerSourceLabel &&
+    triggerSourceLabel !== 'retry' &&
+    triggerSourceLabel !== 'validate' &&
+    (/manual/i.test(triggerSourceLabel) || triggerSourceLabel === 'manual_translate' || triggerSourceLabel === 'manualTranslate');
+  const persistManualTranslateOutputs = async ({ rawResponse, extractedResult, errors }) => {
+    if (!shouldPersistManualOutputs) return;
+    const blockKey = normalizedRequestMeta?.blockKey || '';
+    const parentRequestId = normalizedRequestMeta?.parentRequestId || '';
+    const canonicalKey = blockKey || parentRequestId;
+    if (!canonicalKey) {
+      console.warn('Manual translate outputs not persisted: missing block key.', {
+        blockKey,
+        parentRequestId,
+        requestId: normalizedRequestMeta?.requestId || '',
+        triggerSource: triggerSourceLabel,
+        prompt_cache_key: operationType
+      });
+      return;
+    }
+    const stringifySafe = (value) => {
+      if (value == null) return '';
+      if (typeof value === 'string') return value;
+      try {
+        return JSON.stringify(value);
+      } catch (error) {
+        return String(value);
+      }
+    };
+    const truncate = (value, limit = 8000) => {
+      if (!value) return '';
+      if (value.length <= limit) return value;
+      return `${value.slice(0, limit)}…(truncated)`;
+    };
+    const record = {
+      blockKey,
+      parentRequestId,
+      requestId: normalizedRequestMeta?.requestId || '',
+      triggerSource: triggerSourceLabel,
+      op: 'translate',
+      model,
+      createdAt: Date.now(),
+      rawResponse: truncate(stringifySafe(rawResponse)),
+      extractedResult: truncate(stringifySafe(extractedResult)),
+      errors: truncate(stringifySafe(errors))
+    };
+    let manualOutputsByBlock = {};
+    try {
+      manualOutputsByBlock = await new Promise((resolve) => {
+        try {
+          chrome.storage.local.get({ manualTranslateOutputsByBlock: {} }, (data) => {
+            resolve(data?.manualTranslateOutputsByBlock || {});
+          });
+        } catch (error) {
+          resolve({});
+        }
+      });
+    } catch (error) {
+      manualOutputsByBlock = {};
+    }
+    const existing = Array.isArray(manualOutputsByBlock[canonicalKey]) ? manualOutputsByBlock[canonicalKey] : [];
+    const countBefore = existing.length;
+    const nextList = [...existing, record].slice(-5);
+    manualOutputsByBlock[canonicalKey] = nextList;
+    await new Promise((resolve) => {
+      try {
+        chrome.storage.local.set({ manualTranslateOutputsByBlock: manualOutputsByBlock }, () => resolve(true));
+      } catch (error) {
+        resolve(false);
+      }
+    });
+    console.warn('Manual translate outputs persisted.', {
+      blockKey,
+      parentRequestId,
+      requestId: normalizedRequestMeta?.requestId || '',
+      triggerSource: triggerSourceLabel,
+      prompt_cache_key: operationType,
+      countBefore,
+      countAfter: nextList.length,
+      storageKey: canonicalKey
+    });
+  };
 
   let translations;
   try {
@@ -834,7 +1004,21 @@ async function performTranslationRequest(
     if (error && typeof error === 'object') {
       error.rawTranslation = content;
     }
+    if (shouldPersistManualOutputs) {
+      await persistManualTranslateOutputs({
+        rawResponse: content,
+        extractedResult: null,
+        errors: error?.message || 'parse-error'
+      });
+    }
     throw error;
+  }
+  if (shouldPersistManualOutputs) {
+    await persistManualTranslateOutputs({
+      rawResponse: content,
+      extractedResult: translations,
+      errors: debugPayload?.parseIssues?.length ? debugPayload.parseIssues.join(', ') : ''
+    });
   }
   const refusalIndices = translations
     .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
@@ -997,6 +1181,7 @@ async function performTranslationRepairRequest(
   requestMeta = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'validate' });
+  const operationType = 'neuro-translate:translate:v1';
   const contextPayload = { text: context || '', mode: '', baseAnswer: '', baseAnswerIncluded: false };
   const normalizedContext = normalizeContextPayload(contextPayload);
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
@@ -1011,6 +1196,20 @@ async function performTranslationRepairRequest(
     let matchedEntry = null;
     let matchedState = null;
     let matchedUpdatedAt = -1;
+    let manualOutputsByBlock = {};
+    try {
+      manualOutputsByBlock = await new Promise((resolve) => {
+        try {
+          chrome.storage.local.get({ manualTranslateOutputsByBlock: {} }, (data) => {
+            resolve(data?.manualTranslateOutputsByBlock || {});
+          });
+        } catch (error) {
+          resolve({});
+        }
+      });
+    } catch (error) {
+      manualOutputsByBlock = {};
+    }
     try {
       const debugByUrl = await new Promise((resolve) => {
         try {
@@ -1057,7 +1256,55 @@ async function performTranslationRepairRequest(
         }
       }
     }
-    if (matchedEntry || matchedState) {
+    let manualOutputsSource = '';
+    let storedManualOutputs = [];
+    let manualOutputsFoundCount = 0;
+    const canonicalKey = normalizedRequestMeta.blockKey || normalizedRequestMeta.parentRequestId || '';
+    if (canonicalKey && Array.isArray(manualOutputsByBlock[canonicalKey])) {
+      storedManualOutputs = manualOutputsByBlock[canonicalKey];
+      manualOutputsSource = `manualTranslateOutputsByBlock:${canonicalKey}`;
+    }
+    if (!storedManualOutputs.length && normalizedRequestMeta.parentRequestId) {
+      const fallbackList = Object.values(manualOutputsByBlock).find((list) => {
+        if (!Array.isArray(list)) return false;
+        return list.some((entry) => entry?.parentRequestId === normalizedRequestMeta.parentRequestId);
+      });
+      if (Array.isArray(fallbackList)) {
+        storedManualOutputs = fallbackList;
+        manualOutputsSource = 'manualTranslateOutputsByBlock:parentRequestId';
+      }
+    }
+    if (Array.isArray(storedManualOutputs) && storedManualOutputs.length) {
+      const manualParts = storedManualOutputs
+        .filter((payload) => payload?.op === 'translate')
+        .map((payload, index) => {
+          const headerParts = [
+            `Manual attempt ${index + 1}`,
+            payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+            payload?.model ? `model=${payload.model}` : '',
+            payload?.createdAt ? `ts=${payload.createdAt}` : ''
+          ].filter(Boolean);
+          const responseText = payload?.rawResponse ? `RESPONSE (raw): ${payload.rawResponse}` : '';
+          const extractedText = payload?.extractedResult ? `EXTRACTED/PARSED: ${payload.extractedResult}` : '';
+          const payloadError = payload?.errors ? `ERRORS: ${payload.errors}` : '';
+          return [headerParts.join(' | '), responseText, extractedText, payloadError].filter(Boolean).join('\n');
+        });
+      resolvedManualOutputs = manualParts.join('\n\n');
+      manualOutputsFoundCount = storedManualOutputs.length;
+      if (!resolvedManualOutputs) {
+        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
+        console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType,
+          storedCount: storedManualOutputs.length,
+          manualOutputsSource
+        });
+      }
+    }
+    if (!resolvedManualOutputs && (matchedEntry || matchedState)) {
       const debugList = [];
       const debugSources = [];
       if (Array.isArray(matchedEntry?.translationDebug)) {
@@ -1139,21 +1386,45 @@ async function performTranslationRepairRequest(
           .join('\n');
       });
       resolvedManualOutputs = manualParts.join('\n\n');
-      if (!resolvedManualOutputs) {
+      if (!manualOutputsFoundCount) {
+        manualOutputsFoundCount = manualPayloads.length;
+      }
+      if (!resolvedManualOutputs && manualPayloads.length) {
+        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but were not persisted/read)';
+        if (!manualOutputsFoundCount) {
+          manualOutputsFoundCount = manualPayloads.length;
+        }
         const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
-        console.warn('Retry/validate manual outputs not found.', {
+        const missingFields = manualPayloads.map((payload) => ({
+          hasResponse: payload?.response != null,
+          hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
+          hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
+        }));
+        console.warn('Retry/validate manual outputs missing despite manual attempts.', {
           triggerSource,
           requestId: normalizedRequestMeta.requestId,
           parentRequestId: normalizedRequestMeta.parentRequestId,
           blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType,
           debugSources,
-          observedTriggers
+          observedTriggers,
+          manualPayloadCount: manualPayloads.length,
+          missingFields
         });
       }
     }
     if (!resolvedManualOutputs) {
       resolvedManualOutputs = '(no manual outputs found)';
     }
+    console.warn('Retry/validate manual outputs lookup.', {
+      triggerSource,
+      requestId: normalizedRequestMeta.requestId,
+      parentRequestId: normalizedRequestMeta.parentRequestId,
+      blockKey: normalizedRequestMeta.blockKey,
+      prompt_cache_key: operationType,
+      manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
+      manualOutputsCount: manualOutputsFoundCount || 0
+    });
     if (!resolvedShortContextText) {
       resolvedShortContextText = '(short context missing: bundle not found)';
       console.warn('Retry/validate short context missing; using placeholder.', {
