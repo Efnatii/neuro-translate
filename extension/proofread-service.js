@@ -124,6 +124,10 @@ function resolveEffectiveContextMode(requestMeta, normalizedContext) {
   return 'NONE';
 }
 
+function normalizeCanonicalShortText(text) {
+  return typeof text === 'string' ? text.trim() : String(text ?? '').trim();
+}
+
 function trimToShortContext(text, limit = 800) {
   const normalized = typeof text === 'string' ? text.trim() : String(text ?? '').trim();
   if (!normalized) return '';
@@ -185,13 +189,13 @@ async function resolveRetryValidateBundle({ requestMeta, debugPayloadsOptional, 
   let matchedUpdatedAt = -1;
 
   if (effectiveContext?.mode === 'SHORT' && effectiveContext.text) {
-    shortText = trimToShortContext(effectiveContext.text);
+    shortText = normalizeCanonicalShortText(effectiveContext.text);
     shortSource = 'effective-context';
   }
 
   if (!shortText && normalizedContext) {
     const candidate = normalizedContext.shortText || (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') || '';
-    shortText = trimToShortContext(candidate);
+    shortText = normalizeCanonicalShortText(candidate);
     if (shortText) {
       shortSource = 'normalized-context';
     }
@@ -238,12 +242,11 @@ async function resolveRetryValidateBundle({ requestMeta, debugPayloadsOptional, 
   }
 
   if (!shortText && matchedState) {
-    shortText =
-      trimToShortContext(typeof matchedState?.contextShort === 'string' ? matchedState.contextShort : '') || '';
+    shortText = normalizeCanonicalShortText(matchedState?.contextShort) || '';
     if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
       try {
         const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-        shortText = trimToShortContext(rawRecord?.value?.text || rawRecord?.value?.response || '');
+        shortText = normalizeCanonicalShortText(rawRecord?.value?.text || rawRecord?.value?.response || '');
       } catch (error) {
         shortText = '';
       }
@@ -260,7 +263,7 @@ async function resolveRetryValidateBundle({ requestMeta, debugPayloadsOptional, 
 
   if (!shortText && normalizedContext) {
     const fallbackSource = normalizedContext.text || normalizedContext.fullText || '';
-    shortText = trimToShortContext(fallbackSource);
+    shortText = normalizeCanonicalShortText(fallbackSource);
     if (shortText) {
       shortSource = 'fallback-context';
     }
@@ -277,17 +280,29 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
   let mode = resolveEffectiveContextMode(requestMeta, normalized);
   let text = '';
+  const triggerSource = requestMeta?.triggerSource || '';
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
     const candidate = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
-    text = trimToShortContext(candidate);
-    if (!text) {
-      const fallbackSource = normalized.text || normalized.fullText || '';
-      text = trimToShortContext(fallbackSource);
-    }
-    if (!text) {
-      mode = 'NONE';
+    if (triggerSource === 'retry' || triggerSource === 'validate') {
+      text = normalizeCanonicalShortText(candidate);
+      if (!text) {
+        const fallbackSource = normalized.text || normalized.fullText || '';
+        text = normalizeCanonicalShortText(fallbackSource);
+      }
+      if (!text) {
+        mode = 'NONE';
+      }
+    } else {
+      text = trimToShortContext(candidate);
+      if (!text) {
+        const fallbackSource = normalized.text || normalized.fullText || '';
+        text = trimToShortContext(fallbackSource);
+      }
+      if (!text) {
+        mode = 'NONE';
+      }
     }
   }
   const baseAnswer = normalized.baseAnswer || '';
@@ -325,9 +340,20 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  let shortText = trimToShortContext(normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '');
-  if (!shortText) {
-    shortText = trimToShortContext(normalized.text || normalized.fullText || '');
+  const triggerSource = requestMeta?.triggerSource || '';
+  let shortText = '';
+  if (triggerSource === 'retry' || triggerSource === 'validate') {
+    shortText = normalizeCanonicalShortText(
+      normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || ''
+    );
+    if (!shortText) {
+      shortText = normalizeCanonicalShortText(normalized.text || normalized.fullText || '');
+    }
+  } else {
+    shortText = trimToShortContext(normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '');
+    if (!shortText) {
+      shortText = trimToShortContext(normalized.text || normalized.fullText || '');
+    }
   }
   return {
     text: shortText,
