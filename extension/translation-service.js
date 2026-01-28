@@ -84,26 +84,8 @@ function normalizeContextPayload(context) {
 
 function buildShortContextFallback(context = '') {
   if (!context) return '';
-  if (context.length <= 800) return context.trim();
-  const lines = context.split(/\r?\n/);
-  const preferredSections = new Set(['1)', '6)', '8)']);
-  let include = false;
-  const selected = [];
-  lines.forEach((line) => {
-    const trimmed = line.trim();
-    const headerMatch = trimmed.match(/^(\d+)\)/);
-    if (headerMatch) {
-      include = preferredSections.has(`${headerMatch[1]})`);
-    }
-    if (include) {
-      selected.push(line);
-    }
-  });
-  const compact = selected.join('\n').trim();
-  if (compact && compact.length <= 800) {
-    return compact;
-  }
-  return context.slice(0, 800).trimEnd();
+  const normalized = typeof context === 'string' ? context : String(context ?? '');
+  return normalized.trimEnd();
 }
 
 function buildShortContextFromNormalized(normalized) {
