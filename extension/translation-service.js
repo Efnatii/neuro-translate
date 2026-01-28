@@ -110,6 +110,13 @@ function normalizeCanonicalShortText(text) {
   return typeof text === 'string' ? text.trim() : String(text ?? '').trim();
 }
 
+function getStrictGlobalShortText(normalizedContext) {
+  if (!normalizedContext) return '';
+  const directShort = typeof normalizedContext.shortText === 'string' ? normalizedContext.shortText : '';
+  const shortCandidate = directShort || (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') || '';
+  return normalizeCanonicalShortText(shortCandidate);
+}
+
 function buildShortContextSections(context = '') {
   if (!context) return '';
   const lines = context.split(/\r?\n/);
@@ -142,12 +149,7 @@ function buildShortContextFromNormalized(normalized) {
 }
 
 function buildStrictShortContextFromNormalized(normalized) {
-  if (!normalized) return '';
-  const directShort =
-    normalized.shortText ||
-    (normalized.mode === 'SHORT' ? normalized.text : '') ||
-    '';
-  return normalizeCanonicalShortText(directShort);
+  return getStrictGlobalShortText(normalized);
 }
 
 function createRequestId() {
@@ -209,7 +211,9 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    text = buildStrictShortContextFromNormalized(normalized);
+    text = triggerSource === 'retry' || triggerSource === 'validate'
+      ? getStrictGlobalShortText(normalized)
+      : buildStrictShortContextFromNormalized(normalized);
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -252,7 +256,7 @@ function getRetryContextPayload(contextPayload, requestMeta) {
   const triggerSource = requestMeta?.triggerSource || '';
   let shortText = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    shortText = buildStrictShortContextFromNormalized(normalized);
+    shortText = getStrictGlobalShortText(normalized);
   } else {
     shortText = buildShortContextFromNormalized(normalized).trim();
   }
@@ -307,11 +311,12 @@ async function loadStoredShortContext(requestMeta) {
   return normalizeCanonicalShortText(text);
 }
 
-async function persistShortContext(requestMeta, shortText) {
+async function persistShortContext(requestMeta, normalizedContext) {
   const key = getShortContextStorageKey(requestMeta);
-  if (!key || !shortText) return;
+  const candidate = getStrictGlobalShortText(normalizedContext);
+  if (!key || !candidate) return;
   const storageKey = 'translationShortContextByBlock';
-  const trimmed = normalizeCanonicalShortText(shortText);
+  const trimmed = normalizeCanonicalShortText(candidate);
   if (!trimmed) return;
   const saveToArea = (area) =>
     new Promise((resolve) => {
@@ -628,17 +633,17 @@ async function performTranslationRequest(
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
-    const shortCandidate = buildStrictShortContextFromNormalized(normalizedContext);
-    if (shortCandidate) {
-      await persistShortContext(normalizedRequestMeta, shortCandidate);
-    }
+    await persistShortContext(normalizedRequestMeta, normalizedContext);
   }
-  let resolvedShortContextText = buildStrictShortContextFromNormalized(normalizedContext);
+  let resolvedShortContextText = '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
+    const strictShort = getStrictGlobalShortText(normalizedContext);
+    resolvedShortContextText = strictShort;
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
+    let shortContextMissingReason = '';
     let matchedEntry = null;
     let matchedState = null;
     let matchedUpdatedAt = -1;
@@ -691,22 +696,11 @@ async function performTranslationRequest(
       // ignore lookup errors
     }
     if (!resolvedShortContextText && matchedState) {
-      const fullCandidate =
-        normalizedContext.fullText ||
-        (normalizedContext.mode === 'FULL' ? normalizedContext.text : '') ||
-        normalizedContext.text ||
-        '';
       resolvedShortContextText = normalizeCanonicalShortText(matchedState?.contextShort);
-      if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
-        resolvedShortContextText = '';
-      }
       if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
         try {
           const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
           resolvedShortContextText = normalizeCanonicalShortText(rawRecord?.value?.text || rawRecord?.value?.response || '');
-          if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
-            resolvedShortContextText = '';
-          }
         } catch (error) {
           resolvedShortContextText = '';
         }
@@ -882,6 +876,7 @@ async function performTranslationRequest(
       manualOutputsCount: manualOutputsFoundCount || 0
     });
     if (resolvedShortContextText !== effectiveContext.text) {
+      effectiveContext.mode = 'SHORT';
       effectiveContext.text = resolvedShortContextText;
       effectiveContext.length = resolvedShortContextText.length;
       effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
@@ -890,6 +885,7 @@ async function performTranslationRequest(
         : false;
     }
     if (!resolvedShortContextText) {
+      shortContextMissingReason = 'normalized+storage+debug empty';
       effectiveContext.mode = 'SHORT';
       effectiveContext.text = '';
       effectiveContext.length = 0;
@@ -906,6 +902,7 @@ async function performTranslationRequest(
           request: null,
           response: null,
           error: 'short-context-missing',
+          shortContextMissingReason,
           contextMode: 'SHORT',
           contextTypeUsed: 'SHORT',
           contextLength: 0,
@@ -916,6 +913,10 @@ async function performTranslationRequest(
       );
       const error = new Error('Short context missing; retry/validate request aborted.');
       error.code = 'SHORT_CONTEXT_MISSING';
+      error.success = false;
+      error.contextMissing = true;
+      error.error = 'short context missing';
+      error.shortContextMissingReason = shortContextMissingReason;
       error.debugPayload = debugPayload;
       throw error;
     }
@@ -1394,17 +1395,17 @@ async function performTranslationRepairRequest(
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
-    const shortCandidate = buildStrictShortContextFromNormalized(normalizedContext);
-    if (shortCandidate) {
-      await persistShortContext(normalizedRequestMeta, shortCandidate);
-    }
+    await persistShortContext(normalizedRequestMeta, normalizedContext);
   }
-  let resolvedShortContextText = buildStrictShortContextFromNormalized(normalizedContext);
+  let resolvedShortContextText = '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
+    const strictShort = getStrictGlobalShortText(normalizedContext);
+    resolvedShortContextText = strictShort;
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
+    let shortContextMissingReason = '';
     let matchedEntry = null;
     let matchedState = null;
     let matchedUpdatedAt = -1;
@@ -1457,22 +1458,11 @@ async function performTranslationRepairRequest(
       // ignore lookup errors
     }
     if (!resolvedShortContextText && matchedState) {
-      const fullCandidate =
-        normalizedContext.fullText ||
-        (normalizedContext.mode === 'FULL' ? normalizedContext.text : '') ||
-        normalizedContext.text ||
-        '';
       resolvedShortContextText = normalizeCanonicalShortText(matchedState?.contextShort);
-      if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
-        resolvedShortContextText = '';
-      }
       if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
         try {
           const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
           resolvedShortContextText = normalizeCanonicalShortText(rawRecord?.value?.text || rawRecord?.value?.response || '');
-          if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
-            resolvedShortContextText = '';
-          }
         } catch (error) {
           resolvedShortContextText = '';
         }
@@ -1648,6 +1638,7 @@ async function performTranslationRepairRequest(
       manualOutputsCount: manualOutputsFoundCount || 0
     });
     if (resolvedShortContextText !== effectiveContext.text) {
+      effectiveContext.mode = 'SHORT';
       effectiveContext.text = resolvedShortContextText;
       effectiveContext.length = resolvedShortContextText.length;
       effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
@@ -1656,6 +1647,7 @@ async function performTranslationRepairRequest(
         : false;
     }
     if (!resolvedShortContextText) {
+      shortContextMissingReason = 'normalized+storage+debug empty';
       effectiveContext.mode = 'SHORT';
       effectiveContext.text = '';
       effectiveContext.length = 0;
@@ -1672,6 +1664,7 @@ async function performTranslationRepairRequest(
           request: null,
           response: null,
           error: 'short-context-missing',
+          shortContextMissingReason,
           contextMode: 'SHORT',
           contextTypeUsed: 'SHORT',
           contextLength: 0,
@@ -1682,6 +1675,10 @@ async function performTranslationRepairRequest(
       );
       const error = new Error('Short context missing; retry/validate request aborted.');
       error.code = 'SHORT_CONTEXT_MISSING';
+      error.success = false;
+      error.contextMissing = true;
+      error.error = 'short context missing';
+      error.shortContextMissingReason = shortContextMissingReason;
       error.debugPayload = debugPayload;
       throw error;
     }
