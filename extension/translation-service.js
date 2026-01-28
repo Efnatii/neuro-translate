@@ -110,14 +110,6 @@ function normalizeCanonicalShortText(text) {
   return typeof text === 'string' ? text.trim() : String(text ?? '').trim();
 }
 
-function looksLikeFullContext(text = '') {
-  if (!text) return false;
-  const sample = String(text).slice(0, 2000);
-  if (/1\)\s*Text type and purpose/i.test(sample)) return true;
-  const sectionMatches = sample.match(/^\d+\)\s*\w+/gm);
-  return Array.isArray(sectionMatches) && sectionMatches.length >= 3;
-}
-
 function getStrictGlobalShortText(normalizedContext) {
   if (!normalizedContext) return '';
   const directShort = typeof normalizedContext.shortText === 'string' ? normalizedContext.shortText : '';
@@ -640,16 +632,12 @@ async function performTranslationRequest(
   let resolvedShortContextText = '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    let shortContextMissingReason = '';
     const strictShort = getStrictGlobalShortText(normalizedContext);
     resolvedShortContextText = strictShort;
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
-    if (resolvedShortContextText && looksLikeFullContext(resolvedShortContextText)) {
-      shortContextMissingReason = 'short context invalid: looks like FULL';
-      resolvedShortContextText = '';
-    }
+    let shortContextMissingReason = '';
     let matchedEntry = null;
     let matchedState = null;
     let matchedUpdatedAt = -1;
@@ -891,9 +879,7 @@ async function performTranslationRequest(
         : false;
     }
     if (!resolvedShortContextText) {
-      if (!shortContextMissingReason) {
-        shortContextMissingReason = 'normalized+storage+debug empty';
-      }
+      shortContextMissingReason = 'normalized+storage+debug empty';
       effectiveContext.mode = 'SHORT';
       effectiveContext.text = '';
       effectiveContext.length = 0;
