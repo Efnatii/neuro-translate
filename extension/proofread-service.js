@@ -127,8 +127,7 @@ function resolveEffectiveContextMode(requestMeta, normalizedContext) {
 function trimToShortContext(text, limit = 800) {
   const normalized = typeof text === 'string' ? text.trim() : String(text ?? '').trim();
   if (!normalized) return '';
-  if (normalized.length <= limit) return normalized;
-  return normalized.slice(0, limit);
+  return normalized;
 }
 
 function formatManualOutputs(payloads) {
@@ -899,8 +898,7 @@ function buildProofreadBodyPreview(payload, maxLength = 800) {
     raw = String(payload);
   }
   if (!raw) return null;
-  if (raw.length <= maxLength) return raw;
-  return `${raw.slice(0, maxLength)}…`;
+  return raw;
 }
 
 async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
