@@ -141,6 +141,15 @@ function buildShortContextFromNormalized(normalized) {
   return buildShortContextFallback(fallbackSource).trim();
 }
 
+function buildStrictShortContextFromNormalized(normalized) {
+  if (!normalized) return '';
+  const directShort =
+    normalized.shortText ||
+    (normalized.mode === 'SHORT' ? normalized.text : '') ||
+    '';
+  return normalizeCanonicalShortText(directShort);
+}
+
 function createRequestId() {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
@@ -200,16 +209,7 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    if (triggerSource === 'retry' || triggerSource === 'validate') {
-      const directShort = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
-      text = normalizeCanonicalShortText(directShort);
-      if (!text) {
-        const fallbackSource = normalized.text || normalized.fullText || '';
-        text = buildShortContextSections(fallbackSource);
-      }
-    } else {
-      text = buildShortContextFromNormalized(normalized);
-    }
+    text = buildStrictShortContextFromNormalized(normalized);
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -252,12 +252,7 @@ function getRetryContextPayload(contextPayload, requestMeta) {
   const triggerSource = requestMeta?.triggerSource || '';
   let shortText = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    const directShort = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
-    shortText = normalizeCanonicalShortText(directShort);
-    if (!shortText) {
-      const fallbackSource = normalized.text || normalized.fullText || '';
-      shortText = buildShortContextSections(fallbackSource);
-    }
+    shortText = buildStrictShortContextFromNormalized(normalized);
   } else {
     shortText = buildShortContextFromNormalized(normalized).trim();
   }
@@ -373,6 +368,11 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
       payload.manualArtifactsUsed ??
       (effectiveContext?.baseAnswerIncluded ? { baseAnswerIncluded: true } : {})
   };
+}
+
+function isShortCandidateInvalid(shortCandidate, fullCandidate) {
+  if (!shortCandidate || !fullCandidate) return false;
+  return shortCandidate === fullCandidate || fullCandidate.startsWith(shortCandidate);
 }
 
 function createChildRequestMeta(baseMeta, overrides = {}) {
@@ -628,21 +628,14 @@ async function performTranslationRequest(
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
-    const shortCandidate = buildShortContextFromNormalized(normalizedContext);
+    const shortCandidate = buildStrictShortContextFromNormalized(normalizedContext);
     if (shortCandidate) {
       await persistShortContext(normalizedRequestMeta, shortCandidate);
     }
   }
-  let resolvedShortContextText = effectiveContext.text || '';
+  let resolvedShortContextText = buildStrictShortContextFromNormalized(normalizedContext);
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    if (!resolvedShortContextText) {
-      const directShort =
-        normalizedContext.shortText ||
-        (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') ||
-        '';
-      resolvedShortContextText = normalizeCanonicalShortText(directShort);
-    }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
@@ -698,11 +691,22 @@ async function performTranslationRequest(
       // ignore lookup errors
     }
     if (!resolvedShortContextText && matchedState) {
+      const fullCandidate =
+        normalizedContext.fullText ||
+        (normalizedContext.mode === 'FULL' ? normalizedContext.text : '') ||
+        normalizedContext.text ||
+        '';
       resolvedShortContextText = normalizeCanonicalShortText(matchedState?.contextShort);
+      if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
+        resolvedShortContextText = '';
+      }
       if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
         try {
           const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
           resolvedShortContextText = normalizeCanonicalShortText(rawRecord?.value?.text || rawRecord?.value?.response || '');
+          if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
+            resolvedShortContextText = '';
+          }
         } catch (error) {
           resolvedShortContextText = '';
         }
@@ -884,6 +888,36 @@ async function performTranslationRequest(
       effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
         ? !resolvedShortContextText
         : false;
+    }
+    if (!resolvedShortContextText) {
+      effectiveContext.mode = 'SHORT';
+      effectiveContext.text = '';
+      effectiveContext.length = 0;
+      effectiveContext.hash = 0;
+      effectiveContext.contextMissing = true;
+      const debugPayload = attachRequestMeta(
+        {
+          phase: 'TRANSLATE',
+          model,
+          latencyMs: null,
+          usage: null,
+          inputChars: 0,
+          outputChars: 0,
+          request: null,
+          response: null,
+          error: 'short-context-missing',
+          contextMode: 'SHORT',
+          contextTypeUsed: 'SHORT',
+          contextLength: 0,
+          contextMissing: true
+        },
+        normalizedRequestMeta,
+        effectiveContext
+      );
+      const error = new Error('Short context missing; retry/validate request aborted.');
+      error.code = 'SHORT_CONTEXT_MISSING';
+      error.debugPayload = debugPayload;
+      throw error;
     }
   }
   const contextText = effectiveContext.text || '';
@@ -1360,21 +1394,14 @@ async function performTranslationRepairRequest(
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
-    const shortCandidate = buildShortContextFromNormalized(normalizedContext);
+    const shortCandidate = buildStrictShortContextFromNormalized(normalizedContext);
     if (shortCandidate) {
       await persistShortContext(normalizedRequestMeta, shortCandidate);
     }
   }
-  let resolvedShortContextText = effectiveContext.text || '';
+  let resolvedShortContextText = buildStrictShortContextFromNormalized(normalizedContext);
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    if (!resolvedShortContextText) {
-      const directShort =
-        normalizedContext.shortText ||
-        (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') ||
-        '';
-      resolvedShortContextText = normalizeCanonicalShortText(directShort);
-    }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
@@ -1430,11 +1457,22 @@ async function performTranslationRepairRequest(
       // ignore lookup errors
     }
     if (!resolvedShortContextText && matchedState) {
+      const fullCandidate =
+        normalizedContext.fullText ||
+        (normalizedContext.mode === 'FULL' ? normalizedContext.text : '') ||
+        normalizedContext.text ||
+        '';
       resolvedShortContextText = normalizeCanonicalShortText(matchedState?.contextShort);
+      if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
+        resolvedShortContextText = '';
+      }
       if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
         try {
           const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
           resolvedShortContextText = normalizeCanonicalShortText(rawRecord?.value?.text || rawRecord?.value?.response || '');
+          if (resolvedShortContextText && isShortCandidateInvalid(resolvedShortContextText, fullCandidate)) {
+            resolvedShortContextText = '';
+          }
         } catch (error) {
           resolvedShortContextText = '';
         }
@@ -1616,6 +1654,36 @@ async function performTranslationRepairRequest(
       effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
         ? !resolvedShortContextText
         : false;
+    }
+    if (!resolvedShortContextText) {
+      effectiveContext.mode = 'SHORT';
+      effectiveContext.text = '';
+      effectiveContext.length = 0;
+      effectiveContext.hash = 0;
+      effectiveContext.contextMissing = true;
+      const debugPayload = attachRequestMeta(
+        {
+          phase: 'TRANSLATE_REPAIR',
+          model,
+          latencyMs: null,
+          usage: null,
+          inputChars: 0,
+          outputChars: 0,
+          request: null,
+          response: null,
+          error: 'short-context-missing',
+          contextMode: 'SHORT',
+          contextTypeUsed: 'SHORT',
+          contextLength: 0,
+          contextMissing: true
+        },
+        normalizedRequestMeta,
+        effectiveContext
+      );
+      const error = new Error('Short context missing; retry/validate request aborted.');
+      error.code = 'SHORT_CONTEXT_MISSING';
+      error.debugPayload = debugPayload;
+      throw error;
     }
   }
   const contextText = effectiveContext.text || '';
