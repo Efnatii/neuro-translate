@@ -88,16 +88,13 @@ function buildShortContextFallback(context = '') {
   return normalized.trimEnd();
 }
 
-function buildShortContextFromNormalized(normalized, opts) {
+function buildShortContextFromNormalized(normalized) {
   if (!normalized) return '';
   const directShort =
     normalized.shortText ||
     (normalized.mode === 'SHORT' ? normalized.text : '') ||
     '';
   const shortCandidate = directShort ? buildShortContextFallback(directShort) : '';
-  if (opts && opts.directOnly === true) {
-    return shortCandidate.trim();
-  }
   if (shortCandidate) return shortCandidate.trim();
   const fallbackSource = normalized.text || normalized.fullText || '';
   return buildShortContextFallback(fallbackSource).trim();
@@ -161,11 +158,7 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    if (requestMeta?.triggerSource === 'retry' || requestMeta?.triggerSource === 'validate') {
-      text = buildShortContextFromNormalized(normalized, { directOnly: true });
-    } else {
-      text = buildShortContextFromNormalized(normalized);
-    }
+    text = buildShortContextFromNormalized(normalized);
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -205,7 +198,7 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const shortText = buildShortContextFromNormalized(normalized, { directOnly: true }).trim();
+  const shortText = buildShortContextFromNormalized(normalized).trim();
   return {
     text: shortText,
     mode: 'SHORT',
@@ -578,10 +571,12 @@ async function performTranslationRequest(
       await persistShortContext(normalizedRequestMeta, shortCandidate);
     }
   }
-  let resolvedShortContextText = '';
+  let resolvedShortContextText = effectiveContext.text || '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    resolvedShortContextText = buildShortContextFromNormalized(normalizedContext, { directOnly: true });
+    if (!resolvedShortContextText) {
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
+    }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
@@ -817,13 +812,14 @@ async function performTranslationRequest(
       manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
       manualOutputsCount: manualOutputsFoundCount || 0
     });
-    effectiveContext.mode = resolvedShortContextText ? 'SHORT' : 'NONE';
-    effectiveContext.text = resolvedShortContextText;
-    effectiveContext.length = resolvedShortContextText.length;
-    effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
-    effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
-      ? !resolvedShortContextText
-      : false;
+    if (resolvedShortContextText !== effectiveContext.text) {
+      effectiveContext.text = resolvedShortContextText;
+      effectiveContext.length = resolvedShortContextText.length;
+      effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
+      effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
+        ? !resolvedShortContextText
+        : false;
+    }
   }
   const contextText = effectiveContext.text || '';
   const baseAnswerText =
@@ -1304,10 +1300,12 @@ async function performTranslationRepairRequest(
       await persistShortContext(normalizedRequestMeta, shortCandidate);
     }
   }
-  let resolvedShortContextText = '';
+  let resolvedShortContextText = effectiveContext.text || '';
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    resolvedShortContextText = buildShortContextFromNormalized(normalizedContext, { directOnly: true });
+    if (!resolvedShortContextText) {
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
+    }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
     }
@@ -1543,13 +1541,14 @@ async function performTranslationRepairRequest(
       manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
       manualOutputsCount: manualOutputsFoundCount || 0
     });
-    effectiveContext.mode = resolvedShortContextText ? 'SHORT' : 'NONE';
-    effectiveContext.text = resolvedShortContextText;
-    effectiveContext.length = resolvedShortContextText.length;
-    effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
-    effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
-      ? !resolvedShortContextText
-      : false;
+    if (resolvedShortContextText !== effectiveContext.text) {
+      effectiveContext.text = resolvedShortContextText;
+      effectiveContext.length = resolvedShortContextText.length;
+      effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
+      effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
+        ? !resolvedShortContextText
+        : false;
+    }
   }
   const contextText = effectiveContext.text || '';
   const normalizedItems = items.map((item) => ({
