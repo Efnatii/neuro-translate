@@ -180,41 +180,16 @@ async function getDebugData(url) {
   });
 }
 
-async function getDebugStore() {
-  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
-    return null;
-  }
-  return new Promise((resolve) => {
-    chrome.storage.local.get([DEBUG_STORAGE_KEY], (data) => {
-      resolve(data?.[DEBUG_STORAGE_KEY] || {});
-    });
-  });
-}
-
 async function clearContext() {
   if (!sourceUrl) return;
-  const store = await getDebugStore();
-  if (!store) return;
-  const current = store[sourceUrl];
-  if (!current) return;
-  const nextFullStatus = current.contextFullStatus === 'disabled' || current.contextStatus === 'disabled' ? 'disabled' : 'pending';
-  const nextShortStatus = current.contextShortStatus === 'disabled' ? 'disabled' : 'pending';
-  store[sourceUrl] = {
-    ...current,
-    context: '',
-    contextStatus: nextFullStatus,
-    contextFull: '',
-    contextFullStatus: nextFullStatus,
-    contextShort: '',
-    contextShortStatus: nextShortStatus,
-    contextFullRefId: '',
-    contextShortRefId: '',
-    contextFullTruncated: false,
-    contextShortTruncated: false,
-    updatedAt: Date.now()
-  };
+  if (!chrome?.tabs?.query) return;
+  const tabs = await new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (result) => resolve(result || []));
+  });
+  const activeTab = Array.isArray(tabs) ? tabs[0] : null;
+  if (!activeTab?.id) return;
   await new Promise((resolve) => {
-    chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: store }, () => resolve());
+    chrome.tabs.sendMessage(activeTab.id, { type: 'NT_CLEAR_CONTEXT_HARD' }, () => resolve());
   });
   await refreshDebug();
 }
