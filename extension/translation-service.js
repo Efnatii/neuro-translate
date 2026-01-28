@@ -160,9 +160,6 @@ function buildEffectiveContext(contextPayload, requestMeta) {
     if (typeof normalized.shortText === 'string' && normalized.shortText.trim()) {
       return normalized.shortText.trim();
     }
-    if (normalized.mode === 'SHORT' && typeof normalized.text === 'string' && normalized.text.trim()) {
-      return normalized.text.trim();
-    }
     return '';
   };
   if (triggerSource === 'retry' || triggerSource === 'validate') {
@@ -213,7 +210,7 @@ function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
   const shortText = typeof normalized.shortText === 'string' && normalized.shortText.trim()
     ? normalized.shortText.trim()
-    : (normalized.mode === 'SHORT' && typeof normalized.text === 'string' ? normalized.text.trim() : '');
+    : '';
   return {
     text: shortText,
     mode: 'SHORT',
@@ -591,9 +588,7 @@ async function performTranslationRequest(
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   const strictShort = typeof normalizedContext.shortText === 'string' && normalizedContext.shortText.trim()
     ? normalizedContext.shortText.trim()
-    : (normalizedContext.mode === 'SHORT' && typeof normalizedContext.text === 'string'
-      ? normalizedContext.text.trim()
-      : '');
+    : '';
   const fullText = typeof normalizedContext.fullText === 'string' ? normalizedContext.fullText.trim() : '';
   const fullModeText =
     normalizedContext.mode === 'FULL' && typeof normalizedContext.text === 'string'
@@ -871,9 +866,7 @@ async function performTranslationRequest(
     effectiveContext.text = resolvedShortContextText;
     effectiveContext.length = resolvedShortContextText.length;
     effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
-    effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
-      ? !resolvedShortContextText
-      : false;
+    effectiveContext.contextMissing = !resolvedShortContextText;
     if (!resolvedShortContextText) {
       console.warn('Retry/validate requires SHORT context but it is missing', {
         triggerSource,
@@ -1363,9 +1356,7 @@ async function performTranslationRepairRequest(
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   const strictShort = typeof normalizedContext.shortText === 'string' && normalizedContext.shortText.trim()
     ? normalizedContext.shortText.trim()
-    : (normalizedContext.mode === 'SHORT' && typeof normalizedContext.text === 'string'
-      ? normalizedContext.text.trim()
-      : '');
+    : '';
   const fullText = typeof normalizedContext.fullText === 'string' ? normalizedContext.fullText.trim() : '';
   const fullModeText =
     normalizedContext.mode === 'FULL' && typeof normalizedContext.text === 'string'
@@ -1643,9 +1634,7 @@ async function performTranslationRepairRequest(
     effectiveContext.text = resolvedShortContextText;
     effectiveContext.length = resolvedShortContextText.length;
     effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
-    effectiveContext.contextMissing = (effectiveContext.mode === 'FULL' || effectiveContext.mode === 'SHORT')
-      ? !resolvedShortContextText
-      : false;
+    effectiveContext.contextMissing = !resolvedShortContextText;
     if (!resolvedShortContextText) {
       console.warn('Retry/validate requires SHORT context but it is missing', {
         triggerSource,
