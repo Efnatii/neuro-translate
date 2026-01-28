@@ -253,7 +253,13 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const shortText = getStrictGlobalShortText(normalized);
+  const triggerSource = requestMeta?.triggerSource || '';
+  let shortText = '';
+  if (triggerSource === 'retry' || triggerSource === 'validate') {
+    shortText = getStrictGlobalShortText(normalized);
+  } else {
+    shortText = buildShortContextFromNormalized(normalized).trim();
+  }
   return {
     text: shortText,
     mode: 'SHORT',
@@ -1889,12 +1895,12 @@ async function repairTranslationsForLanguage(
   }
 
   try {
+    const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), requestMeta);
     const repairRequestMeta = createChildRequestMeta(requestMeta, {
       purpose: 'validate',
       attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
       triggerSource: 'validate'
     });
-    const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), repairRequestMeta);
     const repairResult = await performTranslationRepairRequest(
       repairItems,
       apiKey,
