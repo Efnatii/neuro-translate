@@ -1016,6 +1016,8 @@ async function translatePage(settings, options = {}) {
               settings.targetLanguage || 'ru',
               {
                 contextText: primaryContext.contextText,
+                contextFullText: primaryContext.contextFullText,
+                contextShortText: primaryContext.contextShortText,
                 contextMode: primaryContext.contextMode,
                 baseAnswer: primaryContext.baseAnswer,
                 baseAnswerIncluded: primaryContext.baseAnswerIncluded,
@@ -1062,6 +1064,8 @@ async function translatePage(settings, options = {}) {
                 settings.targetLanguage || 'ru',
                 {
                   contextText: fallbackContext.contextText,
+                  contextFullText: fallbackContext.contextFullText,
+                  contextShortText: fallbackContext.contextShortText,
                   contextMode: fallbackContext.contextMode,
                   baseAnswer: fallbackContext.baseAnswer,
                   baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
@@ -1542,6 +1546,10 @@ async function translate(
           baseAnswerPreview: '',
           tag: CALL_TAGS.TRANSLATE_BASE_FULL
         };
+  resolvedContextMeta.contextFullText =
+    resolvedContextMeta.contextFullText || latestContextSummary || resolvedContextMeta.contextText || '';
+  resolvedContextMeta.contextShortText =
+    resolvedContextMeta.contextShortText || latestShortContextSummary || '';
   const context = resolvedContextMeta.contextText || '';
   const baseAnswer = resolvedContextMeta.baseAnswerIncluded ? resolvedContextMeta.baseAnswer || '' : '';
   const contextEstimateText = [context, baseAnswer].filter(Boolean).join('\n');
