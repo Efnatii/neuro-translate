@@ -106,12 +106,15 @@ function buildShortContextFallback(context = '') {
   return context.slice(0, 800).trimEnd();
 }
 
-function buildShortContextFromNormalized(normalized) {
+function buildShortContextFromNormalized(normalized, opts) {
   if (!normalized) return '';
   const directShort =
     normalized.shortText ||
     (normalized.mode === 'SHORT' ? normalized.text : '') ||
     '';
+  if (opts && opts.directOnly === true) {
+    return directShort.trim();
+  }
   const shortCandidate = directShort ? buildShortContextFallback(directShort) : '';
   if (shortCandidate) return shortCandidate.trim();
   const fallbackSource = normalized.text || normalized.fullText || '';
@@ -176,7 +179,12 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    text = buildShortContextFromNormalized(normalized);
+    const triggerSource = requestMeta?.triggerSource || '';
+    if (triggerSource === 'retry' || triggerSource === 'validate') {
+      text = buildShortContextFromNormalized(normalized, { directOnly: true });
+    } else {
+      text = buildShortContextFromNormalized(normalized);
+    }
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -216,7 +224,7 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const shortText = buildShortContextFromNormalized(normalized).trim();
+  const shortText = buildShortContextFromNormalized(normalized, { directOnly: true }).trim();
   return {
     text: shortText,
     mode: 'SHORT',
@@ -265,15 +273,15 @@ async function loadStoredShortContext(requestMeta) {
   }
   const record = store && typeof store === 'object' ? store[key] : null;
   const text = typeof record?.text === 'string' ? record.text : '';
-  return buildShortContextFallback(text).trim();
+  return text.trim();
 }
 
 async function persistShortContext(requestMeta, shortText) {
   const key = getShortContextStorageKey(requestMeta);
   if (!key || !shortText) return;
   const storageKey = 'translationShortContextByBlock';
-  const trimmed = buildShortContextFallback(shortText).trim();
-  if (!trimmed) return;
+  const normalized = typeof shortText === 'string' ? shortText.trim() : String(shortText ?? '').trim();
+  if (!normalized) return;
   const saveToArea = (area) =>
     new Promise((resolve) => {
       if (!area?.get || !area?.set) {
@@ -283,7 +291,7 @@ async function persistShortContext(requestMeta, shortText) {
       try {
         area.get({ [storageKey]: {} }, (data) => {
           const store = data?.[storageKey] && typeof data[storageKey] === 'object' ? data[storageKey] : {};
-          store[key] = { text: trimmed, updatedAt: Date.now() };
+          store[key] = { text: normalized, updatedAt: Date.now() };
           area.set({ [storageKey]: store }, () => resolve(true));
         });
       } catch (error) {
@@ -593,7 +601,7 @@ async function performTranslationRequest(
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     if (!resolvedShortContextText) {
-      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext, { directOnly: true });
     }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
@@ -1322,7 +1330,7 @@ async function performTranslationRepairRequest(
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     if (!resolvedShortContextText) {
-      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext, { directOnly: true });
     }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
