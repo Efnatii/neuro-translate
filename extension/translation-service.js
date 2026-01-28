@@ -106,29 +106,6 @@ function buildShortContextFallback(context = '') {
   return context.slice(0, 800).trimEnd();
 }
 
-function normalizeCanonicalShortText(text) {
-  return typeof text === 'string' ? text.trim() : String(text ?? '').trim();
-}
-
-function buildShortContextSections(context = '') {
-  if (!context) return '';
-  const lines = context.split(/\r?\n/);
-  const preferredSections = new Set(['1)', '6)', '8)']);
-  let include = false;
-  const selected = [];
-  lines.forEach((line) => {
-    const trimmed = line.trim();
-    const headerMatch = trimmed.match(/^(\d+)\)/);
-    if (headerMatch) {
-      include = preferredSections.has(`${headerMatch[1]})`);
-    }
-    if (include) {
-      selected.push(line);
-    }
-  });
-  return selected.join('\n').trim();
-}
-
 function buildShortContextFromNormalized(normalized) {
   if (!normalized) return '';
   const directShort =
@@ -196,20 +173,10 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
   let mode = resolveEffectiveContextMode(requestMeta, normalized);
   let text = '';
-  const triggerSource = requestMeta?.triggerSource || '';
   if (mode === 'FULL') {
     text = normalized.fullText || (normalized.mode === 'FULL' ? normalized.text : '') || normalized.text || '';
   } else if (mode === 'SHORT') {
-    if (triggerSource === 'retry' || triggerSource === 'validate') {
-      const directShort = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
-      text = normalizeCanonicalShortText(directShort);
-      if (!text) {
-        const fallbackSource = normalized.text || normalized.fullText || '';
-        text = buildShortContextSections(fallbackSource);
-      }
-    } else {
-      text = buildShortContextFromNormalized(normalized);
-    }
+    text = buildShortContextFromNormalized(normalized);
   }
   const baseAnswer = normalized.baseAnswer || '';
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
@@ -249,18 +216,7 @@ function buildContextTypeUsed(mode) {
 
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
-  const triggerSource = requestMeta?.triggerSource || '';
-  let shortText = '';
-  if (triggerSource === 'retry' || triggerSource === 'validate') {
-    const directShort = normalized.shortText || (normalized.mode === 'SHORT' ? normalized.text : '') || '';
-    shortText = normalizeCanonicalShortText(directShort);
-    if (!shortText) {
-      const fallbackSource = normalized.text || normalized.fullText || '';
-      shortText = buildShortContextSections(fallbackSource);
-    }
-  } else {
-    shortText = buildShortContextFromNormalized(normalized).trim();
-  }
+  const shortText = buildShortContextFromNormalized(normalized).trim();
   return {
     text: shortText,
     mode: 'SHORT',
@@ -309,14 +265,14 @@ async function loadStoredShortContext(requestMeta) {
   }
   const record = store && typeof store === 'object' ? store[key] : null;
   const text = typeof record?.text === 'string' ? record.text : '';
-  return normalizeCanonicalShortText(text);
+  return buildShortContextFallback(text).trim();
 }
 
 async function persistShortContext(requestMeta, shortText) {
   const key = getShortContextStorageKey(requestMeta);
   if (!key || !shortText) return;
   const storageKey = 'translationShortContextByBlock';
-  const trimmed = normalizeCanonicalShortText(shortText);
+  const trimmed = buildShortContextFallback(shortText).trim();
   if (!trimmed) return;
   const saveToArea = (area) =>
     new Promise((resolve) => {
@@ -637,11 +593,7 @@ async function performTranslationRequest(
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     if (!resolvedShortContextText) {
-      const directShort =
-        normalizedContext.shortText ||
-        (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') ||
-        '';
-      resolvedShortContextText = normalizeCanonicalShortText(directShort);
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
     }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
@@ -698,11 +650,12 @@ async function performTranslationRequest(
       // ignore lookup errors
     }
     if (!resolvedShortContextText && matchedState) {
-      resolvedShortContextText = normalizeCanonicalShortText(matchedState?.contextShort);
+      resolvedShortContextText =
+        (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
       if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
         try {
           const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-          resolvedShortContextText = normalizeCanonicalShortText(rawRecord?.value?.text || rawRecord?.value?.response || '');
+          resolvedShortContextText = rawRecord?.value?.text || rawRecord?.value?.response || '';
         } catch (error) {
           resolvedShortContextText = '';
         }
@@ -1369,11 +1322,7 @@ async function performTranslationRepairRequest(
   let resolvedManualOutputs = '';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     if (!resolvedShortContextText) {
-      const directShort =
-        normalizedContext.shortText ||
-        (normalizedContext.mode === 'SHORT' ? normalizedContext.text : '') ||
-        '';
-      resolvedShortContextText = normalizeCanonicalShortText(directShort);
+      resolvedShortContextText = buildShortContextFromNormalized(normalizedContext);
     }
     if (!resolvedShortContextText) {
       resolvedShortContextText = await loadStoredShortContext(normalizedRequestMeta);
@@ -1430,11 +1379,12 @@ async function performTranslationRepairRequest(
       // ignore lookup errors
     }
     if (!resolvedShortContextText && matchedState) {
-      resolvedShortContextText = normalizeCanonicalShortText(matchedState?.contextShort);
+      resolvedShortContextText =
+        (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
       if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
         try {
           const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-          resolvedShortContextText = normalizeCanonicalShortText(rawRecord?.value?.text || rawRecord?.value?.response || '');
+          resolvedShortContextText = rawRecord?.value?.text || rawRecord?.value?.response || '';
         } catch (error) {
           resolvedShortContextText = '';
         }
