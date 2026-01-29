@@ -575,8 +575,6 @@ function buildRequestMeta(base = {}, overrides = {}) {
   const blockKey = overrides.blockKey || base.blockKey || '';
   const stage = overrides.stage || base.stage || '';
   const purpose = overrides.purpose || base.purpose || 'main';
-  const pageUrl = overrides.pageUrl || base.pageUrl || location.href;
-  const contextCacheKey = overrides.contextCacheKey ?? base.contextCacheKey ?? '';
   const attempt = Number.isFinite(overrides.attempt)
     ? overrides.attempt
     : Number.isFinite(base.attempt)
@@ -592,8 +590,6 @@ function buildRequestMeta(base = {}, overrides = {}) {
     blockKey,
     stage,
     purpose,
-    pageUrl,
-    contextCacheKey,
     attempt,
     triggerSource,
     contextMode: contextPolicy,
@@ -1003,8 +999,6 @@ async function translatePage(settings, options = {}) {
           blockKey: queuedItem.key,
           stage: 'translate',
           purpose: 'main',
-          pageUrl: location.href,
-          contextCacheKey,
           attempt: primaryContext.attemptIndex,
           triggerSource: translationTriggerSource
         };
