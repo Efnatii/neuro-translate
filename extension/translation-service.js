@@ -206,17 +206,41 @@ function buildContextTypeUsed(mode) {
   return '';
 }
 
+function isProbablyFullLikeShort(candidateShort, fullText, debugFullText) {
+  const candidate = typeof candidateShort === 'string' ? candidateShort.trim() : '';
+  if (!candidate) return false;
+  const fullCandidates = [fullText, debugFullText]
+    .filter((text) => typeof text === 'string' && text.trim())
+    .map((text) => text.trim());
+  if (!fullCandidates.length) return false;
+  const normalizedCandidate = candidate.replace(/\s+/g, ' ').trim();
+  const hasPatternHint = /^1\)\s*Text type/i.test(normalizedCandidate);
+  for (const full of fullCandidates) {
+    if (!full) continue;
+    if (full.startsWith(candidate)) return true;
+    if (candidate.length >= full.length * 0.7) return true;
+    if (hasPatternHint && /^1\)\s*Text type/i.test(full)) return true;
+  }
+  return false;
+}
+
 function getRetryContextPayload(contextPayload, requestMeta) {
   const normalized = normalizeContextPayload(contextPayload);
   const shortText = typeof normalized.shortText === 'string' && normalized.shortText.trim()
     ? normalized.shortText.trim()
     : '';
+  const fullText =
+    typeof normalized.fullText === 'string' && normalized.fullText.trim()
+      ? normalized.fullText.trim()
+      : normalized.mode === 'FULL' && typeof normalized.text === 'string'
+        ? normalized.text.trim()
+        : '';
   return {
     text: shortText,
     mode: 'SHORT',
     baseAnswer: normalized.baseAnswer || '',
     baseAnswerIncluded: Boolean(normalized.baseAnswerIncluded),
-    fullText: '',
+    fullText: fullText,
     shortText: shortText
   };
 }
@@ -594,8 +618,7 @@ async function performTranslationRequest(
     normalizedContext.mode === 'FULL' && typeof normalizedContext.text === 'string'
       ? normalizedContext.text.trim()
       : '';
-  const matchesFull = (candidate) =>
-    candidate && ((fullText && candidate === fullText) || (fullModeText && candidate === fullModeText));
+  const matchesFull = (candidate) => isProbablyFullLikeShort(candidate, fullText, fullModeText);
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
     if (strictShort && !matchesFull(strictShort)) {
       await persistShortContext(normalizedRequestMeta, strictShort);
@@ -616,12 +639,6 @@ async function performTranslationRequest(
       let manualOutputsSource = '';
       let storedManualOutputs = [];
       let manualOutputsFoundCount = 0;
-      const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
-
-      if (strictPayloadShort) {
-        shortText = strictPayloadShort;
-        shortSource = 'payload';
-      }
 
       try {
         manualOutputsByBlock = await new Promise((resolve) => {
@@ -672,7 +689,7 @@ async function performTranslationRequest(
         // ignore lookup errors
       }
 
-      if (!shortText && matchedState) {
+      if (matchedState) {
         shortText =
           (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
         if (shortText && matchesFull(shortText)) {
@@ -699,7 +716,18 @@ async function performTranslationRequest(
       }
 
       if (!shortText) {
+        const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
+        if (strictPayloadShort) {
+          shortText = strictPayloadShort;
+          shortSource = 'payload';
+        }
+      }
+
+      if (!shortText) {
         shortText = (await loadStoredShortContext(normalizedRequestMeta, normalizedContext))?.trim() || '';
+        if (shortText && matchesFull(shortText)) {
+          shortText = '';
+        }
         if (shortText) {
           shortSource = 'stored';
         }
@@ -1382,8 +1410,7 @@ async function performTranslationRepairRequest(
     normalizedContext.mode === 'FULL' && typeof normalizedContext.text === 'string'
       ? normalizedContext.text.trim()
       : '';
-  const matchesFull = (candidate) =>
-    candidate && ((fullText && candidate === fullText) || (fullModeText && candidate === fullModeText));
+  const matchesFull = (candidate) => isProbablyFullLikeShort(candidate, fullText, fullModeText);
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
     if (strictShort && !matchesFull(strictShort)) {
       await persistShortContext(normalizedRequestMeta, strictShort);
@@ -1404,12 +1431,6 @@ async function performTranslationRepairRequest(
       let manualOutputsSource = '';
       let storedManualOutputs = [];
       let manualOutputsFoundCount = 0;
-      const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
-
-      if (strictPayloadShort) {
-        shortText = strictPayloadShort;
-        shortSource = 'payload';
-      }
 
       try {
         manualOutputsByBlock = await new Promise((resolve) => {
@@ -1460,7 +1481,7 @@ async function performTranslationRepairRequest(
         // ignore lookup errors
       }
 
-      if (!shortText && matchedState) {
+      if (matchedState) {
         shortText =
           (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
         if (shortText && matchesFull(shortText)) {
@@ -1487,7 +1508,18 @@ async function performTranslationRepairRequest(
       }
 
       if (!shortText) {
+        const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
+        if (strictPayloadShort) {
+          shortText = strictPayloadShort;
+          shortSource = 'payload';
+        }
+      }
+
+      if (!shortText) {
         shortText = (await loadStoredShortContext(normalizedRequestMeta, normalizedContext))?.trim() || '';
+        if (shortText && matchesFull(shortText)) {
+          shortText = '';
+        }
         if (shortText) {
           shortSource = 'stored';
         }
