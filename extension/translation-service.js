@@ -122,6 +122,7 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
     requestId: merged.requestId || createRequestId(),
     parentRequestId: merged.parentRequestId || '',
     blockKey: merged.blockKey || '',
+    url: merged.url || '',
     stage: merged.stage || '',
     purpose: merged.purpose || 'main',
     attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
@@ -206,9 +207,18 @@ function buildContextTypeUsed(mode) {
   return '';
 }
 
+function looksLikeFullContextFormat(text) {
+  if (typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (!/^1\)\s*Text type/i.test(trimmed)) return false;
+  const sectionMarkers = trimmed.match(/\n\s*(?:[2-9]|10)\)\s*/g) || [];
+  return sectionMarkers.length >= 2;
+}
+
 function isProbablyFullLikeShort(candidateShort, fullText, debugFullText) {
   const candidate = typeof candidateShort === 'string' ? candidateShort.trim() : '';
   if (!candidate) return false;
+  if (looksLikeFullContextFormat(candidate)) return true;
   const fullCandidates = [fullText, debugFullText]
     .filter((text) => typeof text === 'string' && text.trim())
     .map((text) => text.trim());
@@ -639,6 +649,11 @@ async function performTranslationRequest(
       let manualOutputsSource = '';
       let storedManualOutputs = [];
       let manualOutputsFoundCount = 0;
+      const isFullLikeShort = (candidate) => {
+        const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
+        if (!trimmed) return false;
+        return looksLikeFullContextFormat(trimmed) || isProbablyFullLikeShort(trimmed, fullText, fullModeText);
+      };
 
       try {
         manualOutputsByBlock = await new Promise((resolve) => {
@@ -692,7 +707,7 @@ async function performTranslationRequest(
       if (matchedState) {
         shortText =
           (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
-        if (shortText && matchesFull(shortText)) {
+        if (shortText && isFullLikeShort(shortText)) {
           shortText = '';
         }
         if (shortText) {
@@ -705,7 +720,7 @@ async function performTranslationRequest(
           } catch (error) {
             shortText = '';
           }
-          if (shortText && matchesFull(shortText)) {
+          if (shortText && isFullLikeShort(shortText)) {
             shortText = '';
           }
           if (shortText) {
@@ -716,7 +731,7 @@ async function performTranslationRequest(
       }
 
       if (!shortText) {
-        const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
+        const strictPayloadShort = strictShort && !isFullLikeShort(strictShort) ? strictShort : '';
         if (strictPayloadShort) {
           shortText = strictPayloadShort;
           shortSource = 'payload';
@@ -725,11 +740,45 @@ async function performTranslationRequest(
 
       if (!shortText) {
         shortText = (await loadStoredShortContext(normalizedRequestMeta, normalizedContext))?.trim() || '';
-        if (shortText && matchesFull(shortText)) {
+        if (shortText && isFullLikeShort(shortText)) {
           shortText = '';
         }
         if (shortText) {
           shortSource = 'stored';
+        }
+      }
+
+      if (!shortText) {
+        const debugUrl = normalizedRequestMeta?.url || '';
+        if (debugUrl) {
+          // Edge can fire retry/validate before short context persistence; poll briefly to avoid
+          // mistaking full-format context as short when fullText comparison data is missing.
+          for (let attempt = 0; attempt < 15; attempt += 1) {
+            const debugCandidate = await new Promise((resolve) => {
+              if (!chrome?.storage?.local) {
+                resolve('');
+                return;
+              }
+              try {
+                chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
+                  const store = data?.translationDebugByUrl || {};
+                  const record = store && typeof store === 'object' ? store[debugUrl] : null;
+                  resolve(typeof record?.contextShort === 'string' ? record.contextShort : '');
+                });
+              } catch (error) {
+                resolve('');
+              }
+            });
+            const trimmedCandidate = typeof debugCandidate === 'string' ? debugCandidate.trim() : '';
+            if (trimmedCandidate && !isFullLikeShort(trimmedCandidate)) {
+              shortText = trimmedCandidate;
+              shortSource = 'debug-url-poll';
+              break;
+            }
+            if (attempt < 14) {
+              await sleep(100);
+            }
+          }
         }
       }
 
