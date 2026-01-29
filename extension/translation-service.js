@@ -124,6 +124,8 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
     blockKey: merged.blockKey || '',
     stage: merged.stage || '',
     purpose: merged.purpose || 'main',
+    pageUrl: merged.pageUrl || '',
+    contextCacheKey: merged.contextCacheKey || '',
     attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
     triggerSource: merged.triggerSource || '',
     forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry)
@@ -267,7 +269,7 @@ async function loadStoredShortContext(requestMeta, contextPayload) {
     });
   let store = {};
   try {
-    store = await fetchFromArea(chrome?.storage?.session);
+    store = await fetchFromArea(chrome?.storage?.local);
   } catch (error) {
     store = {};
   }
@@ -276,7 +278,7 @@ async function loadStoredShortContext(requestMeta, contextPayload) {
   }
   if (!store[key]) {
     try {
-      store = await fetchFromArea(chrome?.storage?.local);
+      store = await fetchFromArea(chrome?.storage?.session);
     } catch (error) {
       store = {};
     }
@@ -317,18 +319,15 @@ async function persistShortContext(requestMeta, shortText) {
         resolve(false);
       }
     });
-  let saved = false;
   try {
-    saved = await saveToArea(chrome?.storage?.session);
+    await saveToArea(chrome?.storage?.local);
   } catch (error) {
-    saved = false;
+    // ignore errors
   }
-  if (!saved) {
-    try {
-      await saveToArea(chrome?.storage?.local);
-    } catch (error) {
-      // ignore fallback errors
-    }
+  try {
+    await saveToArea(chrome?.storage?.session);
+  } catch (error) {
+    // ignore fallback errors
   }
 }
 
@@ -654,42 +653,67 @@ async function performTranslationRequest(
         manualOutputsByBlock = {};
       }
 
-      try {
-        const debugByUrl = await new Promise((resolve) => {
-          try {
-            chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
-              resolve(data?.translationDebugByUrl || {});
-            });
-          } catch (error) {
-            resolve({});
+      if (normalizedRequestMeta.contextCacheKey) {
+        try {
+          const contextCacheByPage = await new Promise((resolve) => {
+            try {
+              chrome.storage.local.get({ contextCacheByPage: {} }, (data) => {
+                resolve(data?.contextCacheByPage || {});
+              });
+            } catch (error) {
+              resolve({});
+            }
+          });
+          const cachedEntry = contextCacheByPage?.[normalizedRequestMeta.contextCacheKey] || null;
+          const cachedShort =
+            typeof cachedEntry?.contextShort === 'string' ? cachedEntry.contextShort.trim() : '';
+          if (cachedShort) {
+            shortText = cachedShort;
+            shortSource = 'contextCacheByPage';
           }
-        });
-        const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
-        for (const state of states) {
-          const items = Array.isArray(state?.items) ? state.items : [];
-          let entry = null;
-          if (normalizedRequestMeta.parentRequestId) {
-            entry = items.find((item) => {
-              const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
-              return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
-            });
-          }
-          if (!entry && normalizedRequestMeta.blockKey) {
-            entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
-          }
-          if (!entry) continue;
-          const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
-          if (!matchedState || updatedAt >= matchedUpdatedAt) {
-            matchedState = state;
-            matchedEntry = entry;
-            matchedUpdatedAt = updatedAt;
-          }
+        } catch (error) {
+          // ignore cache lookup errors
         }
-      } catch (error) {
-        // ignore lookup errors
       }
 
-      if (matchedState) {
+      if (!shortText) {
+        try {
+          const debugByUrl = await new Promise((resolve) => {
+            try {
+              chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
+                resolve(data?.translationDebugByUrl || {});
+              });
+            } catch (error) {
+              resolve({});
+            }
+          });
+          const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
+          for (const state of states) {
+            const items = Array.isArray(state?.items) ? state.items : [];
+            let entry = null;
+            if (normalizedRequestMeta.parentRequestId) {
+              entry = items.find((item) => {
+                const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
+                return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
+              });
+            }
+            if (!entry && normalizedRequestMeta.blockKey) {
+              entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
+            }
+            if (!entry) continue;
+            const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
+            if (!matchedState || updatedAt >= matchedUpdatedAt) {
+              matchedState = state;
+              matchedEntry = entry;
+              matchedUpdatedAt = updatedAt;
+            }
+          }
+        } catch (error) {
+          // ignore lookup errors
+        }
+      }
+
+      if (!shortText && matchedState) {
         shortText =
           (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
         if (shortText && matchesFull(shortText)) {
@@ -1446,42 +1470,67 @@ async function performTranslationRepairRequest(
         manualOutputsByBlock = {};
       }
 
-      try {
-        const debugByUrl = await new Promise((resolve) => {
-          try {
-            chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
-              resolve(data?.translationDebugByUrl || {});
-            });
-          } catch (error) {
-            resolve({});
+      if (normalizedRequestMeta.contextCacheKey) {
+        try {
+          const contextCacheByPage = await new Promise((resolve) => {
+            try {
+              chrome.storage.local.get({ contextCacheByPage: {} }, (data) => {
+                resolve(data?.contextCacheByPage || {});
+              });
+            } catch (error) {
+              resolve({});
+            }
+          });
+          const cachedEntry = contextCacheByPage?.[normalizedRequestMeta.contextCacheKey] || null;
+          const cachedShort =
+            typeof cachedEntry?.contextShort === 'string' ? cachedEntry.contextShort.trim() : '';
+          if (cachedShort) {
+            shortText = cachedShort;
+            shortSource = 'contextCacheByPage';
           }
-        });
-        const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
-        for (const state of states) {
-          const items = Array.isArray(state?.items) ? state.items : [];
-          let entry = null;
-          if (normalizedRequestMeta.parentRequestId) {
-            entry = items.find((item) => {
-              const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
-              return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
-            });
-          }
-          if (!entry && normalizedRequestMeta.blockKey) {
-            entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
-          }
-          if (!entry) continue;
-          const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
-          if (!matchedState || updatedAt >= matchedUpdatedAt) {
-            matchedState = state;
-            matchedEntry = entry;
-            matchedUpdatedAt = updatedAt;
-          }
+        } catch (error) {
+          // ignore cache lookup errors
         }
-      } catch (error) {
-        // ignore lookup errors
       }
 
-      if (matchedState) {
+      if (!shortText) {
+        try {
+          const debugByUrl = await new Promise((resolve) => {
+            try {
+              chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
+                resolve(data?.translationDebugByUrl || {});
+              });
+            } catch (error) {
+              resolve({});
+            }
+          });
+          const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
+          for (const state of states) {
+            const items = Array.isArray(state?.items) ? state.items : [];
+            let entry = null;
+            if (normalizedRequestMeta.parentRequestId) {
+              entry = items.find((item) => {
+                const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
+                return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
+              });
+            }
+            if (!entry && normalizedRequestMeta.blockKey) {
+              entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
+            }
+            if (!entry) continue;
+            const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
+            if (!matchedState || updatedAt >= matchedUpdatedAt) {
+              matchedState = state;
+              matchedEntry = entry;
+              matchedUpdatedAt = updatedAt;
+            }
+          }
+        } catch (error) {
+          // ignore lookup errors
+        }
+      }
+
+      if (!shortText && matchedState) {
         shortText =
           (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
         if (shortText && matchesFull(shortText)) {
