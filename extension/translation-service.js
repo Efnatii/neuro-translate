@@ -605,263 +605,283 @@ async function performTranslationRequest(
   let resolvedManualOutputs = '';
   let contextShortSource = 'missing';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    if (strictShort && !matchesFull(strictShort)) {
-      resolvedShortContextText = strictShort;
-      contextShortSource = 'payload';
-    }
-    let matchedEntry = null;
-    let matchedState = null;
-    let matchedUpdatedAt = -1;
-    let manualOutputsByBlock = {};
-    try {
-      manualOutputsByBlock = await new Promise((resolve) => {
-        try {
-          chrome.storage.local.get({ manualTranslateOutputsByBlock: {} }, (data) => {
-            resolve(data?.manualTranslateOutputsByBlock || {});
-          });
-        } catch (error) {
-          resolve({});
+    const buildRetryValidateBundle = async () => {
+      let shortText = '';
+      let shortSource = 'missing';
+      let manualOutputsText = '';
+      let matchedEntry = null;
+      let matchedState = null;
+      let matchedUpdatedAt = -1;
+      let manualOutputsByBlock = {};
+      let manualOutputsSource = '';
+      let storedManualOutputs = [];
+      let manualOutputsFoundCount = 0;
+      const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
+
+      if (strictPayloadShort) {
+        shortText = strictPayloadShort;
+        shortSource = 'payload';
+      }
+
+      try {
+        manualOutputsByBlock = await new Promise((resolve) => {
+          try {
+            chrome.storage.local.get({ manualTranslateOutputsByBlock: {} }, (data) => {
+              resolve(data?.manualTranslateOutputsByBlock || {});
+            });
+          } catch (error) {
+            resolve({});
+          }
+        });
+      } catch (error) {
+        manualOutputsByBlock = {};
+      }
+
+      try {
+        const debugByUrl = await new Promise((resolve) => {
+          try {
+            chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
+              resolve(data?.translationDebugByUrl || {});
+            });
+          } catch (error) {
+            resolve({});
+          }
+        });
+        const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
+        for (const state of states) {
+          const items = Array.isArray(state?.items) ? state.items : [];
+          let entry = null;
+          if (normalizedRequestMeta.parentRequestId) {
+            entry = items.find((item) => {
+              const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
+              return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
+            });
+          }
+          if (!entry && normalizedRequestMeta.blockKey) {
+            entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
+          }
+          if (!entry) continue;
+          const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
+          if (!matchedState || updatedAt >= matchedUpdatedAt) {
+            matchedState = state;
+            matchedEntry = entry;
+            matchedUpdatedAt = updatedAt;
+          }
         }
-      });
-    } catch (error) {
-      manualOutputsByBlock = {};
-    }
-    try {
-      const debugByUrl = await new Promise((resolve) => {
-        try {
-          chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
-            resolve(data?.translationDebugByUrl || {});
-          });
-        } catch (error) {
-          resolve({});
+      } catch (error) {
+        // ignore lookup errors
+      }
+
+      if (!shortText && matchedState) {
+        shortText =
+          (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
+        if (shortText && matchesFull(shortText)) {
+          shortText = '';
         }
-      });
-      const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
-      for (const state of states) {
-        const items = Array.isArray(state?.items) ? state.items : [];
-        let entry = null;
-        if (normalizedRequestMeta.parentRequestId) {
-          entry = items.find((item) => {
+        if (shortText) {
+          shortSource = 'debug-scan';
+        }
+        if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
+          try {
+            const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
+            shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
+          } catch (error) {
+            shortText = '';
+          }
+          if (shortText && matchesFull(shortText)) {
+            shortText = '';
+          }
+          if (shortText) {
+            shortSource = 'debug-raw';
+          }
+        }
+        shortText = typeof shortText === 'string' ? shortText.trim() : '';
+      }
+
+      if (!shortText) {
+        shortText = (await loadStoredShortContext(normalizedRequestMeta, normalizedContext))?.trim() || '';
+        if (shortText) {
+          shortSource = 'stored';
+        }
+      }
+
+      const canonicalKey = normalizedRequestMeta.blockKey || normalizedRequestMeta.parentRequestId || '';
+      if (canonicalKey && Array.isArray(manualOutputsByBlock[canonicalKey])) {
+        storedManualOutputs = manualOutputsByBlock[canonicalKey];
+        manualOutputsSource = `manualTranslateOutputsByBlock:${canonicalKey}`;
+      }
+      if (!storedManualOutputs.length && normalizedRequestMeta.parentRequestId) {
+        const fallbackList = Object.values(manualOutputsByBlock).find((list) => {
+          if (!Array.isArray(list)) return false;
+          return list.some((entry) => entry?.parentRequestId === normalizedRequestMeta.parentRequestId);
+        });
+        if (Array.isArray(fallbackList)) {
+          storedManualOutputs = fallbackList;
+          manualOutputsSource = 'manualTranslateOutputsByBlock:parentRequestId';
+        }
+      }
+      if (Array.isArray(storedManualOutputs) && storedManualOutputs.length) {
+        const manualParts = storedManualOutputs
+          .filter((payload) => payload?.op === 'translate')
+          .map((payload, index) => {
+            const headerParts = [
+              `Manual attempt ${index + 1}`,
+              payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+              payload?.model ? `model=${payload.model}` : '',
+              payload?.createdAt ? `ts=${payload.createdAt}` : ''
+            ].filter(Boolean);
+            const responseText = payload?.rawResponse ? `RESPONSE (raw): ${payload.rawResponse}` : '';
+            const extractedText = payload?.extractedResult ? `EXTRACTED/PARSED: ${payload.extractedResult}` : '';
+            const payloadError = payload?.errors ? `ERRORS: ${payload.errors}` : '';
+            return [headerParts.join(' | '), responseText, extractedText, payloadError].filter(Boolean).join('\n');
+          });
+        manualOutputsText = manualParts.join('\n\n');
+        manualOutputsFoundCount = storedManualOutputs.length;
+        if (!manualOutputsText) {
+          manualOutputsText = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
+          console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
+            triggerSource,
+            requestId: normalizedRequestMeta.requestId,
+            parentRequestId: normalizedRequestMeta.parentRequestId,
+            blockKey: normalizedRequestMeta.blockKey,
+            prompt_cache_key: operationType,
+            storedCount: storedManualOutputs.length,
+            manualOutputsSource
+          });
+        }
+      }
+
+      if (!manualOutputsText && (matchedEntry || matchedState)) {
+        const debugList = [];
+        const debugSources = [];
+        if (Array.isArray(matchedEntry?.translationDebug)) {
+          debugList.push(...matchedEntry.translationDebug);
+          debugSources.push('matchedEntry.translationDebug');
+        }
+        if (Array.isArray(matchedState?.translationDebug)) {
+          debugList.push(...matchedState.translationDebug);
+          debugSources.push('matchedState.translationDebug');
+        }
+        if (Array.isArray(matchedState?.items) && normalizedRequestMeta.blockKey) {
+          matchedState.items.forEach((item) => {
+            if (item?.blockKey === normalizedRequestMeta.blockKey && Array.isArray(item.translationDebug)) {
+              debugList.push(...item.translationDebug);
+              debugSources.push(`matchedState.items[${item.blockKey}].translationDebug`);
+            }
+          });
+        }
+        if (Array.isArray(matchedState?.items) && normalizedRequestMeta.parentRequestId) {
+          matchedState.items.forEach((item) => {
             const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
-            return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
+            if (list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId)) {
+              debugList.push(...list);
+              debugSources.push(`matchedState.items[parent:${normalizedRequestMeta.parentRequestId}].translationDebug`);
+            }
           });
         }
-        if (!entry && normalizedRequestMeta.blockKey) {
-          entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
-        }
-        if (!entry) continue;
-        const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
-        if (!matchedState || updatedAt >= matchedUpdatedAt) {
-          matchedState = state;
-          matchedEntry = entry;
-          matchedUpdatedAt = updatedAt;
-        }
-      }
-    } catch (error) {
-      // ignore lookup errors
-    }
-    if (!resolvedShortContextText && matchedState) {
-      resolvedShortContextText =
-        (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
-      if (resolvedShortContextText && matchesFull(resolvedShortContextText)) {
-        resolvedShortContextText = '';
-      }
-      if (resolvedShortContextText) {
-        contextShortSource = 'debug-scan';
-      }
-      if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
-        try {
-          const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-          resolvedShortContextText = rawRecord?.value?.text || rawRecord?.value?.response || '';
-        } catch (error) {
-          resolvedShortContextText = '';
-        }
-        if (resolvedShortContextText && matchesFull(resolvedShortContextText)) {
-          resolvedShortContextText = '';
-        }
-        if (resolvedShortContextText) {
-          contextShortSource = 'debug-raw';
-        }
-      }
-      resolvedShortContextText = typeof resolvedShortContextText === 'string'
-        ? resolvedShortContextText.trim()
-        : '';
-    }
-    if (!resolvedShortContextText) {
-      resolvedShortContextText = (await loadStoredShortContext(normalizedRequestMeta, normalizedContext))?.trim() || '';
-      if (resolvedShortContextText) {
-        contextShortSource = 'stored';
-      }
-    }
-    let manualOutputsSource = '';
-    let storedManualOutputs = [];
-    let manualOutputsFoundCount = 0;
-    const canonicalKey = normalizedRequestMeta.blockKey || normalizedRequestMeta.parentRequestId || '';
-    if (canonicalKey && Array.isArray(manualOutputsByBlock[canonicalKey])) {
-      storedManualOutputs = manualOutputsByBlock[canonicalKey];
-      manualOutputsSource = `manualTranslateOutputsByBlock:${canonicalKey}`;
-    }
-    if (!storedManualOutputs.length && normalizedRequestMeta.parentRequestId) {
-      const fallbackList = Object.values(manualOutputsByBlock).find((list) => {
-        if (!Array.isArray(list)) return false;
-        return list.some((entry) => entry?.parentRequestId === normalizedRequestMeta.parentRequestId);
-      });
-      if (Array.isArray(fallbackList)) {
-        storedManualOutputs = fallbackList;
-        manualOutputsSource = 'manualTranslateOutputsByBlock:parentRequestId';
-      }
-    }
-    if (Array.isArray(storedManualOutputs) && storedManualOutputs.length) {
-      const manualParts = storedManualOutputs
-        .filter((payload) => payload?.op === 'translate')
-        .map((payload, index) => {
+        const manualPayloads = debugList.filter((payload) => {
+          const trigger = typeof payload?.triggerSource === 'string' ? payload.triggerSource : '';
+          if (!trigger) return false;
+          if (trigger === 'retry' || trigger === 'validate') return false;
+          return /manual/i.test(trigger) || trigger === 'manual_translate' || trigger === 'manualTranslate';
+        });
+        const manualParts = manualPayloads.map((payload, index) => {
           const headerParts = [
             `Manual attempt ${index + 1}`,
             payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+            payload?.phase ? `phase=${payload.phase}` : '',
             payload?.model ? `model=${payload.model}` : '',
-            payload?.createdAt ? `ts=${payload.createdAt}` : ''
+            payload?.timestamp ? `ts=${payload.timestamp}` : ''
           ].filter(Boolean);
-          const responseText = payload?.rawResponse ? `RESPONSE (raw): ${payload.rawResponse}` : '';
-          const extractedText = payload?.extractedResult ? `EXTRACTED/PARSED: ${payload.extractedResult}` : '';
-          const payloadError = payload?.errors ? `ERRORS: ${payload.errors}` : '';
-          return [headerParts.join(' | '), responseText, extractedText, payloadError].filter(Boolean).join('\n');
-        });
-      resolvedManualOutputs = manualParts.join('\n\n');
-      manualOutputsFoundCount = storedManualOutputs.length;
-      if (!resolvedManualOutputs) {
-        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
-        console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
-          triggerSource,
-          requestId: normalizedRequestMeta.requestId,
-          parentRequestId: normalizedRequestMeta.parentRequestId,
-          blockKey: normalizedRequestMeta.blockKey,
-          prompt_cache_key: operationType,
-          storedCount: storedManualOutputs.length,
-          manualOutputsSource
-        });
-      }
-    }
-    if (!resolvedManualOutputs && (matchedEntry || matchedState)) {
-      const debugList = [];
-      const debugSources = [];
-      if (Array.isArray(matchedEntry?.translationDebug)) {
-        debugList.push(...matchedEntry.translationDebug);
-        debugSources.push('matchedEntry.translationDebug');
-      }
-      if (Array.isArray(matchedState?.translationDebug)) {
-        debugList.push(...matchedState.translationDebug);
-        debugSources.push('matchedState.translationDebug');
-      }
-      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.blockKey) {
-        matchedState.items.forEach((item) => {
-          if (item?.blockKey === normalizedRequestMeta.blockKey && Array.isArray(item.translationDebug)) {
-            debugList.push(...item.translationDebug);
-            debugSources.push(`matchedState.items[${item.blockKey}].translationDebug`);
+          let responseText = '';
+          if (payload?.response != null) {
+            try {
+              responseText = typeof payload.response === 'string' ? payload.response : JSON.stringify(payload.response);
+            } catch (error) {
+              responseText = String(payload.response);
+            }
           }
+          const extracted =
+            payload?.extractedResult ??
+            payload?.translations ??
+            payload?.parsed ??
+            payload?.result ??
+            payload?.extracted ??
+            '';
+          let extractedText = '';
+          if (extracted) {
+            try {
+              extractedText = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
+            } catch (error) {
+              extractedText = String(extracted);
+            }
+          }
+          const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
+          const validationErrors = Array.isArray(payload?.validationErrors)
+            ? payload.validationErrors.join(', ')
+            : payload?.validationErrors || '';
+          const payloadError = payload?.error ? String(payload.error) : '';
+          return [
+            headerParts.join(' | '),
+            responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
+            extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
+            parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
+            validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
+            payloadError ? `ERROR: ${payloadError}` : ''
+          ]
+            .filter(Boolean)
+            .join('\n');
         });
-      }
-      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.parentRequestId) {
-        matchedState.items.forEach((item) => {
-          const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
-          if (list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId)) {
-            debugList.push(...list);
-            debugSources.push(`matchedState.items[parent:${normalizedRequestMeta.parentRequestId}].translationDebug`);
-          }
-        });
-      }
-      const manualPayloads = debugList.filter((payload) => {
-        const trigger = typeof payload?.triggerSource === 'string' ? payload.triggerSource : '';
-        if (!trigger) return false;
-        if (trigger === 'retry' || trigger === 'validate') return false;
-        return /manual/i.test(trigger) || trigger === 'manual_translate' || trigger === 'manualTranslate';
-      });
-      const manualParts = manualPayloads.map((payload, index) => {
-        const headerParts = [
-          `Manual attempt ${index + 1}`,
-          payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
-          payload?.phase ? `phase=${payload.phase}` : '',
-          payload?.model ? `model=${payload.model}` : '',
-          payload?.timestamp ? `ts=${payload.timestamp}` : ''
-        ].filter(Boolean);
-        let responseText = '';
-        if (payload?.response != null) {
-          try {
-            responseText = typeof payload.response === 'string' ? payload.response : JSON.stringify(payload.response);
-          } catch (error) {
-            responseText = String(payload.response);
-          }
-        }
-        const extracted =
-          payload?.extractedResult ??
-          payload?.translations ??
-          payload?.parsed ??
-          payload?.result ??
-          payload?.extracted ??
-          '';
-        let extractedText = '';
-        if (extracted) {
-          try {
-            extractedText = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
-          } catch (error) {
-            extractedText = String(extracted);
-          }
-        }
-        const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
-        const validationErrors = Array.isArray(payload?.validationErrors)
-          ? payload.validationErrors.join(', ')
-          : payload?.validationErrors || '';
-        const payloadError = payload?.error ? String(payload.error) : '';
-        return [
-          headerParts.join(' | '),
-          responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
-          extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
-          parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
-          validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
-          payloadError ? `ERROR: ${payloadError}` : ''
-        ]
-          .filter(Boolean)
-          .join('\n');
-      });
-      resolvedManualOutputs = manualParts.join('\n\n');
-      if (!manualOutputsFoundCount) {
-        manualOutputsFoundCount = manualPayloads.length;
-      }
-      if (!resolvedManualOutputs && manualPayloads.length) {
-        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but were not persisted/read)';
+        manualOutputsText = manualParts.join('\n\n');
         if (!manualOutputsFoundCount) {
           manualOutputsFoundCount = manualPayloads.length;
         }
-        const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
-        const missingFields = manualPayloads.map((payload) => ({
-          hasResponse: payload?.response != null,
-          hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
-          hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
-        }));
-        console.warn('Retry/validate manual outputs missing despite manual attempts.', {
-          triggerSource,
-          requestId: normalizedRequestMeta.requestId,
-          parentRequestId: normalizedRequestMeta.parentRequestId,
-          blockKey: normalizedRequestMeta.blockKey,
-          prompt_cache_key: operationType,
-          debugSources,
-          observedTriggers,
-          manualPayloadCount: manualPayloads.length,
-          missingFields
-        });
+        if (!manualOutputsText && manualPayloads.length) {
+          manualOutputsText = '(manual outputs missing: manual attempts exist but were not persisted/read)';
+          if (!manualOutputsFoundCount) {
+            manualOutputsFoundCount = manualPayloads.length;
+          }
+          const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
+          const missingFields = manualPayloads.map((payload) => ({
+            hasResponse: payload?.response != null,
+            hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
+            hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
+          }));
+          console.warn('Retry/validate manual outputs missing despite manual attempts.', {
+            triggerSource,
+            requestId: normalizedRequestMeta.requestId,
+            parentRequestId: normalizedRequestMeta.parentRequestId,
+            blockKey: normalizedRequestMeta.blockKey,
+            prompt_cache_key: operationType,
+            debugSources,
+            observedTriggers,
+            manualPayloadCount: manualPayloads.length,
+            missingFields
+          });
+        }
       }
-    }
-    if (!resolvedManualOutputs) {
-      resolvedManualOutputs = '(no manual outputs found)';
-    }
-    console.warn('Retry/validate manual outputs lookup.', {
-      triggerSource,
-      requestId: normalizedRequestMeta.requestId,
-      parentRequestId: normalizedRequestMeta.parentRequestId,
-      blockKey: normalizedRequestMeta.blockKey,
-      prompt_cache_key: operationType,
-      manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
-      manualOutputsCount: manualOutputsFoundCount || 0
-    });
+
+      if (!manualOutputsText) {
+        manualOutputsText = '(no manual outputs found)';
+      }
+
+      console.warn('Retry/validate manual outputs lookup.', {
+        triggerSource,
+        requestId: normalizedRequestMeta.requestId,
+        parentRequestId: normalizedRequestMeta.parentRequestId,
+        blockKey: normalizedRequestMeta.blockKey,
+        prompt_cache_key: operationType,
+        manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
+        manualOutputsCount: manualOutputsFoundCount || 0
+      });
+
+      return { shortText, manualOutputsText, shortSource };
+    };
+
+    const bundle = await buildRetryValidateBundle();
+    resolvedShortContextText = bundle.shortText || '';
+    resolvedManualOutputs = bundle.manualOutputsText || '(no manual outputs found)';
+    contextShortSource = bundle.shortSource || 'missing';
     effectiveContext.mode = resolvedShortContextText ? 'SHORT' : 'NONE';
     effectiveContext.text = resolvedShortContextText;
     effectiveContext.length = resolvedShortContextText.length;
@@ -1373,263 +1393,283 @@ async function performTranslationRepairRequest(
   let resolvedManualOutputs = '';
   let contextShortSource = 'missing';
   if (triggerSource === 'retry' || triggerSource === 'validate') {
-    if (strictShort && !matchesFull(strictShort)) {
-      resolvedShortContextText = strictShort;
-      contextShortSource = 'payload';
-    }
-    let matchedEntry = null;
-    let matchedState = null;
-    let matchedUpdatedAt = -1;
-    let manualOutputsByBlock = {};
-    try {
-      manualOutputsByBlock = await new Promise((resolve) => {
-        try {
-          chrome.storage.local.get({ manualTranslateOutputsByBlock: {} }, (data) => {
-            resolve(data?.manualTranslateOutputsByBlock || {});
-          });
-        } catch (error) {
-          resolve({});
+    const buildRetryValidateBundle = async () => {
+      let shortText = '';
+      let shortSource = 'missing';
+      let manualOutputsText = '';
+      let matchedEntry = null;
+      let matchedState = null;
+      let matchedUpdatedAt = -1;
+      let manualOutputsByBlock = {};
+      let manualOutputsSource = '';
+      let storedManualOutputs = [];
+      let manualOutputsFoundCount = 0;
+      const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
+
+      if (strictPayloadShort) {
+        shortText = strictPayloadShort;
+        shortSource = 'payload';
+      }
+
+      try {
+        manualOutputsByBlock = await new Promise((resolve) => {
+          try {
+            chrome.storage.local.get({ manualTranslateOutputsByBlock: {} }, (data) => {
+              resolve(data?.manualTranslateOutputsByBlock || {});
+            });
+          } catch (error) {
+            resolve({});
+          }
+        });
+      } catch (error) {
+        manualOutputsByBlock = {};
+      }
+
+      try {
+        const debugByUrl = await new Promise((resolve) => {
+          try {
+            chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
+              resolve(data?.translationDebugByUrl || {});
+            });
+          } catch (error) {
+            resolve({});
+          }
+        });
+        const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
+        for (const state of states) {
+          const items = Array.isArray(state?.items) ? state.items : [];
+          let entry = null;
+          if (normalizedRequestMeta.parentRequestId) {
+            entry = items.find((item) => {
+              const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
+              return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
+            });
+          }
+          if (!entry && normalizedRequestMeta.blockKey) {
+            entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
+          }
+          if (!entry) continue;
+          const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
+          if (!matchedState || updatedAt >= matchedUpdatedAt) {
+            matchedState = state;
+            matchedEntry = entry;
+            matchedUpdatedAt = updatedAt;
+          }
         }
-      });
-    } catch (error) {
-      manualOutputsByBlock = {};
-    }
-    try {
-      const debugByUrl = await new Promise((resolve) => {
-        try {
-          chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
-            resolve(data?.translationDebugByUrl || {});
-          });
-        } catch (error) {
-          resolve({});
+      } catch (error) {
+        // ignore lookup errors
+      }
+
+      if (!shortText && matchedState) {
+        shortText =
+          (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
+        if (shortText && matchesFull(shortText)) {
+          shortText = '';
         }
-      });
-      const states = debugByUrl && typeof debugByUrl === 'object' ? Object.values(debugByUrl) : [];
-      for (const state of states) {
-        const items = Array.isArray(state?.items) ? state.items : [];
-        let entry = null;
-        if (normalizedRequestMeta.parentRequestId) {
-          entry = items.find((item) => {
+        if (shortText) {
+          shortSource = 'debug-scan';
+        }
+        if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
+          try {
+            const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
+            shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
+          } catch (error) {
+            shortText = '';
+          }
+          if (shortText && matchesFull(shortText)) {
+            shortText = '';
+          }
+          if (shortText) {
+            shortSource = 'debug-raw';
+          }
+        }
+        shortText = typeof shortText === 'string' ? shortText.trim() : '';
+      }
+
+      if (!shortText) {
+        shortText = (await loadStoredShortContext(normalizedRequestMeta, normalizedContext))?.trim() || '';
+        if (shortText) {
+          shortSource = 'stored';
+        }
+      }
+
+      const canonicalKey = normalizedRequestMeta.blockKey || normalizedRequestMeta.parentRequestId || '';
+      if (canonicalKey && Array.isArray(manualOutputsByBlock[canonicalKey])) {
+        storedManualOutputs = manualOutputsByBlock[canonicalKey];
+        manualOutputsSource = `manualTranslateOutputsByBlock:${canonicalKey}`;
+      }
+      if (!storedManualOutputs.length && normalizedRequestMeta.parentRequestId) {
+        const fallbackList = Object.values(manualOutputsByBlock).find((list) => {
+          if (!Array.isArray(list)) return false;
+          return list.some((entry) => entry?.parentRequestId === normalizedRequestMeta.parentRequestId);
+        });
+        if (Array.isArray(fallbackList)) {
+          storedManualOutputs = fallbackList;
+          manualOutputsSource = 'manualTranslateOutputsByBlock:parentRequestId';
+        }
+      }
+      if (Array.isArray(storedManualOutputs) && storedManualOutputs.length) {
+        const manualParts = storedManualOutputs
+          .filter((payload) => payload?.op === 'translate')
+          .map((payload, index) => {
+            const headerParts = [
+              `Manual attempt ${index + 1}`,
+              payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+              payload?.model ? `model=${payload.model}` : '',
+              payload?.createdAt ? `ts=${payload.createdAt}` : ''
+            ].filter(Boolean);
+            const responseText = payload?.rawResponse ? `RESPONSE (raw): ${payload.rawResponse}` : '';
+            const extractedText = payload?.extractedResult ? `EXTRACTED/PARSED: ${payload.extractedResult}` : '';
+            const payloadError = payload?.errors ? `ERRORS: ${payload.errors}` : '';
+            return [headerParts.join(' | '), responseText, extractedText, payloadError].filter(Boolean).join('\n');
+          });
+        manualOutputsText = manualParts.join('\n\n');
+        manualOutputsFoundCount = storedManualOutputs.length;
+        if (!manualOutputsText) {
+          manualOutputsText = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
+          console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
+            triggerSource,
+            requestId: normalizedRequestMeta.requestId,
+            parentRequestId: normalizedRequestMeta.parentRequestId,
+            blockKey: normalizedRequestMeta.blockKey,
+            prompt_cache_key: operationType,
+            storedCount: storedManualOutputs.length,
+            manualOutputsSource
+          });
+        }
+      }
+
+      if (!manualOutputsText && (matchedEntry || matchedState)) {
+        const debugList = [];
+        const debugSources = [];
+        if (Array.isArray(matchedEntry?.translationDebug)) {
+          debugList.push(...matchedEntry.translationDebug);
+          debugSources.push('matchedEntry.translationDebug');
+        }
+        if (Array.isArray(matchedState?.translationDebug)) {
+          debugList.push(...matchedState.translationDebug);
+          debugSources.push('matchedState.translationDebug');
+        }
+        if (Array.isArray(matchedState?.items) && normalizedRequestMeta.blockKey) {
+          matchedState.items.forEach((item) => {
+            if (item?.blockKey === normalizedRequestMeta.blockKey && Array.isArray(item.translationDebug)) {
+              debugList.push(...item.translationDebug);
+              debugSources.push(`matchedState.items[${item.blockKey}].translationDebug`);
+            }
+          });
+        }
+        if (Array.isArray(matchedState?.items) && normalizedRequestMeta.parentRequestId) {
+          matchedState.items.forEach((item) => {
             const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
-            return list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId);
+            if (list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId)) {
+              debugList.push(...list);
+              debugSources.push(`matchedState.items[parent:${normalizedRequestMeta.parentRequestId}].translationDebug`);
+            }
           });
         }
-        if (!entry && normalizedRequestMeta.blockKey) {
-          entry = items.find((item) => item?.blockKey === normalizedRequestMeta.blockKey);
-        }
-        if (!entry) continue;
-        const updatedAt = Number.isFinite(state?.updatedAt) ? state.updatedAt : 0;
-        if (!matchedState || updatedAt >= matchedUpdatedAt) {
-          matchedState = state;
-          matchedEntry = entry;
-          matchedUpdatedAt = updatedAt;
-        }
-      }
-    } catch (error) {
-      // ignore lookup errors
-    }
-    if (!resolvedShortContextText && matchedState) {
-      resolvedShortContextText =
-        (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
-      if (resolvedShortContextText && matchesFull(resolvedShortContextText)) {
-        resolvedShortContextText = '';
-      }
-      if (resolvedShortContextText) {
-        contextShortSource = 'debug-scan';
-      }
-      if (!resolvedShortContextText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
-        try {
-          const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-          resolvedShortContextText = rawRecord?.value?.text || rawRecord?.value?.response || '';
-        } catch (error) {
-          resolvedShortContextText = '';
-        }
-        if (resolvedShortContextText && matchesFull(resolvedShortContextText)) {
-          resolvedShortContextText = '';
-        }
-        if (resolvedShortContextText) {
-          contextShortSource = 'debug-raw';
-        }
-      }
-      resolvedShortContextText = typeof resolvedShortContextText === 'string'
-        ? resolvedShortContextText.trim()
-        : '';
-    }
-    if (!resolvedShortContextText) {
-      resolvedShortContextText = (await loadStoredShortContext(normalizedRequestMeta, normalizedContext))?.trim() || '';
-      if (resolvedShortContextText) {
-        contextShortSource = 'stored';
-      }
-    }
-    let manualOutputsSource = '';
-    let storedManualOutputs = [];
-    let manualOutputsFoundCount = 0;
-    const canonicalKey = normalizedRequestMeta.blockKey || normalizedRequestMeta.parentRequestId || '';
-    if (canonicalKey && Array.isArray(manualOutputsByBlock[canonicalKey])) {
-      storedManualOutputs = manualOutputsByBlock[canonicalKey];
-      manualOutputsSource = `manualTranslateOutputsByBlock:${canonicalKey}`;
-    }
-    if (!storedManualOutputs.length && normalizedRequestMeta.parentRequestId) {
-      const fallbackList = Object.values(manualOutputsByBlock).find((list) => {
-        if (!Array.isArray(list)) return false;
-        return list.some((entry) => entry?.parentRequestId === normalizedRequestMeta.parentRequestId);
-      });
-      if (Array.isArray(fallbackList)) {
-        storedManualOutputs = fallbackList;
-        manualOutputsSource = 'manualTranslateOutputsByBlock:parentRequestId';
-      }
-    }
-    if (Array.isArray(storedManualOutputs) && storedManualOutputs.length) {
-      const manualParts = storedManualOutputs
-        .filter((payload) => payload?.op === 'translate')
-        .map((payload, index) => {
+        const manualPayloads = debugList.filter((payload) => {
+          const trigger = typeof payload?.triggerSource === 'string' ? payload.triggerSource : '';
+          if (!trigger) return false;
+          if (trigger === 'retry' || trigger === 'validate') return false;
+          return /manual/i.test(trigger) || trigger === 'manual_translate' || trigger === 'manualTranslate';
+        });
+        const manualParts = manualPayloads.map((payload, index) => {
           const headerParts = [
             `Manual attempt ${index + 1}`,
             payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
+            payload?.phase ? `phase=${payload.phase}` : '',
             payload?.model ? `model=${payload.model}` : '',
-            payload?.createdAt ? `ts=${payload.createdAt}` : ''
+            payload?.timestamp ? `ts=${payload.timestamp}` : ''
           ].filter(Boolean);
-          const responseText = payload?.rawResponse ? `RESPONSE (raw): ${payload.rawResponse}` : '';
-          const extractedText = payload?.extractedResult ? `EXTRACTED/PARSED: ${payload.extractedResult}` : '';
-          const payloadError = payload?.errors ? `ERRORS: ${payload.errors}` : '';
-          return [headerParts.join(' | '), responseText, extractedText, payloadError].filter(Boolean).join('\n');
-        });
-      resolvedManualOutputs = manualParts.join('\n\n');
-      manualOutputsFoundCount = storedManualOutputs.length;
-      if (!resolvedManualOutputs) {
-        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
-        console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
-          triggerSource,
-          requestId: normalizedRequestMeta.requestId,
-          parentRequestId: normalizedRequestMeta.parentRequestId,
-          blockKey: normalizedRequestMeta.blockKey,
-          prompt_cache_key: operationType,
-          storedCount: storedManualOutputs.length,
-          manualOutputsSource
-        });
-      }
-    }
-    if (!resolvedManualOutputs && (matchedEntry || matchedState)) {
-      const debugList = [];
-      const debugSources = [];
-      if (Array.isArray(matchedEntry?.translationDebug)) {
-        debugList.push(...matchedEntry.translationDebug);
-        debugSources.push('matchedEntry.translationDebug');
-      }
-      if (Array.isArray(matchedState?.translationDebug)) {
-        debugList.push(...matchedState.translationDebug);
-        debugSources.push('matchedState.translationDebug');
-      }
-      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.blockKey) {
-        matchedState.items.forEach((item) => {
-          if (item?.blockKey === normalizedRequestMeta.blockKey && Array.isArray(item.translationDebug)) {
-            debugList.push(...item.translationDebug);
-            debugSources.push(`matchedState.items[${item.blockKey}].translationDebug`);
+          let responseText = '';
+          if (payload?.response != null) {
+            try {
+              responseText = typeof payload.response === 'string' ? payload.response : JSON.stringify(payload.response);
+            } catch (error) {
+              responseText = String(payload.response);
+            }
           }
+          const extracted =
+            payload?.extractedResult ??
+            payload?.translations ??
+            payload?.parsed ??
+            payload?.result ??
+            payload?.extracted ??
+            '';
+          let extractedText = '';
+          if (extracted) {
+            try {
+              extractedText = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
+            } catch (error) {
+              extractedText = String(extracted);
+            }
+          }
+          const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
+          const validationErrors = Array.isArray(payload?.validationErrors)
+            ? payload.validationErrors.join(', ')
+            : payload?.validationErrors || '';
+          const payloadError = payload?.error ? String(payload.error) : '';
+          return [
+            headerParts.join(' | '),
+            responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
+            extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
+            parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
+            validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
+            payloadError ? `ERROR: ${payloadError}` : ''
+          ]
+            .filter(Boolean)
+            .join('\n');
         });
-      }
-      if (Array.isArray(matchedState?.items) && normalizedRequestMeta.parentRequestId) {
-        matchedState.items.forEach((item) => {
-          const list = Array.isArray(item?.translationDebug) ? item.translationDebug : [];
-          if (list.some((payload) => payload?.requestId === normalizedRequestMeta.parentRequestId)) {
-            debugList.push(...list);
-            debugSources.push(`matchedState.items[parent:${normalizedRequestMeta.parentRequestId}].translationDebug`);
-          }
-        });
-      }
-      const manualPayloads = debugList.filter((payload) => {
-        const trigger = typeof payload?.triggerSource === 'string' ? payload.triggerSource : '';
-        if (!trigger) return false;
-        if (trigger === 'retry' || trigger === 'validate') return false;
-        return /manual/i.test(trigger) || trigger === 'manual_translate' || trigger === 'manualTranslate';
-      });
-      const manualParts = manualPayloads.map((payload, index) => {
-        const headerParts = [
-          `Manual attempt ${index + 1}`,
-          payload?.triggerSource ? `triggerSource=${payload.triggerSource}` : '',
-          payload?.phase ? `phase=${payload.phase}` : '',
-          payload?.model ? `model=${payload.model}` : '',
-          payload?.timestamp ? `ts=${payload.timestamp}` : ''
-        ].filter(Boolean);
-        let responseText = '';
-        if (payload?.response != null) {
-          try {
-            responseText = typeof payload.response === 'string' ? payload.response : JSON.stringify(payload.response);
-          } catch (error) {
-            responseText = String(payload.response);
-          }
-        }
-        const extracted =
-          payload?.extractedResult ??
-          payload?.translations ??
-          payload?.parsed ??
-          payload?.result ??
-          payload?.extracted ??
-          '';
-        let extractedText = '';
-        if (extracted) {
-          try {
-            extractedText = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
-          } catch (error) {
-            extractedText = String(extracted);
-          }
-        }
-        const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
-        const validationErrors = Array.isArray(payload?.validationErrors)
-          ? payload.validationErrors.join(', ')
-          : payload?.validationErrors || '';
-        const payloadError = payload?.error ? String(payload.error) : '';
-        return [
-          headerParts.join(' | '),
-          responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
-          extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
-          parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
-          validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
-          payloadError ? `ERROR: ${payloadError}` : ''
-        ]
-          .filter(Boolean)
-          .join('\n');
-      });
-      resolvedManualOutputs = manualParts.join('\n\n');
-      if (!manualOutputsFoundCount) {
-        manualOutputsFoundCount = manualPayloads.length;
-      }
-      if (!resolvedManualOutputs && manualPayloads.length) {
-        resolvedManualOutputs = '(manual outputs missing: manual attempts exist but were not persisted/read)';
+        manualOutputsText = manualParts.join('\n\n');
         if (!manualOutputsFoundCount) {
           manualOutputsFoundCount = manualPayloads.length;
         }
-        const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
-        const missingFields = manualPayloads.map((payload) => ({
-          hasResponse: payload?.response != null,
-          hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
-          hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
-        }));
-        console.warn('Retry/validate manual outputs missing despite manual attempts.', {
-          triggerSource,
-          requestId: normalizedRequestMeta.requestId,
-          parentRequestId: normalizedRequestMeta.parentRequestId,
-          blockKey: normalizedRequestMeta.blockKey,
-          prompt_cache_key: operationType,
-          debugSources,
-          observedTriggers,
-          manualPayloadCount: manualPayloads.length,
-          missingFields
-        });
+        if (!manualOutputsText && manualPayloads.length) {
+          manualOutputsText = '(manual outputs missing: manual attempts exist but were not persisted/read)';
+          if (!manualOutputsFoundCount) {
+            manualOutputsFoundCount = manualPayloads.length;
+          }
+          const observedTriggers = [...new Set(debugList.map((payload) => payload?.triggerSource).filter(Boolean))];
+          const missingFields = manualPayloads.map((payload) => ({
+            hasResponse: payload?.response != null,
+            hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
+            hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
+          }));
+          console.warn('Retry/validate manual outputs missing despite manual attempts.', {
+            triggerSource,
+            requestId: normalizedRequestMeta.requestId,
+            parentRequestId: normalizedRequestMeta.parentRequestId,
+            blockKey: normalizedRequestMeta.blockKey,
+            prompt_cache_key: operationType,
+            debugSources,
+            observedTriggers,
+            manualPayloadCount: manualPayloads.length,
+            missingFields
+          });
+        }
       }
-    }
-    if (!resolvedManualOutputs) {
-      resolvedManualOutputs = '(no manual outputs found)';
-    }
-    console.warn('Retry/validate manual outputs lookup.', {
-      triggerSource,
-      requestId: normalizedRequestMeta.requestId,
-      parentRequestId: normalizedRequestMeta.parentRequestId,
-      blockKey: normalizedRequestMeta.blockKey,
-      prompt_cache_key: operationType,
-      manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
-      manualOutputsCount: manualOutputsFoundCount || 0
-    });
+
+      if (!manualOutputsText) {
+        manualOutputsText = '(no manual outputs found)';
+      }
+
+      console.warn('Retry/validate manual outputs lookup.', {
+        triggerSource,
+        requestId: normalizedRequestMeta.requestId,
+        parentRequestId: normalizedRequestMeta.parentRequestId,
+        blockKey: normalizedRequestMeta.blockKey,
+        prompt_cache_key: operationType,
+        manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
+        manualOutputsCount: manualOutputsFoundCount || 0
+      });
+
+      return { shortText, manualOutputsText, shortSource };
+    };
+
+    const bundle = await buildRetryValidateBundle();
+    resolvedShortContextText = bundle.shortText || '';
+    resolvedManualOutputs = bundle.manualOutputsText || '(no manual outputs found)';
+    contextShortSource = bundle.shortSource || 'missing';
     effectiveContext.mode = resolvedShortContextText ? 'SHORT' : 'NONE';
     effectiveContext.text = resolvedShortContextText;
     effectiveContext.length = resolvedShortContextText.length;
