@@ -3054,13 +3054,169 @@ async function clearStoredTranslations(url) {
   }
 }
 
+function limitDebugArray(list, limit) {
+  const values = Array.isArray(list) ? list : [];
+  if (!limit || values.length <= limit) return values;
+  return values.slice(values.length - limit);
+}
+
+function trimDebugText(value, limit) {
+  const preview = truncateText(value || '', limit || DEBUG_PREVIEW_MAX_CHARS);
+  return preview;
+}
+
+function pruneDebugPayload(payload, options = {}) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const maxPreviewChars = options.maxPreviewChars || DEBUG_PREVIEW_MAX_CHARS;
+  const request = trimDebugText(payload.request || '', maxPreviewChars);
+  const response = trimDebugText(payload.response || '', maxPreviewChars);
+  const contextTextSent = trimDebugText(payload.contextTextSent || '', maxPreviewChars);
+  const next = {
+    ...payload,
+    request: request.text,
+    response: response.text,
+    contextTextSent: contextTextSent.text,
+    requestTruncated: payload.requestTruncated || request.truncated,
+    responseTruncated: payload.responseTruncated || response.truncated,
+    contextTruncated: payload.contextTruncated || contextTextSent.truncated
+  };
+  if (typeof payload.baseAnswerPreview === 'string') {
+    next.baseAnswerPreview = trimDebugText(payload.baseAnswerPreview, maxPreviewChars).text;
+  }
+  return next;
+}
+
+function pruneDebugEntry(entry, options = {}) {
+  if (!entry || typeof entry !== 'object') return entry;
+  const maxPreviewChars = options.maxPreviewChars || DEBUG_PREVIEW_MAX_CHARS;
+  const maxPayloads = options.maxPayloads || 60;
+  const maxCallsPerEntry = options.maxCallsPerEntry || 60;
+  const maxEvents = options.maxEvents || 60;
+  const maxComparisons = options.maxComparisons || 60;
+  const maxItems = options.maxItems || null;
+  const contextFullPreview = trimDebugText(entry.contextFull || entry.context || '', maxPreviewChars);
+  const contextShortPreview = trimDebugText(entry.contextShort || '', maxPreviewChars);
+  const items = Array.isArray(entry.items) ? entry.items : [];
+  const trimmedItems = (maxItems ? limitDebugArray(items, maxItems) : items).map((item) => {
+    const nextItem = { ...item };
+    const translationRaw = trimDebugText(item.translationRaw || '', maxPreviewChars);
+    const proofreadRaw = trimDebugText(item.proofreadRaw || '', maxPreviewChars);
+    nextItem.translationRaw = translationRaw.text;
+    nextItem.translationRawTruncated = item.translationRawTruncated || translationRaw.truncated;
+    nextItem.proofreadRaw = proofreadRaw.text;
+    nextItem.proofreadRawTruncated = item.proofreadRawTruncated || proofreadRaw.truncated;
+    if (typeof item.fullContextSnapshot === 'string') {
+      nextItem.fullContextSnapshot = trimDebugText(item.fullContextSnapshot, maxPreviewChars).text;
+    }
+    if (typeof item.shortContextSnapshot === 'string') {
+      nextItem.shortContextSnapshot = trimDebugText(item.shortContextSnapshot, maxPreviewChars).text;
+    }
+    if (Array.isArray(item.translationCalls)) {
+      nextItem.translationCalls = limitDebugArray(item.translationCalls, maxCallsPerEntry).map((call) => {
+        if (!call || typeof call !== 'object') return call;
+        const nextCall = { ...call };
+        if (typeof call.baseAnswerPreview === 'string') {
+          nextCall.baseAnswerPreview = trimDebugText(call.baseAnswerPreview, maxPreviewChars).text;
+        }
+        return nextCall;
+      });
+    }
+    if (Array.isArray(item.proofreadCalls)) {
+      nextItem.proofreadCalls = limitDebugArray(item.proofreadCalls, maxCallsPerEntry).map((call) => {
+        if (!call || typeof call !== 'object') return call;
+        const nextCall = { ...call };
+        if (typeof call.baseAnswerPreview === 'string') {
+          nextCall.baseAnswerPreview = trimDebugText(call.baseAnswerPreview, maxPreviewChars).text;
+        }
+        return nextCall;
+      });
+    }
+    if (Array.isArray(item.translationDebug)) {
+      nextItem.translationDebug = limitDebugArray(item.translationDebug, maxPayloads).map((payload) =>
+        pruneDebugPayload(payload, { maxPreviewChars })
+      );
+    }
+    if (Array.isArray(item.proofreadDebug)) {
+      nextItem.proofreadDebug = limitDebugArray(item.proofreadDebug, maxPayloads).map((payload) =>
+        pruneDebugPayload(payload, { maxPreviewChars })
+      );
+    }
+    if (Array.isArray(item.proofreadComparisons)) {
+      nextItem.proofreadComparisons = limitDebugArray(item.proofreadComparisons, maxComparisons);
+    }
+    return nextItem;
+  });
+  const trimmedEvents = limitDebugArray(entry.events, maxEvents).map((event) => {
+    if (!event || typeof event !== 'object') return event;
+    const nextEvent = { ...event };
+    if (typeof event.message === 'string') {
+      nextEvent.message = trimDebugText(event.message, maxPreviewChars).text;
+    }
+    return nextEvent;
+  });
+  const trimmedCallHistory = limitDebugArray(entry.callHistory, options.maxCallHistory || maxCallsPerEntry * 2);
+  return {
+    ...entry,
+    context: contextFullPreview.text,
+    contextFull: contextFullPreview.text,
+    contextShort: contextShortPreview.text,
+    contextFullTruncated: entry.contextFullTruncated || contextFullPreview.truncated,
+    contextShortTruncated: entry.contextShortTruncated || contextShortPreview.truncated,
+    items: trimmedItems,
+    events: trimmedEvents,
+    callHistory: trimmedCallHistory
+  };
+}
+
 async function saveTranslationDebugInfo(url, data) {
   if (!url) return;
   const existing = await getTranslationDebugObject();
-  existing[url] = data;
+  const maxEntries = 5;
+  const prunedEntry = pruneDebugEntry(data, {
+    maxPreviewChars: DEBUG_PREVIEW_MAX_CHARS,
+    maxPayloads: 60,
+    maxCallsPerEntry: 60,
+    maxEvents: 60,
+    maxComparisons: 60
+  });
+  existing[url] = prunedEntry;
+  const entries = Object.entries(existing).map(([key, value]) => ({
+    key,
+    updatedAt: Number.isFinite(value?.updatedAt) ? value.updatedAt : 0
+  }));
+  entries.sort((a, b) => b.updatedAt - a.updatedAt);
+  const keepKeys = new Set([url]);
+  for (const entry of entries) {
+    if (keepKeys.size >= maxEntries) break;
+    if (entry.key === url) continue;
+    keepKeys.add(entry.key);
+  }
+  const prunedExisting = {};
+  for (const key of keepKeys) {
+    if (existing[key]) {
+      prunedExisting[key] = existing[key];
+    }
+  }
   try {
-    await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: existing });
+    await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: prunedExisting });
   } catch (error) {
+    const isQuotaError = /quota/i.test(error?.message || '');
+    if (isQuotaError) {
+      const emergencyEntry = pruneDebugEntry(data, {
+        maxPreviewChars: Math.min(600, DEBUG_PREVIEW_MAX_CHARS),
+        maxPayloads: 10,
+        maxCallsPerEntry: 10,
+        maxEvents: 10,
+        maxComparisons: 10,
+        maxItems: 5
+      });
+      try {
+        await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: { [url]: emergencyEntry } });
+        return;
+      } catch (retryError) {
+        console.warn('Failed to persist debug info after emergency prune.', retryError);
+      }
+    }
     const now = Date.now();
     if (now - debugStorageWarningSentAt > 30000) {
       debugStorageWarningSentAt = now;

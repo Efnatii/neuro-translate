@@ -3,6 +3,7 @@ const contextEl = document.getElementById('context');
 const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
 const eventsEl = document.getElementById('events');
+const clearDebugButton = document.getElementById('clear-debug');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const DEBUG_PORT_NAME = 'debug';
@@ -62,6 +63,13 @@ async function init() {
         event.preventDefault();
         clearContext();
       }
+    });
+  }
+
+  if (clearDebugButton) {
+    addDebugListener(clearDebugButton, 'click', (event) => {
+      event.preventDefault();
+      clearDebugData();
     });
   }
 
@@ -219,6 +227,32 @@ async function clearContext() {
   await refreshDebug();
 }
 
+async function clearDebugRawStore() {
+  try {
+    const db = await openDebugDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(DEBUG_RAW_STORE, 'readwrite');
+      const store = tx.objectStore(DEBUG_RAW_STORE);
+      const request = store.clear();
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error || new Error('IndexedDB clear failed'));
+    });
+  } catch (error) {
+    console.warn('Failed to clear debug raw store.', error);
+  }
+}
+
+async function clearDebugData() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) {
+    return;
+  }
+  await new Promise((resolve) => {
+    chrome.storage.local.remove([DEBUG_STORAGE_KEY, 'debugRawStore'], () => resolve());
+  });
+  await clearDebugRawStore();
+  renderEmpty('Отладочные данные очищены. Ожидание новых данных...');
+}
+
 function startAutoRefresh() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
@@ -294,7 +328,7 @@ function handleDebugPortMessage(message) {
   if (message.type === 'DEBUG_SNAPSHOT') {
     if (!sourceUrl || message.sourceUrl !== sourceUrl) return;
     if (!message.snapshot) {
-      renderEmpty('Ожидание отладочных данных...');
+      renderEmpty('Нет свежих данных (возможно storage переполнен). Нажмите очистить/перезапустить.');
       return;
     }
     scheduleDebugPatch(sourceUrl, message.snapshot);
@@ -349,7 +383,7 @@ async function handleLoadRawClick(button) {
 async function refreshDebug() {
   const debugData = await getDebugData(sourceUrl);
   if (!debugData) {
-    renderEmpty('Ожидание отладочных данных...');
+    renderEmpty('Нет свежих данных (возможно storage переполнен). Нажмите очистить/перезапустить.');
     return;
   }
   scheduleDebugPatch(sourceUrl, debugData);
