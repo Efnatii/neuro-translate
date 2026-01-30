@@ -604,6 +604,30 @@
       color: #9ca3af;
       font-style: italic;
     }
+    .debug-actions {
+      display: flex;
+      gap: 8px;
+      margin: 8px 0 16px;
+    }
+    .debug-button {
+      border: 1px solid #e2e8f0;
+      border-radius: 999px;
+      padding: 6px 12px;
+      background: #fff;
+      color: #0f172a;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .debug-button:hover {
+      border-color: #94a3b8;
+      color: #0f172a;
+    }
+    .debug-button--danger {
+      background: #fee2e2;
+      border-color: #fecaca;
+      color: #991b1b;
+    }
     @media (max-width: 700px) {
       .summary-header {
         flex-direction: column;
@@ -622,6 +646,11 @@
 <body>
   <h1>Отладка перевода</h1>
   <div class="meta" id="meta"></div>
+  <div class="debug-actions">
+    <button class="debug-button debug-button--danger" id="clear-debug" type="button">
+      Очистить отладочные данные
+    </button>
+  </div>
   <div class="summary" id="summary"></div>
   <div id="events"></div>
   <div class="context" id="context"></div>
