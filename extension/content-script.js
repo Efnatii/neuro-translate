@@ -586,6 +586,8 @@ function buildRequestMeta(base = {}, overrides = {}) {
   const triggerSource = overrides.triggerSource || base.triggerSource || '';
   const contextText = overrides.contextText ?? base.contextText ?? '';
   const contextMode = overrides.contextMode || base.contextMode || '';
+  const url = overrides.url || base.url || '';
+  const contextCacheKey = overrides.contextCacheKey || base.contextCacheKey || '';
   const contextPolicy = deriveContextPolicy(contextMode, contextText, purpose);
   return {
     requestId,
@@ -595,6 +597,8 @@ function buildRequestMeta(base = {}, overrides = {}) {
     purpose,
     attempt,
     triggerSource,
+    url,
+    contextCacheKey,
     contextMode: contextPolicy,
     contextHash: computeContextHash(contextText),
     contextLength: contextText ? contextText.length : 0
@@ -1048,7 +1052,9 @@ async function translatePage(settings, options = {}) {
           stage: 'translate',
           purpose: 'main',
           attempt: primaryContext.attemptIndex,
-          triggerSource: translationTriggerSource
+          triggerSource: translationTriggerSource,
+          url: location.href,
+          contextCacheKey
         };
         const mainRequestMeta = buildRequestMeta(baseRequestMeta, {
           contextText: primaryContext.contextText,
@@ -1339,7 +1345,9 @@ async function translatePage(settings, options = {}) {
           stage: 'proofread',
           purpose: 'main',
           attempt: primaryContext.attemptIndex,
-          triggerSource: translationTriggerSource
+          triggerSource: translationTriggerSource,
+          url: location.href,
+          contextCacheKey
         };
         const mainRequestMeta = buildRequestMeta(baseRequestMeta, {
           contextText: primaryContext.contextText,
