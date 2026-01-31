@@ -106,9 +106,9 @@ const DEFAULT_STATE = {
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
-  translationModelList: ['gpt-4.1-mini'],
-  contextModelList: ['gpt-4.1-mini'],
-  proofreadModelList: ['gpt-4.1-mini'],
+  translationModelList: ['gpt-4.1-mini:standard'],
+  contextModelList: ['gpt-4.1-mini:standard'],
+  proofreadModelList: ['gpt-4.1-mini:standard'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   singleBlockConcurrency: false,
@@ -150,6 +150,24 @@ const SUPPORTED_MODEL_IDS = new Set([
   'o3-mini',
   'o1-mini'
 ]);
+function parseModelSpec(spec) {
+  if (!spec || typeof spec !== 'string') {
+    return { id: '', tier: 'standard' };
+  }
+  const trimmed = spec.trim();
+  if (!trimmed) {
+    return { id: '', tier: 'standard' };
+  }
+  const [id, tierRaw] = trimmed.split(':');
+  const tier = tierRaw === 'flex' || tierRaw === 'standard' ? tierRaw : 'standard';
+  return { id, tier };
+}
+
+function formatModelSpec(id, tier) {
+  if (!id) return '';
+  const normalizedTier = tier === 'flex' || tier === 'standard' ? tier : 'standard';
+  return `${id}:${normalizedTier}`;
+}
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
 const RPC_HEARTBEAT_INTERVAL_MS = 20000;
@@ -377,16 +395,21 @@ async function readSettingsFromStorage() {
         ? [list]
         : [];
     const normalized = [];
-    rawList.forEach((model) => {
-      if (!model || typeof model !== 'string' || model.startsWith('deepseek')) {
+    rawList.forEach((modelSpec) => {
+      if (!modelSpec || typeof modelSpec !== 'string' || modelSpec.startsWith('deepseek')) {
         return;
       }
-      if (SUPPORTED_MODEL_IDS.has(model) && !normalized.includes(model)) {
-        normalized.push(model);
+      const parsed = parseModelSpec(modelSpec);
+      if (!parsed.id) return;
+      if (!SUPPORTED_MODEL_IDS.has(parsed.id)) return;
+      if (parsed.tier !== 'flex' && parsed.tier !== 'standard') return;
+      const spec = formatModelSpec(parsed.id, parsed.tier);
+      if (!normalized.includes(spec)) {
+        normalized.push(spec);
       }
     });
     if (!normalized.length) {
-      normalized.push(fallback);
+      normalized.push(formatModelSpec(fallback, 'standard'));
     }
     return normalized;
   };
@@ -410,9 +433,9 @@ async function readSettingsFromStorage() {
     merged.proofreadModelList || merged.proofreadModel || safeStored.model,
     fallbackProofreadModel
   );
-  merged.translationModel = merged.translationModelList[0] || fallbackTranslationModel;
-  merged.contextModel = merged.contextModelList[0] || fallbackContextModel;
-  merged.proofreadModel = merged.proofreadModelList[0] || fallbackProofreadModel;
+  merged.translationModel = parseModelSpec(merged.translationModelList[0]).id || fallbackTranslationModel;
+  merged.contextModel = parseModelSpec(merged.contextModelList[0]).id || fallbackContextModel;
+  merged.proofreadModel = parseModelSpec(merged.proofreadModelList[0]).id || fallbackProofreadModel;
   if (
     merged.translationModel !== previousModels.translationModel ||
     merged.contextModel !== previousModels.contextModel ||
@@ -463,15 +486,21 @@ function buildSettingsFromState(state) {
       tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
     };
   }
-  const translationModel = Array.isArray(state.translationModelList) && state.translationModelList.length
-    ? state.translationModelList[0]
-    : state.translationModel;
-  const contextModel = Array.isArray(state.contextModelList) && state.contextModelList.length
-    ? state.contextModelList[0]
-    : state.contextModel;
-  const proofreadModel = Array.isArray(state.proofreadModelList) && state.proofreadModelList.length
-    ? state.proofreadModelList[0]
-    : state.proofreadModel;
+  const translationModel = parseModelSpec(
+    Array.isArray(state.translationModelList) && state.translationModelList.length
+      ? state.translationModelList[0]
+      : state.translationModel
+  ).id || state.translationModel;
+  const contextModel = parseModelSpec(
+    Array.isArray(state.contextModelList) && state.contextModelList.length
+      ? state.contextModelList[0]
+      : state.contextModel
+  ).id || state.contextModel;
+  const proofreadModel = parseModelSpec(
+    Array.isArray(state.proofreadModelList) && state.proofreadModelList.length
+      ? state.proofreadModelList[0]
+      : state.proofreadModel
+  ).id || state.proofreadModel;
   const tpmLimitsByRole = {
     translation: getTpmLimitForModel(translationModel, state.tpmLimitsByModel),
     context: getTpmLimitForModel(contextModel, state.tpmLimitsByModel),

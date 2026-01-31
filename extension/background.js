@@ -25,9 +25,9 @@ const DEFAULT_STATE = {
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
-  translationModelList: ['gpt-4.1-mini'],
-  contextModelList: ['gpt-4.1-mini'],
-  proofreadModelList: ['gpt-4.1-mini'],
+  translationModelList: ['gpt-4.1-mini:standard'],
+  contextModelList: ['gpt-4.1-mini:standard'],
+  proofreadModelList: ['gpt-4.1-mini:standard'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   singleBlockConcurrency: false,
@@ -389,11 +389,11 @@ function applyStatePatch(patch = {}) {
       const normalizedList = normalizeModelList(value, fallbackModel);
       next[key] = normalizedList;
       if (key === 'translationModelList') {
-        next.translationModel = normalizedList[0] || next.translationModel;
+        next.translationModel = parseModelSpec(normalizedList[0]).id || next.translationModel;
       } else if (key === 'contextModelList') {
-        next.contextModel = normalizedList[0] || next.contextModel;
+        next.contextModel = parseModelSpec(normalizedList[0]).id || next.contextModel;
       } else if (key === 'proofreadModelList') {
-        next.proofreadModel = normalizedList[0] || next.proofreadModel;
+        next.proofreadModel = parseModelSpec(normalizedList[0]).id || next.proofreadModel;
       }
       continue;
     }
@@ -435,7 +435,8 @@ function getTpmLimitForModel(model, tpmLimitsByModel) {
 }
 
 function normalizeModelList(list, fallbackModelId) {
-  const baseModelIds = new Set(getBaseModelIds());
+  const registry = getModelRegistry();
+  const byKey = registry?.byKey || {};
   const rawList = Array.isArray(list)
     ? list
     : typeof list === 'string'
@@ -443,18 +444,19 @@ function normalizeModelList(list, fallbackModelId) {
       : [];
   const normalized = [];
   rawList.forEach((entry) => {
-    const modelId = typeof entry === 'string' ? entry : '';
-    if (!modelId || !baseModelIds.has(modelId)) return;
-    if (!normalized.includes(modelId)) {
-      normalized.push(modelId);
+    if (typeof entry !== 'string' || !entry) return;
+    const parsed = parseModelSpec(entry);
+    if (!parsed.id) return;
+    const spec = formatModelSpec(parsed.id, parsed.tier);
+    if (!byKey[spec]) return;
+    if (!normalized.includes(spec)) {
+      normalized.push(spec);
     }
   });
   if (!normalized.length) {
-    const fallback = baseModelIds.has(fallbackModelId)
-      ? fallbackModelId
-      : getBaseModelIds()[0];
-    if (fallback) {
-      normalized.push(fallback);
+    const fallbackSpec = fallbackModelId ? formatModelSpec(fallbackModelId, 'standard') : '';
+    if (fallbackSpec && byKey[fallbackSpec]) {
+      normalized.push(fallbackSpec);
     }
   }
   return normalized;
@@ -468,7 +470,7 @@ function areModelListsEqual(left, right) {
 
 function getPrimaryModelId(modelList, fallbackModelId) {
   const normalized = normalizeModelList(modelList, fallbackModelId);
-  return normalized[0] || fallbackModelId;
+  return parseModelSpec(normalized[0]).id || fallbackModelId;
 }
 
 function getModelListForStage(state, stage) {
@@ -570,9 +572,9 @@ async function getState() {
       merged.proofreadModelList || merged.proofreadModel || safeStored.model,
       fallbackProofreadModel
     );
-    merged.translationModel = merged.translationModelList[0] || fallbackTranslationModel;
-    merged.contextModel = merged.contextModelList[0] || fallbackContextModel;
-    merged.proofreadModel = merged.proofreadModelList[0] || fallbackProofreadModel;
+    merged.translationModel = parseModelSpec(merged.translationModelList[0]).id || fallbackTranslationModel;
+    merged.contextModel = parseModelSpec(merged.contextModelList[0]).id || fallbackContextModel;
+    merged.proofreadModel = parseModelSpec(merged.proofreadModelList[0]).id || fallbackProofreadModel;
     if (
       merged.translationModel !== previousModels.translationModel ||
       merged.contextModel !== previousModels.contextModel ||
@@ -1107,15 +1109,21 @@ async function executeModelFallback(stage, state, message, handler) {
   let lastError = null;
   let fallbackReasonForNext = null;
 
-  for (const modelId of orderedList) {
+  for (const modelSpec of orderedList) {
+    const parsed = parseModelSpec(modelSpec);
+    const modelId = parsed.id;
+    const requestedTier = parsed.tier;
+    if (!modelId) continue;
     const flexEntry = getModelEntry(modelId, 'flex');
     const standardEntry = getModelEntry(modelId, 'standard');
     const attemptWithTier = async (tier, fallbackReason) => {
       attemptIndex += 1;
+      const selectedModelSpec = formatModelSpec(modelId, tier);
       const requestMeta = {
         ...baseRequestMeta,
         selectedModel: modelId,
         selectedTier: tier,
+        selectedModelSpec,
         attemptIndex,
         fallbackReason: fallbackReason || baseRequestMeta.fallbackReason || '',
         originalRequestedModelList
@@ -1130,7 +1138,21 @@ async function executeModelFallback(stage, state, message, handler) {
     const attemptFallbackReason = fallbackReasonForNext;
     fallbackReasonForNext = null;
 
-    if (flexEntry) {
+    if (requestedTier === 'flex') {
+      if (!flexEntry) {
+        if (standardEntry) {
+          try {
+            return await attemptWithTier('standard', attemptFallbackReason || 'service_tier_unavailable');
+          } catch (standardError) {
+            lastError = standardError;
+            fallbackReasonForNext = classifyFallbackReason(standardError);
+            continue;
+          }
+        }
+        lastError = new Error('Requested flex tier unavailable.');
+        fallbackReasonForNext = classifyFallbackReason(lastError);
+        continue;
+      }
       try {
         return await attemptWithTier('flex', attemptFallbackReason);
       } catch (error) {
@@ -1150,7 +1172,12 @@ async function executeModelFallback(stage, state, message, handler) {
       }
     }
 
-    if (standardEntry || !flexEntry) {
+    if (requestedTier === 'standard') {
+      if (!standardEntry) {
+        lastError = new Error('Requested standard tier unavailable.');
+        fallbackReasonForNext = classifyFallbackReason(lastError);
+        continue;
+      }
       try {
         return await attemptWithTier('standard', attemptFallbackReason);
       } catch (error) {

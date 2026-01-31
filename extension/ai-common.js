@@ -109,6 +109,33 @@ function getBaseModelIds() {
   return Array.isArray(registry?.baseModelIds) ? [...registry.baseModelIds] : [];
 }
 
+globalThis.__NT_parseModelSpec__ ||= function parseModelSpec(spec) {
+  if (!spec || typeof spec !== 'string') {
+    return { id: '', tier: 'standard' };
+  }
+  const trimmed = spec.trim();
+  if (!trimmed) {
+    return { id: '', tier: 'standard' };
+  }
+  const [id, tierRaw] = trimmed.split(':');
+  const tier = tierRaw === 'flex' || tierRaw === 'standard' ? tierRaw : 'standard';
+  return { id, tier };
+};
+
+globalThis.__NT_formatModelSpec__ ||= function formatModelSpec(id, tier) {
+  if (!id) return '';
+  const normalizedTier = tier === 'flex' || tier === 'standard' ? tier : 'standard';
+  return `${id}:${normalizedTier}`;
+};
+
+function parseModelSpec(spec) {
+  return globalThis.__NT_parseModelSpec__ ? globalThis.__NT_parseModelSpec__(spec) : { id: '', tier: 'standard' };
+}
+
+function formatModelSpec(id, tier) {
+  return globalThis.__NT_formatModelSpec__ ? globalThis.__NT_formatModelSpec__(id, tier) : '';
+}
+
 function getModelParamBlacklist() {
   if (!globalThis.__NT_MODEL_PARAM_BLACKLIST__) {
     globalThis.__NT_MODEL_PARAM_BLACKLIST__ = {};
