@@ -642,10 +642,6 @@ async function translatePage(settings, options = {}) {
       : settings.contextGenerationEnabled && typeof existingDebugEntry?.context === 'string'
         ? existingDebugEntry.context.trim()
         : '';
-  const existingContextShortPreview =
-    settings.contextGenerationEnabled && typeof existingDebugEntry?.contextShort === 'string'
-      ? existingDebugEntry.contextShort.trim()
-      : '';
   const tabId = await getActiveTabId();
   const nodesWithPath = textNodes.map((node) => ({
     node,
@@ -679,11 +675,10 @@ async function translatePage(settings, options = {}) {
     cachedContextFull ||
     existingContextFullRecord?.value?.text ||
     existingContextFullPreview;
-  const shortPreviewAllowed = !existingDebugEntry?.contextShortTruncated;
   const existingContextShortText =
     cachedContextShort ||
     existingContextShortRecord?.value?.text ||
-    (shortPreviewAllowed ? existingContextShortPreview : '');
+    '';
   const contextSignature = buildContextStateSignature(contextCacheSignature, settings);
   originalSnapshot = nodesWithPath.map(({ path, original, originalHash }) => ({
     path,
@@ -849,15 +844,15 @@ async function translatePage(settings, options = {}) {
     return match?.id ?? null;
   };
 
-  const ensureShortContextReadyForRetry = async () => {
+  const ensureShortContextReadyForTrigger = async (requestMeta) => {
+    if (!requestMeta) return;
+    if (requestMeta.triggerSource !== 'retry' && requestMeta.triggerSource !== 'validate') return;
     if (!settings.contextGenerationEnabled) return;
     if (latestShortContextSummary) return;
     if (shortContextPromise) {
-      const resolved = await shortContextPromise;
-      if (!latestShortContextSummary && typeof resolved === 'string') {
-        latestShortContextSummary = resolved;
-      }
-      return;
+      await shortContextPromise;
+      latestShortContextSummary = contextState.short.text || '';
+      if (latestShortContextSummary) return;
     }
     if (!pageText) return;
     const shortResult = getOrBuildContext({
@@ -1124,9 +1119,7 @@ async function translatePage(settings, options = {}) {
               contextMode: fallbackContext.contextMode
             });
             traceRequestInitiator(perTextRequestMeta);
-            if (perTextRequestMeta.triggerSource === 'retry' || perTextRequestMeta.triggerSource === 'validate') {
-              await ensureShortContextReadyForRetry();
-            }
+            await ensureShortContextReadyForTrigger(perTextRequestMeta);
             const perTextResult = await translate(
               [text],
               settings.targetLanguage || 'ru',
@@ -1155,8 +1148,9 @@ async function translatePage(settings, options = {}) {
         } else {
           result = await runJobOnce(
             translateJobKey,
-            () =>
-              translate(
+            async () => {
+              await ensureShortContextReadyForTrigger(mainRequestMeta);
+              return translate(
                 uniqueTexts,
                 settings.targetLanguage || 'ru',
                 {
@@ -1170,7 +1164,8 @@ async function translatePage(settings, options = {}) {
                 keepPunctuationTokens,
                 currentIndex + 1,
                 mainRequestMeta
-              ),
+              );
+            },
             (resolved) => resolved?.success
           );
           if (!result?.success && result?.contextOverflow && primaryContext.contextMode === 'FULL') {
@@ -1199,13 +1194,11 @@ async function translatePage(settings, options = {}) {
               contextMode: fallbackContext.contextMode
             });
             traceRequestInitiator(retryRequestMeta);
-            if (retryRequestMeta.triggerSource === 'retry' || retryRequestMeta.triggerSource === 'validate') {
-              await ensureShortContextReadyForRetry();
-            }
             result = await runJobOnce(
               translateJobKey,
-              () =>
-                translate(
+              async () => {
+                await ensureShortContextReadyForTrigger(retryRequestMeta);
+                return translate(
                   uniqueTexts,
                   settings.targetLanguage || 'ru',
                   {
@@ -1219,7 +1212,8 @@ async function translatePage(settings, options = {}) {
                   keepPunctuationTokens,
                   currentIndex + 1,
                   retryRequestMeta
-                ),
+                );
+              },
               (resolved) => resolved?.success
             );
           }
@@ -1408,8 +1402,9 @@ async function translatePage(settings, options = {}) {
         const proofreadJobKey = `${task.key}:proofread`;
         let proofreadResult = await runJobOnce(
           proofreadJobKey,
-          () =>
-            requestProofreading({
+          async () => {
+            await ensureShortContextReadyForTrigger(mainRequestMeta);
+            return requestProofreading({
               segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
               sourceBlock: formatBlockText(task.originalTexts),
               translatedBlock: formatBlockText(task.translatedTexts),
@@ -1425,7 +1420,8 @@ async function translatePage(settings, options = {}) {
               language: settings.targetLanguage || 'ru',
               debugEntryIndex: task.index + 1,
               requestMeta: mainRequestMeta
-            }),
+            });
+          },
           (resolved) => resolved?.success
         );
         if (!proofreadResult?.success && proofreadResult?.contextOverflow && primaryContext.contextMode === 'FULL') {
@@ -1459,8 +1455,9 @@ async function translatePage(settings, options = {}) {
           traceRequestInitiator(retryRequestMeta);
           proofreadResult = await runJobOnce(
             proofreadJobKey,
-            () =>
-              requestProofreading({
+            async () => {
+              await ensureShortContextReadyForTrigger(retryRequestMeta);
+              return requestProofreading({
                 segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
                 sourceBlock: formatBlockText(task.originalTexts),
                 translatedBlock: formatBlockText(task.translatedTexts),
@@ -1476,7 +1473,8 @@ async function translatePage(settings, options = {}) {
                 language: settings.targetLanguage || 'ru',
                 debugEntryIndex: task.index + 1,
                 requestMeta: retryRequestMeta
-              }),
+              });
+            },
             (resolved) => resolved?.success
           );
         }
