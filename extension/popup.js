@@ -4,6 +4,9 @@ const openAiProjectInput = document.getElementById('openAiProject');
 const translationModelSelect = document.getElementById('translationModel');
 const contextModelSelect = document.getElementById('contextModel');
 const proofreadModelSelect = document.getElementById('proofreadModel');
+const translationModelCount = document.getElementById('translationModelCount');
+const contextModelCount = document.getElementById('contextModelCount');
+const proofreadModelCount = document.getElementById('proofreadModelCount');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
 const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
@@ -34,36 +37,41 @@ let popupReconnectTimer = null;
 let popupReconnectDelay = 500;
 
 const models = buildModelOptions();
+const defaultModelSpec = getDefaultModelSpec(models);
+const modelRegistry = typeof getModelRegistry === 'function' ? getModelRegistry() : { entries: [], byKey: {} };
 
 function buildModelOptions() {
-  const baseIds = typeof getBaseModelIds === 'function' ? getBaseModelIds() : [];
-  return baseIds.map((id) => ({
-    id,
-    name: buildModelLabel(id)
-  }));
-}
-
-function buildModelLabel(modelId) {
   const formatPrice = (value) => {
     if (value == null || Number.isNaN(value)) return '—';
     const fixed = Number(value).toFixed(4);
     return fixed.replace(/\.?0+$/, '');
   };
-  const standard = typeof getModelEntry === 'function' ? getModelEntry(modelId, 'standard') : null;
-  const flex = typeof getModelEntry === 'function' ? getModelEntry(modelId, 'flex') : null;
-  const label = modelId;
-  if (flex && standard) {
-    return `${label} — Σ1M flex ${formatPrice(flex.sum_1M)} (cache ${formatPrice(flex.sum_1M_cached)}) / std ${formatPrice(
-      standard.sum_1M
-    )} (cache ${formatPrice(standard.sum_1M_cached)})`;
-  }
-  if (standard) {
-    return `${label} — Σ1M ${formatPrice(standard.sum_1M)} (cache ${formatPrice(standard.sum_1M_cached)})`;
-  }
-  if (flex) {
-    return `${label} — Σ1M flex ${formatPrice(flex.sum_1M)} (cache ${formatPrice(flex.sum_1M_cached)})`;
-  }
-  return label;
+  const registry = typeof getModelRegistry === 'function' ? getModelRegistry() : { entries: [] };
+  const entries = Array.isArray(registry.entries) ? registry.entries : [];
+  return entries
+    .map((entry) => {
+      const modelSpec = typeof formatModelSpec === 'function' ? formatModelSpec(entry.id, entry.tier) : `${entry.id}:${entry.tier}`;
+      const cacheLabel = entry.sum_1M_cached != null ? formatPrice(entry.sum_1M_cached) : '—';
+      const label = `${entry.id} (${entry.tier.toUpperCase()}) — Σ1M ${formatPrice(entry.sum_1M)} (cache ${cacheLabel})`;
+      return {
+        id: entry.id,
+        tier: entry.tier,
+        spec: modelSpec,
+        sum_1M: entry.sum_1M,
+        name: label
+      };
+    })
+    .sort((left, right) => {
+      if (left.tier !== right.tier) {
+        return left.tier === 'flex' ? -1 : 1;
+      }
+      return (right.sum_1M || 0) - (left.sum_1M || 0);
+    });
+}
+
+function getDefaultModelSpec(modelOptions) {
+  const standardEntry = modelOptions.find((entry) => entry.tier === 'standard');
+  return standardEntry?.spec || modelOptions[0]?.spec || '';
 }
 
 init();
@@ -192,23 +200,26 @@ function handleOpenAiProjectChange() {
 
 async function handleTranslationModelChange() {
   const translationModelList = getSelectedModelList(translationModelSelect);
-  const translationModel = translationModelList[0] || models[0]?.id;
+  const translationModel = parseModelSpec(translationModelList[0] || defaultModelSpec).id;
   await chrome.storage.local.set({ translationModelList, translationModel });
+  updateModelSummaryCount(translationModelSelect);
   renderStatus();
   setTemporaryStatus('Модель для перевода сохранена.');
 }
 
 async function handleContextModelChange() {
   const contextModelList = getSelectedModelList(contextModelSelect);
-  const contextModel = contextModelList[0] || models[0]?.id;
+  const contextModel = parseModelSpec(contextModelList[0] || defaultModelSpec).id;
   await chrome.storage.local.set({ contextModelList, contextModel });
+  updateModelSummaryCount(contextModelSelect);
   setTemporaryStatus('Модель для контекста сохранена.');
 }
 
 async function handleProofreadModelChange() {
   const proofreadModelList = getSelectedModelList(proofreadModelSelect);
-  const proofreadModel = proofreadModelList[0] || models[0]?.id;
+  const proofreadModel = parseModelSpec(proofreadModelList[0] || defaultModelSpec).id;
   await chrome.storage.local.set({ proofreadModelList, proofreadModel });
+  updateModelSummaryCount(proofreadModelSelect);
   setTemporaryStatus('Модель для вычитки сохранена.');
 }
 
@@ -275,7 +286,7 @@ async function getState() {
         'tpmSafetyBufferTokens'
       ],
       (data) => {
-        const defaultModel = models[0]?.id;
+        const defaultModel = parseModelSpec(defaultModelSpec).id;
         const normalizeModelList = (list, fallbackModel) => {
           const rawList = Array.isArray(list)
             ? list
@@ -283,16 +294,27 @@ async function getState() {
               ? [list]
               : [];
           const normalized = [];
-          rawList.forEach((model) => {
-            if (!model || typeof model !== 'string' || model.startsWith('deepseek')) {
+          rawList.forEach((modelSpec) => {
+            if (!modelSpec || typeof modelSpec !== 'string' || modelSpec.startsWith('deepseek')) {
               return;
             }
-            if (models.some((entry) => entry.id === model) && !normalized.includes(model)) {
-              normalized.push(model);
+            const parsed = parseModelSpec(modelSpec);
+            if (!parsed.id) return;
+            const normalizedSpec = formatModelSpec(parsed.id, parsed.tier);
+            if (!modelRegistry.byKey?.[normalizedSpec]) {
+              const fallbackSpec = formatModelSpec(parsed.id, 'standard');
+              if (!modelRegistry.byKey?.[fallbackSpec]) return;
+              if (!normalized.includes(fallbackSpec)) {
+                normalized.push(fallbackSpec);
+              }
+              return;
+            }
+            if (!normalized.includes(normalizedSpec)) {
+              normalized.push(normalizedSpec);
             }
           });
-          if (!normalized.length) {
-            normalized.push(fallbackModel);
+          if (!normalized.length && fallbackModel) {
+            normalized.push(formatModelSpec(fallbackModel, 'standard'));
           }
           return normalized;
         };
@@ -310,9 +332,9 @@ async function getState() {
         );
         const contextModelList = normalizeModelList(data.contextModelList || storedContextModel, defaultModel);
         const proofreadModelList = normalizeModelList(data.proofreadModelList || storedProofreadModel, defaultModel);
-        const translationModel = translationModelList[0];
-        const contextModel = contextModelList[0];
-        const proofreadModel = proofreadModelList[0];
+        const translationModel = parseModelSpec(translationModelList[0] || defaultModelSpec).id;
+        const contextModel = parseModelSpec(contextModelList[0] || defaultModelSpec).id;
+        const proofreadModel = parseModelSpec(proofreadModelList[0] || defaultModelSpec).id;
         if (
           translationModel !== storedTranslationModel ||
           contextModel !== storedContextModel ||
@@ -356,7 +378,7 @@ async function getState() {
 }
 
 function renderModelOptions(select, selectedList) {
-  const defaultModel = models[0]?.id;
+  const defaultModel = defaultModelSpec;
   const normalizedList = Array.isArray(selectedList)
     ? selectedList
     : typeof selectedList === 'string'
@@ -366,27 +388,52 @@ function renderModelOptions(select, selectedList) {
 
   select.innerHTML = '';
 
-  models.forEach((model) => {
-    const option = document.createElement('option');
-    option.value = model.id;
-    option.textContent = model.name;
-    option.selected = selected.includes(model.id);
-    select.appendChild(option);
+  const tierGroups = {
+    flex: models.filter((model) => model.tier === 'flex'),
+    standard: models.filter((model) => model.tier === 'standard')
+  };
+
+  Object.entries(tierGroups).forEach(([tier, entries]) => {
+    if (!entries.length) return;
+    const group = document.createElement('optgroup');
+    group.label = tier.toUpperCase();
+    entries.forEach((model) => {
+      const option = document.createElement('option');
+      option.value = model.spec;
+      option.textContent = model.name;
+      option.selected = selected.includes(model.spec);
+      group.appendChild(option);
+    });
+    select.appendChild(group);
   });
+  updateModelSummaryCount(select);
 }
 
 function getSelectedModelList(select) {
-  if (!select) return [models[0]?.id];
+  if (!select) return [defaultModelSpec];
   const selected = [...select.options]
     .filter((option) => option.selected)
     .map((option) => option.value)
     .filter(Boolean);
-  if (!selected.length && models[0]?.id) {
-    selected.push(models[0].id);
-    const fallbackOption = [...select.options].find((option) => option.value === models[0]?.id);
+  if (!selected.length && defaultModelSpec) {
+    selected.push(defaultModelSpec);
+    const fallbackOption = [...select.options].find((option) => option.value === defaultModelSpec);
     if (fallbackOption) fallbackOption.selected = true;
   }
   return selected;
+}
+
+function updateModelSummaryCount(select) {
+  if (!select) return;
+  const selectedCount = [...select.options].filter((option) => option.selected).length;
+  const label = selectedCount ? `(${selectedCount})` : '';
+  if (select === translationModelSelect && translationModelCount) {
+    translationModelCount.textContent = label;
+  } else if (select === contextModelSelect && contextModelCount) {
+    contextModelCount.textContent = label;
+  } else if (select === proofreadModelSelect && proofreadModelCount) {
+    proofreadModelCount.textContent = label;
+  }
 }
 
 function renderContextGeneration(enabled) {
