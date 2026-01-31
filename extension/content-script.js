@@ -77,9 +77,6 @@ const DEBUG_RAW_MAX_CHARS = 50000;
 const DEBUG_CALLS_TOTAL_LIMIT = 1200;
 const DEBUG_EVENTS_LIMIT = 200;
 const DEBUG_PAYLOADS_PER_ENTRY_LIMIT = 120;
-const MAX_BLOCK_RETRIES = 15;
-const BASE_RETRY_DELAY_MS = 1000;
-const MAX_RETRY_DELAY_MS = 30000;
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
 const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const BLOCK_KEY_ATTR = 'data-nt-block-key';
@@ -906,8 +903,6 @@ async function translatePage(settings, options = {}) {
 
   const singleBlockConcurrency = Boolean(settings.singleBlockConcurrency);
   const translationConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(6, blocks.length));
-  let maxConcurrentTranslationJobs = translationConcurrency;
-  let totalBlockRetries = 0;
   let activeTranslationWorkers = 0;
   let activeProofreadWorkers = 0;
   let translationQueueDone = false;
@@ -961,15 +956,7 @@ async function translatePage(settings, options = {}) {
       return false;
     }
     translationQueueKeys.add(key);
-    translationQueue.push({
-      block,
-      index,
-      key,
-      blockElement,
-      retryCount: 0,
-      availableAt: 0,
-      fallbackMode: 'normal'
-    });
+    translationQueue.push({ block, index, key, blockElement });
     return true;
   };
 
@@ -982,42 +969,12 @@ async function translatePage(settings, options = {}) {
     return true;
   };
 
-  const isFatalBlockError = (err) => {
-    const status = err?.status;
-    if (status === 401 || status === 403) return true;
-    const message = String(err?.message || err || '').toLowerCase();
-    return (
-      message.includes('invalid api key') ||
-      message.includes('api key') ||
-      message.includes('unauthorized') ||
-      message.includes('forbidden') ||
-      message.includes('401') ||
-      message.includes('403')
-    );
-  };
-
-  const isRateLimitOrOverload = (err) => {
-    const status = err?.status;
-    if (status === 429 || status === 503) return true;
-    const message = String(err?.message || err || '').toLowerCase();
-    return message.includes('429') || message.includes('rate') || message.includes('too many');
-  };
-
   const translationWorker = async () => {
     while (true) {
       if (cancelRequested) return;
       const queuedItem = translationQueue.shift();
       if (!queuedItem) {
         return;
-      }
-      if (queuedItem.availableAt && queuedItem.availableAt > Date.now()) {
-        translationQueue.push(queuedItem);
-        await delay(Math.min(queuedItem.availableAt - Date.now(), 200));
-        continue;
-      }
-      while (activeTranslationWorkers >= maxConcurrentTranslationJobs) {
-        if (cancelRequested) return;
-        await delay(50);
       }
       activeTranslationWorkers += 1;
       const currentIndex = queuedItem.index;
@@ -1051,49 +1008,52 @@ async function translatePage(settings, options = {}) {
         });
         traceRequestInitiator(mainRequestMeta);
         const translateJobKey = `${queuedItem.key}:translate`;
-        let result = null;
-
-        if (queuedItem.fallbackMode === 'single') {
-          const fallbackContext = await selectContextForBlock(debugEntry, 'translation', { forceShort: true });
-          const perTextTranslations = [];
-          for (let textIndex = 0; textIndex < uniqueTexts.length; textIndex += 1) {
-            const text = uniqueTexts[textIndex];
-            const perTextRequestMeta = buildRequestMeta(baseRequestMeta, {
-              requestId: createRequestId(),
-              parentRequestId: mainRequestMeta.requestId,
-              purpose: 'single',
-              attempt: fallbackContext.attemptIndex,
-              triggerSource: 'retry',
-              contextText: fallbackContext.contextText,
-              contextMode: fallbackContext.contextMode
-            });
-            traceRequestInitiator(perTextRequestMeta);
-            const perTextResult = await translate(
-              [text],
+        let result = await runJobOnce(
+          translateJobKey,
+          () =>
+            translate(
+              uniqueTexts,
               settings.targetLanguage || 'ru',
               {
-                contextText: fallbackContext.contextText,
-                contextMode: fallbackContext.contextMode,
-                baseAnswer: fallbackContext.baseAnswer,
-                baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-                baseAnswerPreview: fallbackContext.baseAnswerPreview,
-                tag: fallbackContext.tag
+                contextText: primaryContext.contextText,
+                contextMode: primaryContext.contextMode,
+                baseAnswer: primaryContext.baseAnswer,
+                baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+                baseAnswerPreview: primaryContext.baseAnswerPreview,
+                tag: primaryContext.tag
               },
               keepPunctuationTokens,
               currentIndex + 1,
-              perTextRequestMeta
-            );
-            if (!perTextResult?.success || perTextResult.translations.length !== 1) {
-              throw new Error(perTextResult?.error || 'Не удалось выполнить перевод.');
-            }
-            const translatedText = perTextResult.translations[0];
-            if (!translatedText || !translatedText.trim()) {
-              throw new Error('Пустой перевод сегмента.');
-            }
-            perTextTranslations.push(translatedText);
-          }
-          result = { success: true, translations: perTextTranslations, rawTranslation: '', debug: [] };
-        } else {
+              mainRequestMeta
+            ),
+          (resolved) => resolved?.success
+        );
+        if (!result?.success && result?.contextOverflow && primaryContext.contextMode === 'FULL') {
+          appendDebugPayload(
+            currentIndex + 1,
+            'translationDebug',
+            buildContextOverflowDebugPayload({
+              phase: 'TRANSLATE',
+              model: settings.translationModel,
+              errorMessage: result?.error || 'fullContext overflow/error',
+              contextMode: primaryContext.contextMode,
+              contextTextSent: primaryContext.contextText,
+              baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+              tag: primaryContext.tag,
+              requestMeta: mainRequestMeta
+            })
+          );
+          const fallbackContext = await selectContextForBlock(debugEntry, 'translation', { forceShort: true });
+          const retryRequestMeta = buildRequestMeta(baseRequestMeta, {
+            requestId: createRequestId(),
+            parentRequestId: mainRequestMeta.requestId,
+            purpose: 'retry',
+            attempt: fallbackContext.attemptIndex,
+            triggerSource: 'retry',
+            contextText: fallbackContext.contextText,
+            contextMode: fallbackContext.contextMode
+          });
+          traceRequestInitiator(retryRequestMeta);
           result = await runJobOnce(
             translateJobKey,
             () =>
@@ -1101,66 +1061,19 @@ async function translatePage(settings, options = {}) {
                 uniqueTexts,
                 settings.targetLanguage || 'ru',
                 {
-                  contextText: primaryContext.contextText,
-                  contextMode: primaryContext.contextMode,
-                  baseAnswer: primaryContext.baseAnswer,
-                  baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-                  baseAnswerPreview: primaryContext.baseAnswerPreview,
-                  tag: primaryContext.tag
+                  contextText: fallbackContext.contextText,
+                  contextMode: fallbackContext.contextMode,
+                  baseAnswer: fallbackContext.baseAnswer,
+                  baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
+                  baseAnswerPreview: fallbackContext.baseAnswerPreview,
+                  tag: fallbackContext.tag
                 },
                 keepPunctuationTokens,
                 currentIndex + 1,
-                mainRequestMeta
+                retryRequestMeta
               ),
             (resolved) => resolved?.success
           );
-          if (!result?.success && result?.contextOverflow && primaryContext.contextMode === 'FULL') {
-            appendDebugPayload(
-              currentIndex + 1,
-              'translationDebug',
-              buildContextOverflowDebugPayload({
-                phase: 'TRANSLATE',
-                model: settings.translationModel,
-                errorMessage: result?.error || 'fullContext overflow/error',
-                contextMode: primaryContext.contextMode,
-                contextTextSent: primaryContext.contextText,
-                baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-                tag: primaryContext.tag,
-                requestMeta: mainRequestMeta
-              })
-            );
-            const fallbackContext = await selectContextForBlock(debugEntry, 'translation', { forceShort: true });
-            const retryRequestMeta = buildRequestMeta(baseRequestMeta, {
-              requestId: createRequestId(),
-              parentRequestId: mainRequestMeta.requestId,
-              purpose: 'retry',
-              attempt: fallbackContext.attemptIndex,
-              triggerSource: 'retry',
-              contextText: fallbackContext.contextText,
-              contextMode: fallbackContext.contextMode
-            });
-            traceRequestInitiator(retryRequestMeta);
-            result = await runJobOnce(
-              translateJobKey,
-              () =>
-                translate(
-                  uniqueTexts,
-                  settings.targetLanguage || 'ru',
-                  {
-                    contextText: fallbackContext.contextText,
-                    contextMode: fallbackContext.contextMode,
-                    baseAnswer: fallbackContext.baseAnswer,
-                    baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-                    baseAnswerPreview: fallbackContext.baseAnswerPreview,
-                    tag: fallbackContext.tag
-                  },
-                  keepPunctuationTokens,
-                  currentIndex + 1,
-                  retryRequestMeta
-                ),
-              (resolved) => resolved?.success
-            );
-          }
         }
         if (!result?.success) {
           throw new Error(result?.error || 'Не удалось выполнить перевод.');
@@ -1223,7 +1136,6 @@ async function translatePage(settings, options = {}) {
             : {}),
           ...(baseTranslationCallId ? { translationBaseFullCallId: baseTranslationCallId } : {})
         });
-        translationProgress.completedBlocks += 1;
 
         if (settings.proofreadEnabled) {
           const proofreadSegments = translatedTexts.map((text, index) => ({ id: String(index), text }));
@@ -1251,44 +1163,13 @@ async function translatePage(settings, options = {}) {
         }
       } catch (error) {
         console.error('Block translation failed', error);
-        if (isFatalBlockError(error)) {
-          translationError = error;
-          cancelRequested = true;
-          await updateDebugEntry(currentIndex + 1, {
-            translationStatus: 'failed',
-            proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled',
-            translationCompletedAt: Date.now()
-          });
-        } else {
-          queuedItem.retryCount += 1;
-          totalBlockRetries += 1;
-          if (queuedItem.retryCount > MAX_BLOCK_RETRIES) {
-            queuedItem.fallbackMode = 'single';
-            queuedItem.retryCount = 0;
-          }
-          if (isRateLimitOrOverload(error)) {
-            maxConcurrentTranslationJobs = Math.max(1, maxConcurrentTranslationJobs - 1);
-          }
-          const retryBase = Math.max(1, queuedItem.retryCount);
-          const delayMs = Math.min(
-            MAX_RETRY_DELAY_MS,
-            BASE_RETRY_DELAY_MS * Math.pow(2, retryBase - 1)
-          );
-          queuedItem.availableAt = Date.now() + delayMs;
-          await updateDebugEntry(currentIndex + 1, {
-            translationStatus: 'retrying',
-            translationRetryCount: queuedItem.retryCount,
-            translationLastError: String(error?.message || error)
-          });
-          reportProgress(
-            'Повтор перевода блока',
-            translationProgress.completedBlocks,
-            totalBlocks,
-            activeTranslationWorkers
-          );
-          translationQueue.push(queuedItem);
-          continue;
-        }
+        translationError = error;
+        cancelRequested = true;
+        await updateDebugEntry(currentIndex + 1, {
+          translationStatus: 'failed',
+          proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled',
+          translationCompletedAt: Date.now()
+        });
       } finally {
         activeTranslationWorkers = Math.max(0, activeTranslationWorkers - 1);
       }
@@ -1303,6 +1184,7 @@ async function translatePage(settings, options = {}) {
         return;
       }
 
+      translationProgress.completedBlocks += 1;
       reportProgress(
         'Перевод выполняется',
         translationProgress.completedBlocks,
