@@ -237,15 +237,17 @@ async function resolveRetryValidateBundle({ requestMeta, debugPayloadsOptional, 
   }
 
   if (!shortText && matchedState) {
-    shortText =
-      trimToShortContext(typeof matchedState?.contextShort === 'string' ? matchedState.contextShort : '') || '';
-    if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
+    if (matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
       try {
         const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
         shortText = trimToShortContext(rawRecord?.value?.text || rawRecord?.value?.response || '');
       } catch (error) {
         shortText = '';
       }
+    }
+    if (!shortText) {
+      shortText =
+        trimToShortContext(typeof matchedState?.contextShort === 'string' ? matchedState.contextShort : '') || '';
     }
     if (shortText) {
       shortSource = 'debug-scan';
