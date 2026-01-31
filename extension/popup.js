@@ -52,7 +52,7 @@ function buildModelOptions() {
     .map((entry) => {
       const modelSpec = typeof formatModelSpec === 'function' ? formatModelSpec(entry.id, entry.tier) : `${entry.id}:${entry.tier}`;
       const cacheLabel = entry.sum_1M_cached != null ? formatPrice(entry.sum_1M_cached) : '—';
-      const label = `${entry.id} (${entry.tier.toUpperCase()}) — Σ1M ${formatPrice(entry.sum_1M)} (cache ${cacheLabel})`;
+      const label = `${entry.id} — Σ1M ${formatPrice(entry.sum_1M)} (cache ${cacheLabel})`;
       return {
         id: entry.id,
         tier: entry.tier,

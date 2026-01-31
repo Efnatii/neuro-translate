@@ -487,11 +487,60 @@ function getCandidateModels(stage, triggerSource, isManual, state) {
       : state.translationModel;
   const originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
   const isRetry = triggerSource === 'retry' || triggerSource === 'validate';
-  const orderedList = isRetry ? [...originalRequestedModelList].reverse() : [...originalRequestedModelList];
+  const isManualTrigger = Boolean(isManual) || /manual/i.test(triggerSource || '');
+  const candidateStrategy = isManualTrigger
+    ? 'manual_smartest'
+    : isRetry
+      ? 'retry_cheapest'
+      : 'default_preserve_order';
+  const parsedEntries = originalRequestedModelList.map((spec, index) => ({
+    spec,
+    index,
+    parsed: parseModelSpec(spec)
+  }));
+  const flexSpecs = [];
+  const standardSpecs = [];
+  for (const entry of parsedEntries) {
+    if (entry.parsed.tier === 'flex') {
+      flexSpecs.push(entry);
+    } else {
+      standardSpecs.push(entry);
+    }
+  }
+  const sortByRank = (entries) =>
+    [...entries].sort((left, right) => {
+      const leftRank = getModelCapabilityRank(left.parsed.id);
+      const rightRank = getModelCapabilityRank(right.parsed.id);
+      if (leftRank !== rightRank) {
+        return rightRank - leftRank;
+      }
+      return left.index - right.index;
+    });
+  const sortByCost = (entries) =>
+    [...entries].sort((left, right) => {
+      const leftEntry = getModelEntry(left.parsed.id, left.parsed.tier);
+      const rightEntry = getModelEntry(right.parsed.id, right.parsed.tier);
+      const leftCost = leftEntry?.sum_1M ?? Infinity;
+      const rightCost = rightEntry?.sum_1M ?? Infinity;
+      if (leftCost !== rightCost) {
+        return leftCost - rightCost;
+      }
+      return left.index - right.index;
+    });
+  const orderEntries = (entries) => {
+    if (candidateStrategy === 'manual_smartest') return sortByRank(entries);
+    if (candidateStrategy === 'retry_cheapest') return sortByCost(entries);
+    return [...entries];
+  };
+  const orderedList = [
+    ...orderEntries(flexSpecs),
+    ...orderEntries(standardSpecs)
+  ].map((entry) => entry.spec);
   return {
     orderedList,
     originalRequestedModelList,
-    isManual: Boolean(isManual)
+    isManual: Boolean(isManual),
+    candidateStrategy
   };
 }
 
@@ -1104,7 +1153,12 @@ async function executeModelFallback(stage, state, message, handler) {
     triggerSource === 'manual_translate' ||
     triggerSource === 'manualTranslate' ||
     /manual/i.test(triggerSource);
-  const { orderedList, originalRequestedModelList } = getCandidateModels(stage, triggerSource, isManual, state);
+  const { orderedList, originalRequestedModelList, candidateStrategy } = getCandidateModels(
+    stage,
+    triggerSource,
+    isManual,
+    state
+  );
   let attemptIndex = 0;
   let lastError = null;
   let fallbackReasonForNext = null;
@@ -1126,7 +1180,9 @@ async function executeModelFallback(stage, state, message, handler) {
         selectedModelSpec,
         attemptIndex,
         fallbackReason: fallbackReason || baseRequestMeta.fallbackReason || '',
-        originalRequestedModelList
+        originalRequestedModelList,
+        candidateStrategy,
+        candidateOrderedList: orderedList
       };
       const requestOptions = {
         tier,
