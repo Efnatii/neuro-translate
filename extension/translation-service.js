@@ -355,6 +355,17 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     purpose: payload.purpose || requestMeta.purpose || '',
     attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
     triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
+    selectedModel: payload.selectedModel || requestMeta.selectedModel || payload.model || '',
+    selectedTier: payload.selectedTier || requestMeta.selectedTier || '',
+    attemptIndex:
+      Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
+        ? payload.attemptIndex
+        : requestMeta.attemptIndex,
+    fallbackReason: payload.fallbackReason || requestMeta.fallbackReason || '',
+    originalRequestedModelList:
+      payload.originalRequestedModelList ||
+      requestMeta.originalRequestedModelList ||
+      [],
     contextMode: payload.contextMode || contextMode,
     contextTypeUsed: payload.contextTypeUsed || contextTypeUsed,
     contextHash: payload.contextHash ?? (effectiveContext?.hash ?? 0),
@@ -451,7 +462,8 @@ async function translateTexts(
   context = '',
   apiBaseUrl = OPENAI_API_URL,
   keepPunctuationTokens = false,
-  requestMeta = null
+  requestMeta = null,
+  requestOptions = null
 ) {
   if (!Array.isArray(texts) || !texts.length) return { translations: [], rawTranslation: '' };
 
@@ -521,7 +533,8 @@ async function translateTexts(
         false,
         true,
         true,
-        attemptMeta
+        attemptMeta,
+        requestOptions
       );
       lastRawTranslation = result.rawTranslation;
       if (Array.isArray(result?.debug)) {
@@ -583,14 +596,21 @@ async function translateTexts(
           true,
           true,
           debugPayloads,
-          retryMeta
+          retryMeta,
+          requestOptions
         );
         return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
       }
 
       if (isRateLimit) {
         const waitSeconds = Math.max(1, Math.ceil((lastRetryDelayMs || error?.retryAfterMs || 30000) / 1000));
-        throw new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
+        const rateLimitError = new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
+        rateLimitError.status = error?.status || 429;
+        rateLimitError.isRateLimit = true;
+        rateLimitError.isRetryable = false;
+        rateLimitError.retryAfterMs = error?.retryAfterMs || lastRetryDelayMs || null;
+        rateLimitError.fallbackReason = 'rate_limit';
+        throw rateLimitError;
       }
 
       throw lastError;
@@ -612,7 +632,8 @@ async function performTranslationRequest(
   strictTargetLanguage = false,
   allowRefusalRetry = true,
   allowLengthRetry = true,
-  requestMeta = null
+  requestMeta = null,
+  requestOptions = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'main' });
   const operationType = 'neuro-translate:translate:v1';
@@ -1053,6 +1074,7 @@ async function performTranslationRequest(
     }
   };
   applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:translate:v1');
+  applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -1072,7 +1094,7 @@ async function performTranslationRequest(
     } catch (parseError) {
       errorPayload = null;
     }
-    const stripped = stripUnsupportedPromptCacheParams(
+    const stripped = stripUnsupportedRequestParams(
       requestPayload,
       model,
       response.status,
@@ -1080,9 +1102,18 @@ async function performTranslationRequest(
       errorText
     );
     if (response.status === 400 && stripped.changed) {
-      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
+      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+        if (!requestMeta.fallbackReason) {
+          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+        }
+        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+          requestMeta.selectedTier = 'standard';
+        }
+      }
+      console.warn('Unsupported param removed; retrying without it.', {
         model,
-        status: response.status
+        status: response.status,
+        removedParams: stripped.removedParams
       });
       response = await fetch(apiBaseUrl, {
         method: 'POST',
@@ -1115,6 +1146,13 @@ async function performTranslationRequest(
       error.isRateLimit = response.status === 429 || response.status === 503;
       error.isRetryable = isRetryableStatus(response.status);
       error.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
+      error.errorCode = errorPayload?.error?.code || errorPayload?.code;
+      error.errorType = errorPayload?.error?.type || errorPayload?.type;
+      error.isUnavailable =
+        response.status === 503 ||
+        response.status === 502 ||
+        response.status === 504 ||
+        String(errorMessage || '').toLowerCase().includes('unavailable');
       error.debugPayload = attachRequestMeta(
         {
           phase: 'TRANSLATE',
@@ -1305,7 +1343,8 @@ async function performTranslationRequest(
       false,
       true,
       debugPayloads,
-      retryMeta
+      retryMeta,
+      requestOptions
     );
 
     refusalIndices.forEach((index, retryPosition) => {
@@ -1349,7 +1388,8 @@ async function performTranslationRequest(
           purpose: 'retry',
           attempt: normalizedRequestMeta.attempt + 1,
           triggerSource: 'retry'
-        })
+        }),
+        requestOptions
       );
       const retryTranslations = retryResults?.translations || [];
       if (Array.isArray(retryResults?.debug)) {
@@ -1391,7 +1431,8 @@ async function performTranslationRequest(
           purpose: 'retry',
           attempt: normalizedRequestMeta.attempt + 1,
           triggerSource: 'retry'
-        })
+        }),
+        requestOptions
       );
       lengthRetryIndices.forEach((index, retryPosition) => {
         if (retryResults?.[retryPosition]) {
@@ -1410,7 +1451,8 @@ async function performTranslationRequest(
     context,
     apiBaseUrl,
     debugPayloads,
-    normalizedRequestMeta
+    normalizedRequestMeta,
+    requestOptions
   );
 
   return {
@@ -1434,7 +1476,8 @@ async function performTranslationRepairRequest(
   signal,
   context = '',
   apiBaseUrl = OPENAI_API_URL,
-  requestMeta = null
+  requestMeta = null,
+  requestOptions = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'validate' });
   const operationType = 'neuro-translate:translate:v1';
@@ -1880,8 +1923,10 @@ async function performTranslationRepairRequest(
       }
     }
   };
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:translate:v1');
+  applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
-  const response = await fetch(apiBaseUrl, {
+  let response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1892,10 +1937,57 @@ async function performTranslationRepairRequest(
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    const error = new Error(`Repair request failed: ${response.status} ${errorText}`);
-    error.status = response.status;
-    throw error;
+    let errorText = await response.text();
+    let errorPayload = null;
+    try {
+      errorPayload = JSON.parse(errorText);
+    } catch (parseError) {
+      errorPayload = null;
+    }
+    const stripped = stripUnsupportedRequestParams(
+      requestPayload,
+      model,
+      response.status,
+      errorPayload,
+      errorText
+    );
+    if (response.status === 400 && stripped.changed) {
+      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+        if (!requestMeta.fallbackReason) {
+          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+        }
+        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+          requestMeta.selectedTier = 'standard';
+        }
+      }
+      console.warn('Unsupported param removed; retrying repair without it.', {
+        model,
+        status: response.status,
+        removedParams: stripped.removedParams
+      });
+      response = await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestPayload),
+        signal
+      });
+      if (!response.ok) {
+        errorText = await response.text();
+        try {
+          errorPayload = JSON.parse(errorText);
+        } catch (parseError) {
+          errorPayload = null;
+        }
+      }
+    }
+    if (!response.ok) {
+      const error = new Error(`Repair request failed: ${response.status} ${errorText}`);
+      error.status = response.status;
+      throw error;
+    }
   }
 
   const data = await response.json();
@@ -1950,7 +2042,8 @@ async function repairTranslationsForLanguage(
   context,
   apiBaseUrl,
   debugPayloads,
-  requestMeta
+  requestMeta,
+  requestOptions
 ) {
   const repairItems = [];
   const repairIndices = [];
@@ -2008,7 +2101,8 @@ async function repairTranslationsForLanguage(
       undefined,
       retryContextPayload,
       apiBaseUrl,
-      repairRequestMeta
+      repairRequestMeta,
+      requestOptions
     );
     if (repairResult?.debug && Array.isArray(debugPayloads)) {
       if (!Array.isArray(repairResult.debug.parseIssues)) {
@@ -2041,7 +2135,8 @@ async function translateIndividually(
   allowRefusalRetry = true,
   allowLengthRetry = true,
   debugPayloads = null,
-  requestMeta = null
+  requestMeta = null,
+  requestOptions = null
 ) {
   const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'retry' });
   const results = [];

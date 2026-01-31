@@ -33,22 +33,38 @@ let popupPort = null;
 let popupReconnectTimer = null;
 let popupReconnectDelay = 500;
 
-const models = [
-  { id: 'gpt-5-nano', name: 'GPT-5 Nano' },
-  { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano' },
-  { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
-  { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini' },
-  { id: 'gpt-5-mini', name: 'GPT-5 Mini' },
-  { id: 'gpt-4.1', name: 'GPT-4.1' },
-  { id: 'gpt-5.1', name: 'GPT-5.1' },
-  { id: 'gpt-5', name: 'GPT-5' },
-  { id: 'gpt-5.1-chat-latest', name: 'GPT-5.1 Chat Latest' },
-  { id: 'gpt-5-chat-latest', name: 'GPT-5 Chat Latest' },
-  { id: 'gpt-4o', name: 'GPT-4o' },
-  { id: 'gpt-5.2', name: 'GPT-5.2' },
-  { id: 'gpt-5.2-chat-latest', name: 'GPT-5.2 Chat Latest' },
-  { id: 'gpt-4o-2024-05-13', name: 'GPT-4o (2024-05-13)' }
-];
+const models = buildModelOptions();
+
+function buildModelOptions() {
+  const baseIds = typeof getBaseModelIds === 'function' ? getBaseModelIds() : [];
+  return baseIds.map((id) => ({
+    id,
+    name: buildModelLabel(id)
+  }));
+}
+
+function buildModelLabel(modelId) {
+  const formatPrice = (value) => {
+    if (value == null || Number.isNaN(value)) return '—';
+    const fixed = Number(value).toFixed(4);
+    return fixed.replace(/\.?0+$/, '');
+  };
+  const standard = typeof getModelEntry === 'function' ? getModelEntry(modelId, 'standard') : null;
+  const flex = typeof getModelEntry === 'function' ? getModelEntry(modelId, 'flex') : null;
+  const label = modelId;
+  if (flex && standard) {
+    return `${label} — Σ1M flex ${formatPrice(flex.sum_1M)} (cache ${formatPrice(flex.sum_1M_cached)}) / std ${formatPrice(
+      standard.sum_1M
+    )} (cache ${formatPrice(standard.sum_1M_cached)})`;
+  }
+  if (standard) {
+    return `${label} — Σ1M ${formatPrice(standard.sum_1M)} (cache ${formatPrice(standard.sum_1M_cached)})`;
+  }
+  if (flex) {
+    return `${label} — Σ1M flex ${formatPrice(flex.sum_1M)} (cache ${formatPrice(flex.sum_1M_cached)})`;
+  }
+  return label;
+}
 
 init();
 
@@ -67,6 +83,9 @@ async function init() {
         translationModel: state.translationModel,
         contextModel: state.contextModel,
         proofreadModel: state.proofreadModel,
+        translationModelList: state.translationModelList,
+        contextModelList: state.contextModelList,
+        proofreadModelList: state.proofreadModelList,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
         singleBlockConcurrency: state.singleBlockConcurrency,
@@ -82,9 +101,9 @@ async function init() {
   apiKeyInput.value = state.apiKey || '';
   openAiOrganizationInput.value = state.openAiOrganization || '';
   openAiProjectInput.value = state.openAiProject || '';
-  renderModelOptions(translationModelSelect, state.translationModel);
-  renderModelOptions(contextModelSelect, state.contextModel);
-  renderModelOptions(proofreadModelSelect, state.proofreadModel);
+  renderModelOptions(translationModelSelect, state.translationModelList);
+  renderModelOptions(contextModelSelect, state.contextModelList);
+  renderModelOptions(proofreadModelSelect, state.proofreadModelList);
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
@@ -172,21 +191,24 @@ function handleOpenAiProjectChange() {
 }
 
 async function handleTranslationModelChange() {
-  const translationModel = translationModelSelect.value;
-  await chrome.storage.local.set({ translationModel });
+  const translationModelList = getSelectedModelList(translationModelSelect);
+  const translationModel = translationModelList[0] || models[0]?.id;
+  await chrome.storage.local.set({ translationModelList, translationModel });
   renderStatus();
   setTemporaryStatus('Модель для перевода сохранена.');
 }
 
 async function handleContextModelChange() {
-  const contextModel = contextModelSelect.value;
-  await chrome.storage.local.set({ contextModel });
+  const contextModelList = getSelectedModelList(contextModelSelect);
+  const contextModel = contextModelList[0] || models[0]?.id;
+  await chrome.storage.local.set({ contextModelList, contextModel });
   setTemporaryStatus('Модель для контекста сохранена.');
 }
 
 async function handleProofreadModelChange() {
-  const proofreadModel = proofreadModelSelect.value;
-  await chrome.storage.local.set({ proofreadModel });
+  const proofreadModelList = getSelectedModelList(proofreadModelSelect);
+  const proofreadModel = proofreadModelList[0] || models[0]?.id;
+  await chrome.storage.local.set({ proofreadModelList, proofreadModel });
   setTemporaryStatus('Модель для вычитки сохранена.');
 }
 
@@ -238,6 +260,9 @@ async function getState() {
         'translationModel',
         'contextModel',
         'proofreadModel',
+        'translationModelList',
+        'contextModelList',
+        'proofreadModelList',
         'contextGenerationEnabled',
         'proofreadEnabled',
         'singleBlockConcurrency',
@@ -251,24 +276,59 @@ async function getState() {
       ],
       (data) => {
         const defaultModel = models[0]?.id;
-        const normalizeModel = (model) => {
-          if (!model || model.startsWith('deepseek')) {
-            return defaultModel;
+        const normalizeModelList = (list, fallbackModel) => {
+          const rawList = Array.isArray(list)
+            ? list
+            : typeof list === 'string'
+              ? [list]
+              : [];
+          const normalized = [];
+          rawList.forEach((model) => {
+            if (!model || typeof model !== 'string' || model.startsWith('deepseek')) {
+              return;
+            }
+            if (models.some((entry) => entry.id === model) && !normalized.includes(model)) {
+              normalized.push(model);
+            }
+          });
+          if (!normalized.length) {
+            normalized.push(fallbackModel);
           }
-          return models.some((entry) => entry.id === model) ? model : defaultModel;
+          return normalized;
         };
-        const storedTranslationModel = data.translationModel || data.model;
-        const storedContextModel = data.contextModel || data.model;
-        const storedProofreadModel = data.proofreadModel || data.model;
-        const translationModel = normalizeModel(storedTranslationModel);
-        const contextModel = normalizeModel(storedContextModel);
-        const proofreadModel = normalizeModel(storedProofreadModel);
+        const areModelListsEqual = (left, right) => {
+          if (!Array.isArray(left) || !Array.isArray(right)) return false;
+          if (left.length !== right.length) return false;
+          return left.every((value, index) => value === right[index]);
+        };
+        const storedTranslationModel = data.translationModel || data.model || defaultModel;
+        const storedContextModel = data.contextModel || data.model || defaultModel;
+        const storedProofreadModel = data.proofreadModel || data.model || defaultModel;
+        const translationModelList = normalizeModelList(
+          data.translationModelList || storedTranslationModel,
+          defaultModel
+        );
+        const contextModelList = normalizeModelList(data.contextModelList || storedContextModel, defaultModel);
+        const proofreadModelList = normalizeModelList(data.proofreadModelList || storedProofreadModel, defaultModel);
+        const translationModel = translationModelList[0];
+        const contextModel = contextModelList[0];
+        const proofreadModel = proofreadModelList[0];
         if (
           translationModel !== storedTranslationModel ||
           contextModel !== storedContextModel ||
-          proofreadModel !== storedProofreadModel
+          proofreadModel !== storedProofreadModel ||
+          !areModelListsEqual(data.translationModelList, translationModelList) ||
+          !areModelListsEqual(data.contextModelList, contextModelList) ||
+          !areModelListsEqual(data.proofreadModelList, proofreadModelList)
         ) {
-          chrome.storage.local.set({ translationModel, contextModel, proofreadModel });
+          chrome.storage.local.set({
+            translationModel,
+            contextModel,
+            proofreadModel,
+            translationModelList,
+            contextModelList,
+            proofreadModelList
+          });
         }
         resolve({
           apiKey: data.apiKey || '',
@@ -277,6 +337,9 @@ async function getState() {
           translationModel,
           contextModel,
           proofreadModel,
+          translationModelList,
+          contextModelList,
+          proofreadModelList,
           contextGenerationEnabled: data.contextGenerationEnabled,
           proofreadEnabled: data.proofreadEnabled,
           singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
@@ -292,9 +355,14 @@ async function getState() {
   });
 }
 
-function renderModelOptions(select, selected) {
+function renderModelOptions(select, selectedList) {
   const defaultModel = models[0]?.id;
-  const currentModel = selected || defaultModel;
+  const normalizedList = Array.isArray(selectedList)
+    ? selectedList
+    : typeof selectedList === 'string'
+      ? [selectedList]
+      : [];
+  const selected = normalizedList.length ? normalizedList : [defaultModel];
 
   select.innerHTML = '';
 
@@ -302,9 +370,23 @@ function renderModelOptions(select, selected) {
     const option = document.createElement('option');
     option.value = model.id;
     option.textContent = model.name;
-    option.selected = model.id === currentModel;
+    option.selected = selected.includes(model.id);
     select.appendChild(option);
   });
+}
+
+function getSelectedModelList(select) {
+  if (!select) return [models[0]?.id];
+  const selected = [...select.options]
+    .filter((option) => option.selected)
+    .map((option) => option.value)
+    .filter(Boolean);
+  if (!selected.length && models[0]?.id) {
+    selected.push(models[0].id);
+    const fallbackOption = [...select.options].find((option) => option.value === models[0]?.id);
+    if (fallbackOption) fallbackOption.selected = true;
+  }
+  return selected;
 }
 
 function renderContextGeneration(enabled) {

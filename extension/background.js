@@ -25,6 +25,9 @@ const DEFAULT_STATE = {
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
+  translationModelList: ['gpt-4.1-mini'],
+  contextModelList: ['gpt-4.1-mini'],
+  proofreadModelList: ['gpt-4.1-mini'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   singleBlockConcurrency: false,
@@ -53,6 +56,9 @@ const STATE_CACHE_KEYS = new Set([
   'translationModel',
   'contextModel',
   'proofreadModel',
+  'translationModelList',
+  'contextModelList',
+  'proofreadModelList',
   'contextGenerationEnabled',
   'proofreadEnabled',
   'singleBlockConcurrency',
@@ -373,6 +379,24 @@ function applyStatePatch(patch = {}) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
     }
+    if (['translationModelList', 'contextModelList', 'proofreadModelList'].includes(key)) {
+      const fallbackModel =
+        key === 'contextModelList'
+          ? next.contextModel
+          : key === 'proofreadModelList'
+            ? next.proofreadModel
+            : next.translationModel;
+      const normalizedList = normalizeModelList(value, fallbackModel);
+      next[key] = normalizedList;
+      if (key === 'translationModelList') {
+        next.translationModel = normalizedList[0] || next.translationModel;
+      } else if (key === 'contextModelList') {
+        next.contextModel = normalizedList[0] || next.contextModel;
+      } else if (key === 'proofreadModelList') {
+        next.proofreadModel = normalizedList[0] || next.proofreadModel;
+      }
+      continue;
+    }
     if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency'].includes(key)) {
       next[key] = Boolean(value);
       continue;
@@ -410,6 +434,87 @@ function getTpmLimitForModel(model, tpmLimitsByModel) {
   return tpmLimitsByModel[model] ?? fallback;
 }
 
+function normalizeModelList(list, fallbackModelId) {
+  const baseModelIds = new Set(getBaseModelIds());
+  const rawList = Array.isArray(list)
+    ? list
+    : typeof list === 'string'
+      ? [list]
+      : [];
+  const normalized = [];
+  rawList.forEach((entry) => {
+    const modelId = typeof entry === 'string' ? entry : '';
+    if (!modelId || !baseModelIds.has(modelId)) return;
+    if (!normalized.includes(modelId)) {
+      normalized.push(modelId);
+    }
+  });
+  if (!normalized.length) {
+    const fallback = baseModelIds.has(fallbackModelId)
+      ? fallbackModelId
+      : getBaseModelIds()[0];
+    if (fallback) {
+      normalized.push(fallback);
+    }
+  }
+  return normalized;
+}
+
+function areModelListsEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+function getPrimaryModelId(modelList, fallbackModelId) {
+  const normalized = normalizeModelList(modelList, fallbackModelId);
+  return normalized[0] || fallbackModelId;
+}
+
+function getModelListForStage(state, stage) {
+  if (stage === 'context') return state.contextModelList || [];
+  if (stage === 'proofread') return state.proofreadModelList || [];
+  return state.translationModelList || [];
+}
+
+function getCandidateModels(stage, triggerSource, isManual, state) {
+  const fallbackModel = stage === 'context'
+    ? state.contextModel
+    : stage === 'proofread'
+      ? state.proofreadModel
+      : state.translationModel;
+  const originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
+  const isRetry = triggerSource === 'retry' || triggerSource === 'validate';
+  const orderedList = isRetry ? [...originalRequestedModelList].reverse() : [...originalRequestedModelList];
+  return {
+    orderedList,
+    originalRequestedModelList,
+    isManual: Boolean(isManual)
+  };
+}
+
+function classifyFallbackReason(error) {
+  if (!error) return 'unknown_error';
+  if (error?.fallbackReason) return error.fallbackReason;
+  const status = error?.status;
+  const message = String(error?.message || '').toLowerCase();
+  if (error?.isRateLimit || status === 429) return 'rate_limit';
+  if (message.includes('tpm') || message.includes('tokens per minute')) return 'tpm_limit';
+  if (status === 404 || message.includes('not found')) return 'model_not_found';
+  if (message.includes('service_tier')) return 'service_tier_unavailable';
+  if (status === 503 || status === 502 || status === 504 || message.includes('unavailable')) return 'unavailable';
+  if (message.includes('unsupported') || message.includes('unknown parameter')) return 'unsupported_param';
+  return 'request_failed';
+}
+
+function shouldFallbackToStandard(error) {
+  const message = String(error?.message || '').toLowerCase();
+  if (message.includes('service_tier')) return true;
+  if (error?.fallbackReason && String(error.fallbackReason).includes('service_tier')) return true;
+  if (error?.fallbackReason && String(error.fallbackReason).includes('unsupported_param')) return true;
+  return false;
+}
+
 function buildMissingKeyReason(roleLabel, config, model) {
   return `Перевод недоступен: укажите OpenAI API ключ для модели ${model} (${roleLabel}).`;
 }
@@ -445,26 +550,44 @@ async function getState() {
     const previousModels = {
       translationModel: merged.translationModel,
       contextModel: merged.contextModel,
-      proofreadModel: merged.proofreadModel
+      proofreadModel: merged.proofreadModel,
+      translationModelList: merged.translationModelList,
+      contextModelList: merged.contextModelList,
+      proofreadModelList: merged.proofreadModelList
     };
-    if (merged.translationModel?.startsWith('deepseek')) {
-      merged.translationModel = DEFAULT_STATE.translationModel;
-    }
-    if (merged.contextModel?.startsWith('deepseek')) {
-      merged.contextModel = DEFAULT_STATE.contextModel;
-    }
-    if (merged.proofreadModel?.startsWith('deepseek')) {
-      merged.proofreadModel = DEFAULT_STATE.proofreadModel;
-    }
+    const fallbackTranslationModel = merged.translationModel || DEFAULT_STATE.translationModel;
+    const fallbackContextModel = merged.contextModel || DEFAULT_STATE.contextModel;
+    const fallbackProofreadModel = merged.proofreadModel || DEFAULT_STATE.proofreadModel;
+    merged.translationModelList = normalizeModelList(
+      merged.translationModelList || merged.translationModel || safeStored.model,
+      fallbackTranslationModel
+    );
+    merged.contextModelList = normalizeModelList(
+      merged.contextModelList || merged.contextModel || safeStored.model,
+      fallbackContextModel
+    );
+    merged.proofreadModelList = normalizeModelList(
+      merged.proofreadModelList || merged.proofreadModel || safeStored.model,
+      fallbackProofreadModel
+    );
+    merged.translationModel = merged.translationModelList[0] || fallbackTranslationModel;
+    merged.contextModel = merged.contextModelList[0] || fallbackContextModel;
+    merged.proofreadModel = merged.proofreadModelList[0] || fallbackProofreadModel;
     if (
       merged.translationModel !== previousModels.translationModel ||
       merged.contextModel !== previousModels.contextModel ||
-      merged.proofreadModel !== previousModels.proofreadModel
+      merged.proofreadModel !== previousModels.proofreadModel ||
+      !areModelListsEqual(merged.translationModelList, previousModels.translationModelList) ||
+      !areModelListsEqual(merged.contextModelList, previousModels.contextModelList) ||
+      !areModelListsEqual(merged.proofreadModelList, previousModels.proofreadModelList)
     ) {
       await storageLocalSet({
         translationModel: merged.translationModel,
         contextModel: merged.contextModel,
-        proofreadModel: merged.proofreadModel
+        proofreadModel: merged.proofreadModel,
+        translationModelList: merged.translationModelList,
+        contextModelList: merged.contextModelList,
+        proofreadModelList: merged.proofreadModelList
       });
     }
     applyStatePatch(merged);
@@ -663,6 +786,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 translationModel: DEFAULT_STATE.translationModel,
                 contextModel: DEFAULT_STATE.contextModel,
                 proofreadModel: DEFAULT_STATE.proofreadModel,
+                translationModelList: DEFAULT_STATE.translationModelList,
+                contextModelList: DEFAULT_STATE.contextModelList,
+                proofreadModelList: DEFAULT_STATE.proofreadModelList,
                 contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
                 proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
                 blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
@@ -850,6 +976,9 @@ async function handleGetSettings(message, sendResponse) {
         translationModel: DEFAULT_STATE.translationModel,
         contextModel: DEFAULT_STATE.contextModel,
         proofreadModel: DEFAULT_STATE.proofreadModel,
+        translationModelList: DEFAULT_STATE.translationModelList,
+        contextModelList: DEFAULT_STATE.contextModelList,
+        proofreadModelList: DEFAULT_STATE.proofreadModelList,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
@@ -863,24 +992,27 @@ async function handleGetSettings(message, sendResponse) {
         tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
       };
     } else {
-      const translationConfig = getApiConfigForModel(state.translationModel, state);
-      const contextConfig = getApiConfigForModel(state.contextModel, state);
-      const proofreadConfig = getApiConfigForModel(state.proofreadModel, state);
+      const translationModel = getPrimaryModelId(state.translationModelList, state.translationModel);
+      const contextModel = getPrimaryModelId(state.contextModelList, state.contextModel);
+      const proofreadModel = getPrimaryModelId(state.proofreadModelList, state.proofreadModel);
+      const translationConfig = getApiConfigForModel(translationModel, state);
+      const contextConfig = getApiConfigForModel(contextModel, state);
+      const proofreadConfig = getApiConfigForModel(proofreadModel, state);
       const tpmLimitsByRole = {
-        translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
-        context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
-        proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
+        translation: getTpmLimitForModel(translationModel, state.tpmLimitsByModel),
+        context: getTpmLimitForModel(contextModel, state.tpmLimitsByModel),
+        proofread: getTpmLimitForModel(proofreadModel, state.tpmLimitsByModel)
       };
       const hasTranslationKey = Boolean(translationConfig.apiKey);
       const hasContextKey = Boolean(contextConfig.apiKey);
       const hasProofreadKey = Boolean(proofreadConfig.apiKey);
       let disallowedReason = null;
       if (!hasTranslationKey) {
-        disallowedReason = buildMissingKeyReason('перевод', translationConfig, state.translationModel);
+        disallowedReason = buildMissingKeyReason('перевод', translationConfig, translationModel);
       } else if (state.contextGenerationEnabled && !hasContextKey) {
-        disallowedReason = buildMissingKeyReason('контекст', contextConfig, state.contextModel);
+        disallowedReason = buildMissingKeyReason('контекст', contextConfig, contextModel);
       } else if (state.proofreadEnabled && !hasProofreadKey) {
-        disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, state.proofreadModel);
+        disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, proofreadModel);
       }
       response = {
         allowed:
@@ -889,9 +1021,12 @@ async function handleGetSettings(message, sendResponse) {
           (!state.proofreadEnabled || hasProofreadKey),
         disallowedReason,
         apiKey: state.apiKey,
-        translationModel: state.translationModel,
-        contextModel: state.contextModel,
-        proofreadModel: state.proofreadModel,
+        translationModel,
+        contextModel,
+        proofreadModel,
+        translationModelList: state.translationModelList,
+        contextModelList: state.contextModelList,
+        proofreadModelList: state.proofreadModelList,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
         singleBlockConcurrency: state.singleBlockConcurrency,
@@ -914,6 +1049,9 @@ async function handleGetSettings(message, sendResponse) {
       translationModel: DEFAULT_STATE.translationModel,
       contextModel: DEFAULT_STATE.contextModel,
       proofreadModel: DEFAULT_STATE.proofreadModel,
+      translationModelList: DEFAULT_STATE.translationModelList,
+      contextModelList: DEFAULT_STATE.contextModelList,
+      proofreadModelList: DEFAULT_STATE.proofreadModelList,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
@@ -936,6 +1074,9 @@ async function handleGetSettings(message, sendResponse) {
         translationModel: DEFAULT_STATE.translationModel,
         contextModel: DEFAULT_STATE.contextModel,
         proofreadModel: DEFAULT_STATE.proofreadModel,
+        translationModelList: DEFAULT_STATE.translationModelList,
+        contextModelList: DEFAULT_STATE.contextModelList,
+        proofreadModelList: DEFAULT_STATE.proofreadModelList,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
@@ -953,26 +1094,100 @@ async function handleGetSettings(message, sendResponse) {
   }
 }
 
+async function executeModelFallback(stage, state, message, handler) {
+  const baseRequestMeta = message?.requestMeta && typeof message.requestMeta === 'object' ? message.requestMeta : {};
+  const triggerSource = baseRequestMeta?.triggerSource || '';
+  const isManual =
+    triggerSource === 'manual' ||
+    triggerSource === 'manual_translate' ||
+    triggerSource === 'manualTranslate' ||
+    /manual/i.test(triggerSource);
+  const { orderedList, originalRequestedModelList } = getCandidateModels(stage, triggerSource, isManual, state);
+  let attemptIndex = 0;
+  let lastError = null;
+  let fallbackReasonForNext = null;
+
+  for (const modelId of orderedList) {
+    const flexEntry = getModelEntry(modelId, 'flex');
+    const standardEntry = getModelEntry(modelId, 'standard');
+    const attemptWithTier = async (tier, fallbackReason) => {
+      attemptIndex += 1;
+      const requestMeta = {
+        ...baseRequestMeta,
+        selectedModel: modelId,
+        selectedTier: tier,
+        attemptIndex,
+        fallbackReason: fallbackReason || baseRequestMeta.fallbackReason || '',
+        originalRequestedModelList
+      };
+      const requestOptions = {
+        tier,
+        serviceTier: tier === 'flex' ? 'flex' : null
+      };
+      return handler({ modelId, requestOptions, requestMeta });
+    };
+
+    const attemptFallbackReason = fallbackReasonForNext;
+    fallbackReasonForNext = null;
+
+    if (flexEntry) {
+      try {
+        return await attemptWithTier('flex', attemptFallbackReason);
+      } catch (error) {
+        lastError = error;
+        const reason = classifyFallbackReason(error);
+        if (shouldFallbackToStandard(error) && standardEntry) {
+          try {
+            return await attemptWithTier('standard', reason);
+          } catch (standardError) {
+            lastError = standardError;
+            fallbackReasonForNext = classifyFallbackReason(standardError);
+            continue;
+          }
+        }
+        fallbackReasonForNext = reason;
+        continue;
+      }
+    }
+
+    if (standardEntry || !flexEntry) {
+      try {
+        return await attemptWithTier('standard', attemptFallbackReason);
+      } catch (error) {
+        lastError = error;
+        fallbackReasonForNext = classifyFallbackReason(error);
+      }
+    }
+  }
+
+  throw lastError || new Error('All candidate models failed.');
+}
+
 async function handleTranslateText(message, sendResponse) {
   try {
     const state = await getState();
-    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.translationModel, state);
+    const primaryModel = getPrimaryModelId(state.translationModelList, state.translationModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
     if (!apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
     }
 
-    const { translations, rawTranslation, debug } = await translateTexts(
-      message.texts,
-      apiKey,
-      message.targetLanguage,
-      state.translationModel,
-      message.context,
-      apiBaseUrl,
-      message.keepPunctuationTokens,
-      message.requestMeta
-    );
-    sendResponse({ success: true, translations, rawTranslation, debug });
+    const result = await executeModelFallback('translate', state, message, async ({ modelId, requestOptions, requestMeta }) => {
+      const { translations, rawTranslation, debug } = await translateTexts(
+        message.texts,
+        apiKey,
+        message.targetLanguage,
+        modelId,
+        message.context,
+        apiBaseUrl,
+        message.keepPunctuationTokens,
+        requestMeta,
+        requestOptions
+      );
+      return { translations, rawTranslation, debug };
+    });
+    sendResponse({ success: true, translations: result.translations, rawTranslation: result.rawTranslation, debug: result.debug });
   } catch (error) {
     console.error('Translation failed', error);
     sendResponse({
@@ -986,20 +1201,34 @@ async function handleTranslateText(message, sendResponse) {
 async function handleGenerateContext(message, sendResponse) {
   try {
     const state = await getState();
-    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.contextModel, state);
+    const primaryModel = getPrimaryModelId(state.contextModelList, state.contextModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
     if (!apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
     }
 
-    const { context, debug } = await generateTranslationContext(
-      message.text,
-      apiKey,
-      message.targetLanguage,
-      state.contextModel,
-      apiBaseUrl
-    );
-    sendResponse({ success: true, context, debug });
+    const contextMessage = {
+      ...message,
+      requestMeta: {
+        ...(message?.requestMeta || {}),
+        stage: 'context',
+        purpose: message?.requestMeta?.purpose || 'main'
+      }
+    };
+    const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
+      const { context, debug } = await generateTranslationContext(
+        message.text,
+        apiKey,
+        message.targetLanguage,
+        modelId,
+        apiBaseUrl,
+        requestMeta,
+        requestOptions
+      );
+      return { context, debug };
+    });
+    sendResponse({ success: true, context: result.context, debug: result.debug });
   } catch (error) {
     console.error('Context generation failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
@@ -1009,20 +1238,34 @@ async function handleGenerateContext(message, sendResponse) {
 async function handleGenerateShortContext(message, sendResponse) {
   try {
     const state = await getState();
-    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.contextModel, state);
+    const primaryModel = getPrimaryModelId(state.contextModelList, state.contextModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
     if (!apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
     }
 
-    const { context, debug } = await generateShortTranslationContext(
-      message.text,
-      apiKey,
-      message.targetLanguage,
-      state.contextModel,
-      apiBaseUrl
-    );
-    sendResponse({ success: true, context, debug });
+    const contextMessage = {
+      ...message,
+      requestMeta: {
+        ...(message?.requestMeta || {}),
+        stage: 'context',
+        purpose: message?.requestMeta?.purpose || 'short'
+      }
+    };
+    const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
+      const { context, debug } = await generateShortTranslationContext(
+        message.text,
+        apiKey,
+        message.targetLanguage,
+        modelId,
+        apiBaseUrl,
+        requestMeta,
+        requestOptions
+      );
+      return { context, debug };
+    });
+    sendResponse({ success: true, context: result.context, debug: result.debug });
   } catch (error) {
     console.error('Short context generation failed', error);
     sendResponse({ success: false, error: error?.message || 'Unknown error' });
@@ -1032,25 +1275,35 @@ async function handleGenerateShortContext(message, sendResponse) {
 async function handleProofreadText(message, sendResponse) {
   try {
     const state = await getState();
-    const { apiKey, apiBaseUrl } = getApiConfigForModel(state.proofreadModel, state);
+    const primaryModel = getPrimaryModelId(state.proofreadModelList, state.proofreadModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
     if (!apiKey) {
       sendResponse({ success: false, error: 'API key is missing.' });
       return;
     }
 
-    const { translations, rawProofread, debug } = await proofreadTranslation(
-      message.segments,
-      message.sourceBlock,
-      message.translatedBlock,
-      message.context,
-      message.proofreadMode,
-      message.language,
-      apiKey,
-      state.proofreadModel,
-      apiBaseUrl,
-      message.requestMeta
-    );
-    sendResponse({ success: true, translations, rawProofread, debug });
+    const result = await executeModelFallback('proofread', state, message, async ({ modelId, requestOptions, requestMeta }) => {
+      const { translations, rawProofread, debug } = await proofreadTranslation(
+        message.segments,
+        message.sourceBlock,
+        message.translatedBlock,
+        message.context,
+        message.proofreadMode,
+        message.language,
+        apiKey,
+        modelId,
+        apiBaseUrl,
+        requestMeta,
+        requestOptions
+      );
+      return { translations, rawProofread, debug };
+    });
+    sendResponse({
+      success: true,
+      translations: result.translations,
+      rawProofread: result.rawProofread,
+      debug: result.debug
+    });
   } catch (error) {
     console.error('Proofreading failed', error);
     sendResponse({

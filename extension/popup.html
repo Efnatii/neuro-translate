@@ -95,6 +95,13 @@
       background: var(--surface);
       font-size: 13px;
     }
+    select[multiple] {
+      min-height: 140px;
+    }
+    .model-note {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
     .toggle {
       flex-direction: row;
       align-items: center;
@@ -226,16 +233,19 @@
     </details>
     <div class="section">
       <label>
-        Модель для перевода
-        <select id="translationModel"></select>
+        Список моделей для перевода (приоритет сверху вниз)
+        <span class="model-note">Σ1M = input + output; cache = cached input + output.</span>
+        <select id="translationModel" multiple></select>
       </label>
       <label>
-        Модель для контекста
-        <select id="contextModel"></select>
+        Список моделей для контекста (приоритет сверху вниз)
+        <span class="model-note">FLEX будет выбран первым при доступности.</span>
+        <select id="contextModel" multiple></select>
       </label>
       <label>
-        Модель для вычитки
-        <select id="proofreadModel"></select>
+        Список моделей для вычитки (приоритет сверху вниз)
+        <span class="model-note">Ретраи/валидация используют список в обратном порядке.</span>
+        <select id="proofreadModel" multiple></select>
       </label>
       <label class="toggle">
         <input type="checkbox" id="contextGeneration" />
@@ -327,6 +337,7 @@
       </div>
     </div>
   </div>
+  <script src="ai-common.js"></script>
   <script src="messaging.js"></script>
   <script src="popup.js"></script>
 </body>

@@ -353,6 +353,17 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     purpose: payload.purpose || requestMeta.purpose || '',
     attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
     triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
+    selectedModel: payload.selectedModel || requestMeta.selectedModel || payload.model || '',
+    selectedTier: payload.selectedTier || requestMeta.selectedTier || '',
+    attemptIndex:
+      Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
+        ? payload.attemptIndex
+        : requestMeta.attemptIndex,
+    fallbackReason: payload.fallbackReason || requestMeta.fallbackReason || '',
+    originalRequestedModelList:
+      payload.originalRequestedModelList ||
+      requestMeta.originalRequestedModelList ||
+      [],
     contextMode: payload.contextMode || contextMode,
     contextTypeUsed: payload.contextTypeUsed || contextTypeUsed,
     contextHash: payload.contextHash ?? (effectiveContext?.hash ?? 0),
@@ -464,7 +475,8 @@ async function proofreadTranslation(
   apiKey,
   model,
   apiBaseUrl = OPENAI_API_URL,
-  requestMeta = null
+  requestMeta = null,
+  requestOptions = null
 ) {
   if (!Array.isArray(segments) || !segments.length) {
     return { translations: [], rawProofread: '' };
@@ -517,7 +529,7 @@ async function proofreadTranslation(
       apiKey,
       model,
       apiBaseUrl,
-      { strict: false, requestMeta: baseRequestMeta, purpose: 'main', debugPayloads }
+      { strict: false, requestMeta: baseRequestMeta, purpose: 'main', debugPayloads, requestOptions }
     );
     rawProofreadParts.push(result.rawProofread);
     if (Array.isArray(result.debug)) {
@@ -546,7 +558,8 @@ async function proofreadTranslation(
             triggerSource: 'retry'
           }),
           purpose: 'retry',
-          debugPayloads
+          debugPayloads,
+          requestOptions
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -664,7 +677,8 @@ async function proofreadTranslation(
     apiBaseUrl,
     language,
     debugPayloads,
-    baseRequestMeta
+    baseRequestMeta,
+    requestOptions
   );
 
   const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
@@ -905,6 +919,7 @@ function buildProofreadBodyPreview(payload, maxLength = 800) {
 
 async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
   const { strict = false, maxTokensOverride = null, extraReminder = '' } = options;
+  const requestOptions = options.requestOptions || null;
   const requestMeta = normalizeRequestMeta(options.requestMeta, {
     stage: 'proofread',
     purpose: options.purpose || 'main'
@@ -1020,6 +1035,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     }
   };
   applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
+  applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -1038,7 +1054,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     } catch (parseError) {
       errorPayload = null;
     }
-    const stripped = stripUnsupportedPromptCacheParams(
+    const stripped = stripUnsupportedRequestParams(
       requestPayload,
       model,
       response.status,
@@ -1046,9 +1062,18 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       errorText
     );
     if (response.status === 400 && stripped.changed) {
-      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
+      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+        if (!requestMeta.fallbackReason) {
+          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+        }
+        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+          requestMeta.selectedTier = 'standard';
+        }
+      }
+      console.warn('Unsupported param removed; retrying without it.', {
         model,
-        status: response.status
+        status: response.status,
+        removedParams: stripped.removedParams
       });
       response = await fetch(apiBaseUrl, {
         method: 'POST',
@@ -1076,6 +1101,13 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       error.retryAfterMs = retryAfterMs;
       error.isRateLimit = response.status === 429 || response.status === 503;
       error.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
+      error.errorCode = errorPayload?.error?.code || errorPayload?.code;
+      error.errorType = errorPayload?.error?.type || errorPayload?.type;
+      error.isUnavailable =
+        response.status === 503 ||
+        response.status === 502 ||
+        response.status === 504 ||
+        String(errorMessage || '').toLowerCase().includes('unavailable');
       error.debugPayload = attachRequestMeta(
         {
           phase: 'PROOFREAD',
@@ -1176,7 +1208,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         purpose: 'validate',
         attempt: requestMeta.attempt + 1,
         triggerSource: 'validate'
-      })
+      }),
+      requestOptions
     );
     rawProofread = repaired.rawProofread;
     if (Array.isArray(repaired.debug)) {
@@ -1197,7 +1230,15 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   return { itemsById, rawProofread, parseError, debug: debugPayloads };
 }
 
-async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, apiBaseUrl, requestMeta = null) {
+async function requestProofreadFormatRepair(
+  rawResponse,
+  items,
+  apiKey,
+  model,
+  apiBaseUrl,
+  requestMeta = null,
+  requestOptions = null
+) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' });
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   let resolvedShortContextText = '';
@@ -1279,8 +1320,10 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
       }
     }
   };
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
+  applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
-  const response = await fetch(apiBaseUrl, {
+  let response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1290,7 +1333,48 @@ async function requestProofreadFormatRepair(rawResponse, items, apiKey, model, a
   });
 
   if (!response.ok) {
-    return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
+    let errorText = await response.text();
+    let errorPayload = null;
+    try {
+      errorPayload = JSON.parse(errorText);
+    } catch (parseError) {
+      errorPayload = null;
+    }
+    const stripped = stripUnsupportedRequestParams(
+      requestPayload,
+      model,
+      response.status,
+      errorPayload,
+      errorText
+    );
+    if (response.status === 400 && stripped.changed) {
+      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+        if (!requestMeta.fallbackReason) {
+          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+        }
+        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+          requestMeta.selectedTier = 'standard';
+        }
+      }
+      console.warn('Unsupported param removed; retrying format repair without it.', {
+        model,
+        status: response.status,
+        removedParams: stripped.removedParams
+      });
+      response = await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestPayload)
+      });
+      if (!response.ok) {
+        return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
+      }
+    } else {
+      return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
+    }
   }
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content || '';
@@ -1347,7 +1431,8 @@ async function repairProofreadSegments(
   apiBaseUrl,
   language,
   debugPayloads,
-  requestMeta
+  requestMeta,
+  requestOptions = null
 ) {
   const repairItems = [];
   const repairIndices = [];
@@ -1484,9 +1569,11 @@ async function repairProofreadSegments(
       }
     }
   };
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
+  applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   try {
-    const response = await fetch(apiBaseUrl, {
+    let response = await fetch(apiBaseUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1494,6 +1581,45 @@ async function repairProofreadSegments(
       },
       body: JSON.stringify(requestPayload)
     });
+    if (!response.ok) {
+      let errorText = await response.text();
+      let errorPayload = null;
+      try {
+        errorPayload = JSON.parse(errorText);
+      } catch (parseError) {
+        errorPayload = null;
+      }
+      const stripped = stripUnsupportedRequestParams(
+        requestPayload,
+        model,
+        response.status,
+        errorPayload,
+        errorText
+      );
+      if (response.status === 400 && stripped.changed) {
+        if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+          if (!requestMeta.fallbackReason) {
+            requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+          }
+          if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+            requestMeta.selectedTier = 'standard';
+          }
+        }
+        console.warn('Unsupported param removed; retrying proofread repair without it.', {
+          model,
+          status: response.status,
+          removedParams: stripped.removedParams
+        });
+        response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify(requestPayload)
+        });
+      }
+    }
     if (!response.ok) {
       return translations;
     }
