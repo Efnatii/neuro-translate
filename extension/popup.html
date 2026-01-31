@@ -240,8 +240,12 @@
       <summary>Модели для перевода <span class="summary-count" id="translationModelCount"></span></summary>
       <div class="details-body">
         <label>
-          Список моделей для перевода (приоритет сверху вниз)
-          <span class="model-note">Σ1M = input + output; cache = cached input + output.</span>
+          Список моделей для перевода
+          <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
+            • FLEX модели всегда пробуются раньше STANDARD<br>
+            • manual → самая умная из выбранных (по capability rank)<br>
+            • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
+            • при ошибках/лимитах пробуются следующие модели из списка</span>
           <select id="translationModel" multiple></select>
         </label>
       </div>
@@ -250,8 +254,12 @@
       <summary>Модели для контекста <span class="summary-count" id="contextModelCount"></span></summary>
       <div class="details-body">
         <label>
-          Список моделей для контекста (приоритет сверху вниз)
-          <span class="model-note">FLEX будет выбран первым при доступности.</span>
+          Список моделей для контекста
+          <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
+            • FLEX модели всегда пробуются раньше STANDARD<br>
+            • manual → самая умная из выбранных (по capability rank)<br>
+            • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
+            • при ошибках/лимитах пробуются следующие модели из списка</span>
           <select id="contextModel" multiple></select>
         </label>
       </div>
@@ -260,8 +268,12 @@
       <summary>Модели для вычитки <span class="summary-count" id="proofreadModelCount"></span></summary>
       <div class="details-body">
         <label>
-          Список моделей для вычитки (приоритет сверху вниз)
-          <span class="model-note">Ретраи/валидация используют список в обратном порядке.</span>
+          Список моделей для вычитки
+          <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
+            • FLEX модели всегда пробуются раньше STANDARD<br>
+            • manual → самая умная из выбранных (по capability rank)<br>
+            • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
+            • при ошибках/лимитах пробуются следующие модели из списка</span>
           <select id="proofreadModel" multiple></select>
         </label>
       </div>

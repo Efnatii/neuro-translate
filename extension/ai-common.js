@@ -128,12 +128,41 @@ globalThis.__NT_formatModelSpec__ ||= function formatModelSpec(id, tier) {
   return `${id}:${normalizedTier}`;
 };
 
+globalThis.__NT_getModelCapabilityRank__ ||= function getModelCapabilityRank(modelId) {
+  if (!modelId) return 0;
+  const rankMap = {
+    'gpt-5.2-pro': 180,
+    'gpt-5-pro': 170,
+    'gpt-5.2': 160,
+    'gpt-5.1': 150,
+    'gpt-5': 140,
+    'o3-deep-research': 130,
+    'o4-mini-deep-research': 120,
+    o3: 110,
+    'gpt-4.1': 100,
+    'gpt-4o': 90,
+    'gpt-5-mini': 80,
+    'o4-mini': 70,
+    'o3-mini': 60,
+    'o1-mini': 50,
+    'gpt-4.1-mini': 40,
+    'gpt-4o-mini': 30,
+    'gpt-5-nano': 20,
+    'gpt-4.1-nano': 10
+  };
+  return rankMap[modelId] ?? 0;
+};
+
 function parseModelSpec(spec) {
   return globalThis.__NT_parseModelSpec__ ? globalThis.__NT_parseModelSpec__(spec) : { id: '', tier: 'standard' };
 }
 
 function formatModelSpec(id, tier) {
   return globalThis.__NT_formatModelSpec__ ? globalThis.__NT_formatModelSpec__(id, tier) : '';
+}
+
+function getModelCapabilityRank(modelId) {
+  return globalThis.__NT_getModelCapabilityRank__ ? globalThis.__NT_getModelCapabilityRank__(modelId) : 0;
 }
 
 function getModelParamBlacklist() {
