@@ -654,6 +654,7 @@ async function performTranslationRequest(
         if (!trimmed) return false;
         return looksLikeFullContextFormat(trimmed) || isProbablyFullLikeShort(trimmed, fullText, fullModeText);
       };
+      const strictPayloadShort = strictShort && !isFullLikeShort(strictShort) ? strictShort : '';
 
       try {
         manualOutputsByBlock = await new Promise((resolve) => {
@@ -704,38 +705,9 @@ async function performTranslationRequest(
         // ignore lookup errors
       }
 
-      if (matchedState) {
-        shortText =
-          (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
-        if (shortText && isFullLikeShort(shortText)) {
-          shortText = '';
-        }
-        if (shortText) {
-          shortSource = 'debug-scan';
-        }
-        if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
-          try {
-            const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-            shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
-          } catch (error) {
-            shortText = '';
-          }
-          if (shortText && isFullLikeShort(shortText)) {
-            shortText = '';
-          }
-          if (shortText) {
-            shortSource = 'debug-raw';
-          }
-        }
-        shortText = typeof shortText === 'string' ? shortText.trim() : '';
-      }
-
-      if (!shortText) {
-        const strictPayloadShort = strictShort && !isFullLikeShort(strictShort) ? strictShort : '';
-        if (strictPayloadShort) {
-          shortText = strictPayloadShort;
-          shortSource = 'payload';
-        }
+      if (strictPayloadShort) {
+        shortText = strictPayloadShort;
+        shortSource = 'payload';
       }
 
       if (!shortText) {
@@ -749,36 +721,53 @@ async function performTranslationRequest(
       }
 
       if (!shortText) {
-        const debugUrl = normalizedRequestMeta?.url || '';
-        if (debugUrl) {
-          // Edge can fire retry/validate before short context persistence; poll briefly to avoid
-          // mistaking full-format context as short when fullText comparison data is missing.
-          for (let attempt = 0; attempt < 15; attempt += 1) {
-            const debugCandidate = await new Promise((resolve) => {
-              if (!chrome?.storage?.local) {
-                resolve('');
-                return;
-              }
-              try {
-                chrome.storage.local.get({ translationDebugByUrl: {} }, (data) => {
-                  const store = data?.translationDebugByUrl || {};
-                  const record = store && typeof store === 'object' ? store[debugUrl] : null;
-                  resolve(typeof record?.contextShort === 'string' ? record.contextShort : '');
-                });
-              } catch (error) {
-                resolve('');
-              }
-            });
-            const trimmedCandidate = typeof debugCandidate === 'string' ? debugCandidate.trim() : '';
-            if (trimmedCandidate && !isFullLikeShort(trimmedCandidate)) {
-              shortText = trimmedCandidate;
-              shortSource = 'debug-url-poll';
-              break;
+        const cacheKey = normalizedRequestMeta?.contextCacheKey || '';
+        if (cacheKey) {
+          const cachedEntry = await new Promise((resolve) => {
+            if (!chrome?.storage?.local) {
+              resolve(null);
+              return;
             }
-            if (attempt < 14) {
-              await sleep(100);
+            try {
+              chrome.storage.local.get({ contextCacheByPage: {} }, (data) => {
+                const store = data?.contextCacheByPage || {};
+                resolve(store && typeof store === 'object' ? store[cacheKey] : null);
+              });
+            } catch (error) {
+              resolve(null);
             }
+          });
+          if (cachedEntry?.contextShortRefId && typeof getDebugRaw === 'function') {
+            try {
+              const rawRecord = await getDebugRaw(cachedEntry.contextShortRefId);
+              shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
+            } catch (error) {
+              shortText = '';
+            }
+          } else if (typeof cachedEntry?.contextShort === 'string') {
+            shortText = cachedEntry.contextShort;
           }
+          if (shortText && isFullLikeShort(shortText)) {
+            shortText = '';
+          }
+          if (shortText) {
+            shortSource = 'context-cache';
+          }
+        }
+      }
+
+      if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
+        try {
+          const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
+          shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
+        } catch (error) {
+          shortText = '';
+        }
+        if (shortText && isFullLikeShort(shortText)) {
+          shortText = '';
+        }
+        if (shortText) {
+          shortSource = 'debug-raw';
         }
       }
 
@@ -938,6 +927,7 @@ async function performTranslationRequest(
         }
       }
 
+      shortText = typeof shortText === 'string' ? shortText.trim() : '';
       if (!manualOutputsText) {
         manualOutputsText = '(no manual outputs found)';
       }
@@ -1480,6 +1470,7 @@ async function performTranslationRepairRequest(
       let manualOutputsSource = '';
       let storedManualOutputs = [];
       let manualOutputsFoundCount = 0;
+      const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
 
       try {
         manualOutputsByBlock = await new Promise((resolve) => {
@@ -1530,38 +1521,9 @@ async function performTranslationRepairRequest(
         // ignore lookup errors
       }
 
-      if (matchedState) {
-        shortText =
-          (typeof matchedState?.contextShort === 'string' ? matchedState.contextShort.trim() : '') || '';
-        if (shortText && matchesFull(shortText)) {
-          shortText = '';
-        }
-        if (shortText) {
-          shortSource = 'debug-scan';
-        }
-        if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
-          try {
-            const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
-            shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
-          } catch (error) {
-            shortText = '';
-          }
-          if (shortText && matchesFull(shortText)) {
-            shortText = '';
-          }
-          if (shortText) {
-            shortSource = 'debug-raw';
-          }
-        }
-        shortText = typeof shortText === 'string' ? shortText.trim() : '';
-      }
-
-      if (!shortText) {
-        const strictPayloadShort = strictShort && !matchesFull(strictShort) ? strictShort : '';
-        if (strictPayloadShort) {
-          shortText = strictPayloadShort;
-          shortSource = 'payload';
-        }
+      if (strictPayloadShort) {
+        shortText = strictPayloadShort;
+        shortSource = 'payload';
       }
 
       if (!shortText) {
@@ -1571,6 +1533,57 @@ async function performTranslationRepairRequest(
         }
         if (shortText) {
           shortSource = 'stored';
+        }
+      }
+
+      if (!shortText) {
+        const cacheKey = normalizedRequestMeta?.contextCacheKey || '';
+        if (cacheKey) {
+          const cachedEntry = await new Promise((resolve) => {
+            if (!chrome?.storage?.local) {
+              resolve(null);
+              return;
+            }
+            try {
+              chrome.storage.local.get({ contextCacheByPage: {} }, (data) => {
+                const store = data?.contextCacheByPage || {};
+                resolve(store && typeof store === 'object' ? store[cacheKey] : null);
+              });
+            } catch (error) {
+              resolve(null);
+            }
+          });
+          if (cachedEntry?.contextShortRefId && typeof getDebugRaw === 'function') {
+            try {
+              const rawRecord = await getDebugRaw(cachedEntry.contextShortRefId);
+              shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
+            } catch (error) {
+              shortText = '';
+            }
+          } else if (typeof cachedEntry?.contextShort === 'string') {
+            shortText = cachedEntry.contextShort;
+          }
+          if (shortText && matchesFull(shortText)) {
+            shortText = '';
+          }
+          if (shortText) {
+            shortSource = 'context-cache';
+          }
+        }
+      }
+
+      if (!shortText && matchedState?.contextShortRefId && typeof getDebugRaw === 'function') {
+        try {
+          const rawRecord = await getDebugRaw(matchedState.contextShortRefId);
+          shortText = rawRecord?.value?.text || rawRecord?.value?.response || '';
+        } catch (error) {
+          shortText = '';
+        }
+        if (shortText && matchesFull(shortText)) {
+          shortText = '';
+        }
+        if (shortText) {
+          shortSource = 'debug-raw';
         }
       }
 
@@ -1730,6 +1743,7 @@ async function performTranslationRepairRequest(
         }
       }
 
+      shortText = typeof shortText === 'string' ? shortText.trim() : '';
       if (!manualOutputsText) {
         manualOutputsText = '(no manual outputs found)';
       }
