@@ -1153,6 +1153,11 @@ function ensurePayloadElement(container, payloadKey) {
     const requestDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:request`, 'Request (raw)');
     const responseDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:response`, 'Response (raw)');
     const parseDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:parse`, 'Parse/Validation');
+    const modelSelectionDetails = ensureDebugDetails(
+      sectionsEl,
+      `${payloadKey}:model-selection`,
+      'Model selection (candidates)'
+    );
     debugDomState.payloadPartsByKey.set(payloadKey, {
       el: payloadEl,
       phaseEl: payloadEl.querySelector('[data-role="payload-phase"]'),
@@ -1166,7 +1171,8 @@ function ensurePayloadElement(container, payloadKey) {
       contextDetails,
       requestDetails,
       responseDetails,
-      parseDetails
+      parseDetails,
+      modelSelectionDetails
     });
     container.appendChild(payloadEl);
   }
@@ -1218,6 +1224,18 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
       : '';
   const contextHash = payload?.contextHash ?? null;
   const contextLength = payload?.contextLength ?? null;
+  const selectedModel = payload?.selectedModel || '';
+  const selectedTier = payload?.selectedTier || '';
+  const selectedModelSpec = payload?.selectedModelSpec || '';
+  const attemptIndex = Number.isFinite(payload?.attemptIndex) ? payload.attemptIndex : null;
+  const fallbackReason = payload?.fallbackReason || '';
+  const candidateStrategy = payload?.candidateStrategy || '';
+  const originalRequestedModelList = payload?.originalRequestedModelList;
+  const candidateOrderedList = payload?.candidateOrderedList;
+  const originalRequestedModelCount = Array.isArray(originalRequestedModelList)
+    ? originalRequestedModelList.length
+    : null;
+  const candidateOrderedListCount = Array.isArray(candidateOrderedList) ? candidateOrderedList.length : null;
   const requestMetaItems = [
     requestId ? `requestId: ${escapeHtml(requestId)}` : '',
     parentRequestId ? `parentRequestId: ${escapeHtml(parentRequestId)}` : '',
@@ -1225,6 +1243,18 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
     stage ? `stage: ${escapeHtml(stage)}` : '',
     purpose ? `purpose: ${escapeHtml(purpose)}` : '',
     Number.isFinite(attempt) ? `attempt: ${escapeHtml(String(attempt))}` : '',
+    selectedModel ? `selectedModel: ${escapeHtml(selectedModel)}` : '',
+    selectedTier ? `selectedTier: ${escapeHtml(selectedTier)}` : '',
+    selectedModelSpec ? `selectedModelSpec: ${escapeHtml(selectedModelSpec)}` : '',
+    Number.isFinite(attemptIndex) ? `attemptIndex: ${escapeHtml(String(attemptIndex))}` : '',
+    fallbackReason ? `fallbackReason: ${escapeHtml(fallbackReason)}` : '',
+    candidateStrategy ? `candidateStrategy: ${escapeHtml(candidateStrategy)}` : '',
+    Number.isFinite(originalRequestedModelCount)
+      ? `originalRequestedModelList: ${escapeHtml(String(originalRequestedModelCount))}`
+      : '',
+    Number.isFinite(candidateOrderedListCount)
+      ? `candidateOrderedList: ${escapeHtml(String(candidateOrderedListCount))}`
+      : '',
     triggerSource ? `triggerSource: ${escapeHtml(triggerSource)}` : '',
     contextPolicy ? `contextMode: ${escapeHtml(contextPolicy)}` : '',
     Number.isFinite(contextLength) ? `contextLen: ${escapeHtml(String(contextLength))}` : '',
@@ -1282,6 +1312,25 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
     })
   );
   setHtmlIfChanged(parts.parseDetails.contentEl, buildDebugParseContent(payload?.parseIssues));
+  const hasModelSelectionDetails =
+    payload &&
+    (payload.candidateStrategy !== undefined ||
+      payload.selectedModelSpec !== undefined ||
+      payload.selectedTier !== undefined ||
+      payload.candidateOrderedList !== undefined ||
+      payload.originalRequestedModelList !== undefined);
+  parts.modelSelectionDetails.detailsEl.style.display = hasModelSelectionDetails ? '' : 'none';
+  if (hasModelSelectionDetails) {
+    const modelSelectionPayload = {
+      originalRequestedModelList: Array.isArray(originalRequestedModelList) ? originalRequestedModelList : [],
+      candidateOrderedList: Array.isArray(candidateOrderedList) ? candidateOrderedList : [],
+      candidateStrategy: candidateStrategy || '',
+      selectedModelSpec: selectedModelSpec || '',
+      selectedTier: selectedTier || '',
+      fallbackReason: fallbackReason || ''
+    };
+    setHtmlIfChanged(parts.modelSelectionDetails.contentEl, buildDebugSectionContent(JSON.stringify(modelSelectionPayload, null, 2)));
+  }
 }
 
 function buildDebugSectionContent(value, options = {}) {
