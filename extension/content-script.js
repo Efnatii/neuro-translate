@@ -913,7 +913,7 @@ async function translatePage(settings, options = {}) {
   let translationQueueDone = false;
   const translationQueue = [];
   const proofreadQueue = [];
-  const translationQueueKeys = new Set();
+  const queuedBlockElements = new WeakSet();
   const proofreadQueueKeys = new Set();
   let proofreadConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(4, blocks.length));
   // Duplicate translate/proofread requests could be triggered for the same block; dedupe by jobKey.
@@ -957,10 +957,15 @@ async function translatePage(settings, options = {}) {
   const enqueueTranslationBlock = (block, index) => {
     const key = getBlockKey(block);
     const blockElement = block?.[0]?.blockElement;
-    if (translationQueueKeys.has(key) || isBlockProcessed(blockElement, 'translate')) {
+    if (blockElement && queuedBlockElements.has(blockElement)) {
       return false;
     }
-    translationQueueKeys.add(key);
+    if (isBlockProcessed(blockElement, 'translate')) {
+      return false;
+    }
+    if (blockElement) {
+      queuedBlockElements.add(blockElement);
+    }
     translationQueue.push({
       block,
       index,
@@ -3207,10 +3212,10 @@ function pruneDebugPayload(payload, options = {}) {
 function pruneDebugEntry(entry, options = {}) {
   if (!entry || typeof entry !== 'object') return entry;
   const maxPreviewChars = options.maxPreviewChars || DEBUG_PREVIEW_MAX_CHARS;
-  const maxPayloads = options.maxPayloads || 60;
-  const maxCallsPerEntry = options.maxCallsPerEntry || 60;
-  const maxEvents = options.maxEvents || 60;
-  const maxComparisons = options.maxComparisons || 60;
+  const maxPayloads = options.maxPayloads || 20;
+  const maxCallsPerEntry = options.maxCallsPerEntry || 20;
+  const maxEvents = options.maxEvents || 200;
+  const maxComparisons = options.maxComparisons || 30;
   const maxItems = options.maxItems || null;
   const contextFullPreview = trimDebugText(entry.contextFull || entry.context || '', maxPreviewChars);
   const contextShortPreview = trimDebugText(entry.contextShort || '', maxPreviewChars);
@@ -3229,25 +3234,12 @@ function pruneDebugEntry(entry, options = {}) {
     if (typeof item.shortContextSnapshot === 'string') {
       nextItem.shortContextSnapshot = trimDebugText(item.shortContextSnapshot, maxPreviewChars).text;
     }
-    if (Array.isArray(item.translationCalls)) {
-      nextItem.translationCalls = limitDebugArray(item.translationCalls, maxCallsPerEntry).map((call) => {
-        if (!call || typeof call !== 'object') return call;
-        const nextCall = { ...call };
-        if (typeof call.baseAnswerPreview === 'string') {
-          nextCall.baseAnswerPreview = trimDebugText(call.baseAnswerPreview, maxPreviewChars).text;
-        }
-        return nextCall;
-      });
-    }
-    if (Array.isArray(item.proofreadCalls)) {
-      nextItem.proofreadCalls = limitDebugArray(item.proofreadCalls, maxCallsPerEntry).map((call) => {
-        if (!call || typeof call !== 'object') return call;
-        const nextCall = { ...call };
-        if (typeof call.baseAnswerPreview === 'string') {
-          nextCall.baseAnswerPreview = trimDebugText(call.baseAnswerPreview, maxPreviewChars).text;
-        }
-        return nextCall;
-      });
+    delete nextItem.originalSegments;
+    delete nextItem.translatedSegments;
+    delete nextItem.translationCalls;
+    delete nextItem.proofreadCalls;
+    if (nextItem.proofreadStatus != null) {
+      delete nextItem.proofread;
     }
     if (Array.isArray(item.translationDebug)) {
       nextItem.translationDebug = limitDebugArray(item.translationDebug, maxPayloads).map((payload) =>
@@ -3260,7 +3252,8 @@ function pruneDebugEntry(entry, options = {}) {
       );
     }
     if (Array.isArray(item.proofreadComparisons)) {
-      nextItem.proofreadComparisons = limitDebugArray(item.proofreadComparisons, maxComparisons);
+      const changedOnly = item.proofreadComparisons.filter((comparison) => comparison?.changed);
+      nextItem.proofreadComparisons = limitDebugArray(changedOnly, maxComparisons);
     }
     return nextItem;
   });
@@ -3272,7 +3265,7 @@ function pruneDebugEntry(entry, options = {}) {
     }
     return nextEvent;
   });
-  const trimmedCallHistory = limitDebugArray(entry.callHistory, options.maxCallHistory || maxCallsPerEntry * 2);
+  const trimmedCallHistory = limitDebugArray(entry.callHistory, options.maxCallHistory || 200);
   return {
     ...entry,
     context: contextFullPreview.text,
@@ -3292,10 +3285,11 @@ async function saveTranslationDebugInfo(url, data) {
   const maxEntries = 5;
   const prunedEntry = pruneDebugEntry(data, {
     maxPreviewChars: DEBUG_PREVIEW_MAX_CHARS,
-    maxPayloads: 60,
-    maxCallsPerEntry: 60,
-    maxEvents: 60,
-    maxComparisons: 60
+    maxPayloads: 20,
+    maxCallsPerEntry: 20,
+    maxEvents: 200,
+    maxComparisons: 30,
+    maxCallHistory: 200
   });
   existing[url] = prunedEntry;
   const entries = Object.entries(existing).map(([key, value]) => ({
@@ -3324,9 +3318,9 @@ async function saveTranslationDebugInfo(url, data) {
         maxPreviewChars: Math.min(600, DEBUG_PREVIEW_MAX_CHARS),
         maxPayloads: 10,
         maxCallsPerEntry: 10,
-        maxEvents: 10,
-        maxComparisons: 10,
-        maxItems: 5
+        maxEvents: 50,
+        maxComparisons: 30,
+        maxCallHistory: 50
       });
       try {
         await chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: { [url]: emergencyEntry } });
@@ -3519,8 +3513,10 @@ async function flushPersistDebugState(reason = '') {
   debugState.items = debugEntries;
   try {
     await saveTranslationDebugInfo(location.href, debugState);
-    await notifyDebugUpdate();
+  } catch (error) {
+    console.warn('Failed to persist debug info.', error);
   } finally {
+    await notifyDebugUpdate().catch(() => {});
     debugPersistInFlight = false;
     debugLastPersistAt = Date.now();
   }

@@ -20,6 +20,8 @@ const STATUS_CONFIG = {
 
 let sourceUrl = '';
 let refreshTimer = null;
+let refreshInFlight = false;
+let autoLoadInFlight = false;
 let debugPort = null;
 let debugReconnectTimer = null;
 let debugReconnectDelay = 500;
@@ -125,6 +127,17 @@ async function init() {
       }
     });
   }
+
+  document.addEventListener(
+    'toggle',
+    (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLDetailsElement)) return;
+      if (!target.open) return;
+      void autoLoadRawButtonsInContainer(target);
+    },
+    true
+  );
 
   await refreshDebug();
   connectDebugPort();
@@ -274,11 +287,10 @@ function startAutoRefresh() {
     });
   }
 
-  if (!canListen) {
-    refreshTimer = setInterval(() => {
-      refreshDebug();
-    }, 1000);
-  }
+  refreshTimer = setInterval(() => {
+    if (!sourceUrl || document.hidden || debugPatchScheduled || refreshInFlight) return;
+    refreshDebug();
+  }, 1000);
 }
 
 function connectDebugPort() {
@@ -424,12 +436,18 @@ async function handleLoadRawClick(button) {
 }
 
 async function refreshDebug() {
+  if (!sourceUrl || refreshInFlight) return;
+  refreshInFlight = true;
   const debugData = await getDebugData(sourceUrl);
-  if (!debugData) {
-    renderEmpty('Нет свежих данных (возможно storage переполнен). Нажмите очистить/перезапустить.');
-    return;
+  try {
+    if (!debugData) {
+      renderEmpty('Нет свежих данных (возможно storage переполнен). Нажмите очистить/перезапустить.');
+      return;
+    }
+    scheduleDebugPatch(sourceUrl, debugData);
+  } finally {
+    refreshInFlight = false;
   }
-  scheduleDebugPatch(sourceUrl, debugData);
 }
 
 function extractTokensFromUsage(usage) {
@@ -518,7 +536,7 @@ function patchDebug(url, data) {
     debugDomState.entriesByKey.clear();
     restoreUiState();
     runDebugRecreationCheck();
-    autoLoadAllRawButtons();
+    autoLoadVisibleRawButtons();
     return;
   }
 
@@ -546,22 +564,50 @@ function patchDebug(url, data) {
   });
   restoreUiState();
   runDebugRecreationCheck();
-  autoLoadAllRawButtons();
+  autoLoadVisibleRawButtons();
 }
 
-async function autoLoadAllRawButtons() {
-  const buttons = Array.from(document.querySelectorAll('[data-action="load-raw"]'));
-  if (!buttons.length) return;
-  const queue = buttons.slice();
-  const concurrency = Math.min(4, queue.length);
-  const workers = Array.from({ length: concurrency }, async () => {
-    while (queue.length) {
-      const button = queue.shift();
-      if (!button || !button.isConnected) continue;
-      await handleLoadRawClick(button);
+function isElementVisible(element) {
+  if (!element?.getBoundingClientRect) return false;
+  const rect = element.getBoundingClientRect();
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+  return rect.bottom > 0 && rect.top < viewportHeight;
+}
+
+function isButtonAutoLoadAllowed(button) {
+  const details = button.closest('details');
+  if (!details) return true;
+  return details.open;
+}
+
+async function autoLoadRawButtonsInContainer(container) {
+  const buttons = Array.from(container.querySelectorAll('[data-action="load-raw"]')).filter((button) =>
+    isButtonAutoLoadAllowed(button)
+  );
+  for (const button of buttons) {
+    if (!button.isConnected) continue;
+    await handleLoadRawClick(button);
+  }
+}
+
+async function autoLoadVisibleRawButtons() {
+  if (autoLoadInFlight) return;
+  autoLoadInFlight = true;
+  try {
+    const containers = [];
+    if (contextEl && isElementVisible(contextEl)) {
+      containers.push(contextEl);
     }
-  });
-  await Promise.all(workers);
+    if (entriesEl) {
+      const visibleEntries = Array.from(entriesEl.querySelectorAll('.entry')).filter((entry) => isElementVisible(entry));
+      containers.push(...visibleEntries);
+    }
+    for (const container of containers) {
+      await autoLoadRawButtonsInContainer(container);
+    }
+  } finally {
+    autoLoadInFlight = false;
+  }
 }
 
 function renderSummary(data, fallbackMessage = '') {
@@ -1242,6 +1288,7 @@ function buildDebugSectionContent(value, options = {}) {
   const rawRefId = options.rawRefId || '';
   const rawField = options.rawField || 'text';
   const allowLoad = Boolean(options.allowLoad);
+  const autoLoad = Boolean(options.autoLoad);
   const emptyMessage = options.emptyMessage || 'Нет данных.';
   const targetId = rawRefId ? `raw-${Math.random().toString(16).slice(2)}` : '';
   const cacheKey = rawRefId ? getRawCacheKey(rawRefId, rawField) : '';
@@ -1260,7 +1307,7 @@ function buildDebugSectionContent(value, options = {}) {
         )}" data-raw-field="${escapeHtml(rawField)}" data-target-id="${escapeHtml(targetId)}">Загрузить полностью</button>`
       : '';
   const previewValue = value == null ? '' : String(value);
-  const showPlaceholder = allowLoad && rawRefId;
+  const showPlaceholder = autoLoad && allowLoad && rawRefId;
   return `
     ${loadButton}
     <div data-raw-target="${escapeHtml(targetId)}" data-preview="${escapeHtml(previewValue)}">
