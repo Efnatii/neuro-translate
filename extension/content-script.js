@@ -679,10 +679,11 @@ async function translatePage(settings, options = {}) {
     cachedContextFull ||
     existingContextFullRecord?.value?.text ||
     existingContextFullPreview;
+  const shortPreviewAllowed = !existingDebugEntry?.contextShortTruncated;
   const existingContextShortText =
     cachedContextShort ||
     existingContextShortRecord?.value?.text ||
-    existingContextShortPreview;
+    (shortPreviewAllowed ? existingContextShortPreview : '');
   const contextSignature = buildContextStateSignature(contextCacheSignature, settings);
   originalSnapshot = nodesWithPath.map(({ path, original, originalHash }) => ({
     path,
@@ -734,9 +735,9 @@ async function translatePage(settings, options = {}) {
       : 'pending'
     : 'disabled';
   await initializeDebugState(blocks, settings, {
-    initialContextFull: latestContextSummary || existingContextFullPreview,
+    initialContextFull: latestContextSummary || existingContextFullText,
     initialContextFullStatus,
-    initialContextShort: latestShortContextSummary || existingContextShortPreview,
+    initialContextShort: latestShortContextSummary || existingContextShortText,
     initialContextShortStatus
   }, { blockKeys });
   if (latestContextSummary) {
@@ -846,6 +847,50 @@ async function translatePage(settings, options = {}) {
     const list = Array.isArray(calls) ? calls : [];
     const match = list.find((call) => call?.contextMode === 'FULL');
     return match?.id ?? null;
+  };
+
+  const ensureShortContextReadyForRetry = async () => {
+    if (!settings.contextGenerationEnabled) return;
+    if (latestShortContextSummary) return;
+    if (shortContextPromise) {
+      const resolved = await shortContextPromise;
+      if (!latestShortContextSummary && typeof resolved === 'string') {
+        latestShortContextSummary = resolved;
+      }
+      return;
+    }
+    if (!pageText) return;
+    const shortResult = getOrBuildContext({
+      state: contextState.short,
+      signature: contextSignature,
+      build: () => requestShortContext(pageText, settings.targetLanguage || 'ru')
+    });
+    if (shortResult.started || contextState.short.status === 'building') {
+      await updateDebugContextShortStatus('in_progress');
+    }
+    if (!shortResult.promise) return;
+    shortContextPromise = shortResult.promise
+      .then(async (shortContext) => {
+        latestShortContextSummary = shortContext;
+        if (latestShortContextSummary && contextCacheKey) {
+          const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
+          await setContextCacheEntry(contextCacheKey, {
+            ...currentEntry,
+            contextShort: latestShortContextSummary,
+            contextFull: currentEntry.contextFull || currentEntry.context || '',
+            signature: contextCacheSignature,
+            updatedAt: Date.now()
+          });
+        }
+        await updateDebugContextShort(latestShortContextSummary, 'done');
+        return latestShortContextSummary;
+      })
+      .catch(async (error) => {
+        console.warn('Short context generation failed, continuing without it.', error);
+        await updateDebugContextShort(latestShortContextSummary, 'failed');
+        return latestShortContextSummary;
+      });
+    await shortContextPromise;
   };
 
   const selectContextForBlock = async (entry, kind, options = {}) => {
@@ -1079,6 +1124,9 @@ async function translatePage(settings, options = {}) {
               contextMode: fallbackContext.contextMode
             });
             traceRequestInitiator(perTextRequestMeta);
+            if (perTextRequestMeta.triggerSource === 'retry' || perTextRequestMeta.triggerSource === 'validate') {
+              await ensureShortContextReadyForRetry();
+            }
             const perTextResult = await translate(
               [text],
               settings.targetLanguage || 'ru',
@@ -1151,6 +1199,9 @@ async function translatePage(settings, options = {}) {
               contextMode: fallbackContext.contextMode
             });
             traceRequestInitiator(retryRequestMeta);
+            if (retryRequestMeta.triggerSource === 'retry' || retryRequestMeta.triggerSource === 'validate') {
+              await ensureShortContextReadyForRetry();
+            }
             result = await runJobOnce(
               translateJobKey,
               () =>
