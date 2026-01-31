@@ -119,10 +119,12 @@ function computeTextHash(text = '') {
 function normalizeRequestMeta(meta = {}, overrides = {}) {
   const merged = { ...(meta || {}), ...(overrides || {}) };
   return {
+    ...merged,
     requestId: merged.requestId || createRequestId(),
     parentRequestId: merged.parentRequestId || '',
     blockKey: merged.blockKey || '',
     url: merged.url || '',
+    contextCacheKey: merged.contextCacheKey || '',
     stage: merged.stage || '',
     purpose: merged.purpose || 'main',
     attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
@@ -357,6 +359,7 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
     selectedModel: payload.selectedModel || requestMeta.selectedModel || payload.model || '',
     selectedTier: payload.selectedTier || requestMeta.selectedTier || '',
+    selectedModelSpec: payload.selectedModelSpec || requestMeta.selectedModelSpec || '',
     attemptIndex:
       Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
         ? payload.attemptIndex
@@ -366,6 +369,8 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
       payload.originalRequestedModelList ||
       requestMeta.originalRequestedModelList ||
       [],
+    candidateStrategy: payload.candidateStrategy || requestMeta.candidateStrategy || '',
+    candidateOrderedList: payload.candidateOrderedList || requestMeta.candidateOrderedList || [],
     contextMode: payload.contextMode || contextMode,
     contextTypeUsed: payload.contextTypeUsed || contextTypeUsed,
     contextHash: payload.contextHash ?? (effectiveContext?.hash ?? 0),
