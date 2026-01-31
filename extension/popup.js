@@ -1,9 +1,9 @@
 const apiKeyInput = document.getElementById('apiKey');
 const openAiOrganizationInput = document.getElementById('openAiOrganization');
 const openAiProjectInput = document.getElementById('openAiProject');
-const translationModelSelect = document.getElementById('translationModel');
-const contextModelSelect = document.getElementById('contextModel');
-const proofreadModelSelect = document.getElementById('proofreadModel');
+const translationModelListContainer = document.getElementById('translationModelList');
+const contextModelListContainer = document.getElementById('contextModelList');
+const proofreadModelListContainer = document.getElementById('proofreadModelList');
 const translationModelCount = document.getElementById('translationModelCount');
 const contextModelCount = document.getElementById('contextModelCount');
 const proofreadModelCount = document.getElementById('proofreadModelCount');
@@ -51,8 +51,8 @@ function buildModelOptions() {
   return entries
     .map((entry) => {
       const modelSpec = typeof formatModelSpec === 'function' ? formatModelSpec(entry.id, entry.tier) : `${entry.id}:${entry.tier}`;
-      const cacheLabel = entry.sum_1M_cached != null ? formatPrice(entry.sum_1M_cached) : '—';
-      const label = `${entry.id} — Σ1M ${formatPrice(entry.sum_1M)} (cache ${cacheLabel})`;
+      const cacheLabel = entry.cachedInputPrice != null ? formatPrice(entry.cachedInputPrice) : '—';
+      const label = `${entry.id} — in ${formatPrice(entry.inputPrice)} / cache ${cacheLabel} / out ${formatPrice(entry.outputPrice)} / Σ1M ${formatPrice(entry.sum_1M)}`;
       return {
         id: entry.id,
         tier: entry.tier,
@@ -109,9 +109,36 @@ async function init() {
   apiKeyInput.value = state.apiKey || '';
   openAiOrganizationInput.value = state.openAiOrganization || '';
   openAiProjectInput.value = state.openAiProject || '';
-  renderModelOptions(translationModelSelect, state.translationModelList);
-  renderModelOptions(contextModelSelect, state.contextModelList);
-  renderModelOptions(proofreadModelSelect, state.proofreadModelList);
+  renderModelChecklist(translationModelListContainer, state.translationModelList, () =>
+    handleModelChecklistChange({
+      container: translationModelListContainer,
+      modelListKey: 'translationModelList',
+      modelKey: 'translationModel',
+      countLabel: translationModelCount,
+      statusMessage: 'Модель для перевода сохранена.'
+    })
+  );
+  renderModelChecklist(contextModelListContainer, state.contextModelList, () =>
+    handleModelChecklistChange({
+      container: contextModelListContainer,
+      modelListKey: 'contextModelList',
+      modelKey: 'contextModel',
+      countLabel: contextModelCount,
+      statusMessage: 'Модель для контекста сохранена.'
+    })
+  );
+  renderModelChecklist(proofreadModelListContainer, state.proofreadModelList, () =>
+    handleModelChecklistChange({
+      container: proofreadModelListContainer,
+      modelListKey: 'proofreadModelList',
+      modelKey: 'proofreadModel',
+      countLabel: proofreadModelCount,
+      statusMessage: 'Модель для вычитки сохранена.'
+    })
+  );
+  updateModelSummaryCount(translationModelListContainer, translationModelCount);
+  updateModelSummaryCount(contextModelListContainer, contextModelCount);
+  updateModelSummaryCount(proofreadModelListContainer, proofreadModelCount);
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
@@ -129,9 +156,6 @@ async function init() {
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   openAiOrganizationInput.addEventListener('input', handleOpenAiOrganizationChange);
   openAiProjectInput.addEventListener('input', handleOpenAiProjectChange);
-  translationModelSelect.addEventListener('change', handleTranslationModelChange);
-  contextModelSelect.addEventListener('change', handleContextModelChange);
-  proofreadModelSelect.addEventListener('change', handleProofreadModelChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
   singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
@@ -198,29 +222,15 @@ function handleOpenAiProjectChange() {
   }, 300);
 }
 
-async function handleTranslationModelChange() {
-  const translationModelList = getSelectedModelList(translationModelSelect);
-  const translationModel = parseModelSpec(translationModelList[0] || defaultModelSpec).id;
-  await chrome.storage.local.set({ translationModelList, translationModel });
-  updateModelSummaryCount(translationModelSelect);
-  renderStatus();
-  setTemporaryStatus('Модель для перевода сохранена.');
-}
-
-async function handleContextModelChange() {
-  const contextModelList = getSelectedModelList(contextModelSelect);
-  const contextModel = parseModelSpec(contextModelList[0] || defaultModelSpec).id;
-  await chrome.storage.local.set({ contextModelList, contextModel });
-  updateModelSummaryCount(contextModelSelect);
-  setTemporaryStatus('Модель для контекста сохранена.');
-}
-
-async function handleProofreadModelChange() {
-  const proofreadModelList = getSelectedModelList(proofreadModelSelect);
-  const proofreadModel = parseModelSpec(proofreadModelList[0] || defaultModelSpec).id;
-  await chrome.storage.local.set({ proofreadModelList, proofreadModel });
-  updateModelSummaryCount(proofreadModelSelect);
-  setTemporaryStatus('Модель для вычитки сохранена.');
+async function handleModelChecklistChange({ container, modelListKey, modelKey, countLabel, statusMessage }) {
+  const modelList = getSelectedModelList(container);
+  const selectedModel = parseModelSpec(modelList[0] || defaultModelSpec).id;
+  await chrome.storage.local.set({ [modelListKey]: modelList, [modelKey]: selectedModel });
+  updateModelSummaryCount(container, countLabel);
+  if (modelKey === 'translationModel') {
+    renderStatus();
+  }
+  setTemporaryStatus(statusMessage);
 }
 
 async function handleContextGenerationChange() {
@@ -377,7 +387,7 @@ async function getState() {
   });
 }
 
-function renderModelOptions(select, selectedList) {
+function renderModelChecklist(container, selectedList, onChange) {
   const defaultModel = defaultModelSpec;
   const normalizedList = Array.isArray(selectedList)
     ? selectedList
@@ -386,7 +396,8 @@ function renderModelOptions(select, selectedList) {
       : [];
   const selected = normalizedList.length ? normalizedList : [defaultModel];
 
-  select.innerHTML = '';
+  if (!container) return;
+  container.innerHTML = '';
 
   const tierGroups = {
     flex: models.filter((model) => model.tier === 'flex'),
@@ -395,45 +406,75 @@ function renderModelOptions(select, selectedList) {
 
   Object.entries(tierGroups).forEach(([tier, entries]) => {
     if (!entries.length) return;
-    const group = document.createElement('optgroup');
-    group.label = tier.toUpperCase();
+    const group = document.createElement('details');
+    group.className = 'model-tier';
+    group.dataset.modelTier = tier;
+    group.open = true;
+    const summary = document.createElement('summary');
+    const summaryLabel = document.createElement('span');
+    summaryLabel.dataset.modelTierLabel = tier;
+    summary.appendChild(summaryLabel);
+    group.appendChild(summary);
+    const list = document.createElement('div');
+    list.className = 'model-options';
     entries.forEach((model) => {
-      const option = document.createElement('option');
-      option.value = model.spec;
-      option.textContent = model.name;
-      option.selected = selected.includes(model.spec);
-      group.appendChild(option);
+      const itemLabel = document.createElement('label');
+      itemLabel.className = 'model-option';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.dataset.modelSpec = model.spec;
+      checkbox.checked = selected.includes(model.spec);
+      checkbox.addEventListener('change', () => {
+        if (typeof onChange === 'function') {
+          onChange();
+        }
+      });
+      const text = document.createElement('span');
+      text.textContent = model.name;
+      itemLabel.appendChild(checkbox);
+      itemLabel.appendChild(text);
+      list.appendChild(itemLabel);
     });
-    select.appendChild(group);
+    group.appendChild(list);
+    container.appendChild(group);
   });
-  updateModelSummaryCount(select);
+  updateModelSummaryCount(container, null);
 }
 
-function getSelectedModelList(select) {
-  if (!select) return [defaultModelSpec];
-  const selected = [...select.options]
-    .filter((option) => option.selected)
-    .map((option) => option.value)
+function getSelectedModelList(container) {
+  if (!container) return [defaultModelSpec];
+  const checkboxes = [...container.querySelectorAll('input[type="checkbox"][data-model-spec]')];
+  const selected = checkboxes
+    .filter((checkbox) => checkbox.checked)
+    .map((checkbox) => checkbox.dataset.modelSpec)
     .filter(Boolean);
   if (!selected.length && defaultModelSpec) {
+    const fallback = checkboxes.find((checkbox) => checkbox.dataset.modelSpec === defaultModelSpec);
+    if (fallback) fallback.checked = true;
     selected.push(defaultModelSpec);
-    const fallbackOption = [...select.options].find((option) => option.value === defaultModelSpec);
-    if (fallbackOption) fallbackOption.selected = true;
   }
   return selected;
 }
 
-function updateModelSummaryCount(select) {
-  if (!select) return;
-  const selectedCount = [...select.options].filter((option) => option.selected).length;
+function updateModelSummaryCount(container, countLabel) {
+  if (!container) return;
+  const checkboxes = [...container.querySelectorAll('input[type="checkbox"][data-model-spec]')];
+  const selectedCount = checkboxes.filter((checkbox) => checkbox.checked).length;
   const label = selectedCount ? `(${selectedCount})` : '';
-  if (select === translationModelSelect && translationModelCount) {
-    translationModelCount.textContent = label;
-  } else if (select === contextModelSelect && contextModelCount) {
-    contextModelCount.textContent = label;
-  } else if (select === proofreadModelSelect && proofreadModelCount) {
-    proofreadModelCount.textContent = label;
+  if (countLabel) {
+    countLabel.textContent = label;
   }
+  const groups = [...container.querySelectorAll('[data-model-tier]')];
+  groups.forEach((group) => {
+    const tier = group.dataset.modelTier || '';
+    const tierCount = [...group.querySelectorAll('input[type="checkbox"][data-model-spec]')].filter(
+      (checkbox) => checkbox.checked
+    ).length;
+    const summaryLabel = group.querySelector('[data-model-tier-label]');
+    if (summaryLabel) {
+      summaryLabel.textContent = `${tier.toUpperCase()} (выбрано ${tierCount})`;
+    }
+  });
 }
 
 function renderContextGeneration(enabled) {

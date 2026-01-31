@@ -514,6 +514,13 @@ function getCandidateModels(stage, triggerSource, isManual, state) {
       if (leftRank !== rightRank) {
         return rightRank - leftRank;
       }
+      const leftEntry = getModelEntry(left.parsed.id, left.parsed.tier);
+      const rightEntry = getModelEntry(right.parsed.id, right.parsed.tier);
+      const leftCost = leftEntry?.sum_1M ?? 0;
+      const rightCost = rightEntry?.sum_1M ?? 0;
+      if (leftCost !== rightCost) {
+        return rightCost - leftCost;
+      }
       return left.index - right.index;
     });
   const sortByCost = (entries) =>
