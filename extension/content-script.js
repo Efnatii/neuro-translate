@@ -106,6 +106,9 @@ const DEFAULT_STATE = {
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
+  translationModelList: ['gpt-4.1-mini'],
+  contextModelList: ['gpt-4.1-mini'],
+  proofreadModelList: ['gpt-4.1-mini'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   singleBlockConcurrency: false,
@@ -128,20 +131,24 @@ const CALL_TAGS = {
   STORAGE_DROPPED: 'STORAGE_DROPPED'
 };
 const SUPPORTED_MODEL_IDS = new Set([
-  'gpt-5-nano',
-  'gpt-4.1-nano',
-  'gpt-4o-mini',
-  'gpt-4.1-mini',
-  'gpt-5-mini',
-  'gpt-4.1',
+  'gpt-5.2',
   'gpt-5.1',
   'gpt-5',
-  'gpt-5.1-chat-latest',
-  'gpt-5-chat-latest',
+  'gpt-5-mini',
+  'gpt-5-nano',
+  'gpt-5.2-pro',
+  'gpt-5-pro',
+  'gpt-4.1',
+  'gpt-4.1-mini',
+  'gpt-4.1-nano',
   'gpt-4o',
-  'gpt-5.2',
-  'gpt-5.2-chat-latest',
-  'gpt-4o-2024-05-13'
+  'gpt-4o-mini',
+  'o3',
+  'o3-deep-research',
+  'o4-mini',
+  'o4-mini-deep-research',
+  'o3-mini',
+  'o1-mini'
 ]);
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
@@ -358,27 +365,70 @@ async function readSettingsFromStorage() {
   const previousModels = {
     translationModel: merged.translationModel,
     contextModel: merged.contextModel,
-    proofreadModel: merged.proofreadModel
+    proofreadModel: merged.proofreadModel,
+    translationModelList: merged.translationModelList,
+    contextModelList: merged.contextModelList,
+    proofreadModelList: merged.proofreadModelList
   };
-  const normalizeModel = (model, fallback) => {
-    if (!model || model.startsWith('deepseek')) {
-      return fallback;
+  const normalizeModelList = (list, fallback) => {
+    const rawList = Array.isArray(list)
+      ? list
+      : typeof list === 'string'
+        ? [list]
+        : [];
+    const normalized = [];
+    rawList.forEach((model) => {
+      if (!model || typeof model !== 'string' || model.startsWith('deepseek')) {
+        return;
+      }
+      if (SUPPORTED_MODEL_IDS.has(model) && !normalized.includes(model)) {
+        normalized.push(model);
+      }
+    });
+    if (!normalized.length) {
+      normalized.push(fallback);
     }
-    return SUPPORTED_MODEL_IDS.has(model) ? model : fallback;
+    return normalized;
   };
-  merged.translationModel = normalizeModel(merged.translationModel, DEFAULT_STATE.translationModel);
-  merged.contextModel = normalizeModel(merged.contextModel, DEFAULT_STATE.contextModel);
-  merged.proofreadModel = normalizeModel(merged.proofreadModel, DEFAULT_STATE.proofreadModel);
+  const areModelListsEqual = (left, right) => {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    if (left.length !== right.length) return false;
+    return left.every((value, index) => value === right[index]);
+  };
+  const fallbackTranslationModel = merged.translationModel || DEFAULT_STATE.translationModel;
+  const fallbackContextModel = merged.contextModel || DEFAULT_STATE.contextModel;
+  const fallbackProofreadModel = merged.proofreadModel || DEFAULT_STATE.proofreadModel;
+  merged.translationModelList = normalizeModelList(
+    merged.translationModelList || merged.translationModel || safeStored.model,
+    fallbackTranslationModel
+  );
+  merged.contextModelList = normalizeModelList(
+    merged.contextModelList || merged.contextModel || safeStored.model,
+    fallbackContextModel
+  );
+  merged.proofreadModelList = normalizeModelList(
+    merged.proofreadModelList || merged.proofreadModel || safeStored.model,
+    fallbackProofreadModel
+  );
+  merged.translationModel = merged.translationModelList[0] || fallbackTranslationModel;
+  merged.contextModel = merged.contextModelList[0] || fallbackContextModel;
+  merged.proofreadModel = merged.proofreadModelList[0] || fallbackProofreadModel;
   if (
     merged.translationModel !== previousModels.translationModel ||
     merged.contextModel !== previousModels.contextModel ||
-    merged.proofreadModel !== previousModels.proofreadModel
+    merged.proofreadModel !== previousModels.proofreadModel ||
+    !areModelListsEqual(merged.translationModelList, previousModels.translationModelList) ||
+    !areModelListsEqual(merged.contextModelList, previousModels.contextModelList) ||
+    !areModelListsEqual(merged.proofreadModelList, previousModels.proofreadModelList)
   ) {
     try {
       await chrome.storage.local.set({
         translationModel: merged.translationModel,
         contextModel: merged.contextModel,
-        proofreadModel: merged.proofreadModel
+        proofreadModel: merged.proofreadModel,
+        translationModelList: merged.translationModelList,
+        contextModelList: merged.contextModelList,
+        proofreadModelList: merged.proofreadModelList
       });
     } catch (error) {
       console.warn('Failed to normalize stored model ids.', error);
@@ -397,6 +447,9 @@ function buildSettingsFromState(state) {
       translationModel: DEFAULT_STATE.translationModel,
       contextModel: DEFAULT_STATE.contextModel,
       proofreadModel: DEFAULT_STATE.proofreadModel,
+      translationModelList: DEFAULT_STATE.translationModelList,
+      contextModelList: DEFAULT_STATE.contextModelList,
+      proofreadModelList: DEFAULT_STATE.proofreadModelList,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
@@ -410,23 +463,35 @@ function buildSettingsFromState(state) {
       tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
     };
   }
+  const translationModel = Array.isArray(state.translationModelList) && state.translationModelList.length
+    ? state.translationModelList[0]
+    : state.translationModel;
+  const contextModel = Array.isArray(state.contextModelList) && state.contextModelList.length
+    ? state.contextModelList[0]
+    : state.contextModel;
+  const proofreadModel = Array.isArray(state.proofreadModelList) && state.proofreadModelList.length
+    ? state.proofreadModelList[0]
+    : state.proofreadModel;
   const tpmLimitsByRole = {
-    translation: getTpmLimitForModel(state.translationModel, state.tpmLimitsByModel),
-    context: getTpmLimitForModel(state.contextModel, state.tpmLimitsByModel),
-    proofread: getTpmLimitForModel(state.proofreadModel, state.tpmLimitsByModel)
+    translation: getTpmLimitForModel(translationModel, state.tpmLimitsByModel),
+    context: getTpmLimitForModel(contextModel, state.tpmLimitsByModel),
+    proofread: getTpmLimitForModel(proofreadModel, state.tpmLimitsByModel)
   };
   const hasApiKey = Boolean(state.apiKey);
   let disallowedReason = null;
   if (!hasApiKey) {
-    disallowedReason = buildMissingKeyReason('перевод', state.translationModel);
+    disallowedReason = buildMissingKeyReason('перевод', translationModel);
   }
   return {
     allowed: hasApiKey,
     disallowedReason,
     apiKey: state.apiKey,
-    translationModel: state.translationModel,
-    contextModel: state.contextModel,
-    proofreadModel: state.proofreadModel,
+    translationModel,
+    contextModel,
+    proofreadModel,
+    translationModelList: state.translationModelList,
+    contextModelList: state.contextModelList,
+    proofreadModelList: state.proofreadModelList,
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
     singleBlockConcurrency: Boolean(state.singleBlockConcurrency),

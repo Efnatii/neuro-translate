@@ -1,6 +1,174 @@
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
+function createModelRegistry() {
+  const entries = [];
+  const baseModelIds = [];
+  const byKey = {};
+  const byId = {};
+  const addEntry = (entry, includeInBaseList = false) => {
+    const sum_1M = entry.inputPrice + entry.outputPrice;
+    const sum_1M_cached =
+      entry.cachedInputPrice != null
+        ? entry.cachedInputPrice + entry.outputPrice
+        : null;
+    const normalized = {
+      id: entry.id,
+      tier: entry.tier,
+      inputPrice: entry.inputPrice,
+      cachedInputPrice: entry.cachedInputPrice ?? null,
+      outputPrice: entry.outputPrice,
+      sum_1M,
+      sum_1M_cached,
+      supportsFlex: entry.tier === 'flex',
+      supportsPromptCacheRetention24h: entry.cachedInputPrice != null,
+      supportsPromptCacheKey: true,
+      supportsServiceTierParam: true,
+      supportsTextJsonSchema: true
+    };
+    entries.push(normalized);
+    const key = `${normalized.id}:${normalized.tier}`;
+    byKey[key] = normalized;
+    if (!byId[normalized.id]) {
+      byId[normalized.id] = [];
+    }
+    byId[normalized.id].push(normalized);
+    if (includeInBaseList && !baseModelIds.includes(normalized.id)) {
+      baseModelIds.push(normalized.id);
+    }
+  };
+
+  [
+    { id: 'gpt-5.2', tier: 'standard', inputPrice: 1.75, cachedInputPrice: 0.175, outputPrice: 14.0 },
+    { id: 'gpt-5.1', tier: 'standard', inputPrice: 1.25, cachedInputPrice: 0.125, outputPrice: 10.0 },
+    { id: 'gpt-5', tier: 'standard', inputPrice: 1.25, cachedInputPrice: 0.125, outputPrice: 10.0 },
+    { id: 'gpt-5-mini', tier: 'standard', inputPrice: 0.25, cachedInputPrice: 0.025, outputPrice: 2.0 },
+    { id: 'gpt-5-nano', tier: 'standard', inputPrice: 0.05, cachedInputPrice: 0.005, outputPrice: 0.4 },
+    { id: 'gpt-5.2-pro', tier: 'standard', inputPrice: 21.0, cachedInputPrice: null, outputPrice: 168.0 },
+    { id: 'gpt-5-pro', tier: 'standard', inputPrice: 15.0, cachedInputPrice: null, outputPrice: 120.0 },
+    { id: 'gpt-4.1', tier: 'standard', inputPrice: 2.0, cachedInputPrice: 0.5, outputPrice: 8.0 },
+    { id: 'gpt-4.1-mini', tier: 'standard', inputPrice: 0.4, cachedInputPrice: 0.1, outputPrice: 1.6 },
+    { id: 'gpt-4.1-nano', tier: 'standard', inputPrice: 0.1, cachedInputPrice: 0.025, outputPrice: 0.4 },
+    { id: 'gpt-4o', tier: 'standard', inputPrice: 2.5, cachedInputPrice: 1.25, outputPrice: 10.0 },
+    { id: 'gpt-4o-mini', tier: 'standard', inputPrice: 0.15, cachedInputPrice: 0.075, outputPrice: 0.6 },
+    { id: 'o3', tier: 'standard', inputPrice: 2.0, cachedInputPrice: 0.5, outputPrice: 8.0 },
+    { id: 'o3-deep-research', tier: 'standard', inputPrice: 10.0, cachedInputPrice: 2.5, outputPrice: 40.0 },
+    { id: 'o4-mini', tier: 'standard', inputPrice: 1.1, cachedInputPrice: 0.275, outputPrice: 4.4 },
+    { id: 'o4-mini-deep-research', tier: 'standard', inputPrice: 2.0, cachedInputPrice: 0.5, outputPrice: 8.0 },
+    { id: 'o3-mini', tier: 'standard', inputPrice: 1.1, cachedInputPrice: 0.55, outputPrice: 4.4 },
+    { id: 'o1-mini', tier: 'standard', inputPrice: 1.1, cachedInputPrice: 0.55, outputPrice: 4.4 }
+  ].forEach((entry) => addEntry(entry, true));
+
+  [
+    { id: 'gpt-5.2', tier: 'flex', inputPrice: 0.875, cachedInputPrice: 0.0875, outputPrice: 7.0 },
+    { id: 'gpt-5.1', tier: 'flex', inputPrice: 0.625, cachedInputPrice: 0.0625, outputPrice: 5.0 },
+    { id: 'gpt-5', tier: 'flex', inputPrice: 0.625, cachedInputPrice: 0.0625, outputPrice: 5.0 },
+    { id: 'gpt-5-mini', tier: 'flex', inputPrice: 0.125, cachedInputPrice: 0.0125, outputPrice: 1.0 },
+    { id: 'gpt-5-nano', tier: 'flex', inputPrice: 0.025, cachedInputPrice: 0.0025, outputPrice: 0.2 },
+    { id: 'o3', tier: 'flex', inputPrice: 1.0, cachedInputPrice: 0.25, outputPrice: 4.0 },
+    { id: 'o4-mini', tier: 'flex', inputPrice: 0.55, cachedInputPrice: 0.138, outputPrice: 2.2 }
+  ].forEach((entry) => addEntry(entry));
+
+  const sortedBaseModelIds = [...baseModelIds].sort((left, right) => {
+    const leftEntry = byKey[`${left}:standard`] || byKey[`${left}:flex`];
+    const rightEntry = byKey[`${right}:standard`] || byKey[`${right}:flex`];
+    const leftCost = leftEntry?.sum_1M ?? 0;
+    const rightCost = rightEntry?.sum_1M ?? 0;
+    return rightCost - leftCost;
+  });
+
+  return {
+    entries,
+    baseModelIds: sortedBaseModelIds,
+    byId,
+    byKey
+  };
+}
+
+function getModelRegistry() {
+  if (!globalThis.__NT_MODEL_REGISTRY__) {
+    globalThis.__NT_MODEL_REGISTRY__ = createModelRegistry();
+  }
+  return globalThis.__NT_MODEL_REGISTRY__;
+}
+
+globalThis.__NT_MODEL_REGISTRY__ ||= createModelRegistry();
+
+function getModelEntry(modelId, tier = 'standard') {
+  if (!modelId) return null;
+  const registry = getModelRegistry();
+  const byKey = registry?.byKey || {};
+  if (tier) {
+    return byKey[`${modelId}:${tier}`] || null;
+  }
+  return byKey[`${modelId}:standard`] || byKey[`${modelId}:flex`] || null;
+}
+
+function getBaseModelIds() {
+  const registry = getModelRegistry();
+  return Array.isArray(registry?.baseModelIds) ? [...registry.baseModelIds] : [];
+}
+
+function getModelParamBlacklist() {
+  if (!globalThis.__NT_MODEL_PARAM_BLACKLIST__) {
+    globalThis.__NT_MODEL_PARAM_BLACKLIST__ = {};
+  }
+  return globalThis.__NT_MODEL_PARAM_BLACKLIST__;
+}
+
+function isModelParamUnsupported(modelId, paramName) {
+  if (!modelId || !paramName) return false;
+  const blacklist = getModelParamBlacklist();
+  const entry = blacklist[modelId];
+  if (!entry) return false;
+  if (typeof entry.has === 'function') {
+    return entry.has(paramName);
+  }
+  if (Array.isArray(entry)) {
+    return entry.includes(paramName);
+  }
+  return false;
+}
+
+function markModelParamUnsupported(modelId, paramName) {
+  if (!modelId || !paramName) return;
+  const blacklist = getModelParamBlacklist();
+  let entry = blacklist[modelId];
+  if (!entry || typeof entry.add !== 'function') {
+    entry = new Set(Array.isArray(entry) ? entry : []);
+    blacklist[modelId] = entry;
+  }
+  entry.add(paramName);
+}
+
+function applyModelRequestParams(requestPayload, modelId, requestOptions = null) {
+  if (!requestPayload || typeof requestPayload !== 'object') return;
+  const tier = requestOptions?.tier || 'standard';
+  const entry = getModelEntry(modelId, tier) || getModelEntry(modelId, 'standard');
+  const canUseParam = (paramName, supported) => supported && !isModelParamUnsupported(modelId, paramName);
+  const supportsCacheRetention = entry?.supportsPromptCacheRetention24h ?? false;
+  const supportsCacheKey = entry?.supportsPromptCacheKey ?? true;
+  const supportsServiceTier = entry?.supportsServiceTierParam ?? true;
+  const supportsSchema = entry?.supportsTextJsonSchema ?? true;
+
+  if (requestOptions?.serviceTier) {
+    if (canUseParam('service_tier', supportsServiceTier)) {
+      requestPayload.service_tier = requestOptions.serviceTier;
+    } else {
+      delete requestPayload.service_tier;
+    }
+  }
+
+  if (requestPayload.prompt_cache_retention !== undefined && !canUseParam('prompt_cache_retention', supportsCacheRetention)) {
+    delete requestPayload.prompt_cache_retention;
+  }
+  if (requestPayload.prompt_cache_key !== undefined && !canUseParam('prompt_cache_key', supportsCacheKey)) {
+    delete requestPayload.prompt_cache_key;
+  }
+  if (requestPayload.response_format !== undefined && !canUseParam('response_format', supportsSchema)) {
+    delete requestPayload.response_format;
+  }
+}
 function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
   if (apiBaseUrl !== OPENAI_API_URL) return messages;
   return messages.map((message) =>
@@ -135,23 +303,35 @@ function applyPromptCacheParams(requestPayload, apiBaseUrl, model, cacheKey) {
   if (!requestPayload || typeof requestPayload !== 'object') return;
   if (apiBaseUrl !== OPENAI_API_URL) return;
 
-  if (cacheKey && typeof cacheKey === 'string' && model && !PROMPT_CACHE_KEY_UNSUPPORTED_MODELS.has(model)) {
+  const entry = getModelEntry(model);
+  const supportsCacheKey = entry?.supportsPromptCacheKey ?? true;
+  if (
+    cacheKey &&
+    typeof cacheKey === 'string' &&
+    model &&
+    supportsCacheKey &&
+    !PROMPT_CACHE_KEY_UNSUPPORTED_MODELS.has(model) &&
+    !isModelParamUnsupported(model, 'prompt_cache_key')
+  ) {
     requestPayload.prompt_cache_key = cacheKey;
   }
 }
 
 function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorPayload, errorText) {
-  if (!requestPayload || typeof requestPayload !== 'object') return { changed: false };
+  if (!requestPayload || typeof requestPayload !== 'object') return { changed: false, removedParams: [] };
 
   let changed = false;
+  const removedParams = [];
 
   if (
     requestPayload.prompt_cache_retention !== undefined &&
     isUnsupportedParamError(status, errorPayload, errorText, 'prompt_cache_retention')
   ) {
     if (model) PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS.add(model);
+    if (model) markModelParamUnsupported(model, 'prompt_cache_retention');
     delete requestPayload.prompt_cache_retention;
     changed = true;
+    removedParams.push('prompt_cache_retention');
   }
 
   if (
@@ -159,10 +339,51 @@ function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorP
     isUnsupportedParamError(status, errorPayload, errorText, 'prompt_cache_key')
   ) {
     if (model) PROMPT_CACHE_KEY_UNSUPPORTED_MODELS.add(model);
+    if (model) markModelParamUnsupported(model, 'prompt_cache_key');
     delete requestPayload.prompt_cache_key;
     if (requestPayload.prompt_cache_retention !== undefined) delete requestPayload.prompt_cache_retention;
     changed = true;
+    removedParams.push('prompt_cache_key');
   }
 
-  return { changed };
+  return { changed, removedParams };
+}
+
+function stripUnsupportedRequestParams(requestPayload, model, status, errorPayload, errorText) {
+  if (!requestPayload || typeof requestPayload !== 'object') {
+    return { changed: false, removedParams: [] };
+  }
+
+  const removedParams = [];
+  let changed = false;
+
+  const promptResult = stripUnsupportedPromptCacheParams(requestPayload, model, status, errorPayload, errorText);
+  if (promptResult.changed) {
+    changed = true;
+    if (Array.isArray(promptResult.removedParams)) {
+      removedParams.push(...promptResult.removedParams);
+    }
+  }
+
+  if (
+    requestPayload.service_tier !== undefined &&
+    isUnsupportedParamError(status, errorPayload, errorText, 'service_tier')
+  ) {
+    if (model) markModelParamUnsupported(model, 'service_tier');
+    delete requestPayload.service_tier;
+    changed = true;
+    removedParams.push('service_tier');
+  }
+
+  if (
+    requestPayload.response_format !== undefined &&
+    isUnsupportedParamError(status, errorPayload, errorText, 'response_format')
+  ) {
+    if (model) markModelParamUnsupported(model, 'response_format');
+    delete requestPayload.response_format;
+    changed = true;
+    removedParams.push('response_format');
+  }
+
+  return { changed, removedParams };
 }

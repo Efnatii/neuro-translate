@@ -69,12 +69,40 @@ const SHORT_CONTEXT_SYSTEM_PROMPT = [
   'Target length: 5-10 bullet points maximum.'
 ].join('\n');
 
+function attachContextRequestMeta(payload, requestMeta) {
+  if (!payload || typeof payload !== 'object' || !requestMeta || typeof requestMeta !== 'object') {
+    return payload;
+  }
+  return {
+    ...payload,
+    requestId: payload.requestId || requestMeta.requestId || '',
+    parentRequestId: payload.parentRequestId || requestMeta.parentRequestId || '',
+    stage: payload.stage || requestMeta.stage || '',
+    purpose: payload.purpose || requestMeta.purpose || '',
+    attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
+    triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
+    selectedModel: payload.selectedModel || requestMeta.selectedModel || payload.model || '',
+    selectedTier: payload.selectedTier || requestMeta.selectedTier || '',
+    attemptIndex:
+      Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
+        ? payload.attemptIndex
+        : requestMeta.attemptIndex,
+    fallbackReason: payload.fallbackReason || requestMeta.fallbackReason || '',
+    originalRequestedModelList:
+      payload.originalRequestedModelList ||
+      requestMeta.originalRequestedModelList ||
+      []
+  };
+}
+
 async function generateTranslationContext(
   text,
   apiKey,
   targetLanguage = 'ru',
   model,
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  requestMeta = null,
+  requestOptions = null
 ) {
   if (!text?.trim()) return { context: '', debug: [] };
 
@@ -103,6 +131,7 @@ async function generateTranslationContext(
     messages: prompt
   };
   applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:context:v1');
+  applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -121,7 +150,7 @@ async function generateTranslationContext(
     } catch (parseError) {
       errorPayload = null;
     }
-    const stripped = stripUnsupportedPromptCacheParams(
+    const stripped = stripUnsupportedRequestParams(
       requestPayload,
       model,
       response.status,
@@ -129,9 +158,18 @@ async function generateTranslationContext(
       errorText
     );
     if (response.status === 400 && stripped.changed) {
-      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
+      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+        if (!requestMeta.fallbackReason) {
+          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+        }
+        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+          requestMeta.selectedTier = 'standard';
+        }
+      }
+      console.warn('Unsupported param removed; retrying without it.', {
         model,
-        status: response.status
+        status: response.status,
+        removedParams: stripped.removedParams
       });
       response = await fetch(apiBaseUrl, {
         method: 'POST',
@@ -159,17 +197,20 @@ async function generateTranslationContext(
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
   const trimmed = typeof content === 'string' ? content.trim() : '';
-  const debugPayload = {
-    phase: 'CONTEXT',
-    model,
-    latencyMs,
-    usage,
-    inputChars: text.length,
-    outputChars: trimmed.length,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
+  const debugPayload = attachContextRequestMeta(
+    {
+      phase: 'CONTEXT',
+      model,
+      latencyMs,
+      usage,
+      inputChars: text.length,
+      outputChars: trimmed.length,
+      request: requestPayload,
+      response: content,
+      parseIssues: []
+    },
+    requestMeta
+  );
 
   return { context: trimmed, debug: [debugPayload] };
 }
@@ -179,7 +220,9 @@ async function generateShortTranslationContext(
   apiKey,
   targetLanguage = 'ru',
   model,
-  apiBaseUrl = OPENAI_API_URL
+  apiBaseUrl = OPENAI_API_URL,
+  requestMeta = null,
+  requestOptions = null
 ) {
   if (!text?.trim()) return { context: '', debug: [] };
 
@@ -205,6 +248,7 @@ async function generateShortTranslationContext(
     messages: prompt
   };
   applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:context-short:v1');
+  applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -223,7 +267,7 @@ async function generateShortTranslationContext(
     } catch (parseError) {
       errorPayload = null;
     }
-    const stripped = stripUnsupportedPromptCacheParams(
+    const stripped = stripUnsupportedRequestParams(
       requestPayload,
       model,
       response.status,
@@ -231,9 +275,18 @@ async function generateShortTranslationContext(
       errorText
     );
     if (response.status === 400 && stripped.changed) {
-      console.warn('prompt_cache_* param not supported by model; retrying without cache params.', {
+      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+        if (!requestMeta.fallbackReason) {
+          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+        }
+        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+          requestMeta.selectedTier = 'standard';
+        }
+      }
+      console.warn('Unsupported param removed; retrying without it.', {
         model,
-        status: response.status
+        status: response.status,
+        removedParams: stripped.removedParams
       });
       response = await fetch(apiBaseUrl, {
         method: 'POST',
@@ -261,17 +314,20 @@ async function generateShortTranslationContext(
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
   const trimmed = typeof content === 'string' ? content.trim() : '';
-  const debugPayload = {
-    phase: 'CONTEXT_SHORT',
-    model,
-    latencyMs,
-    usage,
-    inputChars: text.length,
-    outputChars: trimmed.length,
-    request: requestPayload,
-    response: content,
-    parseIssues: []
-  };
+  const debugPayload = attachContextRequestMeta(
+    {
+      phase: 'CONTEXT_SHORT',
+      model,
+      latencyMs,
+      usage,
+      inputChars: text.length,
+      outputChars: trimmed.length,
+      request: requestPayload,
+      response: content,
+      parseIssues: []
+    },
+    requestMeta
+  );
 
   return { context: trimmed, debug: [debugPayload] };
 }
