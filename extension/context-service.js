@@ -78,15 +78,19 @@ function attachContextRequestMeta(payload, requestMeta) {
     requestId: payload.requestId || requestMeta.requestId || '',
     parentRequestId: payload.parentRequestId || requestMeta.parentRequestId || '',
     stage: payload.stage || requestMeta.stage || '',
-    purpose: payload.purpose || requestMeta.purpose || '',
+    purpose: requestMeta.purpose || payload.purpose || '',
     attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
-    triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
-    selectedModel: payload.selectedModel || requestMeta.selectedModel || payload.model || '',
-    selectedTier: payload.selectedTier || requestMeta.selectedTier || '',
-    selectedModelSpec: payload.selectedModelSpec || requestMeta.selectedModelSpec || '',
-    candidateStrategy: payload.candidateStrategy || requestMeta.candidateStrategy || '',
+    triggerSource: requestMeta.triggerSource || payload.triggerSource || '',
+    selectedModel: requestMeta.selectedModel || payload.selectedModel || payload.model || '',
+    selectedTier: requestMeta.selectedTier || payload.selectedTier || '',
+    selectedModelSpec: requestMeta.selectedModelSpec || payload.selectedModelSpec || '',
+    candidateStrategy: requestMeta.candidateStrategy || payload.candidateStrategy || '',
     candidateOrderedList:
-      Array.isArray(payload.candidateOrderedList) ? payload.candidateOrderedList : requestMeta.candidateOrderedList || [],
+      Array.isArray(requestMeta.candidateOrderedList)
+        ? requestMeta.candidateOrderedList
+        : Array.isArray(payload.candidateOrderedList)
+          ? payload.candidateOrderedList
+          : [],
     attemptIndex:
       Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
         ? payload.attemptIndex
@@ -95,10 +99,10 @@ function attachContextRequestMeta(payload, requestMeta) {
           : 0,
     fallbackReason: payload.fallbackReason || requestMeta.fallbackReason || '',
     originalRequestedModelList:
-      Array.isArray(payload.originalRequestedModelList)
-        ? payload.originalRequestedModelList
-        : Array.isArray(requestMeta.originalRequestedModelList)
-          ? requestMeta.originalRequestedModelList
+      Array.isArray(requestMeta.originalRequestedModelList)
+        ? requestMeta.originalRequestedModelList
+        : Array.isArray(payload.originalRequestedModelList)
+          ? payload.originalRequestedModelList
           : []
   };
 }

@@ -513,23 +513,29 @@ function getCandidateModels(stage, requestMeta, state) {
     : stage === 'proofread'
       ? state.proofreadModel
       : state.translationModel;
-  const originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
+  let originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
   const triggerSource = requestMeta?.triggerSource || '';
   const purpose = requestMeta?.purpose || '';
   const effectivePurpose = purpose || triggerSource || '';
   const isManualTrigger =
     Boolean(requestMeta?.isManual) ||
-    triggerSource === 'manual' ||
-    triggerSource === 'manual_translate' ||
-    triggerSource === 'manualTranslate' ||
-    /manual/i.test(triggerSource || '');
+    (typeof triggerSource === 'string' && triggerSource.toLowerCase().includes('manual')) ||
+    effectivePurpose === 'manual';
   let candidateStrategy = 'default_preserve_order';
   if (purpose === 'retry' || triggerSource === 'retry') {
     candidateStrategy = 'retry_cheapest';
   } else if (purpose === 'validate' || triggerSource === 'validate') {
     candidateStrategy = 'validate_cheapest';
-  } else if (effectivePurpose === 'manual' || isManualTrigger) {
+  } else if (isManualTrigger) {
     candidateStrategy = 'manual_smartest';
+  }
+  if (!Array.isArray(originalRequestedModelList) || !originalRequestedModelList.length) {
+    const fallbackSpec = fallbackModel ? formatModelSpec(fallbackModel, 'standard') : '';
+    if (fallbackSpec) {
+      originalRequestedModelList = [fallbackSpec];
+    } else {
+      originalRequestedModelList = [];
+    }
   }
   const parsedEntries = originalRequestedModelList.map((spec, index) => {
     const parsed = parseModelSpec(spec);
@@ -549,7 +555,7 @@ function getCandidateModels(stage, requestMeta, state) {
     if (left.capabilityRank !== right.capabilityRank) {
       return right.capabilityRank - left.capabilityRank;
     }
-    if (left.tierPref !== right.tierPref) {
+    if (left.parsed.id === right.parsed.id && left.tierPref !== right.tierPref) {
       return right.tierPref - left.tierPref;
     }
     if (left.index !== right.index) {
