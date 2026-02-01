@@ -4,9 +4,11 @@ const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
 const eventsEl = document.getElementById('events');
 const clearDebugButton = document.getElementById('clear-debug');
+const consoleJsonLogCheckbox = document.getElementById('console-json-log');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const CONTEXT_CACHE_KEY = 'contextCacheByPage';
+const CONSOLE_JSON_LOG_KEY = 'ntConsoleJsonLogEnabled';
 const DEBUG_PORT_NAME = 'debug';
 const DEBUG_DB_NAME = 'nt_debug';
 const DEBUG_DB_VERSION = 1;
@@ -58,6 +60,7 @@ async function init() {
   }
 
   setupDebugInstrumentation();
+  await hydrateConsoleJsonLogToggle();
 
   if (contextEl) {
     addDebugListener(contextEl, 'click', (event) => {
@@ -80,6 +83,13 @@ async function init() {
     addDebugListener(clearDebugButton, 'click', (event) => {
       event.preventDefault();
       clearDebugData();
+    });
+  }
+
+  if (consoleJsonLogCheckbox) {
+    addDebugListener(consoleJsonLogCheckbox, 'change', () => {
+      if (typeof chrome === 'undefined' || !chrome.storage?.local) return;
+      chrome.storage.local.set({ [CONSOLE_JSON_LOG_KEY]: consoleJsonLogCheckbox.checked });
     });
   }
 
@@ -143,6 +153,15 @@ async function init() {
   await refreshDebug();
   connectDebugPort();
   startAutoRefresh();
+}
+
+async function hydrateConsoleJsonLogToggle() {
+  if (!consoleJsonLogCheckbox) return;
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) return;
+  const data = await new Promise((resolve) => {
+    chrome.storage.local.get({ [CONSOLE_JSON_LOG_KEY]: false }, (result) => resolve(result));
+  });
+  consoleJsonLogCheckbox.checked = Boolean(data[CONSOLE_JSON_LOG_KEY]);
 }
 
 function isDebugInstrumentationEnabled() {

@@ -663,6 +663,15 @@
       display: flex;
       gap: 8px;
       margin: 8px 0 16px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .debug-checkbox {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #0f172a;
     }
     .debug-button {
       border: 1px solid #e2e8f0;
@@ -705,6 +714,10 @@
     <button class="debug-button debug-button--danger" id="clear-debug" type="button">
       Очистить отладочные данные
     </button>
+    <label class="debug-checkbox" for="console-json-log">
+      <input type="checkbox" id="console-json-log" />
+      JSON лог в консоль (очень подробно)
+    </label>
   </div>
   <div class="summary" id="summary"></div>
   <div id="events"></div>
