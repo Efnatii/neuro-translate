@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Neuro Translate</title>
+  <link rel="stylesheet" href="popup.css" />
   <style>
     :root {
       color-scheme: light;
@@ -127,18 +128,22 @@
     .model-options {
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 4px;
       margin-top: 6px;
+      max-height: 180px;
+      overflow-y: auto;
+      padding-right: 4px;
     }
     .model-option {
-      display: flex;
-      align-items: flex-start;
-      gap: 8px;
+      display: grid;
+      grid-template-columns: auto 1fr auto auto;
+      align-items: center;
+      gap: 6px;
       font-size: 12px;
       color: var(--text-secondary);
     }
     .model-option input {
-      margin-top: 2px;
+      margin-top: 0;
     }
     .model-note {
       font-size: 11px;
@@ -274,12 +279,11 @@
       </div>
     </details>
     <details class="section" id="translationModels">
-      <summary>Модели для перевода <span class="summary-count" id="translationModelCount"></span></summary>
+      <summary><span class="summary-title">Модели перевода</span> <span class="summary-count" id="translationModelCount"></span></summary>
       <div class="details-body">
         <label>
           Список моделей для перевода
           <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
-            • FLEX модели всегда пробуются раньше STANDARD<br>
             • manual → самая умная из выбранных (по capability rank)<br>
             • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
             • при ошибках/лимитах пробуются следующие модели из списка</span>
@@ -288,12 +292,11 @@
       </div>
     </details>
     <details class="section" id="contextModels">
-      <summary>Модели для контекста <span class="summary-count" id="contextModelCount"></span></summary>
+      <summary><span class="summary-title">Модели контекста</span> <span class="summary-count" id="contextModelCount"></span></summary>
       <div class="details-body">
         <label>
           Список моделей для контекста
           <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
-            • FLEX модели всегда пробуются раньше STANDARD<br>
             • manual → самая умная из выбранных (по capability rank)<br>
             • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
             • при ошибках/лимитах пробуются следующие модели из списка</span>
@@ -302,12 +305,11 @@
       </div>
     </details>
     <details class="section" id="proofreadModels">
-      <summary>Модели для вычитки <span class="summary-count" id="proofreadModelCount"></span></summary>
+      <summary><span class="summary-title">Модели для вычитки</span> <span class="summary-count" id="proofreadModelCount"></span></summary>
       <div class="details-body">
         <label>
           Список моделей для вычитки
           <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
-            • FLEX модели всегда пробуются раньше STANDARD<br>
             • manual → самая умная из выбранных (по capability rank)<br>
             • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
             • при ошибках/лимитах пробуются следующие модели из списка</span>

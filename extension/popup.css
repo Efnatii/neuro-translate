@@ -1,0 +1,60 @@
+.model-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-filter input {
+  flex: 1;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.model-tier-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.model-tier-actions button {
+  padding: 4px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+
+.model-tier-actions button:hover {
+  background: var(--text-secondary);
+  color: var(--surface);
+}
+
+.model-id {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.model-price {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.model-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.model-option.is-hidden {
+  display: none;
+}
