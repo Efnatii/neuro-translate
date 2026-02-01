@@ -130,6 +130,32 @@ function logLlmFetchResponse({ ts, requestId, status, ok, responseHeaders, respo
   });
 }
 
+function logLlmRawResponse({ ts, stage, requestId, status, ok, responseText }) {
+  let responseJson = null;
+  try {
+    responseJson = JSON.parse(responseText);
+  } catch (error) {
+    responseJson = null;
+  }
+  const resolvedRequestId = requestId || createRequestId();
+  const event = {
+    kind: 'llm.raw_response',
+    ts: ts || Date.now(),
+    stage,
+    requestId: resolvedRequestId,
+    http: {
+      status,
+      ok
+    }
+  };
+  if (responseJson !== null) {
+    event.response_json = responseJson;
+  } else {
+    event.response_text = responseText;
+  }
+  emitJsonLog(event);
+}
+
 function logLlmFetchError({ ts, requestId, error }) {
   emitJsonLog({
     kind: 'llm.fetch.error',
@@ -444,6 +470,14 @@ async function generateTranslationContext(
       body: requestBody
     });
     responseText = await response.clone().text();
+    logLlmRawResponse({
+      ts: Date.now(),
+      stage: 'context',
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseText
+    });
     logLlmFetchResponse({
       ts: Date.now(),
       requestId,
@@ -508,6 +542,14 @@ async function generateTranslationContext(
           body: requestBody
         });
         responseText = await response.clone().text();
+        logLlmRawResponse({
+          ts: Date.now(),
+          stage: 'context',
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseText
+        });
         logLlmFetchResponse({
           ts: Date.now(),
           requestId,
@@ -711,6 +753,14 @@ async function generateShortTranslationContext(
       body: requestBody
     });
     responseText = await response.clone().text();
+    logLlmRawResponse({
+      ts: Date.now(),
+      stage: 'context',
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseText
+    });
     logLlmFetchResponse({
       ts: Date.now(),
       requestId,
@@ -775,6 +825,14 @@ async function generateShortTranslationContext(
           body: requestBody
         });
         responseText = await response.clone().text();
+        logLlmRawResponse({
+          ts: Date.now(),
+          stage: 'context',
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseText
+        });
         logLlmFetchResponse({
           ts: Date.now(),
           requestId,
