@@ -9,7 +9,6 @@ const contextModelCount = document.getElementById('contextModelCount');
 const proofreadModelCount = document.getElementById('proofreadModelCount');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
-const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
 const blockLengthLimitInput = document.getElementById('blockLengthLimit');
 const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
@@ -102,6 +101,7 @@ async function init() {
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
         singleBlockConcurrency: state.singleBlockConcurrency,
+        assumeOpenAICompatibleApi: state.assumeOpenAICompatibleApi,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByModel: state.tpmLimitsByModel,
         outputRatioByRole: state.outputRatioByRole,
@@ -147,6 +147,7 @@ async function init() {
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
+  renderAssumeOpenAICompatibleApi(state.assumeOpenAICompatibleApi);
   renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   updateCanShowTranslation(currentTranslationStatus);
@@ -163,7 +164,14 @@ async function init() {
   openAiProjectInput.addEventListener('input', handleOpenAiProjectChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
-  singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
+  const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
+  if (singleBlockConcurrencyCheckbox) {
+    singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
+  }
+  const assumeOpenAICompatibleApiCheckbox = getAssumeOpenAICompatibleApiCheckbox();
+  if (assumeOpenAICompatibleApiCheckbox) {
+    assumeOpenAICompatibleApiCheckbox.addEventListener('change', handleAssumeOpenAICompatibleApiChange);
+  }
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
   cancelButton.addEventListener('click', sendCancel);
@@ -252,13 +260,35 @@ async function handleProofreadEnabledChange() {
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
+function getSingleBlockConcurrencyCheckbox() {
+  return document.getElementById('singleBlockConcurrency');
+}
+
+function getAssumeOpenAICompatibleApiCheckbox() {
+  return document.getElementById('assumeOpenAICompatibleApi');
+}
+
 async function handleSingleBlockConcurrencyChange() {
-  const singleBlockConcurrency = singleBlockConcurrencyCheckbox.checked;
+  const checkbox = getSingleBlockConcurrencyCheckbox();
+  if (!checkbox) return;
+  const singleBlockConcurrency = checkbox.checked;
   await chrome.storage.local.set({ singleBlockConcurrency });
   setTemporaryStatus(
     singleBlockConcurrency
       ? 'Ограничение параллельности включено.'
       : 'Ограничение параллельности отключено.'
+  );
+}
+
+async function handleAssumeOpenAICompatibleApiChange() {
+  const checkbox = getAssumeOpenAICompatibleApiCheckbox();
+  if (!checkbox) return;
+  const assumeOpenAICompatibleApi = checkbox.checked;
+  await chrome.storage.local.set({ assumeOpenAICompatibleApi });
+  setTemporaryStatus(
+    assumeOpenAICompatibleApi
+      ? 'Режим OpenAI-совместимого прокси включён.'
+      : 'Режим OpenAI-совместимого прокси отключён.'
   );
 }
 
@@ -292,6 +322,7 @@ async function getState() {
         'contextGenerationEnabled',
         'proofreadEnabled',
         'singleBlockConcurrency',
+        'assumeOpenAICompatibleApi',
         'blockLengthLimit',
         'chunkLengthLimit',
         'translationStatusByTab',
@@ -380,6 +411,7 @@ async function getState() {
           contextGenerationEnabled: data.contextGenerationEnabled,
           proofreadEnabled: data.proofreadEnabled,
           singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
+          assumeOpenAICompatibleApi: Boolean(data.assumeOpenAICompatibleApi),
           blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
           translationStatusByTab: data.translationStatusByTab || {},
           translationVisibilityByTab: data.translationVisibilityByTab || {},
@@ -566,7 +598,17 @@ function renderProofreadEnabled(enabled) {
 }
 
 function renderSingleBlockConcurrency(enabled) {
-  singleBlockConcurrencyCheckbox.checked = Boolean(enabled);
+  const checkbox = getSingleBlockConcurrencyCheckbox();
+  if (checkbox) {
+    checkbox.checked = Boolean(enabled);
+  }
+}
+
+function renderAssumeOpenAICompatibleApi(enabled) {
+  const checkbox = getAssumeOpenAICompatibleApiCheckbox();
+  if (checkbox) {
+    checkbox.checked = Boolean(enabled);
+  }
 }
 
 function renderBlockLengthLimit(limit) {

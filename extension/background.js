@@ -31,6 +31,7 @@ const DEFAULT_STATE = {
   contextGenerationEnabled: false,
   proofreadEnabled: false,
   singleBlockConcurrency: false,
+  assumeOpenAICompatibleApi: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -62,6 +63,7 @@ const STATE_CACHE_KEYS = new Set([
   'contextGenerationEnabled',
   'proofreadEnabled',
   'singleBlockConcurrency',
+  'assumeOpenAICompatibleApi',
   'blockLengthLimit',
   'tpmLimitsByModel',
   'outputRatioByRole',
@@ -397,7 +399,7 @@ function applyStatePatch(patch = {}) {
       }
       continue;
     }
-    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency'].includes(key)) {
+    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency', 'assumeOpenAICompatibleApi'].includes(key)) {
       next[key] = Boolean(value);
       continue;
     }
@@ -933,6 +935,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 proofreadModelList: DEFAULT_STATE.proofreadModelList,
                 contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
                 proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+                assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
                 blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
                 tpmLimitsByRole: {
                   translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -1124,6 +1127,7 @@ async function handleGetSettings(message, sendResponse) {
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+        assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
           translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -1172,6 +1176,7 @@ async function handleGetSettings(message, sendResponse) {
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
         singleBlockConcurrency: state.singleBlockConcurrency,
+        assumeOpenAICompatibleApi: state.assumeOpenAICompatibleApi,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByRole,
         outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -1197,6 +1202,7 @@ async function handleGetSettings(message, sendResponse) {
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+      assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
         translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -1222,6 +1228,7 @@ async function handleGetSettings(message, sendResponse) {
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+        assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
           translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -1266,7 +1273,8 @@ async function executeModelFallback(stage, state, message, handler) {
       };
       const requestOptions = {
         tier,
-        serviceTier: tier === 'flex' ? 'flex' : null
+        serviceTier: tier === 'flex' ? 'flex' : null,
+        assumeOpenAICompatibleApi: Boolean(state.assumeOpenAICompatibleApi)
       };
       return handler({ modelId, requestOptions, requestMeta });
     };

@@ -222,8 +222,43 @@ function getModelParamBlacklist() {
   return globalThis.__NT_MODEL_PARAM_BLACKLIST__;
 }
 
-function isModelParamUnsupported(modelId, paramName) {
+function getUnsupportedParamsByEndpoint() {
+  if (!globalThis.__NT_UNSUPPORTED_PARAMS_BY_ENDPOINT__) {
+    globalThis.__NT_UNSUPPORTED_PARAMS_BY_ENDPOINT__ = new Map();
+  }
+  return globalThis.__NT_UNSUPPORTED_PARAMS_BY_ENDPOINT__;
+}
+
+function normalizeBaseUrlHost(apiBaseUrl) {
+  if (!apiBaseUrl || typeof apiBaseUrl !== 'string') return '';
+  const trimmed = apiBaseUrl.trim();
+  if (!trimmed) return '';
+  try {
+    return new URL(trimmed).host.toLowerCase();
+  } catch (error) {
+    try {
+      return new URL(`https://${trimmed}`).host.toLowerCase();
+    } catch (nestedError) {
+      return '';
+    }
+  }
+}
+
+function buildUnsupportedParamKey(modelId, apiBaseUrl) {
+  if (!modelId) return '';
+  const host = normalizeBaseUrlHost(apiBaseUrl);
+  if (!host) return '';
+  return `${modelId}|${host}`;
+}
+
+function isModelParamUnsupported(modelId, paramName, apiBaseUrl) {
   if (!modelId || !paramName) return false;
+  const endpointKey = buildUnsupportedParamKey(modelId, apiBaseUrl);
+  if (endpointKey) {
+    const endpointMap = getUnsupportedParamsByEndpoint();
+    const endpointEntry = endpointMap.get(endpointKey);
+    if (endpointEntry?.has?.(paramName)) return true;
+  }
   const blacklist = getModelParamBlacklist();
   const entry = blacklist[modelId];
   if (!entry) return false;
@@ -236,8 +271,19 @@ function isModelParamUnsupported(modelId, paramName) {
   return false;
 }
 
-function markModelParamUnsupported(modelId, paramName) {
+function markModelParamUnsupported(modelId, paramName, apiBaseUrl) {
   if (!modelId || !paramName) return;
+  const endpointKey = buildUnsupportedParamKey(modelId, apiBaseUrl);
+  if (endpointKey) {
+    const endpointMap = getUnsupportedParamsByEndpoint();
+    let endpointEntry = endpointMap.get(endpointKey);
+    if (!endpointEntry || typeof endpointEntry.add !== 'function') {
+      endpointEntry = new Set(Array.isArray(endpointEntry) ? endpointEntry : []);
+      endpointMap.set(endpointKey, endpointEntry);
+    }
+    endpointEntry.add(paramName);
+    return;
+  }
   const blacklist = getModelParamBlacklist();
   let entry = blacklist[modelId];
   if (!entry || typeof entry.add !== 'function') {
@@ -247,11 +293,12 @@ function markModelParamUnsupported(modelId, paramName) {
   entry.add(paramName);
 }
 
-function applyModelRequestParams(requestPayload, modelId, requestOptions = null) {
+function applyModelRequestParams(requestPayload, modelId, requestOptions = null, apiBaseUrl = null) {
   if (!requestPayload || typeof requestPayload !== 'object') return;
   const tier = requestOptions?.tier || 'standard';
   const entry = getModelEntry(modelId, tier) || getModelEntry(modelId, 'standard');
-  const canUseParam = (paramName, supported) => supported && !isModelParamUnsupported(modelId, paramName);
+  const canUseParam = (paramName, supported) =>
+    supported && !isModelParamUnsupported(modelId, paramName, apiBaseUrl);
   const supportsCacheRetention = entry?.supportsPromptCacheRetention24h ?? false;
   const supportsCacheKey = entry?.supportsPromptCacheKey ?? true;
   const supportsServiceTier = entry?.supportsServiceTierParam ?? true;
@@ -434,9 +481,55 @@ function isUnsupportedParamError(status, errorPayload, errorText, paramName) {
   return p === needle || msg.includes(needle);
 }
 
-function applyPromptCacheParams(requestPayload, apiBaseUrl, model, cacheKey) {
+function isOpenAICompatibleBaseUrl(apiBaseUrl, assumeOpenAICompatibleApi = false) {
+  if (assumeOpenAICompatibleApi) return true;
+  if (!apiBaseUrl || typeof apiBaseUrl !== 'string') return false;
+  const trimmed = apiBaseUrl.trim();
+  if (!trimmed) return false;
+  let host = '';
+  let path = '';
+  try {
+    const parsed = new URL(trimmed);
+    host = parsed.hostname.toLowerCase();
+    path = parsed.pathname.toLowerCase();
+  } catch (error) {
+    try {
+      const parsed = new URL(`https://${trimmed}`);
+      host = parsed.hostname.toLowerCase();
+      path = parsed.pathname.toLowerCase();
+    } catch (nestedError) {
+      const lower = trimmed.toLowerCase();
+      if (lower.includes('openai.com')) return true;
+      return lower.endsWith('/v1/chat/completions') || lower.endsWith('/v1/responses');
+    }
+  }
+  if (host.includes('openai.com')) return true;
+  return path.endsWith('/v1/chat/completions') || path.endsWith('/v1/responses');
+}
+
+function getPromptCacheUnsupportedKey(model, apiBaseUrl) {
+  if (!model) return '';
+  const host = normalizeBaseUrlHost(apiBaseUrl);
+  return host ? `${model}|${host}` : model;
+}
+
+function isPromptCacheParamUnsupported(paramSet, model, apiBaseUrl) {
+  if (!paramSet || !model) return false;
+  const key = getPromptCacheUnsupportedKey(model, apiBaseUrl);
+  return key ? paramSet.has(key) : false;
+}
+
+function markPromptCacheParamUnsupported(paramSet, model, apiBaseUrl) {
+  if (!paramSet || !model) return;
+  const key = getPromptCacheUnsupportedKey(model, apiBaseUrl);
+  if (key) {
+    paramSet.add(key);
+  }
+}
+
+function applyPromptCacheParams(requestPayload, apiBaseUrl, model, cacheKey, requestOptions = null) {
   if (!requestPayload || typeof requestPayload !== 'object') return;
-  if (apiBaseUrl !== OPENAI_API_URL) return;
+  if (!isOpenAICompatibleBaseUrl(apiBaseUrl, requestOptions?.assumeOpenAICompatibleApi)) return;
 
   const entry = getModelEntry(model);
   const supportsCacheKey = entry?.supportsPromptCacheKey ?? true;
@@ -446,22 +539,22 @@ function applyPromptCacheParams(requestPayload, apiBaseUrl, model, cacheKey) {
     typeof cacheKey === 'string' &&
     model &&
     supportsCacheKey &&
-    !PROMPT_CACHE_KEY_UNSUPPORTED_MODELS.has(model) &&
-    !isModelParamUnsupported(model, 'prompt_cache_key')
+    !isPromptCacheParamUnsupported(PROMPT_CACHE_KEY_UNSUPPORTED_MODELS, model, apiBaseUrl) &&
+    !isModelParamUnsupported(model, 'prompt_cache_key', apiBaseUrl)
   ) {
     requestPayload.prompt_cache_key = cacheKey;
   }
   if (
     model &&
     supportsCacheRetention &&
-    !PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS.has(model) &&
-    !isModelParamUnsupported(model, 'prompt_cache_retention')
+    !isPromptCacheParamUnsupported(PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS, model, apiBaseUrl) &&
+    !isModelParamUnsupported(model, 'prompt_cache_retention', apiBaseUrl)
   ) {
     requestPayload.prompt_cache_retention = '24h';
   }
 }
 
-function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorPayload, errorText) {
+function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorPayload, errorText, apiBaseUrl) {
   if (!requestPayload || typeof requestPayload !== 'object') return { changed: false, removedParams: [] };
 
   let changed = false;
@@ -471,8 +564,8 @@ function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorP
     requestPayload.prompt_cache_retention !== undefined &&
     isUnsupportedParamError(status, errorPayload, errorText, 'prompt_cache_retention')
   ) {
-    if (model) PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS.add(model);
-    if (model) markModelParamUnsupported(model, 'prompt_cache_retention');
+    if (model) markPromptCacheParamUnsupported(PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS, model, apiBaseUrl);
+    if (model) markModelParamUnsupported(model, 'prompt_cache_retention', apiBaseUrl);
     delete requestPayload.prompt_cache_retention;
     changed = true;
     removedParams.push('prompt_cache_retention');
@@ -482,8 +575,8 @@ function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorP
     requestPayload.prompt_cache_key !== undefined &&
     isUnsupportedParamError(status, errorPayload, errorText, 'prompt_cache_key')
   ) {
-    if (model) PROMPT_CACHE_KEY_UNSUPPORTED_MODELS.add(model);
-    if (model) markModelParamUnsupported(model, 'prompt_cache_key');
+    if (model) markPromptCacheParamUnsupported(PROMPT_CACHE_KEY_UNSUPPORTED_MODELS, model, apiBaseUrl);
+    if (model) markModelParamUnsupported(model, 'prompt_cache_key', apiBaseUrl);
     delete requestPayload.prompt_cache_key;
     if (requestPayload.prompt_cache_retention !== undefined) delete requestPayload.prompt_cache_retention;
     changed = true;
@@ -493,7 +586,7 @@ function stripUnsupportedPromptCacheParams(requestPayload, model, status, errorP
   return { changed, removedParams };
 }
 
-function stripUnsupportedRequestParams(requestPayload, model, status, errorPayload, errorText) {
+function stripUnsupportedRequestParams(requestPayload, model, status, errorPayload, errorText, apiBaseUrl) {
   if (!requestPayload || typeof requestPayload !== 'object') {
     return { changed: false, removedParams: [] };
   }
@@ -501,7 +594,14 @@ function stripUnsupportedRequestParams(requestPayload, model, status, errorPaylo
   const removedParams = [];
   let changed = false;
 
-  const promptResult = stripUnsupportedPromptCacheParams(requestPayload, model, status, errorPayload, errorText);
+  const promptResult = stripUnsupportedPromptCacheParams(
+    requestPayload,
+    model,
+    status,
+    errorPayload,
+    errorText,
+    apiBaseUrl
+  );
   if (promptResult.changed) {
     changed = true;
     if (Array.isArray(promptResult.removedParams)) {
@@ -513,7 +613,7 @@ function stripUnsupportedRequestParams(requestPayload, model, status, errorPaylo
     requestPayload.service_tier !== undefined &&
     isUnsupportedParamError(status, errorPayload, errorText, 'service_tier')
   ) {
-    if (model) markModelParamUnsupported(model, 'service_tier');
+    if (model) markModelParamUnsupported(model, 'service_tier', apiBaseUrl);
     delete requestPayload.service_tier;
     changed = true;
     removedParams.push('service_tier');
@@ -523,7 +623,7 @@ function stripUnsupportedRequestParams(requestPayload, model, status, errorPaylo
     requestPayload.response_format !== undefined &&
     isUnsupportedParamError(status, errorPayload, errorText, 'response_format')
   ) {
-    if (model) markModelParamUnsupported(model, 'response_format');
+    if (model) markModelParamUnsupported(model, 'response_format', apiBaseUrl);
     delete requestPayload.response_format;
     changed = true;
     removedParams.push('response_format');
@@ -541,7 +641,7 @@ function stripUnsupportedRequestParams(requestPayload, model, status, errorPaylo
     } else {
       removedParams.push('max_tokens');
     }
-    if (model) markModelParamUnsupported(model, 'max_tokens');
+    if (model) markModelParamUnsupported(model, 'max_tokens', apiBaseUrl);
     changed = true;
   }
 
@@ -557,7 +657,7 @@ function stripUnsupportedRequestParams(requestPayload, model, status, errorPaylo
     } else {
       removedParams.push('max_completion_tokens');
     }
-    if (model) markModelParamUnsupported(model, 'max_completion_tokens');
+    if (model) markModelParamUnsupported(model, 'max_completion_tokens', apiBaseUrl);
     changed = true;
   }
 
