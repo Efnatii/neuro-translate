@@ -6,6 +6,7 @@ const eventsEl = document.getElementById('events');
 const clearDebugButton = document.getElementById('clear-debug');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const CONTEXT_CACHE_KEY = 'contextCacheByPage';
 const DEBUG_PORT_NAME = 'debug';
 const DEBUG_DB_NAME = 'nt_debug';
 const DEBUG_DB_VERSION = 1;
@@ -220,29 +221,49 @@ async function getDebugStore() {
 
 async function clearContext() {
   if (!sourceUrl) return;
-  const store = await getDebugStore();
-  if (!store) return;
-  const current = store[sourceUrl];
-  if (!current) return;
-  const nextFullStatus = current.contextFullStatus === 'disabled' || current.contextStatus === 'disabled' ? 'disabled' : 'pending';
-  const nextShortStatus = current.contextShortStatus === 'disabled' ? 'disabled' : 'pending';
-  store[sourceUrl] = {
-    ...current,
-    context: '',
-    contextStatus: nextFullStatus,
-    contextFull: '',
-    contextFullStatus: nextFullStatus,
-    contextShort: '',
-    contextShortStatus: nextShortStatus,
-    contextFullRefId: '',
-    contextShortRefId: '',
-    contextFullTruncated: false,
-    contextShortTruncated: false,
-    updatedAt: Date.now()
-  };
   await new Promise((resolve) => {
-    chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: store }, () => resolve());
+    chrome.storage.local.get({ [CONTEXT_CACHE_KEY]: {} }, (data) => {
+      const cache = data?.[CONTEXT_CACHE_KEY] || {};
+      let changed = false;
+      Object.keys(cache).forEach((key) => {
+        if (key.includes(`::${sourceUrl}::`)) {
+          delete cache[key];
+          changed = true;
+        }
+      });
+      if (!changed) {
+        resolve();
+        return;
+      }
+      chrome.storage.local.set({ [CONTEXT_CACHE_KEY]: cache }, () => resolve());
+    });
   });
+  const store = await getDebugStore();
+  if (store) {
+    const current = store[sourceUrl];
+    if (current) {
+      const nextFullStatus =
+        current.contextFullStatus === 'disabled' || current.contextStatus === 'disabled' ? 'disabled' : 'pending';
+      const nextShortStatus = current.contextShortStatus === 'disabled' ? 'disabled' : 'pending';
+      store[sourceUrl] = {
+        ...current,
+        context: '',
+        contextStatus: nextFullStatus,
+        contextFull: '',
+        contextFullStatus: nextFullStatus,
+        contextShort: '',
+        contextShortStatus: nextShortStatus,
+        contextFullRefId: '',
+        contextShortRefId: '',
+        contextFullTruncated: false,
+        contextShortTruncated: false,
+        updatedAt: Date.now()
+      };
+      await new Promise((resolve) => {
+        chrome.storage.local.set({ [DEBUG_STORAGE_KEY]: store }, () => resolve());
+      });
+    }
+  }
   await refreshDebug();
 }
 
