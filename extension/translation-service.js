@@ -363,23 +363,30 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     parentRequestId: payload.parentRequestId || requestMeta.parentRequestId || '',
     blockKey: payload.blockKey || requestMeta.blockKey || '',
     stage: payload.stage || requestMeta.stage || '',
-    purpose: payload.purpose || requestMeta.purpose || '',
+    purpose: requestMeta.purpose || payload.purpose || '',
     attempt: Number.isFinite(payload.attempt) ? payload.attempt : requestMeta.attempt,
-    triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
-    selectedModel: payload.selectedModel || requestMeta.selectedModel || payload.model || '',
-    selectedTier: payload.selectedTier || requestMeta.selectedTier || '',
-    selectedModelSpec: payload.selectedModelSpec || requestMeta.selectedModelSpec || '',
+    triggerSource: requestMeta.triggerSource || payload.triggerSource || '',
+    selectedModel: requestMeta.selectedModel || payload.selectedModel || payload.model || '',
+    selectedTier: requestMeta.selectedTier || payload.selectedTier || '',
+    selectedModelSpec: requestMeta.selectedModelSpec || payload.selectedModelSpec || '',
     attemptIndex:
       Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
         ? payload.attemptIndex
         : requestMeta.attemptIndex,
     fallbackReason: payload.fallbackReason || requestMeta.fallbackReason || '',
     originalRequestedModelList:
-      payload.originalRequestedModelList ||
-      requestMeta.originalRequestedModelList ||
-      [],
-    candidateStrategy: payload.candidateStrategy || requestMeta.candidateStrategy || '',
-    candidateOrderedList: payload.candidateOrderedList || requestMeta.candidateOrderedList || [],
+      Array.isArray(requestMeta.originalRequestedModelList)
+        ? requestMeta.originalRequestedModelList
+        : Array.isArray(payload.originalRequestedModelList)
+          ? payload.originalRequestedModelList
+          : [],
+    candidateStrategy: requestMeta.candidateStrategy || payload.candidateStrategy || '',
+    candidateOrderedList:
+      Array.isArray(requestMeta.candidateOrderedList)
+        ? requestMeta.candidateOrderedList
+        : Array.isArray(payload.candidateOrderedList)
+          ? payload.candidateOrderedList
+          : [],
     contextMode: payload.contextMode || contextMode,
     contextTypeUsed: payload.contextTypeUsed || contextTypeUsed,
     contextHash: payload.contextHash ?? (effectiveContext?.hash ?? 0),
