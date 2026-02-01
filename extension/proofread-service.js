@@ -27,6 +27,100 @@ const PROOFREAD_SYSTEM_PROMPT = [
   'Return only JSON, without commentary.'
 ].join(' ');
 
+function shouldLogJson() {
+  return typeof globalThis.ntJsonLogEnabled === 'function' && globalThis.ntJsonLogEnabled();
+}
+
+function emitJsonLog(eventObject) {
+  if (!shouldLogJson()) return;
+  if (typeof globalThis.ntJsonLog === 'function') {
+    globalThis.ntJsonLog(eventObject);
+  }
+}
+
+function maskApiKey(apiKey) {
+  if (!apiKey) return '';
+  const text = String(apiKey);
+  const tail = text.slice(-4);
+  return `****${tail}`;
+}
+
+function logLlmFetchRequest({ ts, role, requestId, url, method, headers, body, model, temperature, responseFormat }) {
+  const event = {
+    kind: 'llm.fetch.request',
+    ts,
+    role,
+    requestId,
+    url,
+    method,
+    headers,
+    body,
+    model
+  };
+  if (temperature != null) {
+    event.temperature = temperature;
+  }
+  if (responseFormat != null) {
+    event.response_format = responseFormat;
+  }
+  emitJsonLog(event);
+}
+
+function logLlmFetchResponse({ ts, requestId, status, ok, responseHeaders, responseText, durationMs }) {
+  emitJsonLog({
+    kind: 'llm.fetch.response',
+    ts,
+    requestId,
+    status,
+    ok,
+    responseHeaders,
+    responseText,
+    durationMs
+  });
+}
+
+function logLlmFetchError({ ts, requestId, error }) {
+  emitJsonLog({
+    kind: 'llm.fetch.error',
+    ts,
+    requestId,
+    error: error && typeof error === 'object'
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : { name: 'Error', message: String(error ?? ''), stack: '' }
+  });
+}
+
+function logLlmParseExtract({ requestId, extractedText, source }) {
+  emitJsonLog({
+    kind: 'llm.parse.extract',
+    requestId,
+    extractedTextLength: extractedText?.length || 0,
+    extractedText: extractedText || '',
+    source: source || 'empty'
+  });
+}
+
+function logLlmParseOk({ requestId, parsed, ts }) {
+  emitJsonLog({
+    kind: 'llm.parse.ok',
+    requestId,
+    parsed,
+    ts
+  });
+}
+
+function logLlmParseFail({ requestId, error, rawText, ts }) {
+  emitJsonLog({
+    kind: 'llm.parse.fail',
+    requestId,
+    error: error && typeof error === 'object'
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : error,
+    rawText,
+    ts
+  });
+}
+
 function normalizeContextPayload(context) {
   if (!context) {
     return {
@@ -1448,6 +1542,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
   const promptCacheKey = requestPayload.prompt_cache_key || '';
   const promptCacheRetention = requestPayload.prompt_cache_retention || '';
+  const requestId = requestMeta?.requestId || createRequestId();
   const startedAt = Date.now();
   const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
   const batchSize = items.length;
@@ -1456,17 +1551,49 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       limitPerMinute: 12
     });
   }
-  let response = await fetch(apiBaseUrl, {
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`
+  };
+  const requestBody = JSON.stringify(requestPayload);
+  let response;
+  let responseText = '';
+  let fetchStartedAt = Date.now();
+  logLlmFetchRequest({
+    ts: fetchStartedAt,
+    role: 'proofread',
+    requestId,
+    url: apiBaseUrl,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
+    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+    body: requestBody,
+    model: requestPayload.model,
+    temperature: requestPayload.temperature,
+    responseFormat: requestPayload.response_format
   });
+  try {
+    response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: requestBody
+    });
+    responseText = await response.clone().text();
+    logLlmFetchResponse({
+      ts: Date.now(),
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseHeaders: Array.from(response.headers.entries()),
+      responseText,
+      durationMs: Date.now() - fetchStartedAt
+    });
+  } catch (error) {
+    logLlmFetchError({ ts: Date.now(), requestId, error });
+    throw error;
+  }
 
   if (!response.ok) {
-    let errorText = await response.text();
+    let errorText = responseText;
     let errorPayload = null;
     try {
       errorPayload = JSON.parse(errorText);
@@ -1504,16 +1631,41 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         status: response.status,
         removedParams: stripped.removedParams
       });
-      response = await fetch(apiBaseUrl, {
+      fetchStartedAt = Date.now();
+      logLlmFetchRequest({
+        ts: fetchStartedAt,
+        role: 'proofread',
+        requestId,
+        url: apiBaseUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload)
+        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+        body: requestBody,
+        model: requestPayload.model,
+        temperature: requestPayload.temperature,
+        responseFormat: requestPayload.response_format
       });
+      try {
+        response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: requestBody
+        });
+        responseText = await response.clone().text();
+        logLlmFetchResponse({
+          ts: Date.now(),
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseHeaders: Array.from(response.headers.entries()),
+          responseText,
+          durationMs: Date.now() - fetchStartedAt
+        });
+      } catch (error) {
+        logLlmFetchError({ ts: Date.now(), requestId, error });
+        throw error;
+      }
       if (!response.ok) {
-        errorText = await response.text();
+        errorText = responseText;
         try {
           errorPayload = JSON.parse(errorText);
         } catch (parseError) {
@@ -1568,6 +1720,11 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const data = await response.json();
   const assistantContentMeta = {};
   const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  logLlmParseExtract({
+    requestId,
+    extractedText: extractedContent,
+    source: assistantContentMeta.assistant_content_source || 'empty'
+  });
   const content = extractedContent.trim();
   if (!content) {
     const latencyMs = Date.now() - startedAt;
@@ -1663,6 +1820,12 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   if (!parseError && (hasUnknownIds || hasMissingIds || hasDuplicateIds || hasCountMismatch)) {
     parseError = 'schema-mismatch:items';
     debugPayload.parseIssues.push(parseError);
+  }
+
+  if (parseError) {
+    logLlmParseFail({ requestId, error: parseError, rawText: content, ts: Date.now() });
+  } else {
+    logLlmParseOk({ requestId, parsed, ts: Date.now() });
   }
 
   let rawProofread = content;
@@ -1816,18 +1979,51 @@ async function requestProofreadFormatRepair(
     requestOptions
   );
   applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
+  const requestId = normalizedRequestMeta?.requestId || createRequestId();
   const startedAt = Date.now();
-  let response = await fetch(apiBaseUrl, {
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`
+  };
+  const requestBody = JSON.stringify(requestPayload);
+  let response;
+  let responseText = '';
+  let fetchStartedAt = Date.now();
+  logLlmFetchRequest({
+    ts: fetchStartedAt,
+    role: 'proofread',
+    requestId,
+    url: apiBaseUrl,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
+    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+    body: requestBody,
+    model: requestPayload.model,
+    temperature: requestPayload.temperature,
+    responseFormat: requestPayload.response_format
   });
+  try {
+    response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: requestBody
+    });
+    responseText = await response.clone().text();
+    logLlmFetchResponse({
+      ts: Date.now(),
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseHeaders: Array.from(response.headers.entries()),
+      responseText,
+      durationMs: Date.now() - fetchStartedAt
+    });
+  } catch (error) {
+    logLlmFetchError({ ts: Date.now(), requestId, error });
+    throw error;
+  }
 
   if (!response.ok) {
-    let errorText = await response.text();
+    let errorText = responseText;
     let errorPayload = null;
     try {
       errorPayload = JSON.parse(errorText);
@@ -1865,14 +2061,39 @@ async function requestProofreadFormatRepair(
         status: response.status,
         removedParams: stripped.removedParams
       });
-      response = await fetch(apiBaseUrl, {
+      fetchStartedAt = Date.now();
+      logLlmFetchRequest({
+        ts: fetchStartedAt,
+        role: 'proofread',
+        requestId,
+        url: apiBaseUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload)
+        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+        body: requestBody,
+        model: requestPayload.model,
+        temperature: requestPayload.temperature,
+        responseFormat: requestPayload.response_format
       });
+      try {
+        response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: requestBody
+        });
+        responseText = await response.clone().text();
+        logLlmFetchResponse({
+          ts: Date.now(),
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseHeaders: Array.from(response.headers.entries()),
+          responseText,
+          durationMs: Date.now() - fetchStartedAt
+        });
+      } catch (error) {
+        logLlmFetchError({ ts: Date.now(), requestId, error });
+        throw error;
+      }
       if (!response.ok) {
         return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
       }
@@ -1883,6 +2104,11 @@ async function requestProofreadFormatRepair(
   const data = await response.json();
   const assistantContentMeta = {};
   const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  logLlmParseExtract({
+    requestId,
+    extractedText: extractedContent,
+    source: assistantContentMeta.assistant_content_source || 'empty'
+  });
   const content = extractedContent.trim();
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
@@ -1937,6 +2163,12 @@ async function requestProofreadFormatRepair(
       parseError = 'schema-mismatch:items';
       debugPayload.parseIssues.push(parseError);
     }
+  }
+
+  if (parseError) {
+    logLlmParseFail({ requestId, error: parseError, rawText: content, ts: Date.now() });
+  } else {
+    logLlmParseOk({ requestId, parsed, ts: Date.now() });
   }
 
   return {
@@ -2104,18 +2336,51 @@ async function repairProofreadSegments(
     requestOptions
   );
   applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
+  const requestId = repairRequestMeta?.requestId || createRequestId();
   const startedAt = Date.now();
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`
+  };
+  const requestBody = JSON.stringify(requestPayload);
   try {
-    let response = await fetch(apiBaseUrl, {
+    let response;
+    let responseText = '';
+    let fetchStartedAt = Date.now();
+    logLlmFetchRequest({
+      ts: fetchStartedAt,
+      role: 'proofread',
+      requestId,
+      url: apiBaseUrl,
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify(requestPayload)
+      headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+      body: requestBody,
+      model: requestPayload.model,
+      temperature: requestPayload.temperature,
+      responseFormat: requestPayload.response_format
     });
+    try {
+      response = await fetch(apiBaseUrl, {
+        method: 'POST',
+        headers: requestHeaders,
+        body: requestBody
+      });
+      responseText = await response.clone().text();
+      logLlmFetchResponse({
+        ts: Date.now(),
+        requestId,
+        status: response.status,
+        ok: response.ok,
+        responseHeaders: Array.from(response.headers.entries()),
+        responseText,
+        durationMs: Date.now() - fetchStartedAt
+      });
+    } catch (error) {
+      logLlmFetchError({ ts: Date.now(), requestId, error });
+      throw error;
+    }
     if (!response.ok) {
-      let errorText = await response.text();
+      let errorText = responseText;
       let errorPayload = null;
       try {
         errorPayload = JSON.parse(errorText);
@@ -2153,14 +2418,39 @@ async function repairProofreadSegments(
           status: response.status,
           removedParams: stripped.removedParams
         });
-        response = await fetch(apiBaseUrl, {
+        fetchStartedAt = Date.now();
+        logLlmFetchRequest({
+          ts: fetchStartedAt,
+          role: 'proofread',
+          requestId,
+          url: apiBaseUrl,
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`
-          },
-          body: JSON.stringify(requestPayload)
+          headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+          body: requestBody,
+          model: requestPayload.model,
+          temperature: requestPayload.temperature,
+          responseFormat: requestPayload.response_format
         });
+        try {
+          response = await fetch(apiBaseUrl, {
+            method: 'POST',
+            headers: requestHeaders,
+            body: requestBody
+          });
+          responseText = await response.clone().text();
+          logLlmFetchResponse({
+            ts: Date.now(),
+            requestId,
+            status: response.status,
+            ok: response.ok,
+            responseHeaders: Array.from(response.headers.entries()),
+            responseText,
+            durationMs: Date.now() - fetchStartedAt
+          });
+        } catch (error) {
+          logLlmFetchError({ ts: Date.now(), requestId, error });
+          throw error;
+        }
       }
     }
     if (!response.ok) {
@@ -2169,6 +2459,11 @@ async function repairProofreadSegments(
     const data = await response.json();
     const assistantContentMeta = {};
     const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+    logLlmParseExtract({
+      requestId,
+      extractedText: extractedContent,
+      source: assistantContentMeta.assistant_content_source || 'empty'
+    });
     const content = extractedContent.trim();
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
@@ -2224,6 +2519,11 @@ async function repairProofreadSegments(
         parseError = 'schema-mismatch:items';
         debugPayload.parseIssues.push(parseError);
       }
+    }
+    if (parseError) {
+      logLlmParseFail({ requestId, error: parseError, rawText: content, ts: Date.now() });
+    } else {
+      logLlmParseOk({ requestId, parsed, ts: Date.now() });
     }
     if (parseError) {
       const fallbackSpec =

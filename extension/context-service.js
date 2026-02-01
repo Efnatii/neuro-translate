@@ -71,6 +71,97 @@ const SHORT_CONTEXT_SYSTEM_PROMPT = [
   'Target length: 5-10 bullet points maximum.'
 ].join('\n');
 
+function shouldLogJson() {
+  return typeof globalThis.ntJsonLogEnabled === 'function' && globalThis.ntJsonLogEnabled();
+}
+
+function emitJsonLog(eventObject) {
+  if (!shouldLogJson()) return;
+  if (typeof globalThis.ntJsonLog === 'function') {
+    globalThis.ntJsonLog(eventObject);
+  }
+}
+
+function maskApiKey(apiKey) {
+  if (!apiKey) return '';
+  const text = String(apiKey);
+  const tail = text.slice(-4);
+  return `****${tail}`;
+}
+
+function createRequestId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function logLlmFetchRequest({ ts, role, requestId, url, method, headers, body, model, temperature, responseFormat }) {
+  const event = {
+    kind: 'llm.fetch.request',
+    ts,
+    role,
+    requestId,
+    url,
+    method,
+    headers,
+    body,
+    model
+  };
+  if (temperature != null) {
+    event.temperature = temperature;
+  }
+  if (responseFormat != null) {
+    event.response_format = responseFormat;
+  }
+  emitJsonLog(event);
+}
+
+function logLlmFetchResponse({ ts, requestId, status, ok, responseHeaders, responseText, durationMs }) {
+  emitJsonLog({
+    kind: 'llm.fetch.response',
+    ts,
+    requestId,
+    status,
+    ok,
+    responseHeaders,
+    responseText,
+    durationMs
+  });
+}
+
+function logLlmFetchError({ ts, requestId, error }) {
+  emitJsonLog({
+    kind: 'llm.fetch.error',
+    ts,
+    requestId,
+    error: error && typeof error === 'object'
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : { name: 'Error', message: String(error ?? ''), stack: '' }
+  });
+}
+
+function logLlmParseOk({ requestId, parsed, ts }) {
+  emitJsonLog({
+    kind: 'llm.parse.ok',
+    requestId,
+    parsed,
+    ts
+  });
+}
+
+function logLlmParseFail({ requestId, error, rawText, ts }) {
+  emitJsonLog({
+    kind: 'llm.parse.fail',
+    requestId,
+    error: error && typeof error === 'object'
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : error,
+    rawText,
+    ts
+  });
+}
+
 function resolveContextModelSpec(requestMeta, fallbackModelSpec) {
   const triggerSource =
     requestMeta && typeof requestMeta.triggerSource === 'string'
@@ -321,18 +412,54 @@ async function generateTranslationContext(
   const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, effectiveRequestOptions);
   const promptCacheKey = requestPayload.prompt_cache_key || '';
   const promptCacheRetention = requestPayload.prompt_cache_retention || '';
+  const requestId = requestMeta?.requestId || createRequestId();
+  if (requestMeta && typeof requestMeta === 'object' && !requestMeta.requestId) {
+    requestMeta.requestId = requestId;
+  }
   const startedAt = Date.now();
-  let response = await fetch(apiBaseUrl, {
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`
+  };
+  const requestBody = JSON.stringify(requestPayload);
+  let response;
+  let responseText = '';
+  let fetchStartedAt = Date.now();
+  logLlmFetchRequest({
+    ts: fetchStartedAt,
+    role: 'context',
+    requestId,
+    url: apiBaseUrl,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
+    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+    body: requestBody,
+    model: requestPayload.model,
+    temperature: requestPayload.temperature,
+    responseFormat: requestPayload.response_format
   });
+  try {
+    response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: requestBody
+    });
+    responseText = await response.clone().text();
+    logLlmFetchResponse({
+      ts: Date.now(),
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseHeaders: Array.from(response.headers.entries()),
+      responseText,
+      durationMs: Date.now() - fetchStartedAt
+    });
+  } catch (error) {
+    logLlmFetchError({ ts: Date.now(), requestId, error });
+    throw error;
+  }
 
   if (!response.ok) {
-    let errorText = await response.text();
+    let errorText = responseText;
     let errorPayload = null;
     try {
       errorPayload = JSON.parse(errorText);
@@ -361,16 +488,41 @@ async function generateTranslationContext(
         status: response.status,
         removedParams: stripped.removedParams
       });
-      response = await fetch(apiBaseUrl, {
+      fetchStartedAt = Date.now();
+      logLlmFetchRequest({
+        ts: fetchStartedAt,
+        role: 'context',
+        requestId,
+        url: apiBaseUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload)
+        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+        body: requestBody,
+        model: requestPayload.model,
+        temperature: requestPayload.temperature,
+        responseFormat: requestPayload.response_format
       });
+      try {
+        response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: requestBody
+        });
+        responseText = await response.clone().text();
+        logLlmFetchResponse({
+          ts: Date.now(),
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseHeaders: Array.from(response.headers.entries()),
+          responseText,
+          durationMs: Date.now() - fetchStartedAt
+        });
+      } catch (error) {
+        logLlmFetchError({ ts: Date.now(), requestId, error });
+        throw error;
+      }
       if (!response.ok) {
-        errorText = await response.text();
+        errorText = responseText;
       }
     }
     if (!response.ok) {
@@ -381,12 +533,14 @@ async function generateTranslationContext(
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content;
   if (!content) {
+    logLlmParseFail({ requestId, error: 'no-content', rawText: responseText, ts: Date.now() });
     throw new Error('No context returned');
   }
 
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
   const trimmed = typeof content === 'string' ? content.trim() : '';
+  logLlmParseOk({ requestId, parsed: trimmed, ts: Date.now() });
   const debugPayload = attachContextRequestMeta(
     {
       phase: 'CONTEXT',
@@ -525,18 +679,54 @@ async function generateShortTranslationContext(
   const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, effectiveRequestOptions);
   const promptCacheKey = requestPayload.prompt_cache_key || '';
   const promptCacheRetention = requestPayload.prompt_cache_retention || '';
+  const requestId = requestMeta?.requestId || createRequestId();
+  if (requestMeta && typeof requestMeta === 'object' && !requestMeta.requestId) {
+    requestMeta.requestId = requestId;
+  }
   const startedAt = Date.now();
-  let response = await fetch(apiBaseUrl, {
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`
+  };
+  const requestBody = JSON.stringify(requestPayload);
+  let response;
+  let responseText = '';
+  let fetchStartedAt = Date.now();
+  logLlmFetchRequest({
+    ts: fetchStartedAt,
+    role: 'context',
+    requestId,
+    url: apiBaseUrl,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload)
+    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+    body: requestBody,
+    model: requestPayload.model,
+    temperature: requestPayload.temperature,
+    responseFormat: requestPayload.response_format
   });
+  try {
+    response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: requestBody
+    });
+    responseText = await response.clone().text();
+    logLlmFetchResponse({
+      ts: Date.now(),
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseHeaders: Array.from(response.headers.entries()),
+      responseText,
+      durationMs: Date.now() - fetchStartedAt
+    });
+  } catch (error) {
+    logLlmFetchError({ ts: Date.now(), requestId, error });
+    throw error;
+  }
 
   if (!response.ok) {
-    let errorText = await response.text();
+    let errorText = responseText;
     let errorPayload = null;
     try {
       errorPayload = JSON.parse(errorText);
@@ -565,16 +755,41 @@ async function generateShortTranslationContext(
         status: response.status,
         removedParams: stripped.removedParams
       });
-      response = await fetch(apiBaseUrl, {
+      fetchStartedAt = Date.now();
+      logLlmFetchRequest({
+        ts: fetchStartedAt,
+        role: 'context',
+        requestId,
+        url: apiBaseUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload)
+        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+        body: requestBody,
+        model: requestPayload.model,
+        temperature: requestPayload.temperature,
+        responseFormat: requestPayload.response_format
       });
+      try {
+        response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: requestBody
+        });
+        responseText = await response.clone().text();
+        logLlmFetchResponse({
+          ts: Date.now(),
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseHeaders: Array.from(response.headers.entries()),
+          responseText,
+          durationMs: Date.now() - fetchStartedAt
+        });
+      } catch (error) {
+        logLlmFetchError({ ts: Date.now(), requestId, error });
+        throw error;
+      }
       if (!response.ok) {
-        errorText = await response.text();
+        errorText = responseText;
       }
     }
     if (!response.ok) {
@@ -585,12 +800,14 @@ async function generateShortTranslationContext(
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content;
   if (!content) {
+    logLlmParseFail({ requestId, error: 'no-content', rawText: responseText, ts: Date.now() });
     throw new Error('No short context returned');
   }
 
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
   const trimmed = typeof content === 'string' ? content.trim() : '';
+  logLlmParseOk({ requestId, parsed: trimmed, ts: Date.now() });
   const debugPayload = attachContextRequestMeta(
     {
       phase: 'CONTEXT_SHORT',
