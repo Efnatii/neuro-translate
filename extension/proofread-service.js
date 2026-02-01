@@ -115,6 +115,91 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
   };
 }
 
+function resolveProofreadCandidateSelection(requestMeta, fallbackModelSpec, overrides = {}) {
+  const purpose = overrides.purpose || requestMeta?.purpose || '';
+  const triggerSource = overrides.triggerSource || requestMeta?.triggerSource || '';
+  const normalizedTrigger = typeof triggerSource === 'string' ? triggerSource.toLowerCase() : '';
+  const effectivePurpose = typeof purpose === 'string' ? purpose : '';
+  const isManualTrigger =
+    Boolean(requestMeta?.isManual) ||
+    normalizedTrigger.includes('manual') ||
+    effectivePurpose === 'manual';
+  let candidateStrategy = 'default_preserve_order';
+  if (effectivePurpose === 'retry') {
+    candidateStrategy = 'retry_cheapest';
+  } else if (effectivePurpose === 'validate') {
+    candidateStrategy = 'validate_cheapest';
+  } else if (isManualTrigger) {
+    candidateStrategy = 'manual_smartest';
+  }
+
+  let originalRequestedModelList = Array.isArray(requestMeta?.originalRequestedModelList)
+    ? requestMeta.originalRequestedModelList
+    : [];
+  if (!originalRequestedModelList.length && fallbackModelSpec) {
+    originalRequestedModelList = [fallbackModelSpec];
+  }
+  const parsedEntries = originalRequestedModelList.map((spec, index) => {
+    const parsed = parseModelSpec(spec);
+    const tierPref = parsed.tier === 'flex' ? 1 : 0;
+    const capabilityRank = getModelCapabilityRank(parsed.id);
+    const costSum = getModelEntry(parsed.id, parsed.tier)?.sum_1M ?? Infinity;
+    return {
+      spec,
+      index,
+      parsed,
+      tierPref,
+      capabilityRank,
+      costSum
+    };
+  });
+  const compareManual = (left, right) => {
+    if (left.capabilityRank !== right.capabilityRank) {
+      return right.capabilityRank - left.capabilityRank;
+    }
+    if (left.tierPref !== right.tierPref) {
+      return right.tierPref - left.tierPref;
+    }
+    if (left.index !== right.index) {
+      return left.index - right.index;
+    }
+    return 0;
+  };
+  const compareCheapest = (left, right) => {
+    if (left.costSum !== right.costSum) {
+      return left.costSum - right.costSum;
+    }
+    if (left.capabilityRank !== right.capabilityRank) {
+      return right.capabilityRank - left.capabilityRank;
+    }
+    if (left.tierPref !== right.tierPref) {
+      return right.tierPref - left.tierPref;
+    }
+    if (left.index !== right.index) {
+      return left.index - right.index;
+    }
+    return 0;
+  };
+  const orderedEntries = [...parsedEntries];
+  if (candidateStrategy === 'manual_smartest') {
+    orderedEntries.sort(compareManual);
+  } else if (candidateStrategy === 'retry_cheapest' || candidateStrategy === 'validate_cheapest') {
+    orderedEntries.sort(compareCheapest);
+  }
+  const orderedList = orderedEntries.map((entry) => entry.spec);
+  const selectedModelSpec = orderedList[0] || '';
+  return { candidateStrategy, orderedList, originalRequestedModelList, selectedModelSpec };
+}
+
+function buildRequestOptionsForTier(requestOptions, tier) {
+  const normalizedTier = tier === 'flex' ? 'flex' : 'standard';
+  return {
+    ...(requestOptions && typeof requestOptions === 'object' ? requestOptions : {}),
+    tier: normalizedTier,
+    serviceTier: normalizedTier === 'flex' ? 'flex' : null
+  };
+}
+
 function resolveContextPolicy(contextPayload, purpose) {
   const normalized = normalizeContextPayload(contextPayload);
   if (!normalized.text) {
@@ -505,6 +590,31 @@ async function proofreadTranslation(
   }
 
   const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'main' });
+  const baseModelSpec = formatModelSpec(model, baseRequestMeta.selectedTier || 'standard');
+  if (!baseRequestMeta.candidateStrategy || !baseRequestMeta.candidateOrderedList?.length) {
+    const baseSelection = resolveProofreadCandidateSelection(baseRequestMeta, baseModelSpec);
+    baseRequestMeta.candidateStrategy = baseSelection.candidateStrategy;
+    baseRequestMeta.candidateOrderedList = baseSelection.orderedList;
+    if (!baseRequestMeta.originalRequestedModelList?.length) {
+      baseRequestMeta.originalRequestedModelList = baseSelection.originalRequestedModelList;
+    }
+  }
+  const resolveModelSelection = (purpose, triggerSource) => {
+    const selection = resolveProofreadCandidateSelection(baseRequestMeta, baseModelSpec, {
+      purpose,
+      triggerSource
+    });
+    const fallbackSpec = selection.selectedModelSpec || baseModelSpec;
+    const parsed = parseModelSpec(fallbackSpec);
+    return {
+      ...selection,
+      modelId: parsed.id || model,
+      tier: parsed.tier || baseRequestMeta.selectedTier || 'standard',
+      selectedModelSpec: fallbackSpec
+    };
+  };
+  const retrySelection = resolveModelSelection('retry', 'retry');
+  const validateSelection = resolveModelSelection('validate', 'validate');
   const { items, originalById } = normalizeProofreadSegments(segments);
   const chunks = chunkProofreadItems(items);
   const revisionsById = new Map();
@@ -570,18 +680,24 @@ async function proofreadTranslation(
         chunk,
         { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
         apiKey,
-        model,
+        retrySelection.modelId,
         apiBaseUrl,
         {
           strict: true,
           requestMeta: createChildRequestMeta(baseRequestMeta, {
             purpose: 'retry',
             attempt: baseRequestMeta.attempt + 1,
-            triggerSource: 'retry'
+            triggerSource: 'retry',
+            selectedModel: retrySelection.modelId,
+            selectedTier: retrySelection.tier,
+            selectedModelSpec: retrySelection.selectedModelSpec,
+            candidateStrategy: retrySelection.candidateStrategy,
+            candidateOrderedList: retrySelection.orderedList,
+            originalRequestedModelList: retrySelection.originalRequestedModelList
           }),
           purpose: 'retry',
           debugPayloads,
-          requestOptions
+          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -604,7 +720,7 @@ async function proofreadTranslation(
         chunk,
         { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
         apiKey,
-        model,
+        retrySelection.modelId,
         apiBaseUrl,
         {
           strict: true,
@@ -613,10 +729,17 @@ async function proofreadTranslation(
           requestMeta: createChildRequestMeta(baseRequestMeta, {
             purpose: 'retry',
             attempt: baseRequestMeta.attempt + 2,
-            triggerSource: 'retry'
+            triggerSource: 'retry',
+            selectedModel: retrySelection.modelId,
+            selectedTier: retrySelection.tier,
+            selectedModelSpec: retrySelection.selectedModelSpec,
+            candidateStrategy: retrySelection.candidateStrategy,
+            candidateOrderedList: retrySelection.orderedList,
+            originalRequestedModelList: retrySelection.originalRequestedModelList
           }),
           purpose: 'retry',
-          debugPayloads
+          debugPayloads,
+          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -640,17 +763,24 @@ async function proofreadTranslation(
           [item],
           { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
           apiKey,
-          model,
+          retrySelection.modelId,
           apiBaseUrl,
           {
             strict: true,
             requestMeta: createChildRequestMeta(baseRequestMeta, {
               purpose: 'retry',
               attempt: baseRequestMeta.attempt + 3,
-              triggerSource: 'retry'
+              triggerSource: 'retry',
+              selectedModel: retrySelection.modelId,
+              selectedTier: retrySelection.tier,
+              selectedModelSpec: retrySelection.selectedModelSpec,
+              candidateStrategy: retrySelection.candidateStrategy,
+              candidateOrderedList: retrySelection.orderedList,
+              originalRequestedModelList: retrySelection.originalRequestedModelList
             }),
             purpose: 'retry',
-            debugPayloads
+            debugPayloads,
+            requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
           }
         );
         rawProofreadParts.push(singleResult.rawProofread);
@@ -690,17 +820,27 @@ async function proofreadTranslation(
     return originalText;
   });
 
+  const validateRequestMeta = createChildRequestMeta(baseRequestMeta, {
+    purpose: 'validate',
+    triggerSource: 'validate',
+    selectedModel: validateSelection.modelId,
+    selectedTier: validateSelection.tier,
+    selectedModelSpec: validateSelection.selectedModelSpec,
+    candidateStrategy: validateSelection.candidateStrategy,
+    candidateOrderedList: validateSelection.orderedList,
+    originalRequestedModelList: validateSelection.originalRequestedModelList
+  });
   const repairedTranslations = await repairProofreadSegments(
     items,
     translations,
     originalById,
     apiKey,
-    model,
+    validateSelection.modelId,
     apiBaseUrl,
     language,
     debugPayloads,
-    baseRequestMeta,
-    requestOptions
+    validateRequestMeta,
+    buildRequestOptionsForTier(requestOptions, validateSelection.tier)
   );
 
   const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
@@ -1220,18 +1360,33 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   let rawProofread = content;
   if (parseError) {
     debugPayload.parseIssues.push('fallback:format-repair');
+    const fallbackSpec = formatModelSpec(model, requestMeta?.selectedTier || 'standard');
+    const validateSelection = resolveProofreadCandidateSelection(requestMeta, fallbackSpec, {
+      purpose: 'validate',
+      triggerSource: 'validate'
+    });
+    const validateSpec = validateSelection.selectedModelSpec || fallbackSpec;
+    const parsedValidateSpec = parseModelSpec(validateSpec);
+    const validateModelId = parsedValidateSpec.id || model;
+    const validateTier = parsedValidateSpec.tier || requestMeta?.selectedTier || 'standard';
     const repaired = await requestProofreadFormatRepair(
       content,
       items,
       apiKey,
-      model,
+      validateModelId,
       apiBaseUrl,
       createChildRequestMeta(requestMeta, {
         purpose: 'validate',
         attempt: requestMeta.attempt + 1,
-        triggerSource: 'validate'
+        triggerSource: 'validate',
+        selectedModel: validateModelId,
+        selectedTier: validateTier,
+        selectedModelSpec: validateSpec,
+        candidateStrategy: validateSelection.candidateStrategy,
+        candidateOrderedList: validateSelection.orderedList,
+        originalRequestedModelList: validateSelection.originalRequestedModelList
       }),
-      requestOptions
+      buildRequestOptionsForTier(requestOptions, validateTier)
     );
     rawProofread = repaired.rawProofread;
     if (Array.isArray(repaired.debug)) {
