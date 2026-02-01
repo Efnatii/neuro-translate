@@ -1220,8 +1220,6 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           properties: {
             items: {
               type: 'array',
-              minItems: items.length,
-              maxItems: items.length,
               items: {
                 type: 'object',
                 properties: {
@@ -1406,6 +1404,19 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     parsed = parseJsonObjectFlexible(content, 'proofread');
   } catch (error) {
     parseError = error?.message || 'parse-error';
+    debugPayload.parseIssues.push(parseError);
+  }
+  const expectedIds = items.map((item) => String(item.id));
+  const expectedIdSet = new Set(expectedIds);
+  const normalizedParsedItems = normalizeProofreadItems(parsed?.items);
+  const responseIds = normalizedParsedItems.map((item) => item.id);
+  const responseIdSet = new Set(responseIds);
+  const hasUnknownIds = responseIds.some((id) => !expectedIdSet.has(id));
+  const hasMissingIds = expectedIds.some((id) => !responseIdSet.has(id));
+  const hasDuplicateIds = responseIdSet.size !== responseIds.length;
+  const hasCountMismatch = normalizedParsedItems.length !== expectedIds.length;
+  if (!parseError && (hasUnknownIds || hasMissingIds || hasDuplicateIds || hasCountMismatch)) {
+    parseError = 'schema-mismatch:items';
     debugPayload.parseIssues.push(parseError);
   }
 

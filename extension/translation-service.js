@@ -1227,8 +1227,6 @@ async function performTranslationRequest(
           properties: {
             translations: {
               type: 'array',
-              minItems: tokenizedTexts.length,
-              maxItems: tokenizedTexts.length,
               items: { type: 'string' }
             }
           },
@@ -1454,7 +1452,7 @@ async function performTranslationRequest(
 
   let translations;
   try {
-    translations = parseTranslationsResponse(content, texts.length);
+    translations = parseTranslationsResponse(content, tokenizedTexts.length, { enforceLength: false });
   } catch (error) {
     if (error && typeof error === 'object') {
       debugPayload.parseIssues.push(error?.message || 'parse-error');
@@ -1471,6 +1469,64 @@ async function performTranslationRequest(
       });
     }
     throw error;
+  }
+  const expectedLength = tokenizedTexts.length;
+  if (Array.isArray(translations) && translations.length !== expectedLength) {
+    debugPayload.parseIssues.push('fallback:length-mismatch');
+    debugPayload.fallbackReason = 'length_mismatch';
+    if (!normalizedRequestMeta.fallbackReason) {
+      normalizedRequestMeta.fallbackReason = 'length_mismatch';
+    }
+    if (requestMeta && typeof requestMeta === 'object' && !requestMeta.fallbackReason) {
+      requestMeta.fallbackReason = 'length_mismatch';
+    }
+    const repairItems = texts.map((text, index) => ({
+      id: String(index),
+      source: text,
+      draft: translations[index] ?? ''
+    }));
+    try {
+      const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), normalizedRequestMeta);
+      const repairRequestMeta = createChildRequestMeta(normalizedRequestMeta, {
+        stage: 'translation',
+        purpose: 'validate',
+        attempt: normalizedRequestMeta.attempt + 1,
+        triggerSource: 'validate'
+      });
+      const repairResult = await performTranslationRepairRequest(
+        repairItems,
+        apiKey,
+        targetLanguage,
+        model,
+        signal,
+        retryContextPayload,
+        apiBaseUrl,
+        repairRequestMeta,
+        requestOptions
+      );
+      if (repairResult?.debug && Array.isArray(debugPayloads)) {
+        if (!Array.isArray(repairResult.debug.parseIssues)) {
+          repairResult.debug.parseIssues = [];
+        }
+        repairResult.debug.parseIssues.push('fallback:length-mismatch');
+        debugPayloads.push(repairResult.debug);
+      }
+      if (Array.isArray(repairResult?.translations) && repairResult.translations.length === expectedLength) {
+        translations = repairResult.translations;
+      } else {
+        throw new Error(
+          `translation response length mismatch: expected ${expectedLength}, got ${translations.length}`
+        );
+      }
+    } catch (error) {
+      console.warn('Translation length mismatch repair failed; falling back.', error);
+      const lengthError = new Error(
+        `translation response length mismatch: expected ${expectedLength}, got ${translations.length}`
+      );
+      lengthError.rawTranslation = content;
+      lengthError.debugPayload = debugPayload;
+      throw lengthError;
+    }
   }
   if (shouldPersistManualOutputs) {
     await persistManualTranslateOutputs({
@@ -2486,7 +2542,9 @@ function parseJsonObjectFlexible(content = '', label = 'response') {
   return parsed;
 }
 
-function parseTranslationsResponse(content, expectedLength) {
+function parseTranslationsResponse(content, expectedLength, options = {}) {
+  const { enforceLength = true } = options || {};
+  const lengthForValidation = enforceLength ? expectedLength : null;
   try {
     const parsed = parseJsonObjectFlexible(content, 'translation');
     const translations = parsed?.translations;
@@ -2494,9 +2552,9 @@ function parseTranslationsResponse(content, expectedLength) {
       throw new Error('translation response is missing translations array.');
     }
     const normalizedArray = translations.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
-    if (expectedLength && normalizedArray.length !== expectedLength) {
+    if (lengthForValidation && normalizedArray.length !== lengthForValidation) {
       throw new Error(
-        `translation response length mismatch: expected ${expectedLength}, got ${normalizedArray.length}`
+        `translation response length mismatch: expected ${lengthForValidation}, got ${normalizedArray.length}`
       );
     }
     return normalizedArray;
@@ -2504,7 +2562,7 @@ function parseTranslationsResponse(content, expectedLength) {
     console.warn('Translation response object parsing failed; falling back to array parsing.', error);
   }
 
-  return parseJsonArrayFlexible(content, expectedLength, 'translation');
+  return parseJsonArrayFlexible(content, lengthForValidation, 'translation');
 }
 
 function extractJsonArray(content = '', label = 'response') {
