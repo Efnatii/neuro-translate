@@ -1,3 +1,55 @@
+if (!globalThis.__NT_JSON_LOGGER__) {
+  globalThis.__NT_JSON_LOGGER__ = true;
+  (() => {
+    let enabled = false;
+
+    const safeJsonStringify = (value) => {
+      const seen = new WeakSet();
+      return JSON.stringify(value, (_key, currentValue) => {
+        if (typeof currentValue === 'bigint') return currentValue.toString();
+        if (currentValue === undefined) return null;
+        if (currentValue instanceof Error) {
+          return {
+            name: currentValue.name,
+            message: currentValue.message,
+            stack: currentValue.stack
+          };
+        }
+        if (typeof currentValue === 'object' && currentValue !== null) {
+          if (seen.has(currentValue)) {
+            return '[Circular]';
+          }
+          seen.add(currentValue);
+        }
+        return currentValue;
+      });
+    };
+
+    const updateEnabled = (value) => {
+      enabled = Boolean(value);
+    };
+
+    globalThis.ntJsonLogEnabled = () => enabled;
+    globalThis.ntJsonLog = (eventObject, level = 'log') => {
+      if (!enabled) return;
+      const serialized = safeJsonStringify(eventObject);
+      if (serialized === undefined) return;
+      const method = console[level] ? level : 'log';
+      console[method](serialized);
+    };
+
+    if (typeof chrome !== 'undefined' && chrome?.storage?.local) {
+      chrome.storage.local.get({ ntConsoleJsonLogEnabled: false }, (result) => {
+        updateEnabled(result?.ntConsoleJsonLogEnabled);
+      });
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local' || !changes?.ntConsoleJsonLogEnabled) return;
+        updateEnabled(changes.ntConsoleJsonLogEnabled.newValue);
+      });
+    }
+  })();
+}
+
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';

@@ -20,6 +20,53 @@
   }
   globalThis.__neuroTranslateContentScriptLoaded = true;
 
+  (() => {
+    let enabled = false;
+
+    const safeJsonStringify = (value) => {
+      const seen = new WeakSet();
+      return JSON.stringify(value, (_key, currentValue) => {
+        if (typeof currentValue === 'bigint') return currentValue.toString();
+        if (currentValue === undefined) return null;
+        if (currentValue instanceof Error) {
+          return {
+            name: currentValue.name,
+            message: currentValue.message,
+            stack: currentValue.stack
+          };
+        }
+        if (typeof currentValue === 'object' && currentValue !== null) {
+          if (seen.has(currentValue)) {
+            return '[Circular]';
+          }
+          seen.add(currentValue);
+        }
+        return currentValue;
+      });
+    };
+
+    const updateEnabled = (value) => {
+      enabled = Boolean(value);
+    };
+
+    globalThis.ntPageJsonLogEnabled = () => enabled;
+    globalThis.ntPageJsonLog = (eventObject, level = 'log') => {
+      if (!enabled) return;
+      const serialized = safeJsonStringify(eventObject);
+      if (serialized === undefined) return;
+      const method = console[level] ? level : 'log';
+      console[method](serialized);
+    };
+
+    storageLocal.get({ ntConsoleJsonLogEnabled: false }, (result) => {
+      updateEnabled(result?.ntConsoleJsonLogEnabled);
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes?.ntConsoleJsonLogEnabled) return;
+      updateEnabled(changes.ntConsoleJsonLogEnabled.newValue);
+    });
+  })();
+
 let cancelRequested = false;
 let translationError = null;
 let translationProgress = { completedBlocks: 0, totalBlocks: 0 };
