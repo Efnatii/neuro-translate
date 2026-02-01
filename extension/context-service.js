@@ -83,15 +83,23 @@ function attachContextRequestMeta(payload, requestMeta) {
     triggerSource: payload.triggerSource || requestMeta.triggerSource || '',
     selectedModel: payload.selectedModel || requestMeta.selectedModel || payload.model || '',
     selectedTier: payload.selectedTier || requestMeta.selectedTier || '',
+    selectedModelSpec: payload.selectedModelSpec || requestMeta.selectedModelSpec || '',
+    candidateStrategy: payload.candidateStrategy || requestMeta.candidateStrategy || '',
+    candidateOrderedList:
+      Array.isArray(payload.candidateOrderedList) ? payload.candidateOrderedList : requestMeta.candidateOrderedList || [],
     attemptIndex:
       Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
         ? payload.attemptIndex
-        : requestMeta.attemptIndex,
+        : Number.isFinite(requestMeta.attemptIndex)
+          ? requestMeta.attemptIndex
+          : 0,
     fallbackReason: payload.fallbackReason || requestMeta.fallbackReason || '',
     originalRequestedModelList:
-      payload.originalRequestedModelList ||
-      requestMeta.originalRequestedModelList ||
-      []
+      Array.isArray(payload.originalRequestedModelList)
+        ? payload.originalRequestedModelList
+        : Array.isArray(requestMeta.originalRequestedModelList)
+          ? requestMeta.originalRequestedModelList
+          : []
   };
 }
 

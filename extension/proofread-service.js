@@ -102,7 +102,16 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
     purpose: merged.purpose || 'main',
     attempt: Number.isFinite(merged.attempt) ? merged.attempt : 0,
     triggerSource: merged.triggerSource || '',
-    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry)
+    forceFullContextOnRetry: Boolean(merged.forceFullContextOnRetry),
+    candidateStrategy: merged.candidateStrategy || '',
+    candidateOrderedList: Array.isArray(merged.candidateOrderedList) ? merged.candidateOrderedList : [],
+    originalRequestedModelList:
+      Array.isArray(merged.originalRequestedModelList) ? merged.originalRequestedModelList : [],
+    selectedModel: merged.selectedModel || '',
+    selectedTier: merged.selectedTier || '',
+    selectedModelSpec: merged.selectedModelSpec || '',
+    attemptIndex: Number.isFinite(merged.attemptIndex) ? merged.attemptIndex : 0,
+    fallbackReason: merged.fallbackReason || ''
   };
 }
 
@@ -1245,7 +1254,11 @@ async function requestProofreadFormatRepair(
   requestMeta = null,
   requestOptions = null
 ) {
-  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' });
+  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, {
+    stage: 'proofread',
+    purpose: 'validate',
+    triggerSource: 'validate'
+  });
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   let resolvedShortContextText = '';
   let resolvedManualOutputs = '';
@@ -1463,7 +1476,11 @@ async function repairProofreadSegments(
       }
       last.parseIssues.push('fallback:language-repair');
     } else {
-      const validateRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'validate' });
+      const validateRequestMeta = normalizeRequestMeta(requestMeta, {
+        stage: 'proofread',
+        purpose: 'validate',
+        triggerSource: 'validate'
+      });
       debugPayloads.push(
         attachRequestMeta(
           {
