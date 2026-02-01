@@ -864,12 +864,44 @@ chrome.runtime.onConnect.addListener((port) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'DEBUG_STORE_RAW') {
+    const shouldLog = globalThis.__NT_DEBUG__ || globalThis.__NT_DEV__;
+    const startedAt = Date.now();
+    const recordId = message?.record?.id || '';
+    let responded = false;
+    const timeoutMs = 1200;
+    const timeoutId = setTimeout(() => {
+      if (responded) return;
+      responded = true;
+      if (shouldLog) {
+        console.debug('DEBUG_STORE_RAW timeout', { id: recordId, durationMs: Date.now() - startedAt });
+      }
+      sendResponse({ ok: false, error: 'raw-store-timeout' });
+    }, timeoutMs);
+    if (shouldLog) {
+      console.debug('DEBUG_STORE_RAW start', { id: recordId });
+    }
     Promise.resolve()
       .then(() => storeDebugRaw(message?.record || {}))
       .then((result) => {
+        if (responded) return;
+        responded = true;
+        clearTimeout(timeoutId);
+        if (shouldLog) {
+          console.debug('DEBUG_STORE_RAW end', { id: recordId, ok: result?.ok, durationMs: Date.now() - startedAt });
+        }
         sendResponse(result || { ok: false, error: 'store-failed' });
       })
       .catch((error) => {
+        if (responded) return;
+        responded = true;
+        clearTimeout(timeoutId);
+        if (shouldLog) {
+          console.debug('DEBUG_STORE_RAW error', {
+            id: recordId,
+            durationMs: Date.now() - startedAt,
+            error: error?.message || String(error)
+          });
+        }
         sendResponse({ ok: false, error: error?.message || String(error) });
       });
     return true;

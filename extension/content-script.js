@@ -129,6 +129,7 @@ const CALL_TAGS = {
   PROOFREAD_REWRITE_SHORT: 'PROOFREAD_REWRITE_SHORT',
   PROOFREAD_NOISE_SHORT: 'PROOFREAD_NOISE_SHORT',
   PROOFREAD_OVERFLOW_FALLBACK: 'PROOFREAD_OVERFLOW_FALLBACK',
+  PIPELINE_TRACE: 'PIPELINE_TRACE',
   UI_BROADCAST_SKIPPED: 'UI_BROADCAST_SKIPPED',
   STORAGE_DROPPED: 'STORAGE_DROPPED'
 };
@@ -342,7 +343,18 @@ async function storeDebugRawSafe(record) {
   if (!record?.id) {
     return { ok: false, error: 'missing-id' };
   }
-  const response = await sendBackgroundMessageSafe({ type: 'DEBUG_STORE_RAW', record });
+  let timeoutId;
+  const timeoutMs = 1200;
+  const timeoutPromise = new Promise((resolve) => {
+    timeoutId = setTimeout(() => resolve({ ok: false, error: 'raw-store-timeout' }), timeoutMs);
+  });
+  const response = await Promise.race([
+    sendBackgroundMessageSafe({ type: 'DEBUG_STORE_RAW', record }),
+    timeoutPromise
+  ]);
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+  }
   if (!response?.ok) {
     appendDebugEvent(CALL_TAGS.STORAGE_DROPPED, response?.error || 'raw-store-failed');
   }
@@ -735,6 +747,15 @@ function traceRequestInitiator(meta) {
   if (!debugState) return;
   console.debug('Neuro Translate request initiated', meta);
   console.trace('Neuro Translate request trace');
+}
+
+function traceBlockLifecycle(entryIndex, stage, message, meta = null) {
+  if (!debugState) return;
+  const suffix = meta ? ` ${JSON.stringify(meta)}` : '';
+  appendDebugEvent(CALL_TAGS.PIPELINE_TRACE, `[${stage}#${entryIndex}] ${message}${suffix}`);
+  if (globalThis.__NT_DEBUG__ || globalThis.__NT_DEV__) {
+    console.debug('Neuro Translate pipeline', { entryIndex, stage, message, meta });
+  }
 }
 
 async function translatePage(settings, options = {}) {
@@ -1353,6 +1374,7 @@ async function translatePage(settings, options = {}) {
             proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled',
             translationStartedAt: Date.now()
           });
+          traceBlockLifecycle(item.index + 1, 'translate', 'block start', { blockKey: item.key });
         }
         reportProgress('Перевод выполняется');
         const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
@@ -1420,6 +1442,10 @@ async function translatePage(settings, options = {}) {
             perTextTranslations.push(translatedText);
           }
           result = { success: true, translations: perTextTranslations, rawTranslation: '', debug: [] };
+          traceBlockLifecycle(seedIndex + 1, 'translate', 'LLM response received', {
+            mode: 'single',
+            segments: perTextTranslations.length
+          });
         } else {
           const combinedPreparedTexts = [];
           const segmentMap = [];
@@ -1513,6 +1539,14 @@ async function translatePage(settings, options = {}) {
               `Translation length mismatch: expected ${uniqueTexts.length}, got ${result.translations.length}`
             );
           }
+          for (const item of batchItems) {
+            traceBlockLifecycle(item.index + 1, 'translate', 'LLM response received', {
+              batchSize: batchItems.length
+            });
+          }
+          for (const item of batchItems) {
+            traceBlockLifecycle(item.index + 1, 'translate', 'parsed OK', { batchSize: batchItems.length });
+          }
           const perItemTranslations = batchItems.map(() => []);
           combinedPreparedTexts.forEach((_text, combinedIndex) => {
             const mapping = segmentMap[combinedIndex];
@@ -1550,6 +1584,9 @@ async function translatePage(settings, options = {}) {
               updateActiveEntry(path, original, withOriginalFormatting, originalHash);
             });
             markBlockProcessed(item.blockElement, 'translate');
+            traceBlockLifecycle(item.index + 1, 'translate', 'applied to DOM', {
+              visible: translationVisible
+            });
             const baseTranslationAnswer =
               contextMeta.contextMode === 'FULL' && batchEntries[itemIndex] && !batchEntries[itemIndex].translationBaseFullAnswer
                 ? formatBlockText(finalTranslations)
@@ -1577,6 +1614,7 @@ async function translatePage(settings, options = {}) {
                 : {}),
               ...(baseTranslationCallId ? { translationBaseFullCallId: baseTranslationCallId } : {})
             });
+            traceBlockLifecycle(item.index + 1, 'translate', 'status -> DONE');
             translationProgress.completedBlocks += 1;
             if (settings.proofreadEnabled) {
               const proofreadSegments = translatedTexts.map((text, index) => ({ id: String(index), text }));
@@ -1606,6 +1644,7 @@ async function translatePage(settings, options = {}) {
           continue;
         }
 
+        traceBlockLifecycle(seedIndex + 1, 'translate', 'parsed OK', { batchSize: 1 });
         const translatedTexts = seedBlock.map(({ original }, index) => {
           const translationIndex = seedIndexMap[index];
           const translated = translationIndex == null ? original : (result.translations[translationIndex] || original);
@@ -1629,6 +1668,7 @@ async function translatePage(settings, options = {}) {
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
         markBlockProcessed(seedItem.blockElement, 'translate');
+        traceBlockLifecycle(seedIndex + 1, 'translate', 'applied to DOM', { visible: translationVisible });
         const baseTranslationAnswer =
           sharedContext.contextMode === 'FULL' && seedDebugEntry && !seedDebugEntry.translationBaseFullAnswer
             ? formatBlockText(finalTranslations)
@@ -1652,6 +1692,7 @@ async function translatePage(settings, options = {}) {
             : {}),
           ...(baseTranslationCallId ? { translationBaseFullCallId: baseTranslationCallId } : {})
         });
+        traceBlockLifecycle(seedIndex + 1, 'translate', 'status -> DONE');
         translationProgress.completedBlocks += 1;
 
         if (settings.proofreadEnabled) {
@@ -1757,6 +1798,7 @@ async function translatePage(settings, options = {}) {
       activeProofreadWorkers += 1;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress', proofreadExecuted: true });
+        traceBlockLifecycle(task.index + 1, 'proofread', 'block start', { blockKey: task.key });
         const debugEntry = debugEntries.find((item) => item.index === task.index + 1);
         const followupTag =
           task.proofreadMode === 'NOISE_CLEANUP' ? CALL_TAGS.PROOFREAD_NOISE_SHORT : CALL_TAGS.PROOFREAD_REWRITE_SHORT;
@@ -1857,6 +1899,7 @@ async function translatePage(settings, options = {}) {
         if (!proofreadResult?.success) {
           throw new Error(proofreadResult?.error || 'Не удалось выполнить вычитку.');
         }
+        traceBlockLifecycle(task.index + 1, 'proofread', 'LLM response received');
         const revisedSegments = Array.isArray(proofreadResult.translations)
           ? proofreadResult.translations
           : [];
@@ -1894,8 +1937,10 @@ async function translatePage(settings, options = {}) {
           );
         }
 
+        traceBlockLifecycle(task.index + 1, 'proofread', 'parsed OK');
         updatePageWithProofreading(task, finalTranslations);
         markBlockProcessed(task.blockElement, 'proofread');
+        traceBlockLifecycle(task.index + 1, 'proofread', 'applied to DOM');
 
         const rawProofreadPayload = proofreadResult.rawProofread || '';
         const rawProofread =
@@ -1936,6 +1981,7 @@ async function translatePage(settings, options = {}) {
             : {}),
           ...(baseProofreadCallId ? { proofreadBaseFullCallId: baseProofreadCallId } : {})
         });
+        traceBlockLifecycle(task.index + 1, 'proofread', 'status -> DONE');
         reportProgress('Вычитка выполняется');
       } catch (error) {
         console.warn('Proofreading failed, keeping original translations.', error);
