@@ -32,6 +32,100 @@ const PUNCTUATION_TOKENS = new Map([
 ]);
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526]);
 
+function shouldLogJson() {
+  return typeof globalThis.ntJsonLogEnabled === 'function' && globalThis.ntJsonLogEnabled();
+}
+
+function emitJsonLog(eventObject) {
+  if (!shouldLogJson()) return;
+  if (typeof globalThis.ntJsonLog === 'function') {
+    globalThis.ntJsonLog(eventObject);
+  }
+}
+
+function maskApiKey(apiKey) {
+  if (!apiKey) return '';
+  const text = String(apiKey);
+  const tail = text.slice(-4);
+  return `****${tail}`;
+}
+
+function logLlmFetchRequest({ ts, role, requestId, url, method, headers, body, model, temperature, responseFormat }) {
+  const event = {
+    kind: 'llm.fetch.request',
+    ts,
+    role,
+    requestId,
+    url,
+    method,
+    headers,
+    body,
+    model
+  };
+  if (temperature != null) {
+    event.temperature = temperature;
+  }
+  if (responseFormat != null) {
+    event.response_format = responseFormat;
+  }
+  emitJsonLog(event);
+}
+
+function logLlmFetchResponse({ ts, requestId, status, ok, responseHeaders, responseText, durationMs }) {
+  emitJsonLog({
+    kind: 'llm.fetch.response',
+    ts,
+    requestId,
+    status,
+    ok,
+    responseHeaders,
+    responseText,
+    durationMs
+  });
+}
+
+function logLlmFetchError({ ts, requestId, error }) {
+  emitJsonLog({
+    kind: 'llm.fetch.error',
+    ts,
+    requestId,
+    error: error && typeof error === 'object'
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : { name: 'Error', message: String(error ?? ''), stack: '' }
+  });
+}
+
+function logLlmParseExtract({ requestId, extractedText, source }) {
+  emitJsonLog({
+    kind: 'llm.parse.extract',
+    requestId,
+    extractedTextLength: extractedText?.length || 0,
+    extractedText: extractedText || '',
+    source: source || 'empty'
+  });
+}
+
+function logLlmParseOk({ requestId, parsed, ts }) {
+  emitJsonLog({
+    kind: 'llm.parse.ok',
+    requestId,
+    parsed,
+    ts
+  });
+}
+
+function logLlmParseFail({ requestId, error, rawText, ts }) {
+  emitJsonLog({
+    kind: 'llm.parse.fail',
+    requestId,
+    error: error && typeof error === 'object'
+      ? { name: error.name, message: error.message, stack: error.stack }
+      : error,
+    rawText,
+    ts
+  });
+}
+
 function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
 }
@@ -1455,18 +1549,51 @@ async function performTranslationRequest(
       limitPerMinute: 12
     });
   }
-  let response = await fetch(apiBaseUrl, {
+  const requestId = normalizedRequestMeta?.requestId || createRequestId();
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`
+  };
+  const requestBody = JSON.stringify(requestPayload);
+  let response;
+  let responseText = '';
+  let fetchStartedAt = Date.now();
+  logLlmFetchRequest({
+    ts: fetchStartedAt,
+    role: 'translation',
+    requestId,
+    url: apiBaseUrl,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload),
-    signal
+    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+    body: requestBody,
+    model: requestPayload.model,
+    temperature: requestPayload.temperature,
+    responseFormat: requestPayload.response_format
   });
+  try {
+    response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: requestBody,
+      signal
+    });
+    responseText = await response.clone().text();
+    logLlmFetchResponse({
+      ts: Date.now(),
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseHeaders: Array.from(response.headers.entries()),
+      responseText,
+      durationMs: Date.now() - fetchStartedAt
+    });
+  } catch (error) {
+    logLlmFetchError({ ts: Date.now(), requestId, error });
+    throw error;
+  }
 
   if (!response.ok) {
-    let errorText = await response.text();
+    let errorText = responseText;
     let errorPayload = null;
     try {
       errorPayload = JSON.parse(errorText);
@@ -1495,17 +1622,42 @@ async function performTranslationRequest(
         status: response.status,
         removedParams: stripped.removedParams
       });
-      response = await fetch(apiBaseUrl, {
+      fetchStartedAt = Date.now();
+      logLlmFetchRequest({
+        ts: fetchStartedAt,
+        role: 'translation',
+        requestId,
+        url: apiBaseUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload),
-        signal
+        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+        body: requestBody,
+        model: requestPayload.model,
+        temperature: requestPayload.temperature,
+        responseFormat: requestPayload.response_format
       });
+      try {
+        response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: requestBody,
+          signal
+        });
+        responseText = await response.clone().text();
+        logLlmFetchResponse({
+          ts: Date.now(),
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseHeaders: Array.from(response.headers.entries()),
+          responseText,
+          durationMs: Date.now() - fetchStartedAt
+        });
+      } catch (error) {
+        logLlmFetchError({ ts: Date.now(), requestId, error });
+        throw error;
+      }
       if (!response.ok) {
-        errorText = await response.text();
+        errorText = responseText;
         try {
           errorPayload = JSON.parse(errorText);
         } catch (parseError) {
@@ -1566,6 +1718,11 @@ async function performTranslationRequest(
   const data = await response.json();
   const assistantContentMeta = {};
   const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  logLlmParseExtract({
+    requestId,
+    extractedText: extractedContent,
+    source: assistantContentMeta.assistant_content_source || 'empty'
+  });
   const content = extractedContent.trim();
   if (!content) {
     throw new Error('No translation returned');
@@ -1694,7 +1851,9 @@ async function performTranslationRequest(
   let translations;
   try {
     translations = parseTranslationsResponse(content, tokenizedTexts.length, { enforceLength: false });
+    logLlmParseOk({ requestId, parsed: translations, ts: Date.now() });
   } catch (error) {
+    logLlmParseFail({ requestId, error, rawText: content, ts: Date.now() });
     if (error && typeof error === 'object') {
       debugPayload.parseIssues.push(error?.message || 'parse-error');
       error.debugPayload = debugPayload;
@@ -2433,19 +2592,52 @@ async function performTranslationRepairRequest(
   const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, resolvedRequestOptions);
   const promptCacheKey = requestPayload.prompt_cache_key || '';
   const promptCacheRetention = requestPayload.prompt_cache_retention || '';
+  const requestId = normalizedRequestMeta?.requestId || createRequestId();
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`
+  };
+  const requestBody = JSON.stringify(requestPayload);
   const startedAt = Date.now();
-  let response = await fetch(apiBaseUrl, {
+  let response;
+  let responseText = '';
+  let fetchStartedAt = Date.now();
+  logLlmFetchRequest({
+    ts: fetchStartedAt,
+    role: 'translation',
+    requestId,
+    url: apiBaseUrl,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestPayload),
-    signal
+    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+    body: requestBody,
+    model: requestPayload.model,
+    temperature: requestPayload.temperature,
+    responseFormat: requestPayload.response_format
   });
+  try {
+    response = await fetch(apiBaseUrl, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: requestBody,
+      signal
+    });
+    responseText = await response.clone().text();
+    logLlmFetchResponse({
+      ts: Date.now(),
+      requestId,
+      status: response.status,
+      ok: response.ok,
+      responseHeaders: Array.from(response.headers.entries()),
+      responseText,
+      durationMs: Date.now() - fetchStartedAt
+    });
+  } catch (error) {
+    logLlmFetchError({ ts: Date.now(), requestId, error });
+    throw error;
+  }
 
   if (!response.ok) {
-    let errorText = await response.text();
+    let errorText = responseText;
     let errorPayload = null;
     try {
       errorPayload = JSON.parse(errorText);
@@ -2474,17 +2666,42 @@ async function performTranslationRepairRequest(
         status: response.status,
         removedParams: stripped.removedParams
       });
-      response = await fetch(apiBaseUrl, {
+      fetchStartedAt = Date.now();
+      logLlmFetchRequest({
+        ts: fetchStartedAt,
+        role: 'translation',
+        requestId,
+        url: apiBaseUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(requestPayload),
-        signal
+        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
+        body: requestBody,
+        model: requestPayload.model,
+        temperature: requestPayload.temperature,
+        responseFormat: requestPayload.response_format
       });
+      try {
+        response = await fetch(apiBaseUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: requestBody,
+          signal
+        });
+        responseText = await response.clone().text();
+        logLlmFetchResponse({
+          ts: Date.now(),
+          requestId,
+          status: response.status,
+          ok: response.ok,
+          responseHeaders: Array.from(response.headers.entries()),
+          responseText,
+          durationMs: Date.now() - fetchStartedAt
+        });
+      } catch (error) {
+        logLlmFetchError({ ts: Date.now(), requestId, error });
+        throw error;
+      }
       if (!response.ok) {
-        errorText = await response.text();
+        errorText = responseText;
         try {
           errorPayload = JSON.parse(errorText);
         } catch (parseError) {
@@ -2502,6 +2719,11 @@ async function performTranslationRepairRequest(
   const data = await response.json();
   const assistantContentMeta = {};
   const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  logLlmParseExtract({
+    requestId,
+    extractedText: extractedContent,
+    source: assistantContentMeta.assistant_content_source || 'empty'
+  });
   const content = extractedContent.trim();
   if (!content) {
     throw new Error('No repair translation returned');
@@ -2536,7 +2758,9 @@ async function performTranslationRepairRequest(
   let translations = null;
   try {
     translations = parseTranslationsResponse(content, normalizedItems.length);
+    logLlmParseOk({ requestId, parsed: translations, ts: Date.now() });
   } catch (error) {
+    logLlmParseFail({ requestId, error, rawText: content, ts: Date.now() });
     debugPayload.parseIssues.push(error?.message || 'parse-error');
     throw error;
   }
