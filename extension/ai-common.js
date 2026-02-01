@@ -1,54 +1,50 @@
-if (!globalThis.__NT_JSON_LOGGER__) {
-  globalThis.__NT_JSON_LOGGER__ = true;
-  (() => {
-    let enabled = false;
+(() => {
+  if (globalThis.__NT_JSON_LOGGER__) return;
+  const loggerState = { enabled: false };
+  globalThis.__NT_JSON_LOGGER__ = loggerState;
 
-    const safeJsonStringify = (value) => {
-      const seen = new WeakSet();
-      return JSON.stringify(value, (_key, currentValue) => {
-        if (typeof currentValue === 'bigint') return currentValue.toString();
-        if (currentValue === undefined) return null;
-        if (currentValue instanceof Error) {
-          return {
-            name: currentValue.name,
-            message: currentValue.message,
-            stack: currentValue.stack
-          };
+  const createSafeReplacer = () => {
+    const seen = new WeakSet();
+    return (_key, value) => {
+      if (typeof value === 'bigint') return value.toString();
+      if (value instanceof Error) {
+        return {
+          name: value.name,
+          message: value.message,
+          stack: value.stack
+        };
+      }
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) {
+          return '[Circular]';
         }
-        if (typeof currentValue === 'object' && currentValue !== null) {
-          if (seen.has(currentValue)) {
-            return '[Circular]';
-          }
-          seen.add(currentValue);
-        }
-        return currentValue;
-      });
+        seen.add(value);
+      }
+      return value;
     };
+  };
 
-    const updateEnabled = (value) => {
-      enabled = Boolean(value);
-    };
+  const updateEnabled = (value) => {
+    loggerState.enabled = Boolean(value);
+  };
 
-    globalThis.ntJsonLogEnabled = () => enabled;
-    globalThis.ntJsonLog = (eventObject, level = 'log') => {
-      if (!enabled) return;
-      const serialized = safeJsonStringify(eventObject);
-      if (serialized === undefined) return;
-      const method = console[level] ? level : 'log';
-      console[method](serialized);
-    };
+  globalThis.ntJsonLogEnabled = () => loggerState.enabled;
+  globalThis.ntJsonLog = (eventObject, level = 'log') => {
+    if (!loggerState.enabled) return;
+    const method = console[level] ? level : 'log';
+    console[method](JSON.stringify(eventObject, createSafeReplacer()));
+  };
 
-    if (typeof chrome !== 'undefined' && chrome?.storage?.local) {
-      chrome.storage.local.get({ ntConsoleJsonLogEnabled: false }, (result) => {
-        updateEnabled(result?.ntConsoleJsonLogEnabled);
-      });
-      chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== 'local' || !changes?.ntConsoleJsonLogEnabled) return;
-        updateEnabled(changes.ntConsoleJsonLogEnabled.newValue);
-      });
-    }
-  })();
-}
+  if (typeof chrome !== 'undefined' && chrome?.storage?.local) {
+    chrome.storage.local.get({ ntConsoleJsonLogEnabled: false }, (result) => {
+      updateEnabled(result?.ntConsoleJsonLogEnabled);
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes?.ntConsoleJsonLogEnabled) return;
+      updateEnabled(changes.ntConsoleJsonLogEnabled.newValue);
+    });
+  }
+})();
 
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const PUNCTUATION_TOKEN_HINT =
