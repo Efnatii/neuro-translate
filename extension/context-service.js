@@ -7,7 +7,8 @@ const CONTEXT_SYSTEM_PROMPT = [
   'If a term is ambiguous, list 2-3 possible interpretations and what in the text suggests each choice.',
   'Do not suggest leaving names/titles/terms untranslated unless explicitly stated in the text.',
   'Your response must be structured and concise.',
-  'Format strictly by the sections below (brief, bullet points).',
+  'Format strictly by the sections below when MODE=FULL (brief, bullet points).',
+  'If MODE=SHORT, ignore numbered sections and output 5-10 concise bullet points instead.',
   'Prefer dense bullet points; avoid repetition; max ~25 lines total (prioritize sections 1, 6, 8).',
   '',
   '1) Text type and purpose:',
@@ -56,8 +57,9 @@ const CONTEXT_SYSTEM_PROMPT = [
   '- brevity/structure requirements',
   '- recurring templates/placeholders (if any)',
   '',
-  'Output only the sections with brief bullet points.',
-  'If a section is empty, write "not specified".'
+  'If MODE=FULL, output only the sections with brief bullet points.',
+  'If MODE=FULL and a section is empty, write "not specified".',
+  'If MODE=SHORT, output only concise bullet points.'
 ].join('\n');
 const SHORT_CONTEXT_SYSTEM_PROMPT = [
   'You are a translation context summarizer.',
@@ -247,11 +249,12 @@ async function generateTranslationContext(
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Return translation context in numbered sections 1-10 as specified.',
+        'Return translation context following the system prompt format rules.',
         'Emphasize sections 1, 6, 8: include domain/genre + style + audience + format + formality in section 1;',
         'include a mini-glossary and an ambiguity watchlist in section 6;',
         'include a compact style guide (tone, pacing, calques, address preferences) in section 8.',
         'Prefer dense bullet points; avoid repetition; keep total length ~25 lines.',
+        'MODE: FULL (use numbered sections 1-10).',
         'Text:',
         text
       ].join('\n')
@@ -386,14 +389,18 @@ async function generateShortTranslationContext(
   const prompt = applyPromptCaching([
     {
       role: 'system',
-      content: SHORT_CONTEXT_SYSTEM_PROMPT
+      content: CONTEXT_SYSTEM_PROMPT
     },
     {
       role: 'user',
       content: [
         `Target language: ${targetLanguage}.`,
-        'Generate a short, actionable translation context from the source text.',
-        'Keep it compact and useful for translation disambiguation.',
+        'Return translation context following the system prompt format rules.',
+        'Emphasize sections 1, 6, 8: include domain/genre + style + audience + format + formality in section 1;',
+        'include a mini-glossary and an ambiguity watchlist in section 6;',
+        'include a compact style guide (tone, pacing, calques, address preferences) in section 8.',
+        'Prefer dense bullet points; avoid repetition; keep total length ~25 lines.',
+        'MODE: SHORT (ignore numbered sections; output 5-10 bullet points).',
         'Text:',
         text
       ].join('\n')
