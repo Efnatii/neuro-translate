@@ -410,10 +410,10 @@ function getPromptCacheKey(stage, variant = '') {
   const normalizedStage = typeof stage === 'string' ? stage.trim().toLowerCase() : '';
   const normalizedVariant = typeof variant === 'string' ? variant.trim().toLowerCase() : '';
   if (normalizedStage === 'translate' || normalizedStage === 'translation') {
-    return 'neuro-translate:translate:v1';
+    return 'neuro-translate:translate:v2';
   }
   if (normalizedStage === 'proofread') {
-    return 'neuro-translate:proofread:v1';
+    return 'neuro-translate:proofread:v2';
   }
   if (normalizedStage === 'context') {
     if (normalizedVariant === 'short') {
