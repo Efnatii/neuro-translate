@@ -265,8 +265,14 @@ async function generateTranslationContext(
     model: selectedModelId,
     messages: prompt
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, selectedModelId, getPromptCacheKey('context'));
-  applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions);
+  applyPromptCacheParams(
+    requestPayload,
+    apiBaseUrl,
+    selectedModelId,
+    getPromptCacheKey('context'),
+    effectiveRequestOptions
+  );
+  applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions, apiBaseUrl);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -290,7 +296,8 @@ async function generateTranslationContext(
       selectedModelId,
       response.status,
       errorPayload,
-      errorText
+      errorText,
+      apiBaseUrl
     );
     if (response.status === 400 && stripped.changed) {
       if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
@@ -411,8 +418,14 @@ async function generateShortTranslationContext(
     model: selectedModelId,
     messages: prompt
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, selectedModelId, getPromptCacheKey('context', 'short'));
-  applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions);
+  applyPromptCacheParams(
+    requestPayload,
+    apiBaseUrl,
+    selectedModelId,
+    getPromptCacheKey('context', 'short'),
+    effectiveRequestOptions
+  );
+  applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions, apiBaseUrl);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -436,7 +449,8 @@ async function generateShortTranslationContext(
       selectedModelId,
       response.status,
       errorPayload,
-      errorText
+      errorText,
+      apiBaseUrl
     );
     if (response.status === 400 && stripped.changed) {
       if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {

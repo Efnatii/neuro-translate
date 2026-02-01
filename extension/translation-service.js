@@ -1297,8 +1297,14 @@ async function performTranslationRequest(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, getPromptCacheKey('translate'));
-  applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions);
+  applyPromptCacheParams(
+    requestPayload,
+    apiBaseUrl,
+    resolvedModel,
+    getPromptCacheKey('translate'),
+    resolvedRequestOptions
+  );
+  applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions, apiBaseUrl);
   const startedAt = Date.now();
   const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
   const batchSize = tokenizedTexts.length;
@@ -1330,7 +1336,8 @@ async function performTranslationRequest(
       resolvedModel,
       response.status,
       errorPayload,
-      errorText
+      errorText,
+      apiBaseUrl
     );
     if (response.status === 400 && stripped.changed) {
       if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
@@ -2266,8 +2273,14 @@ async function performTranslationRepairRequest(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, getPromptCacheKey('translate'));
-  applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions);
+  applyPromptCacheParams(
+    requestPayload,
+    apiBaseUrl,
+    resolvedModel,
+    getPromptCacheKey('translate'),
+    resolvedRequestOptions
+  );
+  applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions, apiBaseUrl);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -2292,7 +2305,8 @@ async function performTranslationRepairRequest(
       resolvedModel,
       response.status,
       errorPayload,
-      errorText
+      errorText,
+      apiBaseUrl
     );
     if (response.status === 400 && stripped.changed) {
       if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {

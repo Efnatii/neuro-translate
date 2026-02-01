@@ -1322,8 +1322,14 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, getPromptCacheKey('proofread'));
-  applyModelRequestParams(requestPayload, model, requestOptions);
+  applyPromptCacheParams(
+    requestPayload,
+    apiBaseUrl,
+    model,
+    getPromptCacheKey('proofread'),
+    requestOptions
+  );
+  applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
   const startedAt = Date.now();
   const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
   const batchSize = items.length;
@@ -1354,7 +1360,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       model,
       response.status,
       errorPayload,
-      errorText
+      errorText,
+      apiBaseUrl
     );
     if (response.status === 400 && stripped.changed) {
       if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
@@ -1672,8 +1679,14 @@ async function requestProofreadFormatRepair(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, getPromptCacheKey('proofread'));
-  applyModelRequestParams(requestPayload, model, requestOptions);
+  applyPromptCacheParams(
+    requestPayload,
+    apiBaseUrl,
+    model,
+    getPromptCacheKey('proofread'),
+    requestOptions
+  );
+  applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -1697,7 +1710,8 @@ async function requestProofreadFormatRepair(
       model,
       response.status,
       errorPayload,
-      errorText
+      errorText,
+      apiBaseUrl
     );
     if (response.status === 400 && stripped.changed) {
       if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
@@ -1934,8 +1948,14 @@ async function repairProofreadSegments(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, getPromptCacheKey('proofread'));
-  applyModelRequestParams(requestPayload, model, requestOptions);
+  applyPromptCacheParams(
+    requestPayload,
+    apiBaseUrl,
+    model,
+    getPromptCacheKey('proofread'),
+    requestOptions
+  );
+  applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
   const startedAt = Date.now();
   try {
     let response = await fetch(apiBaseUrl, {
@@ -1959,7 +1979,8 @@ async function repairProofreadSegments(
         model,
         response.status,
         errorPayload,
-        errorText
+        errorText,
+        apiBaseUrl
       );
       if (response.status === 400 && stripped.changed) {
         if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
