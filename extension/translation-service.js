@@ -488,7 +488,7 @@ async function translateTexts(
 ) {
   if (!Array.isArray(texts) || !texts.length) return { translations: [], rawTranslation: '' };
 
-  const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'main' });
+  const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translation', purpose: 'main' });
   const baseEffectiveContext = buildEffectiveContext(context, baseRequestMeta);
   const maxTimeoutAttempts = 2;
   const maxRetryableRetries = 3;
@@ -656,7 +656,7 @@ async function performTranslationRequest(
   requestMeta = null,
   requestOptions = null
 ) {
-  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translate', purpose: 'main' });
+  const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translation', purpose: 'main' });
   const operationType = 'neuro-translate:translate:v1';
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const normalizedContext = normalizeContextPayload(context);
@@ -1501,7 +1501,7 @@ async function performTranslationRepairRequest(
   requestOptions = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, {
-    stage: 'translate',
+    stage: 'translation',
     purpose: 'validate',
     triggerSource: 'validate'
   });
@@ -2091,7 +2091,7 @@ async function repairTranslationsForLanguage(
       last.parseIssues.push('fallback:language-repair');
     } else {
       const validateRequestMeta = normalizeRequestMeta(requestMeta, {
-        stage: 'translate',
+        stage: 'translation',
         purpose: 'validate',
         triggerSource: 'validate'
       });
@@ -2168,7 +2168,7 @@ async function translateIndividually(
   requestOptions = null
 ) {
   const baseRequestMeta = normalizeRequestMeta(requestMeta, {
-    stage: 'translate',
+    stage: 'translation',
     purpose: 'retry',
     triggerSource: 'retry'
   });

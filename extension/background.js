@@ -516,18 +516,20 @@ function getCandidateModels(stage, requestMeta, state) {
   let originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
   const triggerSource = requestMeta?.triggerSource || '';
   const purpose = requestMeta?.purpose || '';
-  const effectivePurpose = purpose || triggerSource || '';
+  const effectivePurpose = purpose || '';
   const isManualTrigger =
     Boolean(requestMeta?.isManual) ||
     (typeof triggerSource === 'string' && triggerSource.toLowerCase().includes('manual')) ||
     effectivePurpose === 'manual';
   let candidateStrategy = 'default_preserve_order';
-  if (purpose === 'retry' || triggerSource === 'retry') {
-    candidateStrategy = 'retry_cheapest';
-  } else if (purpose === 'validate' || triggerSource === 'validate') {
-    candidateStrategy = 'validate_cheapest';
-  } else if (isManualTrigger) {
-    candidateStrategy = 'manual_smartest';
+  if (stage === 'translate') {
+    if (purpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
+    } else if (purpose === 'validate') {
+      candidateStrategy = 'validate_cheapest';
+    } else if (isManualTrigger) {
+      candidateStrategy = 'manual_smartest';
+    }
   }
   if (!Array.isArray(originalRequestedModelList) || !originalRequestedModelList.length) {
     const fallbackSpec = fallbackModel ? formatModelSpec(fallbackModel, 'standard') : '';
@@ -555,14 +557,11 @@ function getCandidateModels(stage, requestMeta, state) {
     if (left.capabilityRank !== right.capabilityRank) {
       return right.capabilityRank - left.capabilityRank;
     }
-    if (left.parsed.id === right.parsed.id && left.tierPref !== right.tierPref) {
+    if (left.tierPref !== right.tierPref) {
       return right.tierPref - left.tierPref;
     }
     if (left.index !== right.index) {
       return left.index - right.index;
-    }
-    if (left.costSum !== right.costSum) {
-      return left.costSum - right.costSum;
     }
     return 0;
   };
