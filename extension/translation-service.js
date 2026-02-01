@@ -1,5 +1,6 @@
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 45000;
 const TRANSLATE_SYSTEM_PROMPT = [
+  'Neuro-Translate Translation System Prompt v1.',
   'You are a professional translator.',
   'Translate every element of the provided "texts" list into the target language with natural, idiomatic phrasing that preserves meaning and readability.',
   'Never omit, add, or generalize information. Preserve modality, tense, aspect, tone, and level of certainty.',
@@ -19,7 +20,8 @@ const TRANSLATE_SYSTEM_PROMPT = [
   'Do not translate, quote, paraphrase, or include the context text in the output unless it is required to translate the source segments.',
   'If no context is provided, do not invent context or add assumptions.',
   'Never include page context text in the translations unless it is explicitly part of the source segments.',
-  'Self-check: if output equals source (case-insensitive), verify it is allowlisted or already in the target language; otherwise translate or transliterate into the target script.'
+  'Self-check: if output equals source (case-insensitive), verify it is allowlisted or already in the target language; otherwise translate or transliterate into the target script.',
+  'Return only a JSON object with a "translations" array. No commentary.'
 ].join(' ');
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
@@ -540,15 +542,7 @@ function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload
   const messages = [
     {
       role: 'system',
-      content: [
-        TRANSLATE_SYSTEM_PROMPT,
-        strictTargetLanguage
-          ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
-          : null,
-        `Target language: ${targetLanguage}.`
-      ]
-        .filter(Boolean)
-        .join(' ')
+      content: TRANSLATE_SYSTEM_PROMPT
     }
   ];
 
@@ -556,7 +550,6 @@ function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload
     messages.push({
       role: 'user',
       content: [
-        `Target language: ${targetLanguage}.`,
         `Page ${contextMode} context: <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
       ]
         .filter(Boolean)
@@ -575,6 +568,9 @@ function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload
     role: 'user',
     content: [
       `Target language: ${targetLanguage}.`,
+      strictTargetLanguage
+        ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
+        : '',
       `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items in the same order as provided.`,
       'Do not add commentary.',
       'Segments:',
@@ -805,7 +801,7 @@ async function performTranslationRequest(
         serviceTier: resolvedTier === 'flex' ? 'flex' : null
       }
     : requestOptions;
-  const operationType = 'neuro-translate:translate:v1';
+  const operationType = getPromptCacheKey('translate');
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const normalizedContext = normalizeContextPayload(context);
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
@@ -1242,7 +1238,7 @@ async function performTranslationRequest(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, 'neuro-translate:translate:v1');
+  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, getPromptCacheKey('translate'));
   applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
@@ -1688,7 +1684,7 @@ async function performTranslationRepairRequest(
         serviceTier: resolvedTier === 'flex' ? 'flex' : null
       }
     : requestOptions;
-  const operationType = 'neuro-translate:translate:v1';
+  const operationType = getPromptCacheKey('translate');
   const normalizedContext = normalizeContextPayload(context);
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
@@ -2131,7 +2127,7 @@ async function performTranslationRepairRequest(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, 'neuro-translate:translate:v1');
+  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, getPromptCacheKey('translate'));
   applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
