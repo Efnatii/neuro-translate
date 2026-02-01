@@ -516,16 +516,25 @@ function getCandidateModels(stage, requestMeta, state) {
   let originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
   const triggerSource = requestMeta?.triggerSource || '';
   const purpose = requestMeta?.purpose || '';
-  const effectivePurpose = purpose || '';
+  const effectivePurpose = typeof purpose === 'string' ? purpose : '';
+  const normalizedTriggerSource = typeof triggerSource === 'string' ? triggerSource.toLowerCase() : '';
   const isManualTrigger =
     Boolean(requestMeta?.isManual) ||
-    (typeof triggerSource === 'string' && triggerSource.toLowerCase().includes('manual')) ||
+    normalizedTriggerSource.includes('manual') ||
     effectivePurpose === 'manual';
   let candidateStrategy = 'default_preserve_order';
   if (stage === 'translate') {
     if (purpose === 'retry') {
       candidateStrategy = 'retry_cheapest';
     } else if (purpose === 'validate') {
+      candidateStrategy = 'validate_cheapest';
+    } else if (isManualTrigger) {
+      candidateStrategy = 'manual_smartest';
+    }
+  } else if (stage === 'proofread') {
+    if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
+    } else if (effectivePurpose === 'validate') {
       candidateStrategy = 'validate_cheapest';
     } else if (isManualTrigger) {
       candidateStrategy = 'manual_smartest';
