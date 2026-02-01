@@ -1,6 +1,16 @@
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
+function isExtendedPromptCacheRetentionSupported(modelId) {
+  if (!modelId || typeof modelId !== 'string') return false;
+  const normalized = modelId.split(':')[0].trim();
+  return (
+    normalized === 'gpt-5.2' ||
+    normalized === 'gpt-5.1' ||
+    normalized === 'gpt-5' ||
+    normalized === 'gpt-4.1'
+  );
+}
 function createModelRegistry() {
   const entries = [];
   const baseModelIds = [];
@@ -21,7 +31,7 @@ function createModelRegistry() {
       sum_1M,
       sum_1M_cached,
       supportsFlex: entry.tier === 'flex',
-      supportsPromptCacheRetention24h: entry.cachedInputPrice != null,
+      supportsPromptCacheRetention24h: isExtendedPromptCacheRetentionSupported(entry.id),
       supportsPromptCacheKey: true,
       supportsServiceTierParam: true,
       supportsTextJsonSchema: true
@@ -412,6 +422,7 @@ function applyPromptCacheParams(requestPayload, apiBaseUrl, model, cacheKey) {
 
   const entry = getModelEntry(model);
   const supportsCacheKey = entry?.supportsPromptCacheKey ?? true;
+  const supportsCacheRetention = isExtendedPromptCacheRetentionSupported(model);
   if (
     cacheKey &&
     typeof cacheKey === 'string' &&
@@ -421,6 +432,14 @@ function applyPromptCacheParams(requestPayload, apiBaseUrl, model, cacheKey) {
     !isModelParamUnsupported(model, 'prompt_cache_key')
   ) {
     requestPayload.prompt_cache_key = cacheKey;
+  }
+  if (
+    model &&
+    supportsCacheRetention &&
+    !PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS.has(model) &&
+    !isModelParamUnsupported(model, 'prompt_cache_retention')
+  ) {
+    requestPayload.prompt_cache_retention = '24h';
   }
 }
 
