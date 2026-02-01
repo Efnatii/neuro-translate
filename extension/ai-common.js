@@ -130,30 +130,71 @@ globalThis.__NT_formatModelSpec__ ||= function formatModelSpec(id, tier) {
 
 globalThis.__NT_getModelCapabilityRank__ ||= function getModelCapabilityRank(modelId) {
   if (!modelId) return 0;
-  if (!globalThis.__NT_MODEL_CAPABILITY_RANK__) {
-    globalThis.__NT_MODEL_CAPABILITY_RANK__ = {
-      'gpt-5.2-pro': 210,
-      'gpt-5-pro': 200,
-      'gpt-5.2': 190,
-      'gpt-5.1': 180,
-      'gpt-5': 170,
-      'o3-deep-research': 165,
-      'o4-mini-deep-research': 160,
-      o3: 150,
-      'gpt-4.1': 140,
-      'gpt-4o': 130,
-      'o4-mini': 125,
-      'gpt-5-mini': 120,
-      'o3-mini': 110,
-      'o1-mini': 100,
-      'gpt-4.1-mini': 90,
-      'gpt-4o-mini': 80,
-      'gpt-5-nano': 70,
-      'gpt-4.1-nano': 60
+  const normalizedId = typeof modelId === 'string' ? modelId.split(':')[0].trim() : modelId;
+  if (!normalizedId) return 0;
+  if (!globalThis.__NT_CAPABILITY_RANK__) {
+    // OpenAI API model docs: gpt-5.2 guide/models (replaces gpt-5.1; pro uses more compute),
+    // o3 (succeeded by GPT-5), o4-mini (succeeded by GPT-5 mini), o1-mini (recommends o3-mini),
+    // gpt-4.1 (smartest non-reasoning). Mini/nano entries are smaller/faster/less capable per docs.
+    // Heuristic ties: gpt-4.1 vs gpt-4o (not explicitly ordered), and gpt-4.1-mini vs gpt-4o-mini.
+    // Deep-research variants are specialized; keep below GPT-5.* in "smartest" unless user prioritizes.
+    globalThis.__NT_CAPABILITY_RANK__ = {
+      'gpt-5.2-pro': 300,
+      'gpt-5.2': 290,
+      'gpt-5.1': 280,
+      'gpt-5-pro': 275,
+      'gpt-5': 270,
+      'gpt-5-mini': 240,
+      'gpt-5-nano': 230,
+      'o3-deep-research': 225,
+      o3: 215,
+      'o3-mini': 175,
+      'o4-mini-deep-research': 165,
+      'o4-mini': 160,
+      'o1-mini': 155,
+      'gpt-4.1': 150,
+      'gpt-4o': 150,
+      'gpt-4.1-mini': 130,
+      'gpt-4o-mini': 130,
+      'gpt-4.1-nano': 120
     };
   }
-  const rankMap = globalThis.__NT_MODEL_CAPABILITY_RANK__;
-  return rankMap[modelId] ?? 0;
+  const rankMap = globalThis.__NT_CAPABILITY_RANK__;
+  const shouldCheck = globalThis.__NT_DEBUG__ || globalThis.__NT_DEV__;
+  if (shouldCheck) {
+    const rank = (id) => rankMap[id] ?? 0;
+    if (rank('gpt-5.2') <= rank('gpt-5.1')) {
+      console.warn('Rank invariant failed: gpt-5.2 must exceed gpt-5.1');
+    }
+    if (rank('gpt-5.1') <= rank('gpt-5')) {
+      console.warn('Rank invariant failed: gpt-5.1 must exceed gpt-5');
+    }
+    if (rank('gpt-5-pro') <= rank('gpt-5')) {
+      console.warn('Rank invariant failed: gpt-5-pro must exceed gpt-5');
+    }
+    if (rank('gpt-5') <= rank('o3')) {
+      console.warn('Rank invariant failed: gpt-5 must exceed o3');
+    }
+    if (rank('gpt-5-mini') <= rank('o4-mini')) {
+      console.warn('Rank invariant failed: gpt-5-mini must exceed o4-mini');
+    }
+    if (rank('o3-mini') <= rank('o1-mini')) {
+      console.warn('Rank invariant failed: o3-mini must exceed o1-mini');
+    }
+    if (rank('gpt-5.2') <= rank('gpt-5-mini') || rank('gpt-5-mini') <= rank('gpt-5-nano')) {
+      console.warn('Rank invariant failed: gpt-5.2 > gpt-5-mini > gpt-5-nano');
+    }
+    if (rank('gpt-4.1') <= rank('gpt-4.1-mini') || rank('gpt-4.1-mini') <= rank('gpt-4.1-nano')) {
+      console.warn('Rank invariant failed: gpt-4.1 > gpt-4.1-mini > gpt-4.1-nano');
+    }
+    if (rank('o3-deep-research') < rank('o3')) {
+      console.warn('Rank invariant failed: o3-deep-research must be >= o3');
+    }
+    if (rank('o4-mini-deep-research') < rank('o4-mini')) {
+      console.warn('Rank invariant failed: o4-mini-deep-research must be >= o4-mini');
+    }
+  }
+  return rankMap[normalizedId] ?? 0;
 };
 
 function parseModelSpec(spec) {
