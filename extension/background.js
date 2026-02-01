@@ -805,8 +805,27 @@ chrome.runtime.onConnect.addListener((port) => {
     const rpcId = msg.rpcId;
     if (typeof rpcId !== 'string') return;
     const type = msg.type;
+    const startedAt = Date.now();
+    globalThis.ntJsonLog?.({
+      kind: 'rpc.bg.request',
+      rpcId,
+      type,
+      tabId,
+      senderUrl: port.sender?.url ?? null,
+      msg,
+      ts: startedAt
+    });
     const postResponse = (response) => {
       try {
+        globalThis.ntJsonLog?.({
+          kind: 'rpc.bg.response',
+          rpcId,
+          type,
+          tabId,
+          response,
+          durationMs: Date.now() - startedAt,
+          ts: Date.now()
+        });
         port.postMessage({ rpcId, response });
       } catch (error) {
         console.warn('Failed to post RPC response.', { error, rpcId, type, tabId });
@@ -853,6 +872,13 @@ chrome.runtime.onConnect.addListener((port) => {
         postResponse(response);
       })
       .catch((error) => {
+        globalThis.ntJsonLog?.({
+          kind: 'rpc.bg.error',
+          rpcId,
+          type,
+          tabId,
+          error: error?.message || String(error)
+        });
         postResponse({
           success: false,
           error: error?.message || String(error),

@@ -2432,8 +2432,23 @@ function ensureRpcPort() {
   try {
     ntRpcPort = chrome.runtime.connect({ name: NT_RPC_PORT_NAME });
     rpcPortCreatedAt = Date.now();
+    globalThis.ntPageJsonLog?.({
+      kind: 'rpc.port.ensure',
+      pageUrl: window.location.href,
+      rpcPortCreatedAt,
+      reason: 'connect',
+      ok: true
+    });
   } catch (error) {
     console.warn('Failed to connect RPC port', error);
+    globalThis.ntPageJsonLog?.({
+      kind: 'rpc.port.ensure',
+      pageUrl: window.location.href,
+      rpcPortCreatedAt,
+      reason: 'connect',
+      ok: false,
+      error: error?.message || String(error)
+    });
     ntRpcPort = null;
     return null;
   }
@@ -2446,12 +2461,27 @@ function ensureRpcPort() {
     if (!entry) return;
     ntRpcPending.delete(rpcId);
     clearTimeout(entry.timeoutId);
+    const durationMs = entry.startedAt ? Date.now() - entry.startedAt : 0;
+    globalThis.ntPageJsonLog?.({
+      kind: 'rpc.response',
+      rpcId,
+      type: entry.type,
+      response: msg.response,
+      durationMs,
+      ts: Date.now()
+    });
     entry.resolve(msg.response);
   });
 
   ntRpcPort.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError;
     console.warn('RPC port disconnected', err?.message || '');
+    globalThis.ntPageJsonLog?.({
+      kind: 'rpc.disconnect',
+      errorMessage: err?.message || 'RPC port disconnected',
+      pendingCount: ntRpcPending.size,
+      ts: Date.now()
+    });
     for (const [rpcId, entry] of ntRpcPending.entries()) {
       clearTimeout(entry.timeoutId);
       entry.resolve({
@@ -2497,6 +2527,13 @@ function rotateRpcPort(reason = '') {
   ntRpcPort = null;
   rpcPortCreatedAt = 0;
   console.info('RPC port rotated', { reason });
+  globalThis.ntPageJsonLog?.({
+    kind: 'rpc.port.rotate',
+    pageUrl: window.location.href,
+    rpcPortCreatedAt,
+    reason,
+    ok: true
+  });
 }
 
 function getRpcPortAgeMs() {
@@ -2521,16 +2558,32 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
     });
   }
   const rpcId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const requestStartedAt = Date.now();
+  globalThis.ntPageJsonLog?.({
+    kind: 'rpc.request',
+    rpcId,
+    type: payload?.type,
+    payload,
+    pageUrl: window.location.href,
+    ts: requestStartedAt
+  });
   return new Promise((resolve) => {
     let timeoutId = setTimeout(() => {
       ntRpcPending.delete(rpcId);
+      globalThis.ntPageJsonLog?.({
+        kind: 'rpc.timeout',
+        rpcId,
+        type: payload?.type,
+        timeoutMs,
+        ts: Date.now()
+      });
       resolve({
         success: false,
         error: fallbackError || 'RPC timeout',
         isRuntimeError: true
       });
     }, timeoutMs);
-    ntRpcPending.set(rpcId, { resolve, timeoutId });
+    ntRpcPending.set(rpcId, { resolve, timeoutId, type: payload?.type, startedAt: requestStartedAt });
     try {
       port.postMessage({ rpcId, ...payload });
     } catch (error) {
@@ -2552,15 +2605,31 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
         return;
       }
       const retryRpcId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      const retryStartedAt = Date.now();
+      globalThis.ntPageJsonLog?.({
+        kind: 'rpc.request',
+        rpcId: retryRpcId,
+        type: payload?.type,
+        payload,
+        pageUrl: window.location.href,
+        ts: retryStartedAt
+      });
       timeoutId = setTimeout(() => {
         ntRpcPending.delete(retryRpcId);
+        globalThis.ntPageJsonLog?.({
+          kind: 'rpc.timeout',
+          rpcId: retryRpcId,
+          type: payload?.type,
+          timeoutMs,
+          ts: Date.now()
+        });
         resolve({
           success: false,
           error: fallbackError || 'RPC timeout',
           isRuntimeError: true
         });
       }, timeoutMs);
-      ntRpcPending.set(retryRpcId, { resolve, timeoutId });
+      ntRpcPending.set(retryRpcId, { resolve, timeoutId, type: payload?.type, startedAt: retryStartedAt });
       try {
         port.postMessage({ rpcId: retryRpcId, ...payload });
       } catch (retryError) {
