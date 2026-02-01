@@ -375,10 +375,21 @@ function normalizeUsage(usage) {
   const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens);
   const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? usage.completionTokens);
   const totalTokens = Number(usage.total_tokens ?? usage.totalTokens);
+  const cachedTokens = Number(
+    usage?.prompt_tokens_details?.cached_tokens ??
+      usage?.input_tokens_details?.cached_tokens ??
+      usage?.prompt_tokens_details?.cachedTokens ??
+      usage?.input_tokens_details?.cachedTokens ??
+      usage?.cached_tokens ??
+      usage?.cachedTokens
+  );
   return {
     prompt_tokens: Number.isFinite(promptTokens) ? promptTokens : null,
     completion_tokens: Number.isFinite(completionTokens) ? completionTokens : null,
-    total_tokens: Number.isFinite(totalTokens) ? totalTokens : null
+    total_tokens: Number.isFinite(totalTokens) ? totalTokens : null,
+    prompt_tokens_details: {
+      cached_tokens: Number.isFinite(cachedTokens) ? cachedTokens : 0
+    }
   };
 }
 

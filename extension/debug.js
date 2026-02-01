@@ -473,29 +473,42 @@ async function refreshDebug() {
 
 function extractTokensFromUsage(usage) {
   if (!usage || typeof usage !== 'object') {
-    return { inputTokens: 0, outputTokens: 0, totalTokens: 0, hasBreakdown: false };
+    return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedTokens: 0, hasBreakdown: false };
   }
   const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens ?? usage.inputTokens);
   const outputTokens = Number(
     usage.completion_tokens ?? usage.output_tokens ?? usage.completionTokens ?? usage.outputTokens
   );
   const totalTokens = Number(usage.total_tokens ?? usage.totalTokens);
+  const cachedTokens = extractCachedTokensFromUsage(usage);
   const hasBreakdown = Number.isFinite(inputTokens) || Number.isFinite(outputTokens);
   return {
     inputTokens: Number.isFinite(inputTokens) ? inputTokens : 0,
     outputTokens: Number.isFinite(outputTokens) ? outputTokens : 0,
     totalTokens: Number.isFinite(totalTokens) ? totalTokens : 0,
+    cachedTokens,
     hasBreakdown
   };
 }
 
+function extractCachedTokensFromUsage(usage) {
+  if (!usage || typeof usage !== 'object') return 0;
+  const details = usage.prompt_tokens_details ?? usage.input_tokens_details ?? {};
+  const cachedRaw = details.cached_tokens ?? details.cachedTokens ?? usage.cached_tokens ?? usage.cachedTokens;
+  const cachedTokens = Number(cachedRaw);
+  return Number.isFinite(cachedTokens) ? cachedTokens : 0;
+}
+
 function collectTokensFromPayloads(payloads) {
-  const tokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0, hasBreakdown: false };
+  const tokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedTokens: 0, hasBreakdown: false };
   (Array.isArray(payloads) ? payloads : []).forEach((payload) => {
-    const { inputTokens, outputTokens, totalTokens, hasBreakdown } = extractTokensFromUsage(payload?.usage);
+    const { inputTokens, outputTokens, totalTokens, cachedTokens, hasBreakdown } = extractTokensFromUsage(
+      payload?.usage
+    );
     tokens.inputTokens += inputTokens;
     tokens.outputTokens += outputTokens;
     tokens.totalTokens += totalTokens;
+    tokens.cachedTokens += cachedTokens;
     if (hasBreakdown) tokens.hasBreakdown = true;
   });
   return tokens;
@@ -635,10 +648,30 @@ function renderSummary(data, fallbackMessage = '') {
   if (!summaryEl) return;
   const items = Array.isArray(data.items) ? data.items : [];
   const total = items.length;
-  const overallStatuses = items.map((item) => getOverallEntryStatus(item));
-  const completed = overallStatuses.filter((status) => status === 'done').length;
-  const inProgress = overallStatuses.filter((status) => status === 'in_progress').length;
-  const failed = overallStatuses.filter((status) => status === 'failed').length;
+  let completed = 0;
+  let inProgress = 0;
+  let failed = 0;
+  let sumPromptTokens = 0;
+  let sumCachedTokens = 0;
+  items.forEach((item) => {
+    const status = getOverallEntryStatus(item);
+    if (status === 'done') completed += 1;
+    if (status === 'in_progress') inProgress += 1;
+    if (status === 'failed') failed += 1;
+    const payloadGroups = [item?.translationDebug, item?.proofreadDebug, item?.contextDebug];
+    payloadGroups.forEach((payloads) => {
+      (Array.isArray(payloads) ? payloads : []).forEach((payload) => {
+        const { inputTokens, cachedTokens } = extractTokensFromUsage(payload?.usage);
+        sumPromptTokens += inputTokens;
+        sumCachedTokens += cachedTokens;
+      });
+    });
+  });
+  (Array.isArray(data?.contextDebug) ? data.contextDebug : []).forEach((payload) => {
+    const { inputTokens, cachedTokens } = extractTokensFromUsage(payload?.usage);
+    sumPromptTokens += inputTokens;
+    sumCachedTokens += cachedTokens;
+  });
   const contextFullText = (data.contextFull || data.context || '').trim();
   const contextShortText = (data.contextShort || '').trim();
   const contextFullStatus = normalizeStatus(data.contextFullStatus || data.contextStatus, contextFullText);
@@ -646,6 +679,11 @@ function renderSummary(data, fallbackMessage = '') {
   const progress = total ? Math.round((completed / total) * 100) : 0;
   const aiRequestCount = Number.isFinite(data.aiRequestCount) ? data.aiRequestCount : 0;
   const aiResponseCount = Number.isFinite(data.aiResponseCount) ? data.aiResponseCount : 0;
+  const cacheHitPercent = sumPromptTokens > 0 ? (sumCachedTokens / sumPromptTokens) * 100 : 0;
+  const cacheSummary =
+    sumPromptTokens > 0 || sumCachedTokens > 0
+      ? ` • Cache: cached ${sumCachedTokens} / in ${sumPromptTokens} (${cacheHitPercent.toFixed(1)}%)`
+      : '';
   const overallStatus = getOverallStatus({
     completed,
     inProgress,
@@ -656,7 +694,7 @@ function renderSummary(data, fallbackMessage = '') {
   });
   const summaryLine = fallbackMessage
     ? `${fallbackMessage}`
-    : `Контекст SHORT: ${STATUS_CONFIG[contextShortStatus]?.label || '—'} • Контекст FULL: ${STATUS_CONFIG[contextFullStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount}`;
+    : `Контекст SHORT: ${STATUS_CONFIG[contextShortStatus]?.label || '—'} • Контекст FULL: ${STATUS_CONFIG[contextFullStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount}${cacheSummary}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>
@@ -1395,16 +1433,10 @@ function buildDebugParseContent(parseIssues) {
 
 function formatUsage(usage) {
   if (!usage) return '—';
-  const total = usage.total_tokens ?? usage.totalTokens;
-  const prompt = usage.prompt_tokens ?? usage.promptTokens;
-  const completion = usage.completion_tokens ?? usage.completionTokens;
-  if (Number.isFinite(prompt) && Number.isFinite(completion)) {
-    return `${prompt} prompt / ${completion} completion`;
-  }
-  if (Number.isFinite(total)) {
-    return `${total} total`;
-  }
-  return '—';
+  const { inputTokens, outputTokens, totalTokens, cachedTokens } = extractTokensFromUsage(usage);
+  const safeTotal = totalTokens || inputTokens + outputTokens;
+  const cachedPercent = inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : 0;
+  return `in ${inputTokens} (cached ${cachedTokens}, ${cachedPercent.toFixed(1)}%) · out ${outputTokens} · total ${safeTotal}`;
 }
 
 function formatLatency(latencyMs) {
