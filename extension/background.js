@@ -479,6 +479,34 @@ function getModelListForStage(state, stage) {
   return state.translationModelList || [];
 }
 
+function getModelCooldownMap() {
+  if (!globalThis.__NT_MODEL_COOLDOWNS__) {
+    globalThis.__NT_MODEL_COOLDOWNS__ = new Map();
+  }
+  return globalThis.__NT_MODEL_COOLDOWNS__;
+}
+
+function getModelCooldown(spec) {
+  const cooldowns = getModelCooldownMap();
+  const entry = cooldowns.get(spec);
+  if (!entry?.availableAfter) return null;
+  if (entry.availableAfter <= Date.now()) {
+    cooldowns.delete(spec);
+    return null;
+  }
+  return entry;
+}
+
+function setModelCooldown(spec, error) {
+  if (!spec) return;
+  const cooldowns = getModelCooldownMap();
+  const retryAfterMs = Number.isFinite(Number(error?.retryAfterMs))
+    ? Number(error.retryAfterMs)
+    : 5000;
+  const capped = Math.min(Math.max(retryAfterMs, 0), 60000);
+  cooldowns.set(spec, { availableAfter: Date.now() + capped });
+}
+
 function getCandidateModels(stage, triggerSource, isManual, state) {
   const fallbackModel = stage === 'context'
     ? state.contextModel
@@ -486,65 +514,64 @@ function getCandidateModels(stage, triggerSource, isManual, state) {
       ? state.proofreadModel
       : state.translationModel;
   const originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
-  const isRetry = triggerSource === 'retry' || triggerSource === 'validate';
   const isManualTrigger = Boolean(isManual) || /manual/i.test(triggerSource || '');
-  const candidateStrategy = isManualTrigger
-    ? 'manual_smartest'
-    : isRetry
-      ? 'retry_cheapest'
-      : 'default_preserve_order';
-  const parsedEntries = originalRequestedModelList.map((spec, index) => ({
-    spec,
-    index,
-    parsed: parseModelSpec(spec)
-  }));
-  const flexSpecs = [];
-  const standardSpecs = [];
-  for (const entry of parsedEntries) {
-    if (entry.parsed.tier === 'flex') {
-      flexSpecs.push(entry);
-    } else {
-      standardSpecs.push(entry);
-    }
+  let candidateStrategy = 'default_preserve_order';
+  if (triggerSource === 'retry') {
+    candidateStrategy = 'retry_cheapest';
+  } else if (triggerSource === 'validate') {
+    candidateStrategy = 'validate_cheapest';
+  } else if (isManualTrigger) {
+    candidateStrategy = 'manual_smartest';
   }
-  const sortByRank = (entries) =>
-    [...entries].sort((left, right) => {
-      const leftRank = getModelCapabilityRank(left.parsed.id);
-      const rightRank = getModelCapabilityRank(right.parsed.id);
-      if (leftRank !== rightRank) {
-        return rightRank - leftRank;
-      }
-      const leftEntry = getModelEntry(left.parsed.id, left.parsed.tier);
-      const rightEntry = getModelEntry(right.parsed.id, right.parsed.tier);
-      const leftCost = leftEntry?.sum_1M ?? 0;
-      const rightCost = rightEntry?.sum_1M ?? 0;
-      if (leftCost !== rightCost) {
-        return rightCost - leftCost;
-      }
-      return left.index - right.index;
-    });
-  const sortByCost = (entries) =>
-    [...entries].sort((left, right) => {
-      const leftEntry = getModelEntry(left.parsed.id, left.parsed.tier);
-      const rightEntry = getModelEntry(right.parsed.id, right.parsed.tier);
-      const leftCost = leftEntry?.sum_1M ?? Infinity;
-      const rightCost = rightEntry?.sum_1M ?? Infinity;
-      if (leftCost !== rightCost) {
-        return leftCost - rightCost;
-      }
-      return left.index - right.index;
-    });
-  const orderEntries = (entries) => {
-    if (candidateStrategy === 'manual_smartest') return sortByRank(entries);
-    if (candidateStrategy === 'retry_cheapest') return sortByCost(entries);
-    return [...entries];
+  const parsedEntries = originalRequestedModelList.map((spec, index) => {
+    const parsed = parseModelSpec(spec);
+    const tierPref = parsed.tier === 'flex' ? 1 : 0;
+    const capabilityRank = getModelCapabilityRank(parsed.id);
+    const costSum = getModelEntry(parsed.id, parsed.tier)?.sum_1M ?? Infinity;
+    return {
+      spec,
+      index,
+      parsed,
+      tierPref,
+      capabilityRank,
+      costSum
+    };
+  });
+  const compareManual = (left, right) => {
+    if (left.capabilityRank !== right.capabilityRank) {
+      return right.capabilityRank - left.capabilityRank;
+    }
+    if (left.tierPref !== right.tierPref) {
+      return right.tierPref - left.tierPref;
+    }
+    if (left.costSum !== right.costSum) {
+      return right.costSum - left.costSum;
+    }
+    return left.index - right.index;
   };
-  const orderedList = [
-    ...orderEntries(flexSpecs),
-    ...orderEntries(standardSpecs)
-  ].map((entry) => entry.spec);
+  const compareCheapest = (left, right) => {
+    if (left.costSum !== right.costSum) {
+      return left.costSum - right.costSum;
+    }
+    if (left.tierPref !== right.tierPref) {
+      return right.tierPref - left.tierPref;
+    }
+    if (left.capabilityRank !== right.capabilityRank) {
+      return right.capabilityRank - left.capabilityRank;
+    }
+    return left.index - right.index;
+  };
+  const orderedEntries = [...parsedEntries];
+  if (candidateStrategy === 'manual_smartest') {
+    orderedEntries.sort(compareManual);
+  } else if (candidateStrategy === 'retry_cheapest' || candidateStrategy === 'validate_cheapest') {
+    orderedEntries.sort(compareCheapest);
+  }
+  const orderedList = orderedEntries.map((entry) => entry.spec);
+  const cooldownFiltered = orderedList.filter((spec) => !getModelCooldown(spec));
+  const finalOrderedList = cooldownFiltered.length ? cooldownFiltered : orderedList;
   return {
-    orderedList,
+    orderedList: finalOrderedList,
     originalRequestedModelList,
     isManual: Boolean(isManual),
     candidateStrategy
@@ -571,6 +598,13 @@ function shouldFallbackToStandard(error) {
   if (error?.fallbackReason && String(error.fallbackReason).includes('service_tier')) return true;
   if (error?.fallbackReason && String(error.fallbackReason).includes('unsupported_param')) return true;
   return false;
+}
+
+function recordCooldownIfNeeded(modelSpec, reason, error) {
+  if (!modelSpec) return;
+  if (reason === 'tpm_limit' || reason === 'rate_limit') {
+    setModelCooldown(modelSpec, error);
+  }
 }
 
 function buildMissingKeyReason(roleLabel, config, model) {
@@ -1208,7 +1242,9 @@ async function executeModelFallback(stage, state, message, handler) {
             return await attemptWithTier('standard', attemptFallbackReason || 'service_tier_unavailable');
           } catch (standardError) {
             lastError = standardError;
-            fallbackReasonForNext = classifyFallbackReason(standardError);
+            const standardReason = classifyFallbackReason(standardError);
+            recordCooldownIfNeeded(formatModelSpec(modelId, 'standard'), standardReason, standardError);
+            fallbackReasonForNext = standardReason;
             continue;
           }
         }
@@ -1221,12 +1257,15 @@ async function executeModelFallback(stage, state, message, handler) {
       } catch (error) {
         lastError = error;
         const reason = classifyFallbackReason(error);
+        recordCooldownIfNeeded(formatModelSpec(modelId, 'flex'), reason, error);
         if (shouldFallbackToStandard(error) && standardEntry) {
           try {
             return await attemptWithTier('standard', reason);
           } catch (standardError) {
             lastError = standardError;
-            fallbackReasonForNext = classifyFallbackReason(standardError);
+            const standardReason = classifyFallbackReason(standardError);
+            recordCooldownIfNeeded(formatModelSpec(modelId, 'standard'), standardReason, standardError);
+            fallbackReasonForNext = standardReason;
             continue;
           }
         }
@@ -1245,7 +1284,9 @@ async function executeModelFallback(stage, state, message, handler) {
         return await attemptWithTier('standard', attemptFallbackReason);
       } catch (error) {
         lastError = error;
-        fallbackReasonForNext = classifyFallbackReason(error);
+        const reason = classifyFallbackReason(error);
+        recordCooldownIfNeeded(formatModelSpec(modelId, 'standard'), reason, error);
+        fallbackReasonForNext = reason;
       }
     }
   }

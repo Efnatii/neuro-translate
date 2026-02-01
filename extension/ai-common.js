@@ -130,26 +130,29 @@ globalThis.__NT_formatModelSpec__ ||= function formatModelSpec(id, tier) {
 
 globalThis.__NT_getModelCapabilityRank__ ||= function getModelCapabilityRank(modelId) {
   if (!modelId) return 0;
-  const rankMap = {
-    'gpt-5.2-pro': 180,
-    'gpt-5-pro': 170,
-    'gpt-5.2': 160,
-    'gpt-5.1': 150,
-    'gpt-5': 140,
-    'o3-deep-research': 130,
-    'o4-mini-deep-research': 120,
-    o3: 110,
-    'gpt-4.1': 100,
-    'gpt-4o': 90,
-    'gpt-5-mini': 80,
-    'o4-mini': 70,
-    'o3-mini': 60,
-    'o1-mini': 50,
-    'gpt-4.1-mini': 40,
-    'gpt-4o-mini': 30,
-    'gpt-5-nano': 20,
-    'gpt-4.1-nano': 10
-  };
+  if (!globalThis.__NT_MODEL_CAPABILITY_RANK__) {
+    globalThis.__NT_MODEL_CAPABILITY_RANK__ = {
+      'gpt-5.2-pro': 210,
+      'gpt-5-pro': 200,
+      'gpt-5.2': 190,
+      'gpt-5.1': 180,
+      'gpt-5': 170,
+      'o3-deep-research': 165,
+      'o4-mini-deep-research': 160,
+      o3: 150,
+      'gpt-4.1': 140,
+      'gpt-4o': 130,
+      'o4-mini': 125,
+      'gpt-5-mini': 120,
+      'o3-mini': 110,
+      'o1-mini': 100,
+      'gpt-4.1-mini': 90,
+      'gpt-4o-mini': 80,
+      'gpt-5-nano': 70,
+      'gpt-4.1-nano': 60
+    };
+  }
+  const rankMap = globalThis.__NT_MODEL_CAPABILITY_RANK__;
   return rankMap[modelId] ?? 0;
 };
 

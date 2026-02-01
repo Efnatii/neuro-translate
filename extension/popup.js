@@ -51,14 +51,19 @@ function buildModelOptions() {
   return entries
     .map((entry) => {
       const modelSpec = typeof formatModelSpec === 'function' ? formatModelSpec(entry.id, entry.tier) : `${entry.id}:${entry.tier}`;
-      const cacheLabel = entry.cachedInputPrice != null ? formatPrice(entry.cachedInputPrice) : '—';
-      const label = `${entry.id} — in ${formatPrice(entry.inputPrice)} / cache ${cacheLabel} / out ${formatPrice(entry.outputPrice)} / Σ1M ${formatPrice(entry.sum_1M)}`;
+      const inputLabel = formatPrice(entry.inputPrice);
+      const cachedLabel = entry.cachedInputPrice != null ? formatPrice(entry.cachedInputPrice) : '—';
+      const outputLabel = formatPrice(entry.outputPrice);
+      const sumLabel = formatPrice(entry.sum_1M);
       return {
         id: entry.id,
         tier: entry.tier,
         spec: modelSpec,
         sum_1M: entry.sum_1M,
-        name: label
+        sumLabel,
+        inputLabel,
+        cachedLabel,
+        outputLabel
       };
     })
     .sort((left, right) => {
@@ -399,6 +404,15 @@ function renderModelChecklist(container, selectedList, onChange) {
   if (!container) return;
   container.innerHTML = '';
 
+  const filterWrapper = document.createElement('div');
+  filterWrapper.className = 'model-filter';
+  const filterInput = document.createElement('input');
+  filterInput.type = 'text';
+  filterInput.placeholder = 'Поиск модели…';
+  filterInput.dataset.modelFilter = 'true';
+  filterWrapper.appendChild(filterInput);
+  container.appendChild(filterWrapper);
+
   const tierGroups = {
     flex: models.filter((model) => model.tier === 'flex'),
     standard: models.filter((model) => model.tier === 'standard')
@@ -415,11 +429,23 @@ function renderModelChecklist(container, selectedList, onChange) {
     summaryLabel.dataset.modelTierLabel = tier;
     summary.appendChild(summaryLabel);
     group.appendChild(summary);
+    const actions = document.createElement('div');
+    actions.className = 'model-tier-actions';
+    const selectAllButton = document.createElement('button');
+    selectAllButton.type = 'button';
+    selectAllButton.textContent = 'Выбрать все';
+    const clearAllButton = document.createElement('button');
+    clearAllButton.type = 'button';
+    clearAllButton.textContent = 'Снять все';
+    actions.appendChild(selectAllButton);
+    actions.appendChild(clearAllButton);
+    group.appendChild(actions);
     const list = document.createElement('div');
     list.className = 'model-options';
     entries.forEach((model) => {
       const itemLabel = document.createElement('label');
       itemLabel.className = 'model-option';
+      itemLabel.dataset.modelId = model.id.toLowerCase();
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
       checkbox.dataset.modelSpec = model.spec;
@@ -429,15 +455,69 @@ function renderModelChecklist(container, selectedList, onChange) {
           onChange();
         }
       });
-      const text = document.createElement('span');
-      text.textContent = model.name;
+      const modelId = document.createElement('span');
+      modelId.className = 'model-id';
+      modelId.textContent = model.id;
+      const price = document.createElement('span');
+      price.className = 'model-price';
+      price.textContent = `Σ1M: ${model.sumLabel}`;
+      const info = document.createElement('span');
+      info.className = 'model-info';
+      info.textContent = 'i';
+      info.title = `Input: ${model.inputLabel} / Cached: ${model.cachedLabel} / Output: ${model.outputLabel}`;
       itemLabel.appendChild(checkbox);
-      itemLabel.appendChild(text);
+      itemLabel.appendChild(modelId);
+      itemLabel.appendChild(price);
+      itemLabel.appendChild(info);
       list.appendChild(itemLabel);
     });
     group.appendChild(list);
     container.appendChild(group);
+
+    selectAllButton.addEventListener('click', () => {
+      const checkboxes = [...group.querySelectorAll('input[type="checkbox"][data-model-spec]')];
+      let changed = false;
+      checkboxes.forEach((box) => {
+        if (!box.checked) {
+          box.checked = true;
+          changed = true;
+        }
+      });
+      if (changed && typeof onChange === 'function') {
+        onChange();
+      } else {
+        updateModelSummaryCount(container, null);
+      }
+    });
+
+    clearAllButton.addEventListener('click', () => {
+      const checkboxes = [...group.querySelectorAll('input[type="checkbox"][data-model-spec]')];
+      let changed = false;
+      checkboxes.forEach((box) => {
+        if (box.checked) {
+          box.checked = false;
+          changed = true;
+        }
+      });
+      if (changed && typeof onChange === 'function') {
+        onChange();
+      } else {
+        updateModelSummaryCount(container, null);
+      }
+    });
   });
+
+  const applyFilter = () => {
+    const query = filterInput.value.trim().toLowerCase();
+    const items = [...container.querySelectorAll('.model-option[data-model-id]')];
+    items.forEach((item) => {
+      const modelId = item.dataset.modelId || '';
+      const match = !query || modelId.includes(query);
+      item.classList.toggle('is-hidden', !match);
+    });
+  };
+  filterInput.addEventListener('input', applyFilter);
+
   updateModelSummaryCount(container, null);
 }
 
@@ -460,19 +540,19 @@ function updateModelSummaryCount(container, countLabel) {
   if (!container) return;
   const checkboxes = [...container.querySelectorAll('input[type="checkbox"][data-model-spec]')];
   const selectedCount = checkboxes.filter((checkbox) => checkbox.checked).length;
-  const label = selectedCount ? `(${selectedCount})` : '';
+  const label = `(выбрано ${selectedCount})`;
   if (countLabel) {
     countLabel.textContent = label;
   }
   const groups = [...container.querySelectorAll('[data-model-tier]')];
   groups.forEach((group) => {
     const tier = group.dataset.modelTier || '';
-    const tierCount = [...group.querySelectorAll('input[type="checkbox"][data-model-spec]')].filter(
-      (checkbox) => checkbox.checked
-    ).length;
+    const tierCheckboxes = [...group.querySelectorAll('input[type="checkbox"][data-model-spec]')];
+    const tierCount = tierCheckboxes.filter((checkbox) => checkbox.checked).length;
+    const totalCount = tierCheckboxes.length;
     const summaryLabel = group.querySelector('[data-model-tier-label]');
     if (summaryLabel) {
-      summaryLabel.textContent = `${tier.toUpperCase()} (выбрано ${tierCount})`;
+      summaryLabel.textContent = `${tier.toUpperCase()} (выбрано ${tierCount} / всего ${totalCount})`;
     }
   });
 }
