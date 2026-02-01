@@ -527,7 +527,29 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
       role: 'system',
       content: PROOFREAD_SYSTEM_PROMPT
     },
+    {
+      role: 'user',
+      content: [
+        'Proofread instructions:',
+        'Follow the system prompt rules exactly.',
+        'Respond with JSON only; no commentary.',
+        'Context and payload details follow in later messages.'
+      ].join('\n')
+    }
   ];
+
+  messages.push({
+    role: 'user',
+    content: [
+      `Context (${contextMode}):`,
+      contextText ? `<<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>` : '<EMPTY>'
+    ].join('\n')
+  });
+
+  messages.push({
+    role: 'assistant',
+    content: baseAnswerText || 'PREVIOUS BASE ANSWER (FULL): <EMPTY>'
+  });
 
   messages.push({
     role: 'user',
@@ -535,34 +557,7 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
       `PROOFREAD_MODE: ${proofreadMode}.`,
       language ? `Target language: ${language}` : '',
       strict ? 'Strict mode: return every input id exactly once in the output items array.' : '',
-      extraReminder
-    ]
-      .filter(Boolean)
-      .join('\n')
-  });
-
-  if (contextText) {
-    messages.push({
-      role: 'user',
-      content: [
-        `Context (${contextMode}): <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
-      ]
-        .filter(Boolean)
-        .join('\n')
-    });
-  }
-
-  if (baseAnswerText) {
-    messages.push({
-      role: 'assistant',
-      content: baseAnswerText
-    });
-  }
-
-  messages.push({
-    role: 'user',
-    content: [
-      language ? `Target language: ${language}` : '',
+      extraReminder,
       sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
       translatedBlock
         ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`

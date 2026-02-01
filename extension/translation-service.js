@@ -543,26 +543,30 @@ function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload
     {
       role: 'system',
       content: TRANSLATE_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: [
+        'Translation instructions:',
+        'Follow the system prompt rules exactly.',
+        'Return JSON only; no commentary.',
+        'Context and translation segments follow in later messages.'
+      ].join('\n')
     }
   ];
 
-  if (hasContext) {
-    messages.push({
-      role: 'user',
-      content: [
-        `Page ${contextMode} context: <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
-      ]
-        .filter(Boolean)
-        .join('\n')
-    });
-  }
+  messages.push({
+    role: 'user',
+    content: [
+      `Page ${contextMode} context:`,
+      hasContext ? `<<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>` : '<EMPTY>'
+    ].join('\n')
+  });
 
-  if (baseAnswerText) {
-    messages.push({
-      role: 'assistant',
-      content: baseAnswerText
-    });
-  }
+  messages.push({
+    role: 'assistant',
+    content: baseAnswerText || 'PREVIOUS BASE ANSWER (FULL): <EMPTY>'
+  });
 
   messages.push({
     role: 'user',
