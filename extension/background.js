@@ -507,6 +507,11 @@ function setModelCooldown(spec, error) {
   cooldowns.set(spec, { availableAfter: Date.now() + capped });
 }
 
+function normalizeTriggerSource(triggerSource) {
+  if (!triggerSource || typeof triggerSource !== 'string') return '';
+  return triggerSource.trim().toLowerCase();
+}
+
 function getCandidateModels(stage, requestMeta, state) {
   const fallbackModel = stage === 'context'
     ? state.contextModel
@@ -516,34 +521,43 @@ function getCandidateModels(stage, requestMeta, state) {
   let originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
   const triggerSource = requestMeta?.triggerSource || '';
   const purpose = requestMeta?.purpose || '';
-  const effectivePurpose = typeof purpose === 'string' ? purpose : '';
-  const normalizedTriggerSource = typeof triggerSource === 'string' ? triggerSource.toLowerCase() : '';
+  const normalizedTriggerSource = normalizeTriggerSource(triggerSource);
+  let effectivePurpose = typeof purpose === 'string' ? purpose : '';
+  if (normalizedTriggerSource.includes('validate')) {
+    effectivePurpose = 'validate';
+  } else if (normalizedTriggerSource.includes('retry')) {
+    effectivePurpose = 'retry';
+  } else if (!effectivePurpose) {
+    effectivePurpose = 'main';
+  }
   const isManualTrigger =
-    Boolean(requestMeta?.isManual) ||
-    normalizedTriggerSource.includes('manual') ||
-    effectivePurpose === 'manual';
+    (Boolean(requestMeta?.isManual) ||
+      normalizedTriggerSource.includes('manual') ||
+      effectivePurpose === 'manual') &&
+    !normalizedTriggerSource.includes('retry') &&
+    !normalizedTriggerSource.includes('validate');
   let candidateStrategy = 'default_preserve_order';
   if (stage === 'translate') {
-    if (effectivePurpose === 'retry') {
-      candidateStrategy = 'retry_cheapest';
-    } else if (effectivePurpose === 'validate') {
+    if (effectivePurpose === 'validate') {
       candidateStrategy = 'validate_cheapest';
+    } else if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
     } else if (isManualTrigger) {
       candidateStrategy = 'manual_smartest';
     }
   } else if (stage === 'proofread') {
-    if (effectivePurpose === 'retry') {
-      candidateStrategy = 'retry_cheapest';
-    } else if (effectivePurpose === 'validate') {
+    if (effectivePurpose === 'validate') {
       candidateStrategy = 'validate_cheapest';
+    } else if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
     } else if (isManualTrigger) {
       candidateStrategy = 'manual_smartest';
     }
   } else if (stage === 'context') {
-    if (effectivePurpose === 'retry') {
-      candidateStrategy = 'retry_cheapest';
-    } else if (effectivePurpose === 'validate') {
+    if (effectivePurpose === 'validate') {
       candidateStrategy = 'validate_cheapest';
+    } else if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
     } else if (isManualTrigger) {
       candidateStrategy = 'manual_smartest';
     }

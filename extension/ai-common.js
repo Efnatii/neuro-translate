@@ -133,30 +133,26 @@ globalThis.__NT_getModelCapabilityRank__ ||= function getModelCapabilityRank(mod
   const normalizedId = typeof modelId === 'string' ? modelId.split(':')[0].trim() : modelId;
   if (!normalizedId) return 0;
   if (!globalThis.__NT_CAPABILITY_RANK__) {
-    // OpenAI API model docs: gpt-5.2 guide/models (replaces gpt-5.1; pro uses more compute),
-    // o3 (succeeded by GPT-5), o4-mini (succeeded by GPT-5 mini), o1-mini (recommends o3-mini),
-    // gpt-4.1 (smartest non-reasoning). Mini/nano entries are smaller/faster/less capable per docs.
-    // Heuristic ties: gpt-4.1 vs gpt-4o (not explicitly ordered), and gpt-4.1-mini vs gpt-4o-mini.
-    // Deep-research variants are specialized; keep below GPT-5.* in "smartest" unless user prioritizes.
+    // Heuristic ranks based on official model descriptions + successor relationships (deterministic, not empirical).
     globalThis.__NT_CAPABILITY_RANK__ = {
-      'gpt-5.2-pro': 300,
-      'gpt-5.2': 290,
-      'gpt-5.1': 280,
-      'gpt-5-pro': 275,
-      'gpt-5': 270,
-      'gpt-5-mini': 240,
-      'gpt-5-nano': 230,
-      'o3-deep-research': 225,
-      o3: 215,
-      'o3-mini': 175,
-      'o4-mini-deep-research': 165,
-      'o4-mini': 160,
-      'o1-mini': 155,
-      'gpt-4.1': 150,
-      'gpt-4o': 150,
-      'gpt-4.1-mini': 130,
-      'gpt-4o-mini': 130,
-      'gpt-4.1-nano': 120
+      'gpt-5.2-pro': 400,
+      'gpt-5.2': 380,
+      'gpt-5.1': 370,
+      'gpt-5-pro': 365,
+      'gpt-5': 360,
+      'gpt-5-mini': 320,
+      'gpt-5-nano': 300,
+      'o3-deep-research': 290,
+      o3: 280,
+      'gpt-4.1': 260,
+      'gpt-4o': 250,
+      'gpt-4.1-mini': 230,
+      'gpt-4o-mini': 220,
+      'o3-mini': 210,
+      'o4-mini-deep-research': 205,
+      'o4-mini': 200,
+      'o1-mini': 190,
+      'gpt-4.1-nano': 180
     };
   }
   const rankMap = globalThis.__NT_CAPABILITY_RANK__;
