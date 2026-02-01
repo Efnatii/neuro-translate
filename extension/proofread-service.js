@@ -38,6 +38,22 @@ function emitJsonLog(eventObject) {
   }
 }
 
+function emitProofreadLog(kind, level, message, data) {
+  if (!shouldLogJson()) return;
+  if (typeof globalThis.ntJsonLog === 'function') {
+    const event = {
+      kind,
+      level,
+      message,
+      ts: Date.now()
+    };
+    if (data !== undefined) {
+      event.data = data;
+    }
+    globalThis.ntJsonLog(JSON.stringify(event));
+  }
+}
+
 function maskApiKey(apiKey) {
   if (!apiKey) return '';
   const text = String(apiKey);
@@ -523,11 +539,16 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   const baseAnswerIncluded = Boolean(normalized.baseAnswerIncluded);
   const contextMissing = (mode === 'FULL' || mode === 'SHORT') && !text;
   if (contextMissing) {
-    console.warn('Context mode requires text but none was provided.', {
-      mode,
-      triggerSource: requestMeta?.triggerSource,
-      purpose: requestMeta?.purpose
-    });
+    emitProofreadLog(
+      'proofread.context_missing',
+      'warn',
+      'Context mode requires text but none was provided.',
+      {
+        mode,
+        triggerSource: requestMeta?.triggerSource,
+        purpose: requestMeta?.purpose
+      }
+    );
   }
   return {
     mode,
@@ -985,11 +1006,16 @@ async function proofreadTranslation(
     let quality = evaluateProofreadResult(chunk, result.itemsById, result.parseError);
     logProofreadChunk('proofread', index, chunks.length, chunk.length, quality, result.parseError);
     if (quality.isPoor) {
-      console.warn('Proofread chunk incomplete, retrying with strict instructions.', {
-        chunkIndex: index + 1,
-        missing: quality.missingCount,
-        received: quality.receivedCount
-      });
+      emitProofreadLog(
+        'proofread.chunk_incomplete',
+        'warn',
+        'Proofread chunk incomplete, retrying with strict instructions.',
+        {
+          chunkIndex: index + 1,
+          missing: quality.missingCount,
+          received: quality.receivedCount
+        }
+      );
       appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
@@ -1024,12 +1050,17 @@ async function proofreadTranslation(
     }
 
     if (quality.isPoor && chunk.length > 1) {
-      console.info('Proofread chunk still incomplete after strict retry, retrying with higher max tokens.', {
-        chunkIndex: index + 1,
-        missing: quality.missingCount,
-        received: quality.receivedCount,
-        threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
-      });
+      emitProofreadLog(
+        'proofread.chunk_incomplete_retry_max_tokens',
+        'info',
+        'Proofread chunk still incomplete after strict retry, retrying with higher max tokens.',
+        {
+          chunkIndex: index + 1,
+          missing: quality.missingCount,
+          received: quality.receivedCount,
+          threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
+        }
+      );
       appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
@@ -1066,12 +1097,17 @@ async function proofreadTranslation(
     }
 
     if (quality.isPoor && chunk.length > 1) {
-      console.warn('Proofread chunk still incomplete, falling back to per-item requests.', {
-        chunkIndex: index + 1,
-        missing: quality.missingCount,
-        received: quality.receivedCount,
-        threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
-      });
+      emitProofreadLog(
+        'proofread.chunk_incomplete_fallback_per_item',
+        'warn',
+        'Proofread chunk still incomplete, falling back to per-item requests.',
+        {
+          chunkIndex: index + 1,
+          missing: quality.missingCount,
+          received: quality.receivedCount,
+          threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
+        }
+      );
       appendParseIssue('fallback:per-item');
       for (const item of chunk) {
         const singleResult = await requestProofreadChunk(
@@ -1393,10 +1429,15 @@ function logProofreadChunk(label, index, totalChunks, chunkSize, quality, parseE
     missing: quality.missingCount
   };
   if (parseError) {
-    console.warn(`Proofread chunk parse issue (${label}).`, { ...summary, error: parseError });
+    emitProofreadLog(
+      'proofread.chunk_parse_issue',
+      'warn',
+      `Proofread chunk parse issue (${label}).`,
+      { ...summary, error: parseError }
+    );
     return;
   }
-  console.info(`Proofread chunk processed (${label}).`, summary);
+  emitProofreadLog('proofread.chunk_processed', 'info', `Proofread chunk processed (${label}).`, summary);
 }
 
 function buildProofreadBodyPreview(payload, maxLength = 800) {
@@ -1655,16 +1696,26 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
         stripped.removedParams.includes('max_completion_tokens->max_tokens')
       ) {
-        console.debug('[proofread] Retrying with swapped token limit parameter.', {
-          model,
-          removedParams: stripped.removedParams
-        });
+        emitProofreadLog(
+          'proofread.swap_token_limit_param',
+          'debug',
+          '[proofread] Retrying with swapped token limit parameter.',
+          {
+            model,
+            removedParams: stripped.removedParams
+          }
+        );
       }
-      console.warn('Unsupported param removed; retrying without it.', {
-        model,
-        status: response.status,
-        removedParams: stripped.removedParams
-      });
+      emitProofreadLog(
+        'proofread.unsupported_param_removed',
+        'warn',
+        'Unsupported param removed; retrying without it.',
+        {
+          model,
+          status: response.status,
+          removedParams: stripped.removedParams
+        }
+      );
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -1833,14 +1884,19 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const cachedTokens = debugPayload?.usage?.prompt_tokens_details?.cached_tokens ?? 0;
   const promptTokens = debugPayload?.usage?.prompt_tokens ?? debugPayload?.usage?.input_tokens ?? estimatedPromptTokens;
   const cacheHitRate = promptTokens ? Math.round((cachedTokens / promptTokens) * 100) : 0;
-  console.debug('[proofread] Prompt cache metrics.', {
-    batch_size: batchSize,
-    estimatedPromptTokens,
-    cached_tokens: cachedTokens,
-    cached_percent: cacheHitRate,
-    prompt_cache_key: getPromptCacheKey('proofread'),
-    url: requestMeta?.url || ''
-  });
+  emitProofreadLog(
+    'proofread.prompt_cache_metrics',
+    'debug',
+    '[proofread] Prompt cache metrics.',
+    {
+      batch_size: batchSize,
+      estimatedPromptTokens,
+      cached_tokens: cachedTokens,
+      cached_percent: cacheHitRate,
+      prompt_cache_key: getPromptCacheKey('proofread'),
+      url: requestMeta?.url || ''
+    }
+  );
 
   let parsed = null;
   let parseError = null;
@@ -2101,16 +2157,28 @@ async function requestProofreadFormatRepair(
         stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
         stripped.removedParams.includes('max_completion_tokens->max_tokens')
       ) {
-        console.debug('[proofread] Retrying format repair with swapped token limit parameter.', {
-          model,
-          removedParams: stripped.removedParams
-        });
+        emitProofreadLog(
+          'proofread.swap_token_limit_param',
+          'debug',
+          '[proofread] Retrying format repair with swapped token limit parameter.',
+          {
+            model,
+            removedParams: stripped.removedParams,
+            stage: 'format_repair'
+          }
+        );
       }
-      console.warn('Unsupported param removed; retrying format repair without it.', {
-        model,
-        status: response.status,
-        removedParams: stripped.removedParams
-      });
+      emitProofreadLog(
+        'proofread.unsupported_param_removed',
+        'warn',
+        'Unsupported param removed; retrying format repair without it.',
+        {
+          model,
+          status: response.status,
+          removedParams: stripped.removedParams,
+          stage: 'format_repair'
+        }
+      );
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -2474,16 +2542,28 @@ async function repairProofreadSegments(
           stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
           stripped.removedParams.includes('max_completion_tokens->max_tokens')
         ) {
-          console.debug('[proofread] Retrying proofread repair with swapped token limit parameter.', {
-            model,
-            removedParams: stripped.removedParams
-          });
+          emitProofreadLog(
+            'proofread.swap_token_limit_param',
+            'debug',
+            '[proofread] Retrying proofread repair with swapped token limit parameter.',
+            {
+              model,
+              removedParams: stripped.removedParams,
+              stage: 'repair'
+            }
+          );
         }
-        console.warn('Unsupported param removed; retrying proofread repair without it.', {
-          model,
-          status: response.status,
-          removedParams: stripped.removedParams
-        });
+        emitProofreadLog(
+          'proofread.unsupported_param_removed',
+          'warn',
+          'Unsupported param removed; retrying proofread repair without it.',
+          {
+            model,
+            status: response.status,
+            removedParams: stripped.removedParams,
+            stage: 'repair'
+          }
+        );
         fetchStartedAt = Date.now();
         logLlmFetchRequest({
           ts: fetchStartedAt,
@@ -2654,7 +2734,16 @@ async function repairProofreadSegments(
       }
     });
   } catch (error) {
-    console.warn('Proofread language repair failed; keeping original revisions.', error);
+    emitProofreadLog(
+      'proofread.repair_failed',
+      'warn',
+      'Proofread language repair failed; keeping original revisions.',
+      {
+        error: error && typeof error === 'object'
+          ? { name: error.name, message: error.message, stack: error.stack }
+          : { name: 'Error', message: String(error ?? ''), stack: '' }
+      }
+    );
   }
 
   return translations;
