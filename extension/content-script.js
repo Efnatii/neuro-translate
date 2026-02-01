@@ -847,6 +847,20 @@ async function translatePage(settings, options = {}) {
 
   const pageText = settings.contextGenerationEnabled ? buildPageText(nodesWithPath) : '';
 
+  const buildContextRequestMeta = (text, contextMode, overrides = {}) => {
+    const baseMeta = {
+      stage: 'context',
+      purpose: overrides.purpose || (contextMode === 'SHORT' ? 'short' : 'main'),
+      triggerSource: overrides.triggerSource || translationTriggerSource,
+      url: location.href,
+      contextCacheKey
+    };
+    return buildRequestMeta(baseMeta, {
+      contextText: text,
+      contextMode
+    });
+  };
+
   const buildContextBundle = async () => {
     if (!settings.contextGenerationEnabled) return;
     if (!pageText) {
@@ -860,7 +874,12 @@ async function translatePage(settings, options = {}) {
       const shortResult = getOrBuildContext({
         state: contextState.short,
         signature: contextSignature,
-        build: () => requestShortContext(pageText, settings.targetLanguage || 'ru')
+        build: () =>
+          requestShortContext(
+            pageText,
+            settings.targetLanguage || 'ru',
+            buildContextRequestMeta(pageText, 'SHORT')
+          )
       });
       if (shortResult.started || contextState.short.status === 'building') {
         await updateDebugContextShortStatus('in_progress');
@@ -893,7 +912,12 @@ async function translatePage(settings, options = {}) {
       const fullResult = getOrBuildContext({
         state: contextState.full,
         signature: contextSignature,
-        build: () => requestTranslationContext(pageText, settings.targetLanguage || 'ru')
+        build: () =>
+          requestTranslationContext(
+            pageText,
+            settings.targetLanguage || 'ru',
+            buildContextRequestMeta(pageText, 'FULL')
+          )
       });
       if (fullResult.started || contextState.full.status === 'building') {
         await updateDebugContextFullStatus('in_progress');
@@ -949,10 +973,14 @@ async function translatePage(settings, options = {}) {
       if (latestShortContextSummary) return;
     }
     if (!pageText) return;
+    const contextRequestMeta = buildContextRequestMeta(pageText, 'SHORT', {
+      purpose: requestMeta.purpose || 'retry',
+      triggerSource: requestMeta.triggerSource || 'retry'
+    });
     const shortResult = getOrBuildContext({
       state: contextState.short,
       signature: contextSignature,
-      build: () => requestShortContext(pageText, settings.targetLanguage || 'ru')
+      build: () => requestShortContext(pageText, settings.targetLanguage || 'ru', contextRequestMeta)
     });
     if (shortResult.started || contextState.short.status === 'building') {
       await updateDebugContextShortStatus('in_progress');
@@ -2403,7 +2431,7 @@ function detectProofreadMode(segments, targetLanguage = '') {
   return hasNoise ? 'NOISE_CLEANUP' : 'READABILITY_REWRITE';
 }
 
-async function requestTranslationContext(text, targetLanguage) {
+async function requestTranslationContext(text, targetLanguage, requestMeta = null) {
   const estimatedTokens = estimateTokensForRole('context', {
     texts: [text]
   });
@@ -2413,7 +2441,8 @@ async function requestTranslationContext(text, targetLanguage) {
     {
       type: 'GENERATE_CONTEXT',
       text,
-      targetLanguage
+      targetLanguage,
+      requestMeta: requestMeta || undefined
     },
     'Не удалось сгенерировать контекст.'
   );
@@ -2427,7 +2456,7 @@ async function requestTranslationContext(text, targetLanguage) {
   return response.context || '';
 }
 
-async function requestShortContext(text, targetLanguage) {
+async function requestShortContext(text, targetLanguage, requestMeta = null) {
   const estimatedTokens = estimateTokensForRole('context', {
     texts: [text]
   });
@@ -2437,7 +2466,8 @@ async function requestShortContext(text, targetLanguage) {
     {
       type: 'GENERATE_SHORT_CONTEXT',
       text,
-      targetLanguage
+      targetLanguage,
+      requestMeta: requestMeta || undefined
     },
     'Не удалось сгенерировать короткий контекст.'
   );
