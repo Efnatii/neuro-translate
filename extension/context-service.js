@@ -82,6 +82,22 @@ function emitJsonLog(eventObject) {
   }
 }
 
+function emitContextLog(kind, level, message, data) {
+  if (!shouldLogJson()) return;
+  if (typeof globalThis.ntJsonLog === 'function') {
+    const event = {
+      kind,
+      level,
+      message,
+      ts: Date.now()
+    };
+    if (data !== undefined) {
+      event.data = data;
+    }
+    globalThis.ntJsonLog(JSON.stringify(event));
+  }
+}
+
 function maskApiKey(apiKey) {
   if (!apiKey) return '';
   const text = String(apiKey);
@@ -517,11 +533,16 @@ async function generateTranslationContext(
           requestMeta.selectedTier = 'standard';
         }
       }
-      console.warn('Unsupported param removed; retrying without it.', {
-        model: selectedModelId,
-        status: response.status,
-        removedParams: stripped.removedParams
-      });
+      emitContextLog(
+        'context.unsupported_param_removed',
+        'warn',
+        'Unsupported param removed; retrying without it.',
+        {
+          model: selectedModelId,
+          status: response.status,
+          removedParams: stripped.removedParams
+        }
+      );
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -800,11 +821,16 @@ async function generateShortTranslationContext(
           requestMeta.selectedTier = 'standard';
         }
       }
-      console.warn('Unsupported param removed; retrying without it.', {
-        model: selectedModelId,
-        status: response.status,
-        removedParams: stripped.removedParams
-      });
+      emitContextLog(
+        'context.unsupported_param_removed',
+        'warn',
+        'Unsupported param removed; retrying without it.',
+        {
+          model: selectedModelId,
+          status: response.status,
+          removedParams: stripped.removedParams
+        }
+      );
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
