@@ -240,10 +240,55 @@ async function generateTranslationContext(
           serviceTier: selectedTier === 'flex' ? 'flex' : null
         };
 
+  const cachePrefix = [
+    'NEURO-TRANSLATE CACHE PREFIX v1 (context).',
+    'This block is static and identical across context requests.',
+    'Purpose: stabilize the cached prefix; it does not add new requirements.',
+    'Follow the system prompt rules exactly; if a line here conflicts, the system prompt wins.',
+    'Output must be concise, structured, and factual.',
+    'Never paraphrase the source; never invent facts.',
+    'If information is missing, explicitly state "not specified".',
+    'Prioritize terminology, ambiguity notes, and style guidance.',
+    'Avoid repetition; keep bullet points dense.',
+    'Do not quote the prompt or instructions.',
+    'Do not output JSON; output plain text only.',
+    'Do not include the source text verbatim unless required for ambiguity notes.',
+    'Keep the output short and high-signal.',
+    'Repeat: no commentary beyond the requested context.',
+    'Repeat: do not add facts.',
+    'Repeat: follow the requested format.',
+    'Repeat: be concise.',
+    'Repeat: prioritize actionable translation context.',
+    'Repeat: do not translate the text.',
+    'Repeat: do not output markdown fences.',
+    'Repeat: no extra sections beyond requested format.',
+    '',
+    'STABLE CONTEXT CHECKLIST (static; do not emit in output):',
+    '1. Identify genre/domain if explicit.',
+    '2. Identify audience if explicit.',
+    '3. Note tone/formality cues.',
+    '4. Note key entities and roles.',
+    '5. Note ambiguous pronouns/references.',
+    '6. Provide consistent term recommendations.',
+    '7. Flag ambiguity with possible interpretations.',
+    '8. Note any explicit translation constraints.',
+    '9. Note format/structure requirements.',
+    '10. Keep output concise and skimmable.',
+    '11. Avoid repeating the same point.',
+    '12. Avoid quoting long source phrases.',
+    '13. Use bullet points where helpful.',
+    '14. Keep total length compact.',
+    '15. Do not add stylistic opinions.'
+  ].join('\n');
+
   const prompt = applyPromptCaching([
     {
       role: 'system',
       content: CONTEXT_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: cachePrefix
     },
     {
       role: 'user',
@@ -259,7 +304,7 @@ async function generateTranslationContext(
         text
       ].join('\n')
     }
-  ], apiBaseUrl);
+  ], apiBaseUrl, effectiveRequestOptions);
 
   const requestPayload = {
     model: selectedModelId,
@@ -273,6 +318,9 @@ async function generateTranslationContext(
     effectiveRequestOptions
   );
   applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions, apiBaseUrl);
+  const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, effectiveRequestOptions);
+  const promptCacheKey = requestPayload.prompt_cache_key || '';
+  const promptCacheRetention = requestPayload.prompt_cache_retention || '';
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -348,6 +396,9 @@ async function generateTranslationContext(
       inputChars: text.length,
       outputChars: trimmed.length,
       request: requestPayload,
+      promptCacheKey,
+      promptCacheRetention,
+      promptCacheSupport,
       response: content,
       parseIssues: []
     },
@@ -393,10 +444,55 @@ async function generateShortTranslationContext(
           serviceTier: selectedTier === 'flex' ? 'flex' : null
         };
 
+  const cachePrefix = [
+    'NEURO-TRANSLATE CACHE PREFIX v1 (context).',
+    'This block is static and identical across context requests.',
+    'Purpose: stabilize the cached prefix; it does not add new requirements.',
+    'Follow the system prompt rules exactly; if a line here conflicts, the system prompt wins.',
+    'Output must be concise, structured, and factual.',
+    'Never paraphrase the source; never invent facts.',
+    'If information is missing, explicitly state "not specified".',
+    'Prioritize terminology, ambiguity notes, and style guidance.',
+    'Avoid repetition; keep bullet points dense.',
+    'Do not quote the prompt or instructions.',
+    'Do not output JSON; output plain text only.',
+    'Do not include the source text verbatim unless required for ambiguity notes.',
+    'Keep the output short and high-signal.',
+    'Repeat: no commentary beyond the requested context.',
+    'Repeat: do not add facts.',
+    'Repeat: follow the requested format.',
+    'Repeat: be concise.',
+    'Repeat: prioritize actionable translation context.',
+    'Repeat: do not translate the text.',
+    'Repeat: do not output markdown fences.',
+    'Repeat: no extra sections beyond requested format.',
+    '',
+    'STABLE CONTEXT CHECKLIST (static; do not emit in output):',
+    '1. Identify genre/domain if explicit.',
+    '2. Identify audience if explicit.',
+    '3. Note tone/formality cues.',
+    '4. Note key entities and roles.',
+    '5. Note ambiguous pronouns/references.',
+    '6. Provide consistent term recommendations.',
+    '7. Flag ambiguity with possible interpretations.',
+    '8. Note any explicit translation constraints.',
+    '9. Note format/structure requirements.',
+    '10. Keep output concise and skimmable.',
+    '11. Avoid repeating the same point.',
+    '12. Avoid quoting long source phrases.',
+    '13. Use bullet points where helpful.',
+    '14. Keep total length compact.',
+    '15. Do not add stylistic opinions.'
+  ].join('\n');
+
   const prompt = applyPromptCaching([
     {
       role: 'system',
       content: CONTEXT_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: cachePrefix
     },
     {
       role: 'user',
@@ -412,7 +508,7 @@ async function generateShortTranslationContext(
         text
       ].join('\n')
     }
-  ], apiBaseUrl);
+  ], apiBaseUrl, effectiveRequestOptions);
 
   const requestPayload = {
     model: selectedModelId,
@@ -426,6 +522,9 @@ async function generateShortTranslationContext(
     effectiveRequestOptions
   );
   applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions, apiBaseUrl);
+  const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, effectiveRequestOptions);
+  const promptCacheKey = requestPayload.prompt_cache_key || '';
+  const promptCacheRetention = requestPayload.prompt_cache_retention || '';
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -501,6 +600,9 @@ async function generateShortTranslationContext(
       inputChars: text.length,
       outputChars: trimmed.length,
       request: requestPayload,
+      promptCacheKey,
+      promptCacheRetention,
+      promptCacheSupport,
       response: content,
       parseIssues: []
     },
