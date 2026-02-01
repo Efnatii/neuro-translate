@@ -536,6 +536,7 @@ async function translateTexts(
       const attemptMeta =
         timeoutAttempts > 0 || retryableRetries > 0
           ? createChildRequestMeta(baseRequestMeta, {
+              stage: 'translation',
               purpose: 'retry',
               attempt: baseRequestMeta.attempt + timeoutAttempts + retryableRetries,
               triggerSource: 'retry',
@@ -601,6 +602,7 @@ async function translateTexts(
         console.warn('Falling back to per-item translation due to length mismatch.');
         appendParseIssue('fallback:per-item');
         const retryMeta = createChildRequestMeta(baseRequestMeta, {
+          stage: 'translation',
           purpose: 'retry',
           attempt: baseRequestMeta.attempt + 1,
           triggerSource: 'retry'
@@ -1349,6 +1351,7 @@ async function performTranslationRequest(
 
     const retryTexts = refusalIndices.map((index) => texts[index]);
     const retryMeta = createChildRequestMeta(normalizedRequestMeta, {
+      stage: 'translation',
       purpose: 'retry',
       attempt: normalizedRequestMeta.attempt + 1,
       triggerSource: 'retry'
@@ -1406,6 +1409,7 @@ async function performTranslationRequest(
         allowRefusalRetry,
         true,
         createChildRequestMeta(normalizedRequestMeta, {
+          stage: 'translation',
           purpose: 'retry',
           attempt: normalizedRequestMeta.attempt + 1,
           triggerSource: 'retry'
@@ -1449,6 +1453,7 @@ async function performTranslationRequest(
         false,
         debugPayloads,
         createChildRequestMeta(normalizedRequestMeta, {
+          stage: 'translation',
           purpose: 'retry',
           attempt: normalizedRequestMeta.attempt + 1,
           triggerSource: 'retry'
@@ -2118,6 +2123,7 @@ async function repairTranslationsForLanguage(
   try {
     const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), requestMeta);
     const repairRequestMeta = createChildRequestMeta(requestMeta, {
+      stage: 'translation',
       purpose: 'validate',
       attempt: Number.isFinite(requestMeta?.attempt) ? requestMeta.attempt + 1 : 1,
       triggerSource: 'validate'
@@ -2182,6 +2188,7 @@ async function translateIndividually(
       try {
         const attemptRequestMeta = createChildRequestMeta(baseRequestMeta, {
           requestId: '',
+          stage: 'translation',
           purpose: baseRequestMeta.purpose || 'retry',
           attempt: baseRequestMeta.attempt,
           triggerSource: baseRequestMeta.triggerSource || 'retry'
