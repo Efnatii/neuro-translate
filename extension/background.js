@@ -507,20 +507,28 @@ function setModelCooldown(spec, error) {
   cooldowns.set(spec, { availableAfter: Date.now() + capped });
 }
 
-function getCandidateModels(stage, triggerSource, isManual, state) {
+function getCandidateModels(stage, requestMeta, state) {
   const fallbackModel = stage === 'context'
     ? state.contextModel
     : stage === 'proofread'
       ? state.proofreadModel
       : state.translationModel;
   const originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
-  const isManualTrigger = Boolean(isManual) || /manual/i.test(triggerSource || '');
+  const triggerSource = requestMeta?.triggerSource || '';
+  const purpose = requestMeta?.purpose || '';
+  const effectivePurpose = purpose || triggerSource || '';
+  const isManualTrigger =
+    Boolean(requestMeta?.isManual) ||
+    triggerSource === 'manual' ||
+    triggerSource === 'manual_translate' ||
+    triggerSource === 'manualTranslate' ||
+    /manual/i.test(triggerSource || '');
   let candidateStrategy = 'default_preserve_order';
-  if (triggerSource === 'retry') {
+  if (purpose === 'retry' || triggerSource === 'retry') {
     candidateStrategy = 'retry_cheapest';
-  } else if (triggerSource === 'validate') {
+  } else if (purpose === 'validate' || triggerSource === 'validate') {
     candidateStrategy = 'validate_cheapest';
-  } else if (isManualTrigger) {
+  } else if (effectivePurpose === 'manual' || isManualTrigger) {
     candidateStrategy = 'manual_smartest';
   }
   const parsedEntries = originalRequestedModelList.map((spec, index) => {
@@ -544,22 +552,28 @@ function getCandidateModels(stage, triggerSource, isManual, state) {
     if (left.tierPref !== right.tierPref) {
       return right.tierPref - left.tierPref;
     }
-    if (left.costSum !== right.costSum) {
-      return right.costSum - left.costSum;
+    if (left.index !== right.index) {
+      return left.index - right.index;
     }
-    return left.index - right.index;
+    if (left.costSum !== right.costSum) {
+      return left.costSum - right.costSum;
+    }
+    return 0;
   };
   const compareCheapest = (left, right) => {
     if (left.costSum !== right.costSum) {
       return left.costSum - right.costSum;
     }
-    if (left.tierPref !== right.tierPref) {
-      return right.tierPref - left.tierPref;
-    }
     if (left.capabilityRank !== right.capabilityRank) {
       return right.capabilityRank - left.capabilityRank;
     }
-    return left.index - right.index;
+    if (left.tierPref !== right.tierPref) {
+      return right.tierPref - left.tierPref;
+    }
+    if (left.index !== right.index) {
+      return left.index - right.index;
+    }
+    return 0;
   };
   const orderedEntries = [...parsedEntries];
   if (candidateStrategy === 'manual_smartest') {
@@ -573,7 +587,7 @@ function getCandidateModels(stage, triggerSource, isManual, state) {
   return {
     orderedList: finalOrderedList,
     originalRequestedModelList,
-    isManual: Boolean(isManual),
+    isManual: Boolean(isManualTrigger),
     candidateStrategy
   };
 }
@@ -1188,18 +1202,7 @@ async function handleGetSettings(message, sendResponse) {
 
 async function executeModelFallback(stage, state, message, handler) {
   const baseRequestMeta = message?.requestMeta && typeof message.requestMeta === 'object' ? message.requestMeta : {};
-  const triggerSource = baseRequestMeta?.triggerSource || '';
-  const isManual =
-    triggerSource === 'manual' ||
-    triggerSource === 'manual_translate' ||
-    triggerSource === 'manualTranslate' ||
-    /manual/i.test(triggerSource);
-  const { orderedList, originalRequestedModelList, candidateStrategy } = getCandidateModels(
-    stage,
-    triggerSource,
-    isManual,
-    state
-  );
+  const { orderedList, originalRequestedModelList, candidateStrategy } = getCandidateModels(stage, baseRequestMeta, state);
   let attemptIndex = 0;
   let lastError = null;
   let fallbackReasonForNext = null;
