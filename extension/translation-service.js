@@ -585,6 +585,63 @@ function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload
   return messages;
 }
 
+function estimatePromptTokensFromMessages(messages) {
+  if (!Array.isArray(messages)) return 0;
+  const totalChars = messages.reduce((sum, message) => {
+    if (!message) return sum;
+    const content = message.content;
+    if (typeof content === 'string') {
+      return sum + content.length;
+    }
+    if (Array.isArray(content)) {
+      return sum + content.reduce((innerSum, part) => innerSum + String(part ?? '').length, 0);
+    }
+    return sum + String(content ?? '').length;
+  }, 0);
+  return Math.max(1, Math.ceil(totalChars / 4));
+}
+
+function getPromptCacheRateLimiterState() {
+  if (!globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__) {
+    globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__ = { entriesByKey: new Map() };
+  }
+  return globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__;
+}
+
+function buildPromptCacheRateKey(cacheKey, url) {
+  const safeKey = cacheKey || 'translate';
+  const safeUrl = url || '';
+  return `${safeKey}::${safeUrl}`;
+}
+
+async function enforcePromptCacheRateLimit(cacheKey, url, options = {}) {
+  const limitPerMinute = Number.isFinite(options.limitPerMinute) ? options.limitPerMinute : 12;
+  if (!limitPerMinute) return;
+  const windowMs = Number.isFinite(options.windowMs) ? options.windowMs : 60000;
+  const limiter = getPromptCacheRateLimiterState();
+  const key = buildPromptCacheRateKey(cacheKey, url);
+  if (!limiter.entriesByKey.has(key)) {
+    limiter.entriesByKey.set(key, []);
+  }
+  const entries = limiter.entriesByKey.get(key);
+  const prune = (now) => {
+    while (entries.length && entries[0] <= now - windowMs) {
+      entries.shift();
+    }
+  };
+  while (true) {
+    const now = Date.now();
+    prune(now);
+    if (entries.length < limitPerMinute) {
+      entries.push(now);
+      return;
+    }
+    const earliest = entries[0];
+    const waitMs = Math.max(50, earliest + windowMs - now + 25);
+    await sleep(waitMs);
+  }
+}
+
 async function translateTexts(
   texts,
   apiKey,
@@ -1239,6 +1296,13 @@ async function performTranslationRequest(
   applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, getPromptCacheKey('translate'));
   applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions);
   const startedAt = Date.now();
+  const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
+  const batchSize = tokenizedTexts.length;
+  if (triggerSource !== 'retry' && triggerSource !== 'validate') {
+    await enforcePromptCacheRateLimit(operationType, normalizedRequestMeta?.url || '', {
+      limitPerMinute: 12
+    });
+  }
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
@@ -1324,6 +1388,8 @@ async function performTranslationRequest(
           usage: null,
           inputChars,
           outputChars: 0,
+          batchSize,
+          estimatedPromptTokens,
           request: requestPayload,
           response: {
             status: response.status,
@@ -1356,6 +1422,8 @@ async function performTranslationRequest(
       usage,
       inputChars,
       outputChars: content?.length || 0,
+      batchSize,
+      estimatedPromptTokens,
       request: requestPayload,
       response: content,
       parseIssues: [],
@@ -1366,6 +1434,17 @@ async function performTranslationRequest(
     effectiveContext
   );
   const debugPayloads = [debugPayload];
+  const cachedTokens = debugPayload?.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+  const promptTokens = debugPayload?.usage?.prompt_tokens ?? debugPayload?.usage?.input_tokens ?? estimatedPromptTokens;
+  const cacheHitRate = promptTokens ? Math.round((cachedTokens / promptTokens) * 100) : 0;
+  console.debug('[translate] Prompt cache metrics.', {
+    batch_size: batchSize,
+    estimatedPromptTokens,
+    cached_tokens: cachedTokens,
+    cached_percent: cacheHitRate,
+    prompt_cache_key: operationType,
+    url: normalizedRequestMeta?.url || ''
+  });
   const triggerSourceLabel = normalizedRequestMeta?.triggerSource || '';
   const shouldPersistManualOutputs =
     triggerSourceLabel &&

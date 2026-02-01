@@ -71,6 +71,7 @@ const CONTEXT_CACHE_KEY = 'contextCacheByPage';
 const RATE_LIMIT_RETRY_ATTEMPTS = 2;
 const SHORT_CONTEXT_MAX_CHARS = 800;
 const TRANSLATION_MAX_TOKENS_PER_REQUEST = 2600;
+const TRANSLATION_MICROBATCH_TARGET_TOKENS = 1200;
 const PROOFREAD_SUSPICIOUS_RATIO = 0.35;
 const DEBUG_PREVIEW_MAX_CHARS = 2000;
 const DEBUG_RAW_MAX_CHARS = 50000;
@@ -2706,11 +2707,12 @@ function estimateTokensForRole(role, { texts = [], context = '', sourceTexts = [
 }
 
 function splitTextsByTokenEstimate(texts, context, maxTokens) {
+  const targetTokens = TRANSLATION_MICROBATCH_TARGET_TOKENS;
   const batches = [];
   let current = [];
   let currentTokens = 0;
 
-  texts.forEach((text) => {
+  texts.forEach((text, index) => {
     const nextTokens = estimateTokensForRole('translation', {
       texts: [text],
       context: current.length ? '' : context
@@ -2722,6 +2724,12 @@ function splitTextsByTokenEstimate(texts, context, maxTokens) {
     }
     current.push(text);
     currentTokens += nextTokens;
+    const isLast = index === texts.length - 1;
+    if (!isLast && targetTokens && currentTokens >= targetTokens) {
+      batches.push(current);
+      current = [];
+      currentTokens = 0;
+    }
   });
 
   if (current.length) {
