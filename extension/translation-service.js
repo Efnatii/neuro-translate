@@ -695,6 +695,54 @@ function estimatePromptTokensFromMessages(messages) {
   return Math.max(1, Math.ceil(totalChars / 4));
 }
 
+function extractAssistantTextFromChatCompletion(responseBody, meta = {}) {
+  const message = responseBody?.choices?.[0]?.message || {};
+  const content = message?.content;
+  const safeMeta = meta && typeof meta === 'object' ? meta : {};
+  const setSource = (source) => {
+    safeMeta.assistant_content_source = source;
+  };
+  const stringifyValue = (value) => {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      return String(value);
+    }
+  };
+  if (typeof content === 'string' && content) {
+    setSource('content_string');
+    return content;
+  }
+  if (Array.isArray(content) && content.length) {
+    setSource('content_parts');
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && 'text' in part) return String(part.text ?? '');
+        return String(part ?? '');
+      })
+      .join('');
+  }
+  if (content != null && typeof content !== 'string' && !Array.isArray(content)) {
+    setSource('content_string');
+    return stringifyValue(content);
+  }
+  const toolArguments = message?.tool_calls?.[0]?.function?.arguments;
+  if (toolArguments != null) {
+    setSource('tool_calls');
+    return stringifyValue(toolArguments);
+  }
+  const functionArguments = message?.function_call?.arguments;
+  if (functionArguments != null) {
+    setSource('function_call');
+    return stringifyValue(functionArguments);
+  }
+  setSource('empty');
+  return '';
+}
+
 function getPromptCacheRateLimiterState() {
   if (!globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__) {
     globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__ = { entriesByKey: new Map() };
@@ -1516,7 +1564,9 @@ async function performTranslationRequest(
   }
 
   const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
+  const assistantContentMeta = {};
+  const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  const content = extractedContent.trim();
   if (!content) {
     throw new Error('No translation returned');
   }
@@ -1536,6 +1586,7 @@ async function performTranslationRequest(
       promptCacheKey,
       promptCacheRetention,
       promptCacheSupport,
+      assistant_content_source: assistantContentMeta.assistant_content_source || 'empty',
       response: content,
       parseIssues: [],
       contextShortSource:
@@ -2449,7 +2500,9 @@ async function performTranslationRepairRequest(
   }
 
   const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
+  const assistantContentMeta = {};
+  const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  const content = extractedContent.trim();
   if (!content) {
     throw new Error('No repair translation returned');
   }
@@ -2470,6 +2523,7 @@ async function performTranslationRepairRequest(
       promptCacheKey,
       promptCacheRetention,
       promptCacheSupport,
+      assistant_content_source: assistantContentMeta.assistant_content_source || 'empty',
       response: content,
       parseIssues: [],
       contextShortSource:

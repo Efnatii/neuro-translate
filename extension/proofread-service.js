@@ -655,6 +655,54 @@ function estimatePromptTokensFromMessages(messages) {
   return Math.max(1, Math.ceil(totalChars / 4));
 }
 
+function extractAssistantTextFromChatCompletion(responseBody, meta = {}) {
+  const message = responseBody?.choices?.[0]?.message || {};
+  const content = message?.content;
+  const safeMeta = meta && typeof meta === 'object' ? meta : {};
+  const setSource = (source) => {
+    safeMeta.assistant_content_source = source;
+  };
+  const stringifyValue = (value) => {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      return String(value);
+    }
+  };
+  if (typeof content === 'string' && content) {
+    setSource('content_string');
+    return content;
+  }
+  if (Array.isArray(content) && content.length) {
+    setSource('content_parts');
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && 'text' in part) return String(part.text ?? '');
+        return String(part ?? '');
+      })
+      .join('');
+  }
+  if (content != null && typeof content !== 'string' && !Array.isArray(content)) {
+    setSource('content_string');
+    return stringifyValue(content);
+  }
+  const toolArguments = message?.tool_calls?.[0]?.function?.arguments;
+  if (toolArguments != null) {
+    setSource('tool_calls');
+    return stringifyValue(toolArguments);
+  }
+  const functionArguments = message?.function_call?.arguments;
+  if (functionArguments != null) {
+    setSource('function_call');
+    return stringifyValue(functionArguments);
+  }
+  setSource('empty');
+  return '';
+}
+
 function estimatePromptTokensFromChars(chars) {
   if (!Number.isFinite(chars) || chars <= 0) return 0;
   return Math.max(1, Math.ceil(chars / 4));
@@ -1518,7 +1566,9 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   }
 
   const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
+  const assistantContentMeta = {};
+  const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  const content = extractedContent.trim();
   if (!content) {
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
@@ -1542,7 +1592,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           emptyContent: true,
           bodyPreview: buildProofreadBodyPreview(data)
         },
-        parseIssues: ['no-content', 'api-empty-content']
+        parseIssues: ['no-content', 'api-empty-content'],
+        assistant_content_source: assistantContentMeta.assistant_content_source || 'empty'
       },
       requestMeta,
       effectiveContext
@@ -1572,6 +1623,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       promptCacheKey,
       promptCacheRetention,
       promptCacheSupport,
+      assistant_content_source: assistantContentMeta.assistant_content_source || 'empty',
       response: content,
       parseIssues: []
     },
@@ -1829,7 +1881,9 @@ async function requestProofreadFormatRepair(
     }
   }
   const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content || '';
+  const assistantContentMeta = {};
+  const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+  const content = extractedContent.trim();
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
   const effectiveContext = buildEffectiveContext(
@@ -1853,6 +1907,7 @@ async function requestProofreadFormatRepair(
       promptCacheKey,
       promptCacheRetention,
       promptCacheSupport,
+      assistant_content_source: assistantContentMeta.assistant_content_source || 'empty',
       response: content,
       parseIssues: []
     },
@@ -2112,7 +2167,9 @@ async function repairProofreadSegments(
       return translations;
     }
     const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content || '';
+    const assistantContentMeta = {};
+    const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
+    const content = extractedContent.trim();
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
     const debugPayload = attachRequestMeta(
@@ -2127,6 +2184,7 @@ async function repairProofreadSegments(
         promptCacheKey,
         promptCacheRetention,
         promptCacheSupport,
+        assistant_content_source: assistantContentMeta.assistant_content_source || 'empty',
         response: content,
         parseIssues: ['fallback:language-repair']
       },
