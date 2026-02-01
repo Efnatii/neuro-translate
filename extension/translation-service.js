@@ -425,11 +425,15 @@ function buildEffectiveContext(contextPayload, requestMeta) {
   }
   const contextMissing = (mode === 'FULL' || mode === 'SHORT') && !text;
   if (contextMissing) {
-    console.warn('Context mode requires text but none was provided.', {
-      mode,
-      triggerSource: requestMeta?.triggerSource,
-      purpose: requestMeta?.purpose
-    });
+    if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+      globalThis.ntJsonLog({
+        kind: 'translate.context_missing_text',
+        ts: Date.now(),
+        mode,
+        triggerSource: requestMeta?.triggerSource,
+        purpose: requestMeta?.purpose
+      }, 'warn');
+    }
   }
   return {
     mode,
@@ -1009,7 +1013,13 @@ async function translateTexts(
       if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
         timeoutAttempts += 1;
         appendParseIssue('retry:timeout');
-        console.warn('Translation attempt timed out, retrying...');
+        if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+          globalThis.ntJsonLog({
+            kind: 'translate.retry.timeout',
+            ts: Date.now(),
+            message: 'Translation attempt timed out, retrying...'
+          }, 'warn');
+        }
         continue;
       }
 
@@ -1021,14 +1031,28 @@ async function translateTexts(
         lastRetryDelayMs = retryDelayMs;
         const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
         appendParseIssue('retry:retryable');
-        console.warn(`Translation attempt ${retryLabel}, retrying after ${retryDelayMs}ms...`);
+        if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+          globalThis.ntJsonLog({
+            kind: 'translate.retry.retryable',
+            ts: Date.now(),
+            retryLabel,
+            retryDelayMs,
+            message: `Translation attempt ${retryLabel}, retrying after ${retryDelayMs}ms...`
+          }, 'warn');
+        }
         await sleep(retryDelayMs);
         continue;
       }
 
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
       if (isLengthIssue && texts.length > 1) {
-        console.warn('Falling back to per-item translation due to length mismatch.');
+        if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+          globalThis.ntJsonLog({
+            kind: 'translate.fallback.length_mismatch_individual',
+            ts: Date.now(),
+            message: 'Falling back to per-item translation due to length mismatch.'
+          }, 'warn');
+        }
         appendParseIssue('fallback:per-item');
         const retryMeta = createChildRequestMeta(baseRequestMeta, {
           stage: 'translation',
@@ -1310,15 +1334,19 @@ async function performTranslationRequest(
         manualOutputsFoundCount = storedManualOutputs.length;
         if (!manualOutputsText) {
           manualOutputsText = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
-          console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
-            triggerSource,
-            requestId: normalizedRequestMeta.requestId,
-            parentRequestId: normalizedRequestMeta.parentRequestId,
-            blockKey: normalizedRequestMeta.blockKey,
-            prompt_cache_key: operationType,
-            storedCount: storedManualOutputs.length,
-            manualOutputsSource
-          });
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.manual_outputs_empty_stored',
+              ts: Date.now(),
+              triggerSource,
+              requestId: normalizedRequestMeta.requestId,
+              parentRequestId: normalizedRequestMeta.parentRequestId,
+              blockKey: normalizedRequestMeta.blockKey,
+              prompt_cache_key: operationType,
+              storedCount: storedManualOutputs.length,
+              manualOutputsSource
+            }, 'warn');
+          }
         }
       }
 
@@ -1418,17 +1446,21 @@ async function performTranslationRequest(
             hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
             hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
           }));
-          console.warn('Retry/validate manual outputs missing despite manual attempts.', {
-            triggerSource,
-            requestId: normalizedRequestMeta.requestId,
-            parentRequestId: normalizedRequestMeta.parentRequestId,
-            blockKey: normalizedRequestMeta.blockKey,
-            prompt_cache_key: operationType,
-            debugSources,
-            observedTriggers,
-            manualPayloadCount: manualPayloads.length,
-            missingFields
-          });
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.manual_outputs_missing',
+              ts: Date.now(),
+              triggerSource,
+              requestId: normalizedRequestMeta.requestId,
+              parentRequestId: normalizedRequestMeta.parentRequestId,
+              blockKey: normalizedRequestMeta.blockKey,
+              prompt_cache_key: operationType,
+              debugSources,
+              observedTriggers,
+              manualPayloadCount: manualPayloads.length,
+              missingFields
+            }, 'warn');
+          }
         }
       }
 
@@ -1437,15 +1469,19 @@ async function performTranslationRequest(
         manualOutputsText = '(no manual outputs found)';
       }
 
-      console.warn('Retry/validate manual outputs lookup.', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey,
-        prompt_cache_key: operationType,
-        manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
-        manualOutputsCount: manualOutputsFoundCount || 0
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.manual_outputs_lookup',
+          ts: Date.now(),
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType,
+          manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
+          manualOutputsCount: manualOutputsFoundCount || 0
+        }, 'warn');
+      }
 
       return { shortText, manualOutputsText, shortSource };
     };
@@ -1460,13 +1496,17 @@ async function performTranslationRequest(
     effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
     effectiveContext.contextMissing = !resolvedShortContextText;
     if (!resolvedShortContextText) {
-      console.warn('Retry/validate requires SHORT context but it is missing', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey,
-        prompt_cache_key: operationType
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.context_short_missing',
+          ts: Date.now(),
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType
+        }, 'warn');
+      }
     }
   }
   const contextText = effectiveContext.text || '';
@@ -1651,11 +1691,15 @@ async function performTranslationRequest(
           requestMeta.selectedTier = 'standard';
         }
       }
-      console.warn('Unsupported param removed; retrying without it.', {
-        model: resolvedModel,
-        status: response.status,
-        removedParams: stripped.removedParams
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.unsupported_param_removed',
+          ts: Date.now(),
+          model: resolvedModel,
+          status: response.status,
+          removedParams: stripped.removedParams
+        }, 'warn');
+      }
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -1798,14 +1842,18 @@ async function performTranslationRequest(
   const cachedTokens = debugPayload?.usage?.prompt_tokens_details?.cached_tokens ?? 0;
   const promptTokens = debugPayload?.usage?.prompt_tokens ?? debugPayload?.usage?.input_tokens ?? estimatedPromptTokens;
   const cacheHitRate = promptTokens ? Math.round((cachedTokens / promptTokens) * 100) : 0;
-  console.debug('[translate] Prompt cache metrics.', {
-    batch_size: batchSize,
-    estimatedPromptTokens,
-    cached_tokens: cachedTokens,
-    cached_percent: cacheHitRate,
-    prompt_cache_key: operationType,
-    url: normalizedRequestMeta?.url || ''
-  });
+  if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+    globalThis.ntJsonLog({
+      kind: 'translate.prompt_cache_metrics',
+      ts: Date.now(),
+      batch_size: batchSize,
+      estimatedPromptTokens,
+      cached_tokens: cachedTokens,
+      cached_percent: cacheHitRate,
+      prompt_cache_key: operationType,
+      url: normalizedRequestMeta?.url || ''
+    }, 'log');
+  }
   const triggerSourceLabel = normalizedRequestMeta?.triggerSource || '';
   const shouldPersistManualOutputs =
     triggerSourceLabel &&
@@ -1818,13 +1866,17 @@ async function performTranslationRequest(
     const parentRequestId = normalizedRequestMeta?.parentRequestId || '';
     const canonicalKey = blockKey || parentRequestId;
     if (!canonicalKey) {
-      console.warn('Manual translate outputs not persisted: missing block key.', {
-        blockKey,
-        parentRequestId,
-        requestId: normalizedRequestMeta?.requestId || '',
-        triggerSource: triggerSourceLabel,
-        prompt_cache_key: operationType
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.manual_outputs_not_persisted',
+          ts: Date.now(),
+          blockKey,
+          parentRequestId,
+          requestId: normalizedRequestMeta?.requestId || '',
+          triggerSource: triggerSourceLabel,
+          prompt_cache_key: operationType
+        }, 'warn');
+      }
       return;
     }
     const stringifySafe = (value) => {
@@ -1878,16 +1930,20 @@ async function performTranslationRequest(
         resolve(false);
       }
     });
-    console.warn('Manual translate outputs persisted.', {
-      blockKey,
-      parentRequestId,
-      requestId: normalizedRequestMeta?.requestId || '',
-      triggerSource: triggerSourceLabel,
-      prompt_cache_key: operationType,
-      countBefore,
-      countAfter: nextList.length,
-      storageKey: canonicalKey
-    });
+    if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+      globalThis.ntJsonLog({
+        kind: 'translate.manual_outputs_persisted',
+        ts: Date.now(),
+        blockKey,
+        parentRequestId,
+        requestId: normalizedRequestMeta?.requestId || '',
+        triggerSource: triggerSourceLabel,
+        prompt_cache_key: operationType,
+        countBefore,
+        countAfter: nextList.length,
+        storageKey: canonicalKey
+      }, 'warn');
+    }
   };
 
   let translations;
@@ -1961,7 +2017,15 @@ async function performTranslationRequest(
         );
       }
     } catch (error) {
-      console.warn('Translation length mismatch repair failed; falling back.', error);
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.length_mismatch_repair_failed',
+          ts: Date.now(),
+          error: error && typeof error === 'object'
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : String(error ?? '')
+        }, 'warn');
+      }
       const lengthError = new Error(
         `translation response length mismatch: expected ${expectedLength}, got ${translations.length}`
       );
@@ -1983,10 +2047,14 @@ async function performTranslationRequest(
 
   if (allowRefusalRetry && refusalIndices.length) {
     refusalIndices.forEach((index) => {
-      console.warn('Translation refusal/limit detected; retrying segment individually.', {
-        segmentIndex: index,
-        text: texts[index]
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.refusal_retry_segment',
+          ts: Date.now(),
+          segmentIndex: index,
+          text: texts[index]
+        }, 'warn');
+      }
     });
 
     const retryTexts = refusalIndices.map((index) => texts[index]);
@@ -2018,11 +2086,15 @@ async function performTranslationRequest(
         return;
       }
 
-      console.warn('Translation refusal persisted after retry; keeping source segment.', {
-        segmentIndex: index,
-        text: texts[index],
-        retry: retryCandidate
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.refusal_retry_failed',
+          ts: Date.now(),
+          segmentIndex: index,
+          text: texts[index],
+          retry: retryCandidate
+        }, 'warn');
+      }
       translations[index] = texts[index];
     });
   }
@@ -2078,9 +2150,13 @@ async function performTranslationRequest(
 
     if (lengthRetryIndices.length) {
       const retryTexts = lengthRetryIndices.map((index) => texts[index]);
-      console.warn('Translation length anomaly detected; retrying segments individually.', {
-        segmentIndices: lengthRetryIndices
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.length_anomaly_retry',
+          ts: Date.now(),
+          segmentIndices: lengthRetryIndices
+        }, 'warn');
+      }
       const retryResults = await translateIndividually(
         retryTexts,
         apiKey,
@@ -2366,15 +2442,19 @@ async function performTranslationRepairRequest(
         manualOutputsFoundCount = storedManualOutputs.length;
         if (!manualOutputsText) {
           manualOutputsText = '(manual outputs missing: manual attempts exist but outputs fields are empty)';
-          console.warn('Retry/validate manual outputs empty despite stored manual attempts.', {
-            triggerSource,
-            requestId: normalizedRequestMeta.requestId,
-            parentRequestId: normalizedRequestMeta.parentRequestId,
-            blockKey: normalizedRequestMeta.blockKey,
-            prompt_cache_key: operationType,
-            storedCount: storedManualOutputs.length,
-            manualOutputsSource
-          });
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.manual_outputs_empty_stored',
+              ts: Date.now(),
+              triggerSource,
+              requestId: normalizedRequestMeta.requestId,
+              parentRequestId: normalizedRequestMeta.parentRequestId,
+              blockKey: normalizedRequestMeta.blockKey,
+              prompt_cache_key: operationType,
+              storedCount: storedManualOutputs.length,
+              manualOutputsSource
+            }, 'warn');
+          }
         }
       }
 
@@ -2474,17 +2554,21 @@ async function performTranslationRepairRequest(
             hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
             hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
           }));
-          console.warn('Retry/validate manual outputs missing despite manual attempts.', {
-            triggerSource,
-            requestId: normalizedRequestMeta.requestId,
-            parentRequestId: normalizedRequestMeta.parentRequestId,
-            blockKey: normalizedRequestMeta.blockKey,
-            prompt_cache_key: operationType,
-            debugSources,
-            observedTriggers,
-            manualPayloadCount: manualPayloads.length,
-            missingFields
-          });
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.manual_outputs_missing',
+              ts: Date.now(),
+              triggerSource,
+              requestId: normalizedRequestMeta.requestId,
+              parentRequestId: normalizedRequestMeta.parentRequestId,
+              blockKey: normalizedRequestMeta.blockKey,
+              prompt_cache_key: operationType,
+              debugSources,
+              observedTriggers,
+              manualPayloadCount: manualPayloads.length,
+              missingFields
+            }, 'warn');
+          }
         }
       }
 
@@ -2493,15 +2577,19 @@ async function performTranslationRepairRequest(
         manualOutputsText = '(no manual outputs found)';
       }
 
-      console.warn('Retry/validate manual outputs lookup.', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey,
-        prompt_cache_key: operationType,
-        manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
-        manualOutputsCount: manualOutputsFoundCount || 0
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.manual_outputs_lookup',
+          ts: Date.now(),
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType,
+          manualOutputsSource: manualOutputsSource || (matchedEntry || matchedState ? 'debug-scan' : 'none'),
+          manualOutputsCount: manualOutputsFoundCount || 0
+        }, 'warn');
+      }
 
       return { shortText, manualOutputsText, shortSource };
     };
@@ -2516,13 +2604,17 @@ async function performTranslationRepairRequest(
     effectiveContext.hash = resolvedShortContextText ? computeTextHash(resolvedShortContextText) : 0;
     effectiveContext.contextMissing = !resolvedShortContextText;
     if (!resolvedShortContextText) {
-      console.warn('Retry/validate requires SHORT context but it is missing', {
-        triggerSource,
-        requestId: normalizedRequestMeta.requestId,
-        parentRequestId: normalizedRequestMeta.parentRequestId,
-        blockKey: normalizedRequestMeta.blockKey,
-        prompt_cache_key: operationType
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.context_short_missing',
+          ts: Date.now(),
+          triggerSource,
+          requestId: normalizedRequestMeta.requestId,
+          parentRequestId: normalizedRequestMeta.parentRequestId,
+          blockKey: normalizedRequestMeta.blockKey,
+          prompt_cache_key: operationType
+        }, 'warn');
+      }
     }
   }
   const contextText = effectiveContext.text || '';
@@ -2711,11 +2803,15 @@ async function performTranslationRepairRequest(
           requestMeta.selectedTier = 'standard';
         }
       }
-      console.warn('Unsupported param removed; retrying repair without it.', {
-        model: resolvedModel,
-        status: response.status,
-        removedParams: stripped.removedParams
-      });
+      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+        globalThis.ntJsonLog({
+          kind: 'translate.repair.unsupported_param_removed',
+          ts: Date.now(),
+          model: resolvedModel,
+          status: response.status,
+          removedParams: stripped.removedParams
+        }, 'warn');
+      }
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -2920,7 +3016,15 @@ async function repairTranslationsForLanguage(
       }
     });
   } catch (error) {
-    console.warn('Translation repair failed; keeping original translations.', error);
+    if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+      globalThis.ntJsonLog({
+        kind: 'translate.repair_failed',
+        ts: Date.now(),
+        error: error && typeof error === 'object'
+          ? { name: error.name, message: error.message, stack: error.stack }
+          : String(error ?? '')
+      }, 'warn');
+    }
   }
 
   return translations;
@@ -2986,7 +3090,15 @@ async function translateIndividually(
           retryableRetries += 1;
           const retryDelayMs = calculateRetryDelayMs(retryableRetries, error?.retryAfterMs);
           const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
-          console.warn(`Single-item translation ${retryLabel}, retrying after ${retryDelayMs}ms...`);
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.single_item_retry',
+              ts: Date.now(),
+              retryLabel,
+              retryDelayMs,
+              message: `Single-item translation ${retryLabel}, retrying after ${retryDelayMs}ms...`
+            }, 'warn');
+          }
           await sleep(retryDelayMs);
           continue;
         }
@@ -3033,7 +3145,16 @@ function parseJsonArrayFlexible(content, expectedLength, label = 'response') {
   try {
     return parseJsonArrayStrict(content, expectedLength, label);
   } catch (error) {
-    console.warn(`${label} response strict parsing failed; attempting to extract JSON array.`, error);
+    if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+      globalThis.ntJsonLog({
+        kind: 'translate.parse.array_fallback',
+        ts: Date.now(),
+        label,
+        error: error && typeof error === 'object'
+          ? { name: error.name, message: error.message, stack: error.stack }
+          : String(error ?? '')
+      }, 'warn');
+    }
   }
 
   const extracted = extractJsonArray(content, label);
@@ -3096,7 +3217,15 @@ function parseTranslationsResponse(content, expectedLength, options = {}) {
     }
     return normalizedArray;
   } catch (error) {
-    console.warn('Translation response object parsing failed; falling back to array parsing.', error);
+    if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+      globalThis.ntJsonLog({
+        kind: 'translate.parse.object_fallback',
+        ts: Date.now(),
+        error: error && typeof error === 'object'
+          ? { name: error.name, message: error.message, stack: error.stack }
+          : String(error ?? '')
+      }, 'warn');
+    }
   }
 
   return parseJsonArrayFlexible(content, lengthForValidation, 'translation');
