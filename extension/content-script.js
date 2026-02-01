@@ -388,8 +388,24 @@ function sendBackgroundMessageSafe(message) {
 
 async function storeDebugRawSafe(record) {
   if (!record?.id) {
+    if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+      globalThis.ntPageJsonLog(
+        {
+          kind: 'debug.raw.store',
+          ts: Date.now(),
+          pageUrl: location.href,
+          recordId: record?.id ?? null,
+          stage: record?.stage ?? record?.value?.type ?? null,
+          entryIndex: record?.entryIndex ?? null,
+          ok: false,
+          error: 'missing-id'
+        },
+        'log'
+      );
+    }
     return { ok: false, error: 'missing-id' };
   }
+  const startedAt = Date.now();
   let timeoutId;
   const timeoutMs = 1200;
   const timeoutPromise = new Promise((resolve) => {
@@ -401,6 +417,23 @@ async function storeDebugRawSafe(record) {
   ]);
   if (timeoutId) {
     clearTimeout(timeoutId);
+  }
+  const durationMs = Date.now() - startedAt;
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'debug.raw.store',
+        ts: Date.now(),
+        pageUrl: location.href,
+        recordId: record.id,
+        stage: record?.stage ?? record?.value?.type ?? null,
+        entryIndex: record?.entryIndex ?? null,
+        ok: Boolean(response?.ok),
+        error: response?.ok ? null : response?.error || 'raw-store-failed',
+        durationMs
+      },
+      'log'
+    );
   }
   if (!response?.ok) {
     appendDebugEvent(CALL_TAGS.STORAGE_DROPPED, response?.error || 'raw-store-failed');
@@ -4167,6 +4200,18 @@ function appendDebugEvent(tag, message) {
   if (debugState.events.length > DEBUG_EVENTS_LIMIT) {
     debugState.events = debugState.events.slice(debugState.events.length - DEBUG_EVENTS_LIMIT);
   }
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'debug.event',
+        ts: Date.now(),
+        pageUrl: location.href,
+        tag,
+        message
+      },
+      'log'
+    );
+  }
   schedulePersistDebugState('appendDebugEvent');
 }
 
@@ -4187,6 +4232,22 @@ function registerCallHistory(entry, record) {
     if (!targetEntry) continue;
     const callsKey = oldest.stage === 'proofreading' ? 'proofreadCalls' : 'translationCalls';
     targetEntry[callsKey] = (targetEntry[callsKey] || []).filter((call) => call.id !== oldest.id);
+  }
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'ai.call.history',
+        ts: Date.now(),
+        pageUrl: location.href,
+        recordId: record.id ?? null,
+        stage: record.stage ?? null,
+        entryIndex: entry.index ?? null,
+        ok: true,
+        error: null,
+        durationMs: typeof record.durationMs === 'number' ? record.durationMs : undefined
+      },
+      'log'
+    );
   }
 }
 
@@ -4230,6 +4291,20 @@ function appendDebugPayload(index, key, payload) {
   } else {
     entry[key] = next;
   }
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    const stage = key === 'proofreadDebug' ? 'proofread' : 'translation';
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'debug.payload',
+        ts: Date.now(),
+        pageUrl: location.href,
+        stage,
+        entryIndex: index,
+        payload
+      },
+      'log'
+    );
+  }
   schedulePersistDebugState('appendDebugPayload');
 }
 
@@ -4237,6 +4312,21 @@ function incrementDebugAiRequestCount() {
   if (!debugState) return;
   const currentCount = Number.isFinite(debugState.aiRequestCount) ? debugState.aiRequestCount : 0;
   debugState.aiRequestCount = currentCount + 1;
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'ai.request.count',
+        ts: Date.now(),
+        pageUrl: location.href,
+        recordId: null,
+        stage: null,
+        entryIndex: null,
+        ok: true,
+        error: null
+      },
+      'log'
+    );
+  }
   schedulePersistDebugState('aiRequestCount');
 }
 
