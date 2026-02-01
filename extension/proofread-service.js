@@ -578,6 +578,68 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   return messages;
 }
 
+function estimatePromptTokensFromMessages(messages) {
+  if (!Array.isArray(messages)) return 0;
+  const totalChars = messages.reduce((sum, message) => {
+    if (!message) return sum;
+    const content = message.content;
+    if (typeof content === 'string') {
+      return sum + content.length;
+    }
+    if (Array.isArray(content)) {
+      return sum + content.reduce((innerSum, part) => innerSum + String(part ?? '').length, 0);
+    }
+    return sum + String(content ?? '').length;
+  }, 0);
+  return Math.max(1, Math.ceil(totalChars / 4));
+}
+
+function estimatePromptTokensFromChars(chars) {
+  if (!Number.isFinite(chars) || chars <= 0) return 0;
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
+function getPromptCacheRateLimiterState() {
+  if (!globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__) {
+    globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__ = { entriesByKey: new Map() };
+  }
+  return globalThis.__NT_PROMPT_CACHE_RATE_LIMITER__;
+}
+
+function buildPromptCacheRateKey(cacheKey, url) {
+  const safeKey = cacheKey || 'proofread';
+  const safeUrl = url || '';
+  return `${safeKey}::${safeUrl}`;
+}
+
+async function enforcePromptCacheRateLimit(cacheKey, url, options = {}) {
+  const limitPerMinute = Number.isFinite(options.limitPerMinute) ? options.limitPerMinute : 12;
+  if (!limitPerMinute) return;
+  const windowMs = Number.isFinite(options.windowMs) ? options.windowMs : 60000;
+  const limiter = getPromptCacheRateLimiterState();
+  const key = buildPromptCacheRateKey(cacheKey, url);
+  if (!limiter.entriesByKey.has(key)) {
+    limiter.entriesByKey.set(key, []);
+  }
+  const entries = limiter.entriesByKey.get(key);
+  const prune = (now) => {
+    while (entries.length && entries[0] <= now - windowMs) {
+      entries.shift();
+    }
+  };
+  while (true) {
+    const now = Date.now();
+    prune(now);
+    if (entries.length < limitPerMinute) {
+      entries.push(now);
+      return;
+    }
+    const earliest = entries[0];
+    const waitMs = Math.max(50, earliest + windowMs - now + 25);
+    await sleep(waitMs);
+  }
+}
+
 async function proofreadTranslation(
   segments,
   sourceBlock,
@@ -623,11 +685,22 @@ async function proofreadTranslation(
   const retrySelection = resolveModelSelection('retry', 'retry');
   const validateSelection = resolveModelSelection('validate', 'validate');
   const { items, originalById } = normalizeProofreadSegments(segments);
-  const chunks = chunkProofreadItems(items);
+  const normalizedContext = normalizeContextPayload(context);
+  const baseContextChars =
+    (normalizedContext?.text?.length || 0) +
+    (normalizedContext?.baseAnswer?.length || 0) +
+    (sourceBlock?.length || 0) +
+    (translatedBlock?.length || 0);
+  const basePromptTokens = estimatePromptTokensFromChars(baseContextChars + PROOFREAD_SYSTEM_PROMPT.length);
+  const maxPromptTokens = basePromptTokens + estimatePromptTokensFromChars(PROOFREAD_MAX_CHARS_PER_CHUNK);
+  const chunks = chunkProofreadItems(items, {
+    basePromptTokens,
+    maxPromptTokens,
+    targetPromptTokens: 1200
+  });
   const revisionsById = new Map();
   const rawProofreadParts = [];
   const debugPayloads = [];
-  const normalizedContext = normalizeContextPayload(context);
   const baseEffectiveContext = buildEffectiveContext(normalizedContext, baseRequestMeta);
   // Proofread retries are distinct LLM calls; avoid full context unless explicitly forced.
   const retryContextPayload = getRetryContextPayload(normalizedContext, baseRequestMeta);
@@ -894,25 +967,42 @@ function parseJsonObjectFlexible(content = '', label = 'response') {
   return parsed;
 }
 
-function chunkProofreadItems(items) {
+function chunkProofreadItems(items, options = {}) {
   const chunks = [];
   let current = [];
   let currentSize = 0;
+  const basePromptTokens = Number.isFinite(options.basePromptTokens) ? options.basePromptTokens : 0;
+  const maxPromptTokens = Number.isFinite(options.maxPromptTokens) ? options.maxPromptTokens : Infinity;
+  const targetPromptTokens = Number.isFinite(options.targetPromptTokens) ? options.targetPromptTokens : 0;
+  let currentTokens = basePromptTokens;
 
-  items.forEach((item) => {
+  items.forEach((item, index) => {
     const textSize = typeof item.text === 'string' ? item.text.length : 0;
     const estimatedSize = textSize + 30;
-    if (
+    const estimatedTokens = estimatePromptTokensFromChars(estimatedSize);
+    const exceedsMax =
       current.length &&
       (current.length >= PROOFREAD_MAX_ITEMS_PER_CHUNK ||
-        currentSize + estimatedSize > PROOFREAD_MAX_CHARS_PER_CHUNK)
+        currentSize + estimatedSize > PROOFREAD_MAX_CHARS_PER_CHUNK ||
+        currentTokens + estimatedTokens > maxPromptTokens);
+    if (
+      exceedsMax
     ) {
       chunks.push(current);
       current = [];
       currentSize = 0;
+      currentTokens = basePromptTokens;
     }
     current.push(item);
     currentSize += estimatedSize;
+    currentTokens += estimatedTokens;
+    const isLast = index === items.length - 1;
+    if (!isLast && targetPromptTokens && currentTokens >= targetPromptTokens) {
+      chunks.push(current);
+      current = [];
+      currentSize = 0;
+      currentTokens = basePromptTokens;
+    }
   });
 
   if (current.length) {
@@ -1240,6 +1330,13 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   applyPromptCacheParams(requestPayload, apiBaseUrl, model, getPromptCacheKey('proofread'));
   applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
+  const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
+  const batchSize = items.length;
+  if (triggerSource !== 'retry' && triggerSource !== 'validate') {
+    await enforcePromptCacheRateLimit(getPromptCacheKey('proofread'), requestMeta?.url || '', {
+      limitPerMinute: 12
+    });
+  }
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
@@ -1328,6 +1425,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           usage: null,
           inputChars,
           outputChars: 0,
+          batchSize,
+          estimatedPromptTokens,
           request: requestPayload,
           response: {
             status: response.status,
@@ -1389,6 +1488,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       usage,
       inputChars,
       outputChars: content?.length || 0,
+      batchSize,
+      estimatedPromptTokens,
       request: requestPayload,
       response: content,
       parseIssues: []
@@ -1397,6 +1498,17 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     effectiveContext
   );
   const debugPayloads = [debugPayload];
+  const cachedTokens = debugPayload?.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+  const promptTokens = debugPayload?.usage?.prompt_tokens ?? debugPayload?.usage?.input_tokens ?? estimatedPromptTokens;
+  const cacheHitRate = promptTokens ? Math.round((cachedTokens / promptTokens) * 100) : 0;
+  console.debug('[proofread] Prompt cache metrics.', {
+    batch_size: batchSize,
+    estimatedPromptTokens,
+    cached_tokens: cachedTokens,
+    cached_percent: cacheHitRate,
+    prompt_cache_key: getPromptCacheKey('proofread'),
+    url: requestMeta?.url || ''
+  });
 
   let parsed = null;
   let parseError = null;
