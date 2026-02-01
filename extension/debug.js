@@ -514,6 +514,39 @@ function collectTokensFromPayloads(payloads) {
   return tokens;
 }
 
+function getRequestTypeFromPhase(phase) {
+  const normalized = String(phase || '').toUpperCase();
+  if (normalized.startsWith('TRANSLATE')) return 'translate';
+  if (normalized.startsWith('PROOFREAD')) return 'proofread';
+  if (normalized.startsWith('CONTEXT')) return 'context';
+  return '';
+}
+
+function collectCacheStatsByType(data) {
+  const stats = {
+    translate: { requests: 0, promptTokens: 0, cachedTokens: 0 },
+    proofread: { requests: 0, promptTokens: 0, cachedTokens: 0 },
+    context: { requests: 0, promptTokens: 0, cachedTokens: 0 }
+  };
+  const addPayload = (payload) => {
+    const type = getRequestTypeFromPhase(payload?.phase);
+    if (!type) return;
+    const { inputTokens, cachedTokens } = extractTokensFromUsage(payload?.usage);
+    stats[type].requests += 1;
+    stats[type].promptTokens += inputTokens;
+    stats[type].cachedTokens += cachedTokens;
+  };
+  const items = Array.isArray(data?.items) ? data.items : [];
+  items.forEach((item) => {
+    const payloadGroups = [item?.translationDebug, item?.proofreadDebug, item?.contextDebug];
+    payloadGroups.forEach((payloads) => {
+      (Array.isArray(payloads) ? payloads : []).forEach(addPayload);
+    });
+  });
+  (Array.isArray(data?.contextDebug) ? data.contextDebug : []).forEach(addPayload);
+  return stats;
+}
+
 function renderEmpty(message) {
   metaEl.textContent = message;
   ensureContextSkeleton();
@@ -684,6 +717,21 @@ function renderSummary(data, fallbackMessage = '') {
     sumPromptTokens > 0 || sumCachedTokens > 0
       ? ` • Cache: cached ${sumCachedTokens} / in ${sumPromptTokens} (${cacheHitPercent.toFixed(1)}%)`
       : '';
+  const cacheStatsByType = collectCacheStatsByType(data);
+  const renderCacheRow = (label, stat) => {
+    const hitPercent = stat.promptTokens > 0 ? (stat.cachedTokens / stat.promptTokens) * 100 : 0;
+    return `
+      <div class="cache-row">
+        <div class="cache-label">${escapeHtml(label)}</div>
+        <div class="cache-values">
+          <span>requests: ${escapeHtml(String(stat.requests))}</span>
+          <span>prompt_tokens: ${escapeHtml(String(stat.promptTokens))}</span>
+          <span>cached_tokens: ${escapeHtml(String(stat.cachedTokens))}</span>
+          <span>hit%: ${escapeHtml(hitPercent.toFixed(1))}</span>
+        </div>
+      </div>
+    `;
+  };
   const overallStatus = getOverallStatus({
     completed,
     inProgress,
@@ -709,6 +757,11 @@ function renderSummary(data, fallbackMessage = '') {
           ${renderStatusBadge(overallStatus)}
         </div>
       </div>
+    </div>
+    <div class="cache-summary">
+      ${renderCacheRow('Translate', cacheStatsByType.translate)}
+      ${renderCacheRow('Proofread', cacheStatsByType.proofread)}
+      ${renderCacheRow('Context', cacheStatsByType.context)}
     </div>
   `;
 }
@@ -1196,6 +1249,7 @@ function ensurePayloadElement(container, payloadKey) {
           <span class="debug-phase" data-role="payload-phase"></span>
           <span class="debug-model" data-role="payload-model"></span>
           <span class="debug-tag" data-role="payload-tag"></span>
+          <span class="cache-badge" data-role="payload-cache-badge"></span>
         </div>
         <div class="debug-metrics">
           <span data-role="payload-latency"></span>
@@ -1204,6 +1258,7 @@ function ensurePayloadElement(container, payloadKey) {
       </div>
       <div class="debug-meta" data-role="payload-io"></div>
       <div class="debug-meta debug-meta--request" data-role="payload-request-meta"></div>
+      <div class="debug-meta debug-meta--cache" data-role="payload-cache-meta"></div>
       <div class="debug-context" data-role="payload-context-meta"></div>
       <div data-role="payload-sections"></div>
     `;
@@ -1222,10 +1277,12 @@ function ensurePayloadElement(container, payloadKey) {
       phaseEl: payloadEl.querySelector('[data-role="payload-phase"]'),
       modelEl: payloadEl.querySelector('[data-role="payload-model"]'),
       tagEl: payloadEl.querySelector('[data-role="payload-tag"]'),
+      cacheBadgeEl: payloadEl.querySelector('[data-role="payload-cache-badge"]'),
       latencyEl: payloadEl.querySelector('[data-role="payload-latency"]'),
       usageEl: payloadEl.querySelector('[data-role="payload-usage"]'),
       ioMetaEl: payloadEl.querySelector('[data-role="payload-io"]'),
       requestMetaEl: payloadEl.querySelector('[data-role="payload-request-meta"]'),
+      cacheMetaEl: payloadEl.querySelector('[data-role="payload-cache-meta"]'),
       contextMetaEl: payloadEl.querySelector('[data-role="payload-context-meta"]'),
       contextDetails,
       requestDetails,
@@ -1291,6 +1348,30 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
   const candidateStrategy = payload?.candidateStrategy || '';
   const originalRequestedModelList = payload?.originalRequestedModelList;
   const candidateOrderedList = payload?.candidateOrderedList;
+  const batchBlockCount = Number.isFinite(payload?.batchBlockCount) ? payload.batchBlockCount : null;
+  const batchBlockKeys = Array.isArray(payload?.batchBlockKeys) ? payload.batchBlockKeys : [];
+  const { inputTokens, cachedTokens } = extractTokensFromUsage(payload?.usage);
+  const cacheHitPercent = inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : 0;
+  const promptCacheKey =
+    payload?.promptCacheKey ??
+    payload?.prompt_cache_key ??
+    payload?.request?.prompt_cache_key ??
+    '';
+  const promptCacheRetention =
+    payload?.promptCacheRetention ??
+    payload?.prompt_cache_retention ??
+    payload?.request?.prompt_cache_retention ??
+    '';
+  const cacheSupport = payload?.promptCacheSupport || {};
+  const supportsPromptCachingParams =
+    cacheSupport.supportsPromptCachingParams ??
+    payload?.supportsPromptCachingParams;
+  const assumeOpenAICompatibleApi =
+    cacheSupport.assumeOpenAICompatibleApi ??
+    payload?.assumeOpenAICompatibleApi;
+  const isOpenAICompatibleBaseUrl =
+    cacheSupport.isOpenAICompatibleBaseUrl ??
+    payload?.isOpenAICompatibleBaseUrl;
   const originalRequestedModelCount = Array.isArray(originalRequestedModelList)
     ? originalRequestedModelList.length
     : null;
@@ -1314,20 +1395,37 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
     Number.isFinite(candidateOrderedListCount)
       ? `candidateOrderedList: ${escapeHtml(String(candidateOrderedListCount))}`
       : '',
+    Number.isFinite(batchBlockCount) ? `batchBlocks: ${escapeHtml(String(batchBlockCount))}` : '',
+    batchBlockKeys.length ? `batchKeys: ${escapeHtml(batchBlockKeys.join(', '))}` : '',
     triggerSource ? `triggerSource: ${escapeHtml(triggerSource)}` : '',
     contextPolicy ? `contextMode: ${escapeHtml(contextPolicy)}` : '',
     Number.isFinite(contextLength) ? `contextLen: ${escapeHtml(String(contextLength))}` : '',
-    contextHash ? `contextHash: ${escapeHtml(String(contextHash))}` : ''
+    contextHash ? `contextHash: ${escapeHtml(String(contextHash))}` : '',
+    supportsPromptCachingParams === true ? 'cacheParams: yes' : supportsPromptCachingParams === false ? 'cacheParams: no' : '',
+    isOpenAICompatibleBaseUrl === true ? 'openaiCompatible: yes' : isOpenAICompatibleBaseUrl === false ? 'openaiCompatible: no' : '',
+    assumeOpenAICompatibleApi === true ? 'assumeOpenAICompatible: yes' : assumeOpenAICompatibleApi === false ? 'assumeOpenAICompatible: no' : ''
   ].filter(Boolean);
   setTextIfChanged(parts.phaseEl, phase);
   setTextIfChanged(parts.modelEl, model);
   setTextIfChanged(parts.tagEl, tag);
   parts.tagEl.style.display = tag ? '' : 'none';
+  const cacheBadgeLabel = cachedTokens > 0 ? 'CACHE-HIT' : '';
+  setTextIfChanged(parts.cacheBadgeEl, cacheBadgeLabel);
+  parts.cacheBadgeEl.style.display = cacheBadgeLabel ? '' : 'none';
   setTextIfChanged(parts.latencyEl, `Latency: ${latency}`);
   setTextIfChanged(parts.usageEl, `Tokens: ${usage}`);
   setHtmlIfChanged(parts.ioMetaEl, `<span>Input: ${escapeHtml(inputChars)}</span><span>Output: ${escapeHtml(outputChars)}</span>`);
   setHtmlIfChanged(parts.requestMetaEl, requestMetaItems.length ? requestMetaItems.join(' · ') : '');
   parts.requestMetaEl.style.display = requestMetaItems.length ? '' : 'none';
+  const cacheMetaItems = [
+    `prompt_tokens: ${escapeHtml(String(inputTokens))}`,
+    `cached_tokens: ${escapeHtml(String(cachedTokens))}`,
+    `cache_hit: ${escapeHtml(cacheHitPercent.toFixed(1))}%`,
+    promptCacheKey ? `cache_key: ${escapeHtml(String(promptCacheKey))}` : 'cache_key: —',
+    promptCacheRetention ? `retention: ${escapeHtml(String(promptCacheRetention))}` : 'retention: —'
+  ];
+  setHtmlIfChanged(parts.cacheMetaEl, cacheMetaItems.join(' · '));
+  parts.cacheMetaEl.style.display = '';
   setHtmlIfChanged(parts.contextMetaEl, contextMeta);
   parts.contextMetaEl.style.display = contextMeta ? '' : 'none';
   const hasContextSection = Boolean(contextPolicy);

@@ -322,8 +322,32 @@ function applyModelRequestParams(requestPayload, modelId, requestOptions = null,
     delete requestPayload.response_format;
   }
 }
-function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
-  if (apiBaseUrl === OPENAI_API_URL) return messages;
+globalThis.__NT_getPromptCacheSupport__ ||= function getPromptCacheSupport(apiBaseUrl, requestOptions = null) {
+  const assumeOpenAICompatibleApi = Boolean(requestOptions?.assumeOpenAICompatibleApi);
+  const isOpenAICompatibleBase = isOpenAICompatibleBaseUrl(apiBaseUrl, assumeOpenAICompatibleApi);
+  return {
+    assumeOpenAICompatibleApi,
+    isOpenAICompatibleBaseUrl: isOpenAICompatibleBase,
+    supportsPromptCachingParams: isOpenAICompatibleBase
+  };
+};
+
+function getPromptCacheSupport(apiBaseUrl, requestOptions = null) {
+  if (globalThis.__NT_getPromptCacheSupport__) {
+    return globalThis.__NT_getPromptCacheSupport__(apiBaseUrl, requestOptions);
+  }
+  const assumeOpenAICompatibleApi = Boolean(requestOptions?.assumeOpenAICompatibleApi);
+  const isOpenAICompatibleBase = isOpenAICompatibleBaseUrl(apiBaseUrl, assumeOpenAICompatibleApi);
+  return {
+    assumeOpenAICompatibleApi,
+    isOpenAICompatibleBaseUrl: isOpenAICompatibleBase,
+    supportsPromptCachingParams: isOpenAICompatibleBase
+  };
+}
+
+function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL, requestOptions = null) {
+  const support = getPromptCacheSupport(apiBaseUrl, requestOptions);
+  if (support.isOpenAICompatibleBaseUrl) return messages;
   return messages.map((message) =>
     message.role === 'user' ? { ...message, cache_control: { type: 'ephemeral' } } : message
   );

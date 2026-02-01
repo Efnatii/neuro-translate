@@ -522,10 +522,76 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
       ? `PREVIOUS BASE ANSWER (FULL): <<<BASE_ANSWER_START>>>${normalizedContext.baseAnswer}<<<BASE_ANSWER_END>>>`
       : '';
 
+  const cachePrefix = [
+    'NEURO-TRANSLATE CACHE PREFIX v1 (proofread).',
+    'This block is static and identical across proofread requests.',
+    'Purpose: stabilize the cached prefix; it does not add new requirements.',
+    'Follow the system prompt rules exactly; if a line here conflicts, the system prompt wins.',
+    'Output must be strictly JSON with an "items" array; no prose, no markdown.',
+    'Never invent facts; never add commentary; never quote the prompt.',
+    'Preserve placeholders, markup, code, URLs, IDs, numbers/units, and punctuation tokens.',
+    'Do not reorder items; keep ids unchanged; keep one output per input item.',
+    'If no edits are needed, return the original text unchanged.',
+    'Use source block only to verify meaning; never translate it.',
+    'Use translated block for consistency; do not copy it verbatim unless unchanged.',
+    'Do not insert context text into outputs.',
+    'Never drop or merge items.',
+    'Do not output extra keys or metadata.',
+    'Return valid JSON only.',
+    'Repeat: only JSON, only items array.',
+    'Repeat: keep ids unchanged.',
+    'Repeat: preserve placeholders/tokens.',
+    'Repeat: keep the exact number of items.',
+    'Repeat: do not add commentary.',
+    'Repeat: no markdown fences.',
+    'Repeat: no extra keys.',
+    'Repeat: keep output order identical.',
+    'Repeat: preserve meaning exactly.',
+    'Repeat: do not invent content.',
+    'Repeat: avoid paraphrase beyond requested mode.',
+    'Repeat: keep punctuation tokens intact.',
+    'Repeat: output must be valid JSON.',
+    'Repeat: do not quote prompt text.',
+    'Repeat: follow system rules.',
+    'Repeat: ids must be strings.',
+    'Repeat: every item must have {id,text}.',
+    '',
+    'STABLE EDITING GUIDE (static; do not emit in output):',
+    '1. Preserve the original meaning exactly.',
+    '2. Fix obvious grammar and punctuation errors.',
+    '3. Keep terminology consistent with the translated block.',
+    '4. Keep capitalization and casing appropriate for the language.',
+    '5. Do not expand abbreviations unless clearly needed.',
+    '6. Do not add or remove honorifics.',
+    '7. Keep the same segment boundaries.',
+    '8. Preserve UI labels and button text.',
+    '9. Preserve quotations and quotation marks.',
+    '10. Do not introduce new entities or facts.',
+    '11. Preserve numerical formatting.',
+    '12. Keep dates/times unchanged.',
+    '13. Keep line breaks unless clearly erroneous.',
+    '14. Avoid stylistic changes in NOISE_CLEANUP.',
+    '15. In READABILITY_REWRITE, improve flow without changing meaning.',
+    '16. Do not invent missing information.',
+    '17. Keep placeholders and tokens unchanged.',
+    '18. Avoid swapping word order across items.',
+    '19. Keep tone consistent within the block.',
+    '20. Do not translate source block content.',
+    '21. Do not copy context text into outputs.',
+    '22. Keep punctuation tokens exactly.',
+    '23. Avoid adding emphasis or emojis.',
+    '24. Avoid converting formal to informal or vice versa.',
+    '25. Keep sentence mood (question/statement).'
+  ].join('\n');
+
   const messages = [
     {
       role: 'system',
       content: PROOFREAD_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: cachePrefix
     },
     {
       role: 'user',
@@ -1256,7 +1322,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       strict,
       extraReminder
     ),
-    apiBaseUrl
+    apiBaseUrl,
+    requestOptions
   );
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
@@ -1330,6 +1397,15 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     requestOptions
   );
   applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
+  const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
+  const promptCacheKey = requestPayload.prompt_cache_key || '';
+  const promptCacheRetention = requestPayload.prompt_cache_retention || '';
+  const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
+  const promptCacheKey = requestPayload.prompt_cache_key || '';
+  const promptCacheRetention = requestPayload.prompt_cache_retention || '';
+  const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
+  const promptCacheKey = requestPayload.prompt_cache_key || '';
+  const promptCacheRetention = requestPayload.prompt_cache_retention || '';
   const startedAt = Date.now();
   const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
   const batchSize = items.length;
@@ -1430,6 +1506,9 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           batchSize,
           estimatedPromptTokens,
           request: requestPayload,
+          promptCacheKey,
+          promptCacheRetention,
+          promptCacheSupport,
           response: {
             status: response.status,
             statusText: response.statusText,
@@ -1458,6 +1537,9 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         inputChars,
         outputChars: 0,
         request: requestPayload,
+        promptCacheKey,
+        promptCacheRetention,
+        promptCacheSupport,
         response: {
           id: data?.id ?? null,
           status: response.status,
@@ -1493,6 +1575,9 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       batchSize,
       estimatedPromptTokens,
       request: requestPayload,
+      promptCacheKey,
+      promptCacheRetention,
+      promptCacheSupport,
       response: content,
       parseIssues: []
     },
@@ -1632,7 +1717,7 @@ async function requestProofreadFormatRepair(
         rawResponse
       ].join('\n')
     }
-  ], apiBaseUrl);
+  ], apiBaseUrl, requestOptions);
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
     if (resolvedShortContextText) {
@@ -1660,8 +1745,6 @@ async function requestProofreadFormatRepair(
           properties: {
             items: {
               type: 'array',
-              minItems: items.length,
-              maxItems: items.length,
               items: {
                 type: 'object',
                 properties: {
@@ -1773,6 +1856,9 @@ async function requestProofreadFormatRepair(
       inputChars: rawResponse?.length || 0,
       outputChars: content?.length || 0,
       request: requestPayload,
+      promptCacheKey,
+      promptCacheRetention,
+      promptCacheSupport,
       response: content,
       parseIssues: []
     },
@@ -1787,6 +1873,21 @@ async function requestProofreadFormatRepair(
   } catch (error) {
     parseError = error?.message || 'parse-error';
     debugPayload.parseIssues.push(parseError);
+  }
+  if (!parseError) {
+    const expectedIds = items.map((item) => String(item.id));
+    const expectedIdSet = new Set(expectedIds);
+    const normalizedParsedItems = normalizeProofreadItems(parsed?.items);
+    const responseIds = normalizedParsedItems.map((item) => item.id);
+    const responseIdSet = new Set(responseIds);
+    const hasUnknownIds = responseIds.some((id) => !expectedIdSet.has(id));
+    const hasMissingIds = expectedIds.some((id) => !responseIdSet.has(id));
+    const hasDuplicateIds = responseIdSet.size !== responseIds.length;
+    const hasCountMismatch = normalizedParsedItems.length !== expectedIds.length;
+    if (hasUnknownIds || hasMissingIds || hasDuplicateIds || hasCountMismatch) {
+      parseError = 'schema-mismatch:items';
+      debugPayload.parseIssues.push(parseError);
+    }
   }
 
   return {
@@ -1901,7 +2002,7 @@ async function repairProofreadSegments(
         .filter(Boolean)
         .join('\n')
     }
-  ], apiBaseUrl);
+  ], apiBaseUrl, requestOptions);
   if (repairRequestMeta.triggerSource === 'retry' || repairRequestMeta.triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
     if (resolvedShortContextText) {
@@ -1929,8 +2030,6 @@ async function repairProofreadSegments(
           properties: {
             items: {
               type: 'array',
-              minItems: repairItems.length,
-              maxItems: repairItems.length,
               items: {
                 type: 'object',
                 properties: {
@@ -2031,6 +2130,9 @@ async function repairProofreadSegments(
         inputChars: repairItems.reduce((sum, item) => sum + (item?.draft?.length || 0), 0),
         outputChars: content?.length || 0,
         request: requestPayload,
+        promptCacheKey,
+        promptCacheRetention,
+        promptCacheSupport,
         response: content,
         parseIssues: ['fallback:language-repair']
       },
@@ -2048,7 +2150,71 @@ async function repairProofreadSegments(
     if (Array.isArray(debugPayloads)) {
       debugPayloads.push(debugPayload);
     }
-    const parsed = parseJsonObjectFlexible(content, 'proofread-repair');
+    let parsed = null;
+    let parseError = null;
+    try {
+      parsed = parseJsonObjectFlexible(content, 'proofread-repair');
+    } catch (error) {
+      parseError = error?.message || 'parse-error';
+      debugPayload.parseIssues.push(parseError);
+    }
+    if (!parseError) {
+      const expectedIds = repairItems.map((item) => String(item.id));
+      const expectedIdSet = new Set(expectedIds);
+      const normalizedParsedItems = normalizeProofreadItems(parsed?.items);
+      const responseIds = normalizedParsedItems.map((item) => item.id);
+      const responseIdSet = new Set(responseIds);
+      const hasUnknownIds = responseIds.some((id) => !expectedIdSet.has(id));
+      const hasMissingIds = expectedIds.some((id) => !responseIdSet.has(id));
+      const hasDuplicateIds = responseIdSet.size !== responseIds.length;
+      const hasCountMismatch = normalizedParsedItems.length !== expectedIds.length;
+      if (hasUnknownIds || hasMissingIds || hasDuplicateIds || hasCountMismatch) {
+        parseError = 'schema-mismatch:items';
+        debugPayload.parseIssues.push(parseError);
+      }
+    }
+    if (parseError) {
+      const fallbackSpec =
+        repairRequestMeta?.selectedModelSpec || formatModelSpec(model, repairRequestMeta?.selectedTier || 'standard');
+      const validateSelection = resolveProofreadCandidateSelection(repairRequestMeta, fallbackSpec, {
+        purpose: 'validate',
+        triggerSource: 'validate'
+      });
+      const validateSpec = validateSelection.selectedModelSpec || fallbackSpec;
+      const parsedValidateSpec = parseModelSpec(validateSpec);
+      const validateModelId = parsedValidateSpec.id || model;
+      const validateTier = parsedValidateSpec.tier || repairRequestMeta?.selectedTier || 'standard';
+      debugPayload.parseIssues.push('fallback:format-repair');
+      const repaired = await requestProofreadFormatRepair(
+        content,
+        repairItems,
+        apiKey,
+        validateModelId,
+        apiBaseUrl,
+        createChildRequestMeta(repairRequestMeta, {
+          purpose: 'validate',
+          attempt: Number.isFinite(repairRequestMeta?.attempt) ? repairRequestMeta.attempt + 1 : 1,
+          triggerSource: 'validate',
+          selectedModel: validateModelId,
+          selectedTier: validateTier,
+          selectedModelSpec: validateSpec,
+          candidateStrategy: validateSelection.candidateStrategy,
+          candidateOrderedList: validateSelection.orderedList,
+          originalRequestedModelList: validateSelection.originalRequestedModelList
+        }),
+        buildRequestOptionsForTier(requestOptions, validateTier)
+      );
+      if (Array.isArray(repaired.debug)) {
+        debugPayloads.push(...repaired.debug);
+      }
+      if (repaired.parsed && !repaired.parseError) {
+        parsed = repaired.parsed;
+        parseError = null;
+      }
+    }
+    if (parseError) {
+      return translations;
+    }
     const normalizedItems = normalizeProofreadItems(parsed?.items);
     const itemsById = new Map();
     normalizedItems.forEach((item) => {
