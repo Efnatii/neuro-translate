@@ -142,6 +142,120 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
   };
 }
 
+function resolveModelSpecForMeta(requestMeta = {}) {
+  const meta = requestMeta || {};
+  const triggerSource = typeof meta.triggerSource === 'string' ? meta.triggerSource.toLowerCase() : '';
+  let effectivePurpose = typeof meta.purpose === 'string' ? meta.purpose : '';
+  if (triggerSource.includes('validate')) {
+    effectivePurpose = 'validate';
+  } else if (triggerSource.includes('retry')) {
+    effectivePurpose = 'retry';
+  } else if (!effectivePurpose) {
+    effectivePurpose = 'main';
+  }
+  const isManualTrigger =
+    (Boolean(meta.isManual) || triggerSource.includes('manual') || effectivePurpose === 'manual') &&
+    !triggerSource.includes('retry') &&
+    !triggerSource.includes('validate');
+  const candidateStrategyUsed =
+    effectivePurpose === 'validate'
+      ? 'validate_cheapest'
+      : effectivePurpose === 'retry'
+        ? 'retry_cheapest'
+        : isManualTrigger
+          ? 'manual_smartest'
+          : 'preserve_order';
+  const list = Array.isArray(meta.originalRequestedModelList) && meta.originalRequestedModelList.length
+    ? meta.originalRequestedModelList
+    : Array.isArray(meta.candidateOrderedList)
+      ? meta.candidateOrderedList
+      : [];
+  const fallbackSpec =
+    meta.selectedModelSpec ||
+    (meta.selectedModel ? `${meta.selectedModel}:${meta.selectedTier || 'standard'}` : '');
+  const candidateList = list.length ? list : fallbackSpec ? [fallbackSpec] : [];
+  if (!candidateList.length) {
+    return {
+      modelId: meta.selectedModel || '',
+      tier: meta.selectedTier || 'standard',
+      spec: meta.selectedModelSpec || '',
+      candidateStrategyUsed
+    };
+  }
+  const parseSpec = (spec) => {
+    if (typeof parseModelSpec === 'function') {
+      return parseModelSpec(spec);
+    }
+    if (!spec || typeof spec !== 'string') {
+      return { id: '', tier: 'standard' };
+    }
+    const trimmed = spec.trim();
+    if (!trimmed) return { id: '', tier: 'standard' };
+    const parts = trimmed.split(':');
+    return { id: parts[0], tier: parts[1] === 'flex' ? 'flex' : 'standard' };
+  };
+  const resolvedEntries = candidateList.map((spec, index) => {
+    const parsed = parseSpec(spec);
+    const tierPref = parsed.tier === 'flex' ? 1 : 0;
+    const capabilityRank = typeof getModelCapabilityRank === 'function' ? getModelCapabilityRank(parsed.id) : 0;
+    const costSum =
+      typeof getModelEntry === 'function'
+        ? (getModelEntry(parsed.id, parsed.tier)?.sum_1M ?? Infinity)
+        : Infinity;
+    return {
+      spec,
+      index,
+      parsed,
+      tierPref,
+      capabilityRank,
+      costSum
+    };
+  });
+  const ordered = [...resolvedEntries];
+  if (candidateStrategyUsed === 'manual_smartest') {
+    ordered.sort((left, right) => {
+      if (left.capabilityRank !== right.capabilityRank) {
+        return right.capabilityRank - left.capabilityRank;
+      }
+      if (left.tierPref !== right.tierPref) {
+        return right.tierPref - left.tierPref;
+      }
+      if (left.index !== right.index) {
+        return left.index - right.index;
+      }
+      return 0;
+    });
+  } else if (candidateStrategyUsed === 'retry_cheapest' || candidateStrategyUsed === 'validate_cheapest') {
+    ordered.sort((left, right) => {
+      if (left.costSum !== right.costSum) {
+        return left.costSum - right.costSum;
+      }
+      if (left.tierPref !== right.tierPref) {
+        return right.tierPref - left.tierPref;
+      }
+      if (left.index !== right.index) {
+        return left.index - right.index;
+      }
+      return 0;
+    });
+  }
+  const chosen = ordered[0];
+  return {
+    modelId: chosen?.parsed?.id || '',
+    tier: chosen?.parsed?.tier || 'standard',
+    spec: chosen?.spec || '',
+    candidateStrategyUsed
+  };
+}
+
+function applyModelSelectionToMeta(meta, selection) {
+  if (!meta || typeof meta !== 'object' || !selection) return;
+  if (selection.modelId) meta.selectedModel = selection.modelId;
+  if (selection.tier) meta.selectedTier = selection.tier;
+  if (selection.spec) meta.selectedModelSpec = selection.spec;
+  if (selection.candidateStrategyUsed) meta.candidateStrategy = selection.candidateStrategyUsed;
+}
+
 function resolveContextPolicy(contextPayload, purpose) {
   const normalized = normalizeContextPayload(contextPayload);
   if (!normalized.text) {
@@ -659,6 +773,38 @@ async function performTranslationRequest(
   requestOptions = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translation', purpose: 'main' });
+  const selection = resolveModelSpecForMeta(normalizedRequestMeta);
+  const formatSpec = (id, tier) => {
+    if (typeof formatModelSpec === 'function') {
+      return formatModelSpec(id, tier);
+    }
+    const normalizedTier = tier === 'flex' || tier === 'standard' ? tier : 'standard';
+    return id ? `${id}:${normalizedTier}` : '';
+  };
+  let resolvedModel = selection?.modelId || model;
+  let resolvedTier =
+    selection?.tier ||
+    normalizedRequestMeta.selectedTier ||
+    requestOptions?.tier ||
+    'standard';
+  let resolvedSpec = selection?.spec || formatSpec(resolvedModel, resolvedTier);
+  if (resolvedModel) {
+    const appliedSelection = {
+      modelId: resolvedModel,
+      tier: resolvedTier,
+      spec: resolvedSpec,
+      candidateStrategyUsed: selection?.candidateStrategyUsed || normalizedRequestMeta.candidateStrategy
+    };
+    applyModelSelectionToMeta(normalizedRequestMeta, appliedSelection);
+    applyModelSelectionToMeta(requestMeta, appliedSelection);
+  }
+  const resolvedRequestOptions = resolvedModel
+    ? {
+        ...(requestOptions || {}),
+        tier: resolvedTier,
+        serviceTier: resolvedTier === 'flex' ? 'flex' : null
+      }
+    : requestOptions;
   const operationType = 'neuro-translate:translate:v1';
   const tokenizedTexts = texts.map(applyPunctuationTokens);
   const normalizedContext = normalizeContextPayload(context);
@@ -1074,7 +1220,7 @@ async function performTranslationRequest(
   }
 
   const requestPayload = {
-    model,
+    model: resolvedModel,
     messages: prompt,
     response_format: {
       type: 'json_schema',
@@ -1096,8 +1242,8 @@ async function performTranslationRequest(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:translate:v1');
-  applyModelRequestParams(requestPayload, model, requestOptions);
+  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, 'neuro-translate:translate:v1');
+  applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -1119,7 +1265,7 @@ async function performTranslationRequest(
     }
     const stripped = stripUnsupportedRequestParams(
       requestPayload,
-      model,
+      resolvedModel,
       response.status,
       errorPayload,
       errorText
@@ -1134,7 +1280,7 @@ async function performTranslationRequest(
         }
       }
       console.warn('Unsupported param removed; retrying without it.', {
-        model,
+        model: resolvedModel,
         status: response.status,
         removedParams: stripped.removedParams
       });
@@ -1179,7 +1325,7 @@ async function performTranslationRequest(
       error.debugPayload = attachRequestMeta(
         {
           phase: 'TRANSLATE',
-          model,
+          model: resolvedModel,
           latencyMs: Date.now() - startedAt,
           usage: null,
           inputChars,
@@ -1211,7 +1357,7 @@ async function performTranslationRequest(
   const debugPayload = attachRequestMeta(
     {
       phase: 'TRANSLATE',
-      model,
+      model: resolvedModel,
       latencyMs,
       usage,
       inputChars,
@@ -1510,6 +1656,38 @@ async function performTranslationRepairRequest(
     purpose: 'validate',
     triggerSource: 'validate'
   });
+  const selection = resolveModelSpecForMeta(normalizedRequestMeta);
+  const formatSpec = (id, tier) => {
+    if (typeof formatModelSpec === 'function') {
+      return formatModelSpec(id, tier);
+    }
+    const normalizedTier = tier === 'flex' || tier === 'standard' ? tier : 'standard';
+    return id ? `${id}:${normalizedTier}` : '';
+  };
+  let resolvedModel = selection?.modelId || model;
+  let resolvedTier =
+    selection?.tier ||
+    normalizedRequestMeta.selectedTier ||
+    requestOptions?.tier ||
+    'standard';
+  let resolvedSpec = selection?.spec || formatSpec(resolvedModel, resolvedTier);
+  if (resolvedModel) {
+    const appliedSelection = {
+      modelId: resolvedModel,
+      tier: resolvedTier,
+      spec: resolvedSpec,
+      candidateStrategyUsed: selection?.candidateStrategyUsed || normalizedRequestMeta.candidateStrategy
+    };
+    applyModelSelectionToMeta(normalizedRequestMeta, appliedSelection);
+    applyModelSelectionToMeta(requestMeta, appliedSelection);
+  }
+  const resolvedRequestOptions = resolvedModel
+    ? {
+        ...(requestOptions || {}),
+        tier: resolvedTier,
+        serviceTier: resolvedTier === 'flex' ? 'flex' : null
+      }
+    : requestOptions;
   const operationType = 'neuro-translate:translate:v1';
   const normalizedContext = normalizeContextPayload(context);
   const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
@@ -1931,7 +2109,7 @@ async function performTranslationRepairRequest(
   }
 
   const requestPayload = {
-    model,
+    model: resolvedModel,
     messages: prompt,
     response_format: {
       type: 'json_schema',
@@ -1953,8 +2131,8 @@ async function performTranslationRepairRequest(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:translate:v1');
-  applyModelRequestParams(requestPayload, model, requestOptions);
+  applyPromptCacheParams(requestPayload, apiBaseUrl, resolvedModel, 'neuro-translate:translate:v1');
+  applyModelRequestParams(requestPayload, resolvedModel, resolvedRequestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
@@ -1976,7 +2154,7 @@ async function performTranslationRepairRequest(
     }
     const stripped = stripUnsupportedRequestParams(
       requestPayload,
-      model,
+      resolvedModel,
       response.status,
       errorPayload,
       errorText
@@ -1991,7 +2169,7 @@ async function performTranslationRepairRequest(
         }
       }
       console.warn('Unsupported param removed; retrying repair without it.', {
-        model,
+        model: resolvedModel,
         status: response.status,
         removedParams: stripped.removedParams
       });
@@ -2030,7 +2208,7 @@ async function performTranslationRepairRequest(
   const debugPayload = attachRequestMeta(
     {
       phase: 'TRANSLATE_REPAIR',
-      model,
+      model: resolvedModel,
       latencyMs,
       usage,
       inputChars: normalizedItems.reduce(
