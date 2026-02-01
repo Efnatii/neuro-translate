@@ -907,21 +907,8 @@ async function translateTexts(
       }
 
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
-      const isParseSchemaIssue = () => {
-        const message = error?.message?.toLowerCase?.() || '';
-        return [
-          'response is empty',
-          'not a json',
-          'missing translations array',
-          'json parsing failed',
-          'does not contain a json'
-        ].some((fragment) => message.includes(fragment));
-      };
-      const shouldFallbackPerItem =
-        texts.length > 1 && (isLengthIssue || isParseSchemaIssue());
-      if (shouldFallbackPerItem) {
-        const reasonLabel = isLengthIssue ? 'length mismatch' : 'parse/schema error';
-        console.warn(`Falling back to per-item translation due to ${reasonLabel}.`);
+      if (isLengthIssue && texts.length > 1) {
+        console.warn('Falling back to per-item translation due to length mismatch.');
         appendParseIssue('fallback:per-item');
         const retryMeta = createChildRequestMeta(baseRequestMeta, {
           stage: 'translation',
@@ -2813,33 +2800,6 @@ function parseJsonObjectFlexible(content = '', label = 'response') {
 function parseTranslationsResponse(content, expectedLength, options = {}) {
   const { enforceLength = true } = options || {};
   const lengthForValidation = enforceLength ? expectedLength : null;
-  const cleanPlainText = (value) => {
-    const original = String(value ?? '');
-    const originalTrimmed = original.trim();
-    let cleaned = original;
-    cleaned = cleaned.replace(/```(?:json)?/gi, '').replace(/```/g, '');
-    cleaned = cleaned.replace(
-      /^\s*(?:translation|here(?:'|’)?s the translation|here is the translation|translated text|translation result)\s*[:\-–]\s*/i,
-      ''
-    );
-    cleaned = cleaned.trim();
-    if (!cleaned) {
-      return originalTrimmed || original;
-    }
-    return cleaned;
-  };
-  const parseListFallback = (value) => {
-    const lines = String(value ?? '')
-      .replace(/```(?:json)?/gi, '')
-      .replace(/```/g, '')
-      .split(/\r?\n/);
-    return lines
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => line.replace(/^\s*(?:[-•]|\d+[.)])\s*/, '').trim())
-      .filter(Boolean);
-  };
-  let lastError = null;
   try {
     const parsed = parseJsonObjectFlexible(content, 'translation');
     const translations = parsed?.translations;
@@ -2854,31 +2814,10 @@ function parseTranslationsResponse(content, expectedLength, options = {}) {
     }
     return normalizedArray;
   } catch (error) {
-    lastError = error;
     console.warn('Translation response object parsing failed; falling back to array parsing.', error);
   }
 
-  try {
-    return parseJsonArrayFlexible(content, lengthForValidation, 'translation');
-  } catch (error) {
-    lastError = error;
-  }
-
-  if (expectedLength === 1) {
-    return [cleanPlainText(content)];
-  }
-
-  if (expectedLength > 1) {
-    const listFallback = parseListFallback(content);
-    if (listFallback.length === expectedLength) {
-      return listFallback;
-    }
-    throw new Error(
-      `translation response length mismatch: expected ${expectedLength}, got ${listFallback.length}`
-    );
-  }
-
-  throw lastError;
+  return parseJsonArrayFlexible(content, lengthForValidation, 'translation');
 }
 
 function extractJsonArray(content = '', label = 'response') {
