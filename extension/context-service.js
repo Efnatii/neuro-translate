@@ -262,7 +262,7 @@ async function generateTranslationContext(
     model: selectedModelId,
     messages: prompt
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, selectedModelId, 'neuro-translate:context:v1');
+  applyPromptCacheParams(requestPayload, apiBaseUrl, selectedModelId, getPromptCacheKey('context'));
   applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
@@ -404,7 +404,7 @@ async function generateShortTranslationContext(
     model: selectedModelId,
     messages: prompt
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, selectedModelId, 'neuro-translate:context-short:v1');
+  applyPromptCacheParams(requestPayload, apiBaseUrl, selectedModelId, getPromptCacheKey('context', 'short'));
   applyModelRequestParams(requestPayload, selectedModelId, effectiveRequestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {

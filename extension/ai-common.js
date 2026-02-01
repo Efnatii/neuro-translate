@@ -276,7 +276,7 @@ function applyModelRequestParams(requestPayload, modelId, requestOptions = null)
   }
 }
 function applyPromptCaching(messages, apiBaseUrl = OPENAI_API_URL) {
-  if (apiBaseUrl !== OPENAI_API_URL) return messages;
+  if (apiBaseUrl === OPENAI_API_URL) return messages;
   return messages.map((message) =>
     message.role === 'user' ? { ...message, cache_control: { type: 'ephemeral' } } : message
   );
@@ -405,6 +405,24 @@ function normalizeUsage(usage) {
 
 const PROMPT_CACHE_RETENTION_UNSUPPORTED_MODELS = new Set();
 const PROMPT_CACHE_KEY_UNSUPPORTED_MODELS = new Set();
+
+function getPromptCacheKey(stage, variant = '') {
+  const normalizedStage = typeof stage === 'string' ? stage.trim().toLowerCase() : '';
+  const normalizedVariant = typeof variant === 'string' ? variant.trim().toLowerCase() : '';
+  if (normalizedStage === 'translate' || normalizedStage === 'translation') {
+    return 'neuro-translate:translate:v1';
+  }
+  if (normalizedStage === 'proofread') {
+    return 'neuro-translate:proofread:v1';
+  }
+  if (normalizedStage === 'context') {
+    if (normalizedVariant === 'short') {
+      return 'neuro-translate:context-short:v1';
+    }
+    return 'neuro-translate:context:v1';
+  }
+  return '';
+}
 
 function isUnsupportedParamError(status, errorPayload, errorText, paramName) {
   if (status !== 400) return false;

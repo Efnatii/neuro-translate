@@ -4,6 +4,7 @@ const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
 const PROOFREAD_MAX_OUTPUT_TOKENS = 4096;
 const PROOFREAD_SYSTEM_PROMPT = [
+  'Neuro-Translate Proofread System Prompt v1.',
   'You are an expert translation proofreader and editor.',
   'Follow the selected PROOFREAD_MODE instructions exactly.',
   'PROOFREAD_MODE=NOISE_CLEANUP: remove noise, normalize to the target language, fix strange insertions, preserve meaning, keep placeholders/tags unchanged, do not add new meaning.',
@@ -22,7 +23,8 @@ const PROOFREAD_SYSTEM_PROMPT = [
   'Return a JSON object with an "items" array.',
   'Each item must include the original "id" and the corrected "text" string.',
   'Do not add, remove, or reorder items. Keep ids unchanged.',
-  'If a segment does not need edits, return the original text unchanged.'
+  'If a segment does not need edits, return the original text unchanged.',
+  'Return only JSON, without commentary.'
 ].join(' ');
 
 function normalizeContextPayload(context) {
@@ -523,22 +525,18 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const messages = [
     {
       role: 'system',
-      content: [
-        PROOFREAD_SYSTEM_PROMPT,
-        strict
-          ? 'Strict mode: return every input id exactly once in the output items array.'
-          : '',
-        extraReminder,
-        'Return only JSON, without commentary.'
-      ]
-        .filter(Boolean)
-        .join(' ')
+      content: PROOFREAD_SYSTEM_PROMPT
     },
   ];
 
   messages.push({
     role: 'user',
-    content: [`PROOFREAD_MODE: ${proofreadMode}.`, language ? `Target language: ${language}` : '']
+    content: [
+      `PROOFREAD_MODE: ${proofreadMode}.`,
+      language ? `Target language: ${language}` : '',
+      strict ? 'Strict mode: return every input id exactly once in the output items array.' : '',
+      extraReminder
+    ]
       .filter(Boolean)
       .join('\n')
   });
@@ -547,7 +545,6 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
     messages.push({
       role: 'user',
       content: [
-        language ? `Target language: ${language}` : '',
         `Context (${contextMode}): <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
       ]
         .filter(Boolean)
@@ -1242,7 +1239,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, getPromptCacheKey('proofread'));
   applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
@@ -1557,7 +1554,7 @@ async function requestProofreadFormatRepair(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, getPromptCacheKey('proofread'));
   applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   let response = await fetch(apiBaseUrl, {
@@ -1819,7 +1816,7 @@ async function repairProofreadSegments(
       }
     }
   };
-  applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
+  applyPromptCacheParams(requestPayload, apiBaseUrl, model, getPromptCacheKey('proofread'));
   applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
   try {
