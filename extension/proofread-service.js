@@ -1213,7 +1213,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const requestPayload = {
     model,
     messages: prompt,
-    max_tokens: maxTokens,
+    max_completion_tokens: maxTokens,
     response_format: {
       type: 'json_schema',
       json_schema: {
@@ -1277,6 +1277,15 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
           requestMeta.selectedTier = 'standard';
         }
+      }
+      if (
+        stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
+        stripped.removedParams.includes('max_completion_tokens->max_tokens')
+      ) {
+        console.debug('[proofread] Retrying with swapped token limit parameter.', {
+          model,
+          removedParams: stripped.removedParams
+        });
       }
       console.warn('Unsupported param removed; retrying without it.', {
         model,
@@ -1584,6 +1593,15 @@ async function requestProofreadFormatRepair(
           requestMeta.selectedTier = 'standard';
         }
       }
+      if (
+        stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
+        stripped.removedParams.includes('max_completion_tokens->max_tokens')
+      ) {
+        console.debug('[proofread] Retrying format repair with swapped token limit parameter.', {
+          model,
+          removedParams: stripped.removedParams
+        });
+      }
       console.warn('Unsupported param removed; retrying format repair without it.', {
         model,
         status: response.status,
@@ -1836,6 +1854,15 @@ async function repairProofreadSegments(
           if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
             requestMeta.selectedTier = 'standard';
           }
+        }
+        if (
+          stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
+          stripped.removedParams.includes('max_completion_tokens->max_tokens')
+        ) {
+          console.debug('[proofread] Retrying proofread repair with swapped token limit parameter.', {
+            model,
+            removedParams: stripped.removedParams
+          });
         }
         console.warn('Unsupported param removed; retrying proofread repair without it.', {
           model,

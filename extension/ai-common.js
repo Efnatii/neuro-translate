@@ -481,5 +481,37 @@ function stripUnsupportedRequestParams(requestPayload, model, status, errorPaylo
     removedParams.push('response_format');
   }
 
+  if (
+    requestPayload.max_tokens !== undefined &&
+    isUnsupportedParamError(status, errorPayload, errorText, 'max_tokens')
+  ) {
+    const previousMaxTokens = requestPayload.max_tokens;
+    delete requestPayload.max_tokens;
+    if (requestPayload.max_completion_tokens === undefined) {
+      requestPayload.max_completion_tokens = previousMaxTokens;
+      removedParams.push('max_tokens->max_completion_tokens');
+    } else {
+      removedParams.push('max_tokens');
+    }
+    if (model) markModelParamUnsupported(model, 'max_tokens');
+    changed = true;
+  }
+
+  if (
+    requestPayload.max_completion_tokens !== undefined &&
+    isUnsupportedParamError(status, errorPayload, errorText, 'max_completion_tokens')
+  ) {
+    const previousMaxCompletionTokens = requestPayload.max_completion_tokens;
+    delete requestPayload.max_completion_tokens;
+    if (requestPayload.max_tokens === undefined) {
+      requestPayload.max_tokens = previousMaxCompletionTokens;
+      removedParams.push('max_completion_tokens->max_tokens');
+    } else {
+      removedParams.push('max_completion_tokens');
+    }
+    if (model) markModelParamUnsupported(model, 'max_completion_tokens');
+    changed = true;
+  }
+
   return { changed, removedParams };
 }
