@@ -119,11 +119,20 @@ function resolveProofreadCandidateSelection(requestMeta, fallbackModelSpec, over
   const purpose = overrides.purpose || requestMeta?.purpose || '';
   const triggerSource = overrides.triggerSource || requestMeta?.triggerSource || '';
   const normalizedTrigger = typeof triggerSource === 'string' ? triggerSource.toLowerCase() : '';
-  const effectivePurpose = typeof purpose === 'string' ? purpose : '';
+  let effectivePurpose = typeof purpose === 'string' ? purpose : '';
+  if (normalizedTrigger.includes('validate')) {
+    effectivePurpose = 'validate';
+  } else if (normalizedTrigger.includes('retry')) {
+    effectivePurpose = 'retry';
+  } else if (!effectivePurpose) {
+    effectivePurpose = 'main';
+  }
   const isManualTrigger =
-    Boolean(requestMeta?.isManual) ||
-    normalizedTrigger.includes('manual') ||
-    effectivePurpose === 'manual';
+    (Boolean(requestMeta?.isManual) ||
+      normalizedTrigger.includes('manual') ||
+      effectivePurpose === 'manual') &&
+    !normalizedTrigger.includes('retry') &&
+    !normalizedTrigger.includes('validate');
   let candidateStrategy = 'default_preserve_order';
   if (effectivePurpose === 'retry') {
     candidateStrategy = 'retry_cheapest';
@@ -591,14 +600,6 @@ async function proofreadTranslation(
 
   const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'main' });
   const baseModelSpec = formatModelSpec(model, baseRequestMeta.selectedTier || 'standard');
-  if (!baseRequestMeta.candidateStrategy || !baseRequestMeta.candidateOrderedList?.length) {
-    const baseSelection = resolveProofreadCandidateSelection(baseRequestMeta, baseModelSpec);
-    baseRequestMeta.candidateStrategy = baseSelection.candidateStrategy;
-    baseRequestMeta.candidateOrderedList = baseSelection.orderedList;
-    if (!baseRequestMeta.originalRequestedModelList?.length) {
-      baseRequestMeta.originalRequestedModelList = baseSelection.originalRequestedModelList;
-    }
-  }
   const resolveModelSelection = (purpose, triggerSource) => {
     const selection = resolveProofreadCandidateSelection(baseRequestMeta, baseModelSpec, {
       purpose,
@@ -613,6 +614,15 @@ async function proofreadTranslation(
       selectedModelSpec: fallbackSpec
     };
   };
+  const mainSelection = resolveModelSelection('main', baseRequestMeta.triggerSource || 'auto');
+  baseRequestMeta.selectedModel = mainSelection.modelId;
+  baseRequestMeta.selectedTier = mainSelection.tier;
+  baseRequestMeta.selectedModelSpec = mainSelection.selectedModelSpec;
+  baseRequestMeta.candidateStrategy = mainSelection.candidateStrategy;
+  baseRequestMeta.candidateOrderedList = mainSelection.orderedList;
+  if (!baseRequestMeta.originalRequestedModelList?.length) {
+    baseRequestMeta.originalRequestedModelList = mainSelection.originalRequestedModelList;
+  }
   const retrySelection = resolveModelSelection('retry', 'retry');
   const validateSelection = resolveModelSelection('validate', 'validate');
   const { items, originalById } = normalizeProofreadSegments(segments);
@@ -638,7 +648,7 @@ async function proofreadTranslation(
       attachRequestMeta(
         {
           phase: 'PROOFREAD',
-          model,
+          model: mainSelection.modelId,
           latencyMs: null,
           usage: null,
           inputChars: null,
@@ -659,9 +669,15 @@ async function proofreadTranslation(
       chunk,
       { sourceBlock, translatedBlock, context: normalizedContext, language, proofreadMode },
       apiKey,
-      model,
+      mainSelection.modelId,
       apiBaseUrl,
-      { strict: false, requestMeta: baseRequestMeta, purpose: 'main', debugPayloads, requestOptions }
+      {
+        strict: false,
+        requestMeta: baseRequestMeta,
+        purpose: 'main',
+        debugPayloads,
+        requestOptions: buildRequestOptionsForTier(requestOptions, mainSelection.tier)
+      }
     );
     rawProofreadParts.push(result.rawProofread);
     if (Array.isArray(result.debug)) {
@@ -1086,6 +1102,36 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     stage: 'proofread',
     purpose: options.purpose || 'main'
   });
+  const resolvedTier = requestMeta.selectedTier || (requestOptions?.tier === 'flex' ? 'flex' : 'standard');
+  if (requestMeta.selectedModelSpec) {
+    const parsedSelection = parseModelSpec(requestMeta.selectedModelSpec);
+    if (!requestMeta.selectedModel && parsedSelection.id) {
+      requestMeta.selectedModel = parsedSelection.id;
+    }
+    if (!requestMeta.selectedTier && parsedSelection.tier) {
+      requestMeta.selectedTier = parsedSelection.tier;
+    }
+  }
+  if (!requestMeta.selectedModel) {
+    requestMeta.selectedModel = model;
+  }
+  if (!requestMeta.selectedTier) {
+    requestMeta.selectedTier = resolvedTier;
+  }
+  if (!requestMeta.selectedModelSpec) {
+    requestMeta.selectedModelSpec = formatModelSpec(requestMeta.selectedModel || model, requestMeta.selectedTier);
+  }
+  if (!requestMeta.candidateStrategy || !requestMeta.candidateOrderedList?.length) {
+    const selection = resolveProofreadCandidateSelection(requestMeta, requestMeta.selectedModelSpec, {
+      purpose: requestMeta.purpose,
+      triggerSource: requestMeta.triggerSource
+    });
+    requestMeta.candidateStrategy = selection.candidateStrategy;
+    requestMeta.candidateOrderedList = selection.orderedList;
+    if (!requestMeta.originalRequestedModelList?.length) {
+      requestMeta.originalRequestedModelList = selection.originalRequestedModelList;
+    }
+  }
   const normalizedContext = normalizeContextPayload(metadata?.context);
   let effectiveContext = buildEffectiveContext(normalizedContext, requestMeta);
   const triggerSource = requestMeta?.triggerSource || '';
@@ -1360,7 +1406,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   let rawProofread = content;
   if (parseError) {
     debugPayload.parseIssues.push('fallback:format-repair');
-    const fallbackSpec = formatModelSpec(model, requestMeta?.selectedTier || 'standard');
+    const fallbackSpec =
+      requestMeta?.selectedModelSpec || formatModelSpec(model, requestMeta?.selectedTier || 'standard');
     const validateSelection = resolveProofreadCandidateSelection(requestMeta, fallbackSpec, {
       purpose: 'validate',
       triggerSource: 'validate'
