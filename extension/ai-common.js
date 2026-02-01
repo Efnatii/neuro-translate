@@ -685,5 +685,13 @@ function stripUnsupportedRequestParams(requestPayload, model, status, errorPaylo
     changed = true;
   }
 
+  if (changed && (globalThis.__NT_DEBUG__ || globalThis.__NT_DEV__)) {
+    console.debug('stripUnsupportedRequestParams', {
+      model,
+      status,
+      removedParams,
+      apiBaseUrl
+    });
+  }
   return { changed, removedParams };
 }
