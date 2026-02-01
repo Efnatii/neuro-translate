@@ -539,6 +539,14 @@ function getCandidateModels(stage, requestMeta, state) {
     } else if (isManualTrigger) {
       candidateStrategy = 'manual_smartest';
     }
+  } else if (stage === 'context') {
+    if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
+    } else if (effectivePurpose === 'validate') {
+      candidateStrategy = 'validate_cheapest';
+    } else if (isManualTrigger) {
+      candidateStrategy = 'manual_smartest';
+    }
   }
   if (!Array.isArray(originalRequestedModelList) || !originalRequestedModelList.length) {
     const fallbackSpec = fallbackModel ? formatModelSpec(fallbackModel, 'standard') : '';
@@ -1356,13 +1364,20 @@ async function handleGenerateContext(message, sendResponse) {
       return;
     }
 
+    const contextRequestMeta = {
+      ...(message?.requestMeta || {}),
+      stage: 'context',
+      purpose: message?.requestMeta?.purpose || 'main'
+    };
+    if (
+      (contextRequestMeta.purpose === 'retry' || contextRequestMeta.purpose === 'validate') &&
+      !contextRequestMeta.triggerSource
+    ) {
+      contextRequestMeta.triggerSource = contextRequestMeta.purpose;
+    }
     const contextMessage = {
       ...message,
-      requestMeta: {
-        ...(message?.requestMeta || {}),
-        stage: 'context',
-        purpose: message?.requestMeta?.purpose || 'main'
-      }
+      requestMeta: contextRequestMeta
     };
     const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
       const { context, debug } = await generateTranslationContext(
@@ -1393,13 +1408,20 @@ async function handleGenerateShortContext(message, sendResponse) {
       return;
     }
 
+    const contextRequestMeta = {
+      ...(message?.requestMeta || {}),
+      stage: 'context',
+      purpose: message?.requestMeta?.purpose || 'short'
+    };
+    if (
+      (contextRequestMeta.purpose === 'retry' || contextRequestMeta.purpose === 'validate') &&
+      !contextRequestMeta.triggerSource
+    ) {
+      contextRequestMeta.triggerSource = contextRequestMeta.purpose;
+    }
     const contextMessage = {
       ...message,
-      requestMeta: {
-        ...(message?.requestMeta || {}),
-        stage: 'context',
-        purpose: message?.requestMeta?.purpose || 'short'
-      }
+      requestMeta: contextRequestMeta
     };
     const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
       const { context, debug } = await generateShortTranslationContext(
