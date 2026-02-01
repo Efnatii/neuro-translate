@@ -524,9 +524,9 @@ function getCandidateModels(stage, requestMeta, state) {
     effectivePurpose === 'manual';
   let candidateStrategy = 'default_preserve_order';
   if (stage === 'translate') {
-    if (purpose === 'retry') {
+    if (effectivePurpose === 'retry') {
       candidateStrategy = 'retry_cheapest';
-    } else if (purpose === 'validate') {
+    } else if (effectivePurpose === 'validate') {
       candidateStrategy = 'validate_cheapest';
     } else if (isManualTrigger) {
       candidateStrategy = 'manual_smartest';
