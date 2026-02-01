@@ -1400,12 +1400,6 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
   const promptCacheKey = requestPayload.prompt_cache_key || '';
   const promptCacheRetention = requestPayload.prompt_cache_retention || '';
-  const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
-  const promptCacheKey = requestPayload.prompt_cache_key || '';
-  const promptCacheRetention = requestPayload.prompt_cache_retention || '';
-  const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
-  const promptCacheKey = requestPayload.prompt_cache_key || '';
-  const promptCacheRetention = requestPayload.prompt_cache_retention || '';
   const startedAt = Date.now();
   const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
   const batchSize = items.length;
