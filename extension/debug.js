@@ -4,7 +4,6 @@ const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
 const eventsEl = document.getElementById('events');
 const clearDebugButton = document.getElementById('clear-debug');
-const debugLogAiToggle = document.getElementById('debug-log-ai');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const CONTEXT_CACHE_KEY = 'contextCacheByPage';
@@ -12,7 +11,6 @@ const DEBUG_PORT_NAME = 'debug';
 const DEBUG_DB_NAME = 'nt_debug';
 const DEBUG_DB_VERSION = 1;
 const DEBUG_RAW_STORE = 'raw';
-const DEBUG_LOG_AI_KEY = 'debugLogAiFull';
 const STATUS_CONFIG = {
   pending: { label: 'Ожидает', className: 'status-pending' },
   in_progress: { label: 'В работе', className: 'status-in-progress' },
@@ -49,10 +47,6 @@ const debugInstrumentation = {
   lastRefByKey: new Map(),
   lastUserActionTs: 0
 };
-const debugLogState = {
-  enabled: getDebugLogAiEnabled(),
-  loggedRawIds: new Set()
-};
 
 init();
 
@@ -86,18 +80,6 @@ async function init() {
     addDebugListener(clearDebugButton, 'click', (event) => {
       event.preventDefault();
       clearDebugData();
-    });
-  }
-
-  if (debugLogAiToggle) {
-    debugLogAiToggle.checked = debugLogState.enabled;
-    addDebugListener(debugLogAiToggle, 'change', () => {
-      const nextValue = Boolean(debugLogAiToggle.checked);
-      debugLogState.enabled = nextValue;
-      setDebugLogAiEnabled(nextValue);
-      if (nextValue && latestDebugSnapshot) {
-        void logFullAiPayloads(latestDebugSnapshot);
-      }
     });
   }
 
@@ -166,22 +148,6 @@ async function init() {
 function isDebugInstrumentationEnabled() {
   const params = new URLSearchParams(window.location.search);
   return params.get('debug') === '1' || params.get('instrument') === '1';
-}
-
-function getDebugLogAiEnabled() {
-  try {
-    return localStorage.getItem(DEBUG_LOG_AI_KEY) === '1';
-  } catch (error) {
-    return false;
-  }
-}
-
-function setDebugLogAiEnabled(value) {
-  try {
-    localStorage.setItem(DEBUG_LOG_AI_KEY, value ? '1' : '0');
-  } catch (error) {
-    // ignore storage failures
-  }
 }
 
 function setupDebugInstrumentation() {
@@ -666,7 +632,6 @@ function patchDebug(url, data) {
   restoreUiState();
   runDebugRecreationCheck();
   autoLoadVisibleRawButtons();
-  void logFullAiPayloads(data);
 }
 
 function isElementVisible(element) {
@@ -1623,143 +1588,6 @@ function formatRawResponse(value) {
 
 function stripCodeFences(value) {
   return value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-}
-
-function parseJsonMaybe(value) {
-  if (value == null) return value;
-  if (typeof value !== 'string') return value;
-  const trimmed = value.trim();
-  if (!trimmed) return value;
-  const normalized = stripCodeFences(trimmed);
-  try {
-    return JSON.parse(normalized);
-  } catch (error) {
-    return value;
-  }
-}
-
-async function logFullAiPayloads(data) {
-  if (!debugLogState.enabled || !data) return;
-  const items = Array.isArray(data.items) ? data.items : [];
-  for (const item of items) {
-    const payloadGroups = [
-      { label: 'translation', payloads: item?.translationDebug },
-      { label: 'proofread', payloads: item?.proofreadDebug },
-      { label: 'context', payloads: item?.contextDebug }
-    ];
-    for (const group of payloadGroups) {
-      const payloads = Array.isArray(group.payloads) ? group.payloads : [];
-      for (const payload of payloads) {
-        const rawRefId = payload?.rawRefId;
-        if (!rawRefId || debugLogState.loggedRawIds.has(rawRefId)) {
-          continue;
-        }
-        debugLogState.loggedRawIds.add(rawRefId);
-        let rawValue = null;
-        try {
-          const record = await getRawRecord(rawRefId);
-          rawValue = record?.value || null;
-        } catch (error) {
-          rawValue = null;
-        }
-        const requestRaw = rawValue?.request ?? payload?.request;
-        const responseRaw = rawValue?.response ?? payload?.response;
-        const contextTextSent = rawValue?.contextTextSent ?? payload?.contextTextSent;
-        const reasons = {
-          fallbackReason: payload?.fallbackReason || '',
-          parseIssues: Array.isArray(payload?.parseIssues) ? payload.parseIssues : [],
-          contextMissing: Boolean(payload?.contextMissing)
-        };
-        const logPayload = {
-          block: {
-            index: item?.index ?? null,
-            blockKey: item?.blockKey || '',
-            translationStatus: item?.translationStatus || '',
-            proofreadStatus: item?.proofreadStatus || '',
-            original: item?.original || ''
-          },
-          group: group.label,
-          reasons,
-          request: parseJsonMaybe(requestRaw),
-          response: parseJsonMaybe(responseRaw),
-          contextTextSent,
-          meta: {
-            phase: payload?.phase || '',
-            stage: payload?.stage || '',
-            tag: payload?.tag || '',
-            model: payload?.model || '',
-            requestId: payload?.requestId || '',
-            parentRequestId: payload?.parentRequestId || '',
-            attempt: payload?.attempt ?? null,
-            attemptIndex: payload?.attemptIndex ?? null,
-            usage: payload?.usage || null,
-            latencyMs: payload?.latencyMs ?? null,
-            blockKey: payload?.blockKey || '',
-            batchBlockCount: payload?.batchBlockCount ?? null,
-            batchBlockKeys: Array.isArray(payload?.batchBlockKeys) ? payload.batchBlockKeys : []
-          },
-          payload: payload || null,
-          rawRecord: rawValue
-        };
-        console.info('[debug] AI call full payload', logPayload);
-      }
-    }
-  }
-  const contextPayloads = Array.isArray(data.contextDebug) ? data.contextDebug : [];
-  for (const payload of contextPayloads) {
-    const rawRefId = payload?.rawRefId;
-    if (!rawRefId || debugLogState.loggedRawIds.has(rawRefId)) {
-      continue;
-    }
-    debugLogState.loggedRawIds.add(rawRefId);
-    let rawValue = null;
-    try {
-      const record = await getRawRecord(rawRefId);
-      rawValue = record?.value || null;
-    } catch (error) {
-      rawValue = null;
-    }
-    const requestRaw = rawValue?.request ?? payload?.request;
-    const responseRaw = rawValue?.response ?? payload?.response;
-    const contextTextSent = rawValue?.contextTextSent ?? payload?.contextTextSent;
-    const reasons = {
-      fallbackReason: payload?.fallbackReason || '',
-      parseIssues: Array.isArray(payload?.parseIssues) ? payload.parseIssues : [],
-      contextMissing: Boolean(payload?.contextMissing)
-    };
-    const logPayload = {
-      block: {
-        index: null,
-        blockKey: '',
-        translationStatus: '',
-        proofreadStatus: '',
-        original: ''
-      },
-      group: 'context',
-      reasons,
-      request: parseJsonMaybe(requestRaw),
-      response: parseJsonMaybe(responseRaw),
-      contextTextSent,
-      meta: {
-        phase: payload?.phase || '',
-        stage: payload?.stage || '',
-        tag: payload?.tag || '',
-        model: payload?.model || '',
-        requestId: payload?.requestId || '',
-        parentRequestId: payload?.parentRequestId || '',
-        attempt: payload?.attempt ?? null,
-        attemptIndex: payload?.attemptIndex ?? null,
-        usage: payload?.usage || null,
-        latencyMs: payload?.latencyMs ?? null,
-        blockKey: payload?.blockKey || '',
-        batchBlockCount: payload?.batchBlockCount ?? null,
-        batchBlockKeys: Array.isArray(payload?.batchBlockKeys) ? payload.batchBlockKeys : []
-      },
-      payload: payload || null,
-      rawRecord: rawValue
-    };
-    console.info('[debug] AI call full payload', logPayload);
-  }
 }
 
 function escapeHtml(value) {

@@ -663,21 +663,6 @@
       display: flex;
       gap: 8px;
       margin: 8px 0 16px;
-      flex-wrap: wrap;
-    }
-    .debug-toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 12px;
-      color: #334155;
-      background: #fff;
-      border: 1px solid #e2e8f0;
-      border-radius: 999px;
-      padding: 6px 12px;
-    }
-    .debug-toggle input {
-      accent-color: #2563eb;
     }
     .debug-button {
       border: 1px solid #e2e8f0;
@@ -720,10 +705,6 @@
     <button class="debug-button debug-button--danger" id="clear-debug" type="button">
       Очистить отладочные данные
     </button>
-    <label class="debug-toggle">
-      <input type="checkbox" id="debug-log-ai" />
-      Логировать полный запрос/ответ ИИ в консоль
-    </label>
   </div>
   <div class="summary" id="summary"></div>
   <div id="events"></div>
