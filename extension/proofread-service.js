@@ -1622,7 +1622,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`
   };
-  const requestBody = JSON.stringify(requestPayload);
+  let requestBody = JSON.stringify(requestPayload);
   let response;
   let responseText = '';
   let fetchStartedAt = Date.now();
@@ -1716,6 +1716,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           removedParams: stripped.removedParams
         }
       );
+      requestBody = JSON.stringify(requestPayload);
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -2083,7 +2084,7 @@ async function requestProofreadFormatRepair(
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`
   };
-  const requestBody = JSON.stringify(requestPayload);
+  let requestBody = JSON.stringify(requestPayload);
   let response;
   let responseText = '';
   let fetchStartedAt = Date.now();
@@ -2179,6 +2180,7 @@ async function requestProofreadFormatRepair(
           stage: 'format_repair'
         }
       );
+      requestBody = JSON.stringify(requestPayload);
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -2468,7 +2470,7 @@ async function repairProofreadSegments(
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`
   };
-  const requestBody = JSON.stringify(requestPayload);
+  let requestBody = JSON.stringify(requestPayload);
   try {
     let response;
     let responseText = '';
@@ -2564,6 +2566,7 @@ async function repairProofreadSegments(
             stage: 'repair'
           }
         );
+        requestBody = JSON.stringify(requestPayload);
         fetchStartedAt = Date.now();
         logLlmFetchRequest({
           ts: fetchStartedAt,
