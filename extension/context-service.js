@@ -463,7 +463,7 @@ async function generateTranslationContext(
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`
   };
-  const requestBody = JSON.stringify(requestPayload);
+  let requestBody = JSON.stringify(requestPayload);
   let response;
   let responseText = '';
   let fetchStartedAt = Date.now();
@@ -543,6 +543,7 @@ async function generateTranslationContext(
           removedParams: stripped.removedParams
         }
       );
+      requestBody = JSON.stringify(requestPayload);
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
@@ -751,7 +752,7 @@ async function generateShortTranslationContext(
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`
   };
-  const requestBody = JSON.stringify(requestPayload);
+  let requestBody = JSON.stringify(requestPayload);
   let response;
   let responseText = '';
   let fetchStartedAt = Date.now();
@@ -831,6 +832,7 @@ async function generateShortTranslationContext(
           removedParams: stripped.removedParams
         }
       );
+      requestBody = JSON.stringify(requestPayload);
       fetchStartedAt = Date.now();
       logLlmFetchRequest({
         ts: fetchStartedAt,
