@@ -50,7 +50,7 @@ function emitProofreadLog(kind, level, message, data) {
     if (data !== undefined) {
       event.data = data;
     }
-    globalThis.ntJsonLog(JSON.stringify(event));
+    globalThis.ntJsonLog(event);
   }
 }
 
