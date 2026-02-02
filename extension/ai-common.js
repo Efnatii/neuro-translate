@@ -34,6 +34,17 @@
     const method = console[level] ? level : 'log';
     console[method](JSON.stringify(eventObject, createSafeReplacer()));
   };
+  globalThis.ntConsoleLog = (level, eventObjectOrArgs) => {
+    if (!globalThis.ntJsonLogEnabled?.()) return;
+    if (typeof globalThis.ntJsonLog !== 'function') return;
+    const normalizedLevel = typeof level === 'string' ? level : 'log';
+    if (eventObjectOrArgs && typeof eventObjectOrArgs === 'object' && !Array.isArray(eventObjectOrArgs)) {
+      globalThis.ntJsonLog(eventObjectOrArgs, normalizedLevel);
+      return;
+    }
+    const args = Array.isArray(eventObjectOrArgs) ? eventObjectOrArgs : [eventObjectOrArgs];
+    globalThis.ntJsonLog({ kind: 'console', level: normalizedLevel, args }, normalizedLevel);
+  };
 
   if (typeof chrome !== 'undefined' && chrome?.storage?.local) {
     chrome.storage.local.get({ ntConsoleJsonLogEnabled: false }, (result) => {
