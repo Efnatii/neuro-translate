@@ -1736,13 +1736,26 @@ async function translatePage(settings, options = {}) {
         }
         const blockTranslations = [];
         seedBlock.forEach(({ node, path, original, originalHash }, index) => {
-          if (!shouldApplyTranslation(node, original, originalHash)) {
-            blockTranslations.push(node.nodeValue);
+          let resolvedNode = null;
+          if (node && node.nodeType === Node.TEXT_NODE && node.isConnected) {
+            resolvedNode = node;
+          } else {
+            const candidateNode = findNodeByPath(path);
+            if (candidateNode && candidateNode.nodeType === Node.TEXT_NODE && candidateNode.isConnected) {
+              resolvedNode = candidateNode;
+            }
+          }
+          if (!resolvedNode) {
+            blockTranslations.push('');
             return;
           }
-          const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
+          if (!shouldApplyTranslation(resolvedNode, original, originalHash)) {
+            blockTranslations.push(resolvedNode?.nodeValue ?? '');
+            return;
+          }
+          const withOriginalFormatting = finalTranslations[index] || resolvedNode.nodeValue;
           if (translationVisible) {
-            node.nodeValue = withOriginalFormatting;
+            resolvedNode.nodeValue = withOriginalFormatting;
           }
           blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
