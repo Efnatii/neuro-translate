@@ -2156,14 +2156,23 @@ async function translatePage(settings, options = {}) {
     let skipped = 0;
     let applied = 0;
     task.block.forEach(({ node, path, original, originalHash }, index) => {
+      let resolvedNode = null;
+      if (node && node.nodeType === Node.TEXT_NODE && node.isConnected) {
+        resolvedNode = node;
+      } else {
+        const candidateNode = findNodeByPath(path);
+        if (candidateNode && candidateNode.nodeType === Node.TEXT_NODE && candidateNode.isConnected) {
+          resolvedNode = candidateNode;
+        }
+      }
       const entry = getActiveTranslationEntry(path, original, originalHash);
-      if (!shouldApplyProofreadTranslation(node, entry, original)) {
+      if (!shouldApplyProofreadTranslation(resolvedNode, entry, original)) {
         skipped += 1;
         return;
       }
-      const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
+      const withOriginalFormatting = finalTranslations[index] || resolvedNode.nodeValue;
       if (translationVisible) {
-        node.nodeValue = withOriginalFormatting;
+        resolvedNode.nodeValue = withOriginalFormatting;
       }
       updateActiveEntry(path, original, withOriginalFormatting, originalHash);
       applied += 1;
