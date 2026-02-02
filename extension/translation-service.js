@@ -959,11 +959,29 @@ async function translateTexts(
       )
     );
   };
-  const timeoutMs = DEFAULT_TRANSLATION_TIMEOUT_MS;
+  const timeoutBasePrompt = applyPromptCaching(
+    buildTranslationPrompt({
+      tokenizedTexts: texts.map(applyPunctuationTokens),
+      targetLanguage,
+      contextPayload: baseEffectiveContext,
+      strictTargetLanguage: false
+    }),
+    apiBaseUrl,
+    requestOptions
+  );
+  const estimatedPromptTokens = estimatePromptTokensFromMessages(timeoutBasePrompt);
+  const batchSize = texts.length;
+  const dynamicTimeoutMs = Math.min(
+    180000,
+    Math.max(
+      DEFAULT_TRANSLATION_TIMEOUT_MS,
+      DEFAULT_TRANSLATION_TIMEOUT_MS + estimatedPromptTokens * 8 + batchSize * 1500
+    )
+  );
 
   while (true) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), dynamicTimeoutMs);
 
     try {
       const attemptMeta =
