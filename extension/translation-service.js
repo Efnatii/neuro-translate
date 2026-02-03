@@ -880,8 +880,13 @@ function buildPromptCacheRateKey(cacheKey, url) {
   return `${safeKey}::${safeUrl}`;
 }
 
+function clampPromptCacheLimit(min, max, value) {
+  return Math.min(max, Math.max(min, value));
+}
+
 async function enforcePromptCacheRateLimit(cacheKey, url, options = {}) {
   const limitPerMinute = Number.isFinite(options.limitPerMinute) ? options.limitPerMinute : 12;
+  const batchSize = Number.isFinite(options.batchSize) ? options.batchSize : null;
   if (!limitPerMinute) return;
   const windowMs = Number.isFinite(options.windowMs) ? options.windowMs : 60000;
   const limiter = getPromptCacheRateLimiterState();
@@ -904,6 +909,18 @@ async function enforcePromptCacheRateLimit(cacheKey, url, options = {}) {
     }
     const earliest = entries[0];
     const waitMs = Math.max(50, earliest + windowMs - now + 25);
+    if (waitMs > 0) {
+      emitJsonLog({
+        kind: 'prompt_cache_rate_limit_wait',
+        ts: now,
+        cacheKey,
+        url,
+        batchSize,
+        limitPerMinute,
+        waitMs,
+        entriesCount: entries.length
+      });
+    }
     await sleep(waitMs);
   }
 }
@@ -1629,8 +1646,10 @@ async function performTranslationRequest(
   const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
   const batchSize = tokenizedTexts.length;
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
+    const limitPerMinute = clampPromptCacheLimit(12, 120, Math.round(96 / Math.max(1, batchSize)));
     await enforcePromptCacheRateLimit(operationType, normalizedRequestMeta?.url || '', {
-      limitPerMinute: 12
+      limitPerMinute,
+      batchSize
     });
   }
   const requestId = normalizedRequestMeta?.requestId || createRequestId();
