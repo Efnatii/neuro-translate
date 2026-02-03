@@ -77,6 +77,7 @@ let translationVisible = false;
 let latestContextSummary = '';
 let latestShortContextSummary = '';
 let shortContextPromise = null;
+const blockBudget = new Map();
 const contextState = {
   full: {
     status: 'empty',
@@ -128,6 +129,9 @@ const DEBUG_PAYLOADS_PER_ENTRY_LIMIT = 120;
 const MAX_BLOCK_RETRIES = 15;
 const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
+const BLOCK_FALLBACK_TIMEOUT_LIMIT = 2;
+const BLOCK_FALLBACK_ATTEMPT_LIMIT = 6;
+const BLOCK_FALLBACK_ELAPSED_LIMIT_MS = 10 * 60 * 1000;
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
 const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const BLOCK_KEY_ATTR = 'data-nt-block-key';
@@ -217,6 +221,98 @@ function formatModelSpec(id, tier) {
   if (!id) return '';
   const normalizedTier = tier === 'flex' || tier === 'standard' ? tier : 'standard';
   return `${id}:${normalizedTier}`;
+}
+
+function getBlockBudgetEntry(blockKey) {
+  if (!blockKey) return null;
+  let entry = blockBudget.get(blockKey);
+  if (!entry) {
+    entry = {
+      startedAtMs: Date.now(),
+      attemptsTotal: 0,
+      timeouts: 0,
+      fallbackEnabled: false
+    };
+    blockBudget.set(blockKey, entry);
+  }
+  return entry;
+}
+
+function evaluateBlockFallback(entry, blockKey) {
+  if (!entry || entry.fallbackEnabled) return false;
+  const elapsedMs = Date.now() - entry.startedAtMs;
+  const reasons = [];
+  if (entry.timeouts >= BLOCK_FALLBACK_TIMEOUT_LIMIT) reasons.push('timeouts');
+  if (entry.attemptsTotal >= BLOCK_FALLBACK_ATTEMPT_LIMIT) reasons.push('attempts');
+  if (elapsedMs >= BLOCK_FALLBACK_ELAPSED_LIMIT_MS) reasons.push('elapsed');
+  if (!reasons.length) return false;
+  entry.fallbackEnabled = true;
+  globalThis.ntPageJsonLog?.({
+    kind: 'block.fallback.enabled',
+    ts: Date.now(),
+    fields: {
+      blockKey,
+      reason: reasons.join('|'),
+      attemptsTotal: entry.attemptsTotal,
+      timeouts: entry.timeouts,
+      elapsedMs
+    }
+  });
+  return true;
+}
+
+function getRequestBlockKeys(requestMeta) {
+  if (!requestMeta || typeof requestMeta !== 'object') return [];
+  if (Array.isArray(requestMeta.batchBlockKeys) && requestMeta.batchBlockKeys.length) {
+    return requestMeta.batchBlockKeys.filter(Boolean);
+  }
+  if (requestMeta.blockKey) return [requestMeta.blockKey];
+  return [];
+}
+
+function recordBlockAttempt(blockKeys) {
+  let fallbackEnabled = false;
+  blockKeys.forEach((blockKey) => {
+    const entry = getBlockBudgetEntry(blockKey);
+    if (!entry) return;
+    entry.attemptsTotal += 1;
+    if (evaluateBlockFallback(entry, blockKey)) {
+      fallbackEnabled = true;
+    }
+    if (entry.fallbackEnabled) {
+      fallbackEnabled = true;
+    }
+  });
+  return fallbackEnabled;
+}
+
+function recordBlockTimeout(blockKeys) {
+  let fallbackEnabled = false;
+  blockKeys.forEach((blockKey) => {
+    const entry = getBlockBudgetEntry(blockKey);
+    if (!entry) return;
+    entry.timeouts += 1;
+    if (evaluateBlockFallback(entry, blockKey)) {
+      fallbackEnabled = true;
+    }
+    if (entry.fallbackEnabled) {
+      fallbackEnabled = true;
+    }
+  });
+  return fallbackEnabled;
+}
+
+function isTimeoutLikeError(error) {
+  if (!error) return false;
+  if (error?.name === 'AbortError') return true;
+  const message = String(error?.message || error || '').toLowerCase();
+  return message.includes('timeout') || message.includes('timed out') || message.includes('abort');
+}
+
+function isTimeoutLikeResponse(response) {
+  if (!response || typeof response !== 'object') return false;
+  if (response.isTimeout) return true;
+  return isTimeoutLikeError(response.error);
 }
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
@@ -2420,50 +2516,67 @@ async function translate(
           contextMode: resolvedContextMeta.contextMode
         })
       : null;
+    const requestBlockKeys = getRequestBlockKeys(baseRequestMeta);
+    const fallbackEnabled = recordBlockAttempt(requestBlockKeys);
+    const requestMetaForPayload =
+      batchRequestMeta && fallbackEnabled
+        ? { ...batchRequestMeta, flags: { ...(batchRequestMeta.flags || {}), fallbackMode: true } }
+        : batchRequestMeta;
     const estimatedTokens = estimateTokensForRole('translation', {
       texts: batch,
       context: [batchContext, baseAnswer].filter(Boolean).join('\n')
     });
     await ensureTpmBudget('translation', estimatedTokens);
-    const batchResult = await withRateLimitRetry(
-      async () => {
-        await incrementDebugAiRequestCount();
-        const response = await sendRuntimeMessage(
-          {
-            type: 'TRANSLATE_TEXT',
-            texts: batch,
-            targetLanguage,
-            context: {
-              text: batchContext,
-              mode: resolvedContextMeta.contextMode,
-              fullText: resolvedContextMeta.contextFullText || resolvedContextMeta.contextText || '',
-              shortText: resolvedContextMeta.contextShortText || '',
-              baseAnswer,
-              baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded
+    let batchResult = null;
+    try {
+      batchResult = await withRateLimitRetry(
+        async () => {
+          await incrementDebugAiRequestCount();
+          const response = await sendRuntimeMessage(
+            {
+              type: 'TRANSLATE_TEXT',
+              texts: batch,
+              targetLanguage,
+              context: {
+                text: batchContext,
+                mode: resolvedContextMeta.contextMode,
+                fullText: resolvedContextMeta.contextFullText || resolvedContextMeta.contextText || '',
+                shortText: resolvedContextMeta.contextShortText || '',
+                baseAnswer,
+                baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded
+              },
+              keepPunctuationTokens,
+              requestMeta: requestMetaForPayload || undefined
             },
-            keepPunctuationTokens,
-            requestMeta: batchRequestMeta || undefined
-          },
-          'Не удалось выполнить перевод.'
-        );
-        if (!response?.success) {
-          if (response?.contextOverflow) {
-            return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
+            'Не удалось выполнить перевод.'
+          );
+          if (!response?.success) {
+            if (isTimeoutLikeResponse(response)) {
+              recordBlockTimeout(requestBlockKeys);
+            }
+            if (response?.contextOverflow) {
+              return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
+            }
+            if (response?.isRuntimeError) {
+              return { success: false, error: response.error || 'Не удалось выполнить перевод.' };
+            }
+            throw new Error(response?.error || 'Не удалось выполнить перевод.');
           }
-          if (response?.isRuntimeError) {
-            return { success: false, error: response.error || 'Не удалось выполнить перевод.' };
-          }
-          throw new Error(response?.error || 'Не удалось выполнить перевод.');
-        }
-        return {
-          success: true,
-          translations: Array.isArray(response.translations) ? response.translations : [],
-          rawTranslation: response.rawTranslation || '',
-          debug: response.debug || []
-        };
-      },
-      'Translation'
-    );
+          return {
+            success: true,
+            translations: Array.isArray(response.translations) ? response.translations : [],
+            rawTranslation: response.rawTranslation || '',
+            debug: response.debug || []
+          };
+        },
+        'Translation'
+      );
+    } catch (error) {
+      if (isTimeoutLikeError(error)) {
+        recordBlockTimeout(requestBlockKeys);
+      }
+      throw error;
+    }
     if (!batchResult?.success) {
       return {
         success: false,
@@ -2758,7 +2871,8 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
       resolve({
         success: false,
         error: fallbackError || 'RPC timeout',
-        isRuntimeError: true
+        isRuntimeError: true,
+        isTimeout: true
       });
     }, timeoutMs);
     ntRpcPending.set(rpcId, { resolve, timeoutId, type: payload?.type, startedAt: requestStartedAt });
@@ -2804,7 +2918,8 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
         resolve({
           success: false,
           error: fallbackError || 'RPC timeout',
-          isRuntimeError: true
+          isRuntimeError: true,
+          isTimeout: true
         });
       }, timeoutMs);
       ntRpcPending.set(retryRpcId, { resolve, timeoutId, type: payload?.type, startedAt: retryStartedAt });
