@@ -126,6 +126,8 @@ const DEBUG_RAW_MAX_CHARS = 50000;
 const DEBUG_CALLS_TOTAL_LIMIT = 1200;
 const DEBUG_EVENTS_LIMIT = 200;
 const DEBUG_PAYLOADS_PER_ENTRY_LIMIT = 120;
+const DEBUG_TRANSLATE_BATCH_SAMPLE_LIMIT = 200;
+const DEBUG_RATE_LIMIT_WAIT_LIMIT = 200;
 const MAX_BLOCK_RETRIES = 15;
 const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
@@ -247,16 +249,18 @@ function evaluateBlockFallback(entry, blockKey) {
   if (elapsedMs >= BLOCK_FALLBACK_ELAPSED_LIMIT_MS) reasons.push('elapsed');
   if (!reasons.length) return false;
   entry.fallbackEnabled = true;
+  const payload = {
+    blockKey,
+    reason: reasons.join('|'),
+    attemptsTotal: entry.attemptsTotal,
+    timeouts: entry.timeouts,
+    elapsedMs
+  };
+  appendDebugEvent('block.fallback.enabled', '', payload);
   globalThis.ntPageJsonLog?.({
     kind: 'block.fallback.enabled',
     ts: Date.now(),
-    fields: {
-      blockKey,
-      reason: reasons.join('|'),
-      attemptsTotal: entry.attemptsTotal,
-      timeouts: entry.timeouts,
-      elapsedMs
-    }
+    fields: payload
   });
   return true;
 }
@@ -1721,6 +1725,21 @@ async function translatePage(settings, options = {}) {
               const doneSegments = translationsForItem.filter((value) => value != null).length;
               const totalSegments = translationsForItem.length;
               updateDebugEntry(item.index + 1, { doneSegments, totalSegments });
+              const partialPayload = {
+                blockKey: item.key,
+                doneSegments,
+                totalSegments,
+                batchIndex,
+                totalBatches: batchCount,
+                fallbackMode: item.fallbackMode || 'normal'
+              };
+              appendDebugEvent('translate.partial_applied', '', partialPayload);
+              globalThis.ntPageJsonLog?.({
+                kind: 'translate.partial_applied',
+                ts: Date.now(),
+                pageUrl: location.href,
+                fields: partialPayload
+              });
               traceBlockLifecycle(item.index + 1, 'translate', 'translate.partial_applied', {
                 blockKey: item.key,
                 doneSegments,
@@ -2117,7 +2136,11 @@ async function translatePage(settings, options = {}) {
 
       activeProofreadWorkers += 1;
       try {
-        await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress', proofreadExecuted: true });
+        await updateDebugEntry(task.index + 1, {
+          proofreadStatus: 'in_progress',
+          proofreadExecuted: true,
+          proofreadStartedAt: Date.now()
+        });
         traceBlockLifecycle(task.index + 1, 'proofread', 'block start', { blockKey: task.key });
         const debugEntry = debugEntries.find((item) => item.index === task.index + 1);
         const followupTag =
@@ -2517,6 +2540,14 @@ async function translate(
         })
       : null;
     const requestBlockKeys = getRequestBlockKeys(baseRequestMeta);
+    const batchBlockCount = Number.isFinite(baseRequestMeta?.batchBlockCount)
+      ? baseRequestMeta.batchBlockCount
+      : requestBlockKeys.length || 1;
+    recordTranslateBatchSize(batchBlockCount, {
+      requestId: batchRequestMeta?.requestId,
+      batchIndex: index + 1,
+      batchCount: batches.length
+    });
     const fallbackEnabled = recordBlockAttempt(requestBlockKeys);
     const requestMetaForPayload =
       batchRequestMeta && fallbackEnabled
@@ -3017,6 +3048,7 @@ async function withRateLimitRetry(requestFn, label) {
       }
       attempt += 1;
       console.warn(`${label} rate-limited, retrying after ${Math.ceil(delayMs / 1000)}s...`);
+      recordRateLimitWait(delayMs, label);
       await delay(delayMs);
     }
   }
@@ -4328,6 +4360,11 @@ async function resetTranslationDebugInfo(url) {
     sessionEndTime: entry.sessionEndTime ?? null,
     events: Array.isArray(entry.events) ? entry.events : [],
     callHistory: Array.isArray(entry.callHistory) ? entry.callHistory : [],
+    metrics: {
+      translateBatchSizes: [],
+      rateLimitWaits: [],
+      shortContextMaxChars: 0
+    },
     updatedAt: Date.now()
   };
   try {
@@ -4424,6 +4461,11 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
     sessionEndTime: null,
     events: [],
     callHistory: [],
+    metrics: {
+      translateBatchSizes: [],
+      rateLimitWaits: [],
+      shortContextMaxChars: contextShortPreview.text.length
+    },
     updatedAt: Date.now()
   };
   await saveTranslationDebugInfo(location.href, debugState);
@@ -4506,6 +4548,12 @@ function updateDebugContextShort(context, status) {
   const preview = { text: value, truncated: false };
   debugState.contextShort = preview.text;
   debugState.contextShortTruncated = preview.truncated;
+  const metrics = ensureDebugMetrics();
+  if (metrics) {
+    const currentLength = preview.text.length;
+    const existingMax = Number.isFinite(metrics.shortContextMaxChars) ? metrics.shortContextMaxChars : 0;
+    metrics.shortContextMaxChars = Math.max(existingMax, currentLength);
+  }
   if (value) {
     const refId = debugState.contextShortRefId || `${debugSessionId || 'session'}:context:short`;
     debugState.contextShortRefId = refId;
@@ -4561,7 +4609,80 @@ function updateDebugEntry(index, updates = {}) {
   schedulePersistDebugState('updateDebugEntry');
 }
 
-function appendDebugEvent(tag, message) {
+function ensureDebugMetrics() {
+  if (!debugState) return null;
+  if (!debugState.metrics || typeof debugState.metrics !== 'object') {
+    debugState.metrics = {
+      translateBatchSizes: [],
+      rateLimitWaits: [],
+      shortContextMaxChars: 0
+    };
+  }
+  return debugState.metrics;
+}
+
+function recordTranslateBatchSize(batchSize, meta = {}) {
+  if (!debugState || !Number.isFinite(batchSize) || batchSize <= 0) return;
+  const metrics = ensureDebugMetrics();
+  if (!metrics) return;
+  const samples = Array.isArray(metrics.translateBatchSizes) ? metrics.translateBatchSizes : [];
+  samples.push({
+    ts: Date.now(),
+    batchSize
+  });
+  if (samples.length > DEBUG_TRANSLATE_BATCH_SAMPLE_LIMIT) {
+    metrics.translateBatchSizes = samples.slice(samples.length - DEBUG_TRANSLATE_BATCH_SAMPLE_LIMIT);
+  } else {
+    metrics.translateBatchSizes = samples;
+  }
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'translate.batch_size',
+        ts: Date.now(),
+        pageUrl: location.href,
+        batchSize,
+        requestId: meta?.requestId ?? null,
+        batchIndex: meta?.batchIndex ?? null,
+        batchCount: meta?.batchCount ?? null
+      },
+      'log'
+    );
+  }
+  schedulePersistDebugState('translateBatchSize');
+}
+
+function recordRateLimitWait(waitMs, label) {
+  if (!debugState || !Number.isFinite(waitMs) || waitMs <= 0) return;
+  const metrics = ensureDebugMetrics();
+  if (!metrics) return;
+  const waits = Array.isArray(metrics.rateLimitWaits) ? metrics.rateLimitWaits : [];
+  waits.push({
+    ts: Date.now(),
+    waitMs,
+    label: label || ''
+  });
+  if (waits.length > DEBUG_RATE_LIMIT_WAIT_LIMIT) {
+    metrics.rateLimitWaits = waits.slice(waits.length - DEBUG_RATE_LIMIT_WAIT_LIMIT);
+  } else {
+    metrics.rateLimitWaits = waits;
+  }
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'rate_limit.wait',
+        ts: Date.now(),
+        pageUrl: location.href,
+        waitMs,
+        label: label || ''
+      },
+      'log'
+    );
+  }
+  schedulePersistDebugState('rateLimitWait');
+}
+
+function appendDebugEvent(tag, message, payload = null) {
   if (!debugState) return;
   if (!Array.isArray(debugState.events)) {
     debugState.events = [];
@@ -4570,6 +4691,7 @@ function appendDebugEvent(tag, message) {
     id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
     tag,
     message: message || '',
+    payload: payload || null,
     timestamp: Date.now()
   });
   if (debugState.events.length > DEBUG_EVENTS_LIMIT) {
@@ -4582,7 +4704,8 @@ function appendDebugEvent(tag, message) {
         ts: Date.now(),
         pageUrl: location.href,
         tag,
-        message
+        message,
+        payload: payload || null
       },
       'log'
     );
