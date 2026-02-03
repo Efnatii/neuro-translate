@@ -222,6 +222,16 @@ function buildShortContextFromNormalized(normalized) {
   return buildShortContextFallback(fallbackSource).trim();
 }
 
+function buildFallbackContextPayload(normalized) {
+  const shortText = buildShortContextFromNormalized(normalized);
+  return {
+    ...normalized,
+    mode: 'SHORT',
+    text: shortText,
+    shortText
+  };
+}
+
 function createRequestId() {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
@@ -938,16 +948,35 @@ async function translateTexts(
 ) {
   if (!Array.isArray(texts) || !texts.length) return { translations: [], rawTranslation: '' };
 
+  const fallbackMode = Boolean(requestOptions?.fallbackMode || requestMeta?.flags?.fallbackMode);
   const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translation', purpose: 'main' });
-  const baseEffectiveContext = buildEffectiveContext(context, baseRequestMeta);
-  const maxTimeoutAttempts = 2;
-  const maxRetryableRetries = 3;
+  const normalizedContext = normalizeContextPayload(context);
+  const contextPayload = fallbackMode ? buildFallbackContextPayload(normalizedContext) : context;
+  const baseEffectiveContext = buildEffectiveContext(contextPayload, baseRequestMeta);
+  const maxTimeoutAttempts = fallbackMode ? 1 : 2;
+  const maxRetryableRetries = fallbackMode ? 0 : 3;
   let timeoutAttempts = 0;
   let retryableRetries = 0;
   let lastError = null;
   let lastRetryDelayMs = null;
   let lastRawTranslation = '';
   const debugPayloads = [];
+  const resolvedRequestOptions = fallbackMode
+    ? { ...(requestOptions || {}), fallbackMode: true, maxCompletionTokens: 1400 }
+    : requestOptions;
+  if (fallbackMode) {
+    emitJsonLog({
+      kind: 'translate.fallback.mode',
+      ts: Date.now(),
+      fields: {
+        requestId: baseRequestMeta.requestId,
+        maxTokens: 1400,
+        contextMode: 'SHORT',
+        validateEnabled: false,
+        repairEnabled: false
+      }
+    });
+  }
   const appendParseIssue = (issue) => {
     if (!issue) return;
     const last = debugPayloads[debugPayloads.length - 1];
@@ -988,146 +1017,158 @@ async function translateTexts(
   );
   const estimatedPromptTokens = estimatePromptTokensFromMessages(timeoutBasePrompt);
   const batchSize = texts.length;
+  const timeoutCapMs = fallbackMode ? 240000 : 180000;
   const dynamicTimeoutMs = Math.min(
-    180000,
+    timeoutCapMs,
     Math.max(
       DEFAULT_TRANSLATION_TIMEOUT_MS,
       DEFAULT_TRANSLATION_TIMEOUT_MS + estimatedPromptTokens * 8 + batchSize * 1500
     )
   );
 
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), dynamicTimeoutMs);
+  try {
+    while (true) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), dynamicTimeoutMs);
 
-    try {
-      const attemptMeta =
-        timeoutAttempts > 0 || retryableRetries > 0
-          ? createChildRequestMeta(baseRequestMeta, {
-              stage: 'translation',
-              purpose: 'retry',
-              attempt: baseRequestMeta.attempt + timeoutAttempts + retryableRetries,
-              triggerSource: 'retry',
-              forceFullContextOnRetry: true
-            })
-          : baseRequestMeta;
-      const result = await performTranslationRequest(
-        texts,
-        apiKey,
-        targetLanguage,
-        model,
-        controller.signal,
-        context,
-        apiBaseUrl,
-        !keepPunctuationTokens,
-        false,
-        true,
-        true,
-        attemptMeta,
-        requestOptions
-      );
-      lastRawTranslation = result.rawTranslation;
-      if (Array.isArray(result?.debug)) {
-        debugPayloads.push(...result.debug);
-      }
-      return {
-        translations: result.translations,
-        rawTranslation: result.rawTranslation,
-        debug: debugPayloads
-      };
-    } catch (error) {
-      lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
-      if (error?.rawTranslation) {
-        lastRawTranslation = error.rawTranslation;
-      }
-      if (error?.debugPayload) {
-        debugPayloads.push(error.debugPayload);
-      }
-
-      const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
-      if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
-        timeoutAttempts += 1;
-        appendParseIssue('retry:timeout');
-        if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
-          globalThis.ntJsonLog({
-            kind: 'translate.retry.timeout',
-            ts: Date.now(),
-            message: 'Translation attempt timed out, retrying...'
-          }, 'warn');
-        }
-        continue;
-      }
-
-      const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
-      const isRetryable = isRetryableStatus(error?.status) || error?.isRetryable || isRateLimit;
-      if (isRetryable && retryableRetries < maxRetryableRetries) {
-        retryableRetries += 1;
-        const retryDelayMs = calculateRetryDelayMs(retryableRetries, error?.retryAfterMs);
-        lastRetryDelayMs = retryDelayMs;
-        const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
-        appendParseIssue('retry:retryable');
-        if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
-          globalThis.ntJsonLog({
-            kind: 'translate.retry.retryable',
-            ts: Date.now(),
-            retryLabel,
-            retryDelayMs,
-            message: `Translation attempt ${retryLabel}, retrying after ${retryDelayMs}ms...`
-          }, 'warn');
-        }
-        await sleep(retryDelayMs);
-        continue;
-      }
-
-      const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
-      if (isLengthIssue && texts.length > 1) {
-        if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
-          globalThis.ntJsonLog({
-            kind: 'translate.fallback.length_mismatch_individual',
-            ts: Date.now(),
-            message: 'Falling back to per-item translation due to length mismatch.'
-          }, 'warn');
-        }
-        appendParseIssue('fallback:per-item');
-        const retryMeta = createChildRequestMeta(baseRequestMeta, {
-          stage: 'translation',
-          purpose: 'retry',
-          attempt: baseRequestMeta.attempt + 1,
-          triggerSource: 'retry'
-        });
-        const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), retryMeta);
-        const translations = await translateIndividually(
+      try {
+        const attemptMeta =
+          timeoutAttempts > 0 || retryableRetries > 0
+            ? createChildRequestMeta(baseRequestMeta, {
+                stage: 'translation',
+                purpose: 'retry',
+                attempt: baseRequestMeta.attempt + timeoutAttempts + retryableRetries,
+                triggerSource: 'retry',
+                forceFullContextOnRetry: true
+              })
+            : baseRequestMeta;
+        const result = await performTranslationRequest(
           texts,
           apiKey,
           targetLanguage,
           model,
-          retryContextPayload,
+          controller.signal,
+          contextPayload,
           apiBaseUrl,
-          keepPunctuationTokens,
-          true,
-          true,
-          debugPayloads,
-          retryMeta,
-          requestOptions
+          !keepPunctuationTokens,
+          false,
+          !fallbackMode,
+          !fallbackMode,
+          attemptMeta,
+          resolvedRequestOptions
         );
-        return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
-      }
+        lastRawTranslation = result.rawTranslation;
+        if (Array.isArray(result?.debug)) {
+          debugPayloads.push(...result.debug);
+        }
+        return {
+          translations: result.translations,
+          rawTranslation: result.rawTranslation,
+          debug: debugPayloads
+        };
+      } catch (error) {
+        lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
+        if (error?.rawTranslation) {
+          lastRawTranslation = error.rawTranslation;
+        }
+        if (error?.debugPayload) {
+          debugPayloads.push(error.debugPayload);
+        }
 
-      if (isRateLimit) {
-        const waitSeconds = Math.max(1, Math.ceil((lastRetryDelayMs || error?.retryAfterMs || 30000) / 1000));
-        const rateLimitError = new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
-        rateLimitError.status = error?.status || 429;
-        rateLimitError.isRateLimit = true;
-        rateLimitError.isRetryable = false;
-        rateLimitError.retryAfterMs = error?.retryAfterMs || lastRetryDelayMs || null;
-        rateLimitError.fallbackReason = 'rate_limit';
-        throw rateLimitError;
-      }
+        const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
+        if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
+          timeoutAttempts += 1;
+          appendParseIssue('retry:timeout');
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.retry.timeout',
+              ts: Date.now(),
+              message: 'Translation attempt timed out, retrying...'
+            }, 'warn');
+          }
+          continue;
+        }
 
-      throw lastError;
-    } finally {
-      clearTimeout(timeout);
+        const isRateLimit = error?.status === 429 || error?.status === 503 || error?.isRateLimit;
+        const isRetryable = isRetryableStatus(error?.status) || error?.isRetryable || isRateLimit;
+        if (isRetryable && retryableRetries < maxRetryableRetries) {
+          retryableRetries += 1;
+          const retryDelayMs = calculateRetryDelayMs(retryableRetries, error?.retryAfterMs);
+          lastRetryDelayMs = retryDelayMs;
+          const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
+          appendParseIssue('retry:retryable');
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.retry.retryable',
+              ts: Date.now(),
+              retryLabel,
+              retryDelayMs,
+              message: `Translation attempt ${retryLabel}, retrying after ${retryDelayMs}ms...`
+            }, 'warn');
+          }
+          await sleep(retryDelayMs);
+          continue;
+        }
+
+        const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
+        if (isLengthIssue && texts.length > 1 && !fallbackMode) {
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.fallback.length_mismatch_individual',
+              ts: Date.now(),
+              message: 'Falling back to per-item translation due to length mismatch.'
+            }, 'warn');
+          }
+          appendParseIssue('fallback:per-item');
+          const retryMeta = createChildRequestMeta(baseRequestMeta, {
+            stage: 'translation',
+            purpose: 'retry',
+            attempt: baseRequestMeta.attempt + 1,
+            triggerSource: 'retry'
+          });
+          const retryContextPayload = getRetryContextPayload(normalizedContext, retryMeta);
+          const translations = await translateIndividually(
+            texts,
+            apiKey,
+            targetLanguage,
+            model,
+            retryContextPayload,
+            apiBaseUrl,
+            keepPunctuationTokens,
+            true,
+            true,
+            debugPayloads,
+            retryMeta,
+            resolvedRequestOptions
+          );
+          return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
+        }
+
+        if (isRateLimit) {
+          const waitSeconds = Math.max(1, Math.ceil((lastRetryDelayMs || error?.retryAfterMs || 30000) / 1000));
+          const rateLimitError = new Error(`Rate limit reached—please retry in ${waitSeconds} seconds.`);
+          rateLimitError.status = error?.status || 429;
+          rateLimitError.isRateLimit = true;
+          rateLimitError.isRetryable = false;
+          rateLimitError.retryAfterMs = error?.retryAfterMs || lastRetryDelayMs || null;
+          rateLimitError.fallbackReason = 'rate_limit';
+          throw rateLimitError;
+        }
+
+        throw lastError;
+      } finally {
+        clearTimeout(timeout);
+      }
     }
+  } catch (error) {
+    if (fallbackMode) {
+      return {
+        translations: texts.map((text) => text),
+        rawTranslation: lastRawTranslation,
+        debug: debugPayloads
+      };
+    }
+    throw error;
   }
 }
 
@@ -1147,6 +1188,7 @@ async function performTranslationRequest(
   requestOptions = null
 ) {
   const normalizedRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translation', purpose: 'main' });
+  const fallbackMode = Boolean(requestOptions?.fallbackMode || requestMeta?.flags?.fallbackMode);
   const selection = resolveModelSpecForMeta(normalizedRequestMeta);
   const formatSpec = (id, tier) => {
     if (typeof formatModelSpec === 'function') {
@@ -1631,6 +1673,14 @@ async function performTranslationRequest(
       }
     }
   };
+  const maxCompletionTokens = Number.isFinite(requestOptions?.maxCompletionTokens)
+    ? requestOptions.maxCompletionTokens
+    : Number.isFinite(requestOptions?.maxTokens)
+      ? requestOptions.maxTokens
+      : null;
+  if (maxCompletionTokens != null) {
+    requestPayload.max_completion_tokens = maxCompletionTokens;
+  }
   applyPromptCacheParams(
     requestPayload,
     apiBaseUrl,
@@ -2016,60 +2066,64 @@ async function performTranslationRequest(
     if (requestMeta && typeof requestMeta === 'object' && !requestMeta.fallbackReason) {
       requestMeta.fallbackReason = 'length_mismatch';
     }
-    const repairItems = texts.map((text, index) => ({
-      id: String(index),
-      source: text,
-      draft: translations[index] ?? ''
-    }));
-    try {
-      const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), normalizedRequestMeta);
-      const repairRequestMeta = createChildRequestMeta(normalizedRequestMeta, {
-        stage: 'translation',
-        purpose: 'validate',
-        attempt: normalizedRequestMeta.attempt + 1,
-        triggerSource: 'validate'
-      });
-      const repairResult = await performTranslationRepairRequest(
-        repairItems,
-        apiKey,
-        targetLanguage,
-        model,
-        signal,
-        retryContextPayload,
-        apiBaseUrl,
-        repairRequestMeta,
-        requestOptions
-      );
-      if (repairResult?.debug && Array.isArray(debugPayloads)) {
-        if (!Array.isArray(repairResult.debug.parseIssues)) {
-          repairResult.debug.parseIssues = [];
+    if (fallbackMode || !allowLengthRetry) {
+      translations = normalizeTranslationsToLength(texts, translations);
+    } else {
+      const repairItems = texts.map((text, index) => ({
+        id: String(index),
+        source: text,
+        draft: translations[index] ?? ''
+      }));
+      try {
+        const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), normalizedRequestMeta);
+        const repairRequestMeta = createChildRequestMeta(normalizedRequestMeta, {
+          stage: 'translation',
+          purpose: 'validate',
+          attempt: normalizedRequestMeta.attempt + 1,
+          triggerSource: 'validate'
+        });
+        const repairResult = await performTranslationRepairRequest(
+          repairItems,
+          apiKey,
+          targetLanguage,
+          model,
+          signal,
+          retryContextPayload,
+          apiBaseUrl,
+          repairRequestMeta,
+          requestOptions
+        );
+        if (repairResult?.debug && Array.isArray(debugPayloads)) {
+          if (!Array.isArray(repairResult.debug.parseIssues)) {
+            repairResult.debug.parseIssues = [];
+          }
+          repairResult.debug.parseIssues.push('fallback:length-mismatch');
+          debugPayloads.push(repairResult.debug);
         }
-        repairResult.debug.parseIssues.push('fallback:length-mismatch');
-        debugPayloads.push(repairResult.debug);
-      }
-      if (Array.isArray(repairResult?.translations) && repairResult.translations.length === expectedLength) {
-        translations = repairResult.translations;
-      } else {
-        throw new Error(
+        if (Array.isArray(repairResult?.translations) && repairResult.translations.length === expectedLength) {
+          translations = repairResult.translations;
+        } else {
+          throw new Error(
+            `translation response length mismatch: expected ${expectedLength}, got ${translations.length}`
+          );
+        }
+      } catch (error) {
+        if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+          globalThis.ntJsonLog({
+            kind: 'translate.length_mismatch_repair_failed',
+            ts: Date.now(),
+            error: error && typeof error === 'object'
+              ? { name: error.name, message: error.message, stack: error.stack }
+              : String(error ?? '')
+          }, 'warn');
+        }
+        const lengthError = new Error(
           `translation response length mismatch: expected ${expectedLength}, got ${translations.length}`
         );
+        lengthError.rawTranslation = content;
+        lengthError.debugPayload = debugPayload;
+        throw lengthError;
       }
-    } catch (error) {
-      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
-        globalThis.ntJsonLog({
-          kind: 'translate.length_mismatch_repair_failed',
-          ts: Date.now(),
-          error: error && typeof error === 'object'
-            ? { name: error.name, message: error.message, stack: error.stack }
-            : String(error ?? '')
-        }, 'warn');
-      }
-      const lengthError = new Error(
-        `translation response length mismatch: expected ${expectedLength}, got ${translations.length}`
-      );
-      lengthError.rawTranslation = content;
-      lengthError.debugPayload = debugPayload;
-      throw lengthError;
     }
   }
   if (shouldPersistManualOutputs) {
@@ -2222,18 +2276,20 @@ async function performTranslationRequest(
     }
   }
 
-  translations = await repairTranslationsForLanguage(
-    texts,
-    translations,
-    apiKey,
-    targetLanguage,
-    model,
-    context,
-    apiBaseUrl,
-    debugPayloads,
-    normalizedRequestMeta,
-    requestOptions
-  );
+  if (!fallbackMode) {
+    translations = await repairTranslationsForLanguage(
+      texts,
+      translations,
+      apiKey,
+      targetLanguage,
+      model,
+      context,
+      apiBaseUrl,
+      debugPayloads,
+      normalizedRequestMeta,
+      requestOptions
+    );
+  }
 
   return {
     translations: texts.map((text, index) => {
@@ -3089,7 +3145,8 @@ async function translateIndividually(
     triggerSource: 'retry'
   });
   const results = [];
-  const maxRetryableRetries = 3;
+  const fallbackMode = Boolean(requestOptions?.fallbackMode || requestMeta?.flags?.fallbackMode);
+  const maxRetryableRetries = fallbackMode ? 0 : 3;
 
   for (const text of texts) {
     let retryableRetries = 0;
@@ -3115,7 +3172,8 @@ async function translateIndividually(
           false,
           allowRefusalRetry,
           allowLengthRetry,
-          attemptRequestMeta
+          attemptRequestMeta,
+          requestOptions
         );
         if (Array.isArray(result?.debug) && Array.isArray(debugPayloads)) {
           debugPayloads.push(...result.debug);
@@ -3268,6 +3326,17 @@ function parseTranslationsResponse(content, expectedLength, options = {}) {
   }
 
   return parseJsonArrayFlexible(content, lengthForValidation, 'translation');
+}
+
+function normalizeTranslationsToLength(texts, translations) {
+  const safeTranslations = Array.isArray(translations) ? translations : [];
+  return texts.map((text, index) => {
+    const candidate = safeTranslations[index];
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate;
+    }
+    return text;
+  });
 }
 
 function extractJsonArray(content = '', label = 'response') {
