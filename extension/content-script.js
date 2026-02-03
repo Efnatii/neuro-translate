@@ -3229,25 +3229,33 @@ function splitTextsByTokenEstimate(texts, context, maxTokens) {
   const targetTokens = TRANSLATION_MICROBATCH_TARGET_TOKENS;
   const batches = [];
   let current = [];
-  let currentTokens = 0;
+  let currentTokensTotal = 0;
+  let currentTokensNoContext = 0;
 
   texts.forEach((text, index) => {
-    const nextTokens = estimateTokensForRole('translation', {
+    const nextTotal = estimateTokensForRole('translation', {
       texts: [text],
       context: current.length ? '' : context
     });
-    if (current.length && currentTokens + nextTokens > maxTokens) {
+    const nextNoCtx = estimateTokensForRole('translation', {
+      texts: [text],
+      context: ''
+    });
+    if (current.length && currentTokensTotal + nextTotal > maxTokens) {
       batches.push(current);
       current = [];
-      currentTokens = 0;
+      currentTokensTotal = 0;
+      currentTokensNoContext = 0;
     }
     current.push(text);
-    currentTokens += nextTokens;
+    currentTokensTotal += nextTotal;
+    currentTokensNoContext += nextNoCtx;
     const isLast = index === texts.length - 1;
-    if (!isLast && targetTokens && currentTokens >= targetTokens) {
+    if (!isLast && targetTokens && currentTokensNoContext >= targetTokens) {
       batches.push(current);
       current = [];
-      currentTokens = 0;
+      currentTokensTotal = 0;
+      currentTokensNoContext = 0;
     }
   });
 
