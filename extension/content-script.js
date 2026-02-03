@@ -349,6 +349,49 @@ function truncateText(value = '', maxChars = DEBUG_PREVIEW_MAX_CHARS) {
   return { text: `${text.slice(0, maxChars)}…`, truncated: true };
 }
 
+function smartTruncate(value = '', maxChars = SHORT_CONTEXT_MAX_CHARS) {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  if (!maxChars || text.length <= maxChars) {
+    return text;
+  }
+  const candidate = text.slice(0, maxChars);
+  const newlineIndex = candidate.lastIndexOf('\n');
+  const sentenceIndex = candidate.lastIndexOf('. ');
+  const spaceIndex = candidate.lastIndexOf(' ');
+  let cutIndex = Math.max(newlineIndex, sentenceIndex, spaceIndex);
+  if (cutIndex <= 0) {
+    cutIndex = maxChars;
+  } else if (cutIndex === sentenceIndex) {
+    cutIndex += 1;
+  }
+  const trimmed = text.slice(0, cutIndex).trimEnd();
+  return `${trimmed || candidate.trimEnd()}…`;
+}
+
+function normalizeShortContext(text, { url, mode } = {}) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= SHORT_CONTEXT_MAX_CHARS) return trimmed;
+  const truncated = smartTruncate(trimmed, SHORT_CONTEXT_MAX_CHARS);
+  if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'context.short.truncated',
+        ts: Date.now(),
+        fields: {
+          beforeChars: trimmed.length,
+          afterChars: truncated.length,
+          limit: SHORT_CONTEXT_MAX_CHARS,
+          url: url || location.href,
+          mode: mode || 'SHORT'
+        }
+      },
+      'log'
+    );
+  }
+  return truncated;
+}
+
 function serializeRawValue(value) {
   if (value == null) return '';
   if (typeof value === 'string') return value;
@@ -886,6 +929,10 @@ async function translatePage(settings, options = {}) {
     cachedContextShort ||
     existingContextShortRecord?.value?.text ||
     '';
+  const normalizedContextShortText = normalizeShortContext(existingContextShortText, {
+    url: location.href,
+    mode: 'SHORT'
+  });
   const contextSignature = buildContextStateSignature(contextCacheSignature, settings);
   originalSnapshot = nodesWithPath.map(({ path, original, originalHash }) => ({
     path,
@@ -896,7 +943,7 @@ async function translatePage(settings, options = {}) {
   debugEntries = [];
   debugState = null;
   primeContextState(contextState.full, contextSignature, existingContextFullText);
-  primeContextState(contextState.short, contextSignature, existingContextShortText);
+  primeContextState(contextState.short, contextSignature, normalizedContextShortText);
   latestContextSummary = contextState.full.text || '';
   latestShortContextSummary = contextState.short.text || '';
   shortContextPromise = null;
@@ -939,7 +986,7 @@ async function translatePage(settings, options = {}) {
   await initializeDebugState(blocks, settings, {
     initialContextFull: latestContextSummary || existingContextFullText,
     initialContextFullStatus,
-    initialContextShort: latestShortContextSummary || existingContextShortText,
+    initialContextShort: latestShortContextSummary || normalizedContextShortText,
     initialContextShortStatus
   }, { blockKeys });
   if (latestContextSummary) {
@@ -2998,7 +3045,10 @@ async function requestShortContext(text, targetLanguage, requestMeta = null) {
     throw new Error(response?.error || 'Не удалось сгенерировать короткий контекст.');
   }
   recordAiResponseMetrics(response?.debug || []);
-  return response.context || '';
+  return normalizeShortContext(response.context || '', {
+    url: requestMeta?.url || location.href,
+    mode: 'SHORT'
+  });
 }
 
 function deduplicateTexts(texts) {
