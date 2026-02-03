@@ -1583,6 +1583,57 @@ async function translatePage(settings, options = {}) {
             });
           });
           const { uniqueTexts, indexMap } = deduplicateTexts(combinedPreparedTexts);
+          const perItemTranslations = batchItems.map((item) => new Array(item.block.length).fill(null));
+          const uniqueToSegments = new Map();
+          combinedPreparedTexts.forEach((_text, combinedIndex) => {
+            const mapping = segmentMap[combinedIndex];
+            const translationIndex = indexMap[combinedIndex];
+            if (!mapping || translationIndex == null) return;
+            if (!uniqueToSegments.has(translationIndex)) {
+              uniqueToSegments.set(translationIndex, []);
+            }
+            uniqueToSegments.get(translationIndex).push(mapping);
+          });
+          const applyBatchTranslations = ({ batchTranslations, batchIndices, batchIndex, batchCount }) => {
+            const touchedItems = new Set();
+            batchTranslations.forEach((translation, localIndex) => {
+              const uniqueIndex = batchIndices[localIndex];
+              const mappedSegments = uniqueToSegments.get(uniqueIndex) || [];
+              mappedSegments.forEach(({ itemIndex, segmentIndex }) => {
+                const item = batchItems[itemIndex];
+                const segment = item?.block?.[segmentIndex];
+                if (!segment) return;
+                const { node, path, original, originalHash } = segment;
+                const resolvedTranslation = translation || original;
+                let withOriginalFormatting = applyOriginalFormatting(original, resolvedTranslation);
+                if (keepPunctuationTokens) {
+                  withOriginalFormatting = restorePunctuationTokens(withOriginalFormatting);
+                }
+                perItemTranslations[itemIndex][segmentIndex] = withOriginalFormatting;
+                if (node && shouldApplyTranslation(node, original, originalHash)) {
+                  if (translationVisible) {
+                    node.nodeValue = withOriginalFormatting;
+                  }
+                  updateActiveEntry(path, original, withOriginalFormatting, originalHash);
+                }
+                touchedItems.add(itemIndex);
+              });
+            });
+            touchedItems.forEach((itemIndex) => {
+              const item = batchItems[itemIndex];
+              const translationsForItem = perItemTranslations[itemIndex];
+              const doneSegments = translationsForItem.filter((value) => value != null).length;
+              const totalSegments = translationsForItem.length;
+              updateDebugEntry(item.index + 1, { doneSegments, totalSegments });
+              traceBlockLifecycle(item.index + 1, 'translate', 'translate.partial_applied', {
+                blockKey: item.key,
+                doneSegments,
+                totalSegments,
+                batchIndex,
+                batchCount
+              });
+            });
+          };
           result = await runJobOnce(
             translateJobKey,
             async () => {
@@ -1601,7 +1652,7 @@ async function translatePage(settings, options = {}) {
                 keepPunctuationTokens,
                 null,
                 mainRequestMeta,
-                { skipSummaries: true }
+                { skipSummaries: true, onBatchApplied: applyBatchTranslations }
               );
             },
             (resolved) => resolved?.success
@@ -1645,19 +1696,19 @@ async function translatePage(settings, options = {}) {
                     contextText: fallbackContext.contextText,
                     contextMode: fallbackContext.contextMode,
                     baseAnswer: fallbackContext.baseAnswer,
-                    baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-                    baseAnswerPreview: fallbackContext.baseAnswerPreview,
-                    tag: fallbackContext.tag
-                  },
-                  keepPunctuationTokens,
-                  null,
-                  retryRequestMeta,
-                  { skipSummaries: true }
-                );
-              },
-              (resolved) => resolved?.success
-            );
-          }
+                  baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
+                  baseAnswerPreview: fallbackContext.baseAnswerPreview,
+                  tag: fallbackContext.tag
+                },
+                keepPunctuationTokens,
+                null,
+                retryRequestMeta,
+                { skipSummaries: true, onBatchApplied: applyBatchTranslations }
+              );
+            },
+            (resolved) => resolved?.success
+          );
+        }
           if (!result?.success) {
             throw new Error(result?.error || 'Не удалось выполнить перевод.');
           }
@@ -1674,13 +1725,17 @@ async function translatePage(settings, options = {}) {
           for (const item of batchItems) {
             traceBlockLifecycle(item.index + 1, 'translate', 'parsed OK', { batchSize: batchItems.length });
           }
-          const perItemTranslations = batchItems.map(() => []);
           combinedPreparedTexts.forEach((_text, combinedIndex) => {
             const mapping = segmentMap[combinedIndex];
             const translationIndex = indexMap[combinedIndex];
             if (!mapping || translationIndex == null) return;
-            perItemTranslations[mapping.itemIndex][mapping.segmentIndex] =
-              result.translations[translationIndex] ?? '';
+            const resolvedTranslation = result.translations[translationIndex] ?? '';
+            const { original } = batchItems[mapping.itemIndex].block[mapping.segmentIndex];
+            let formatted = applyOriginalFormatting(original, resolvedTranslation || original);
+            if (keepPunctuationTokens) {
+              formatted = restorePunctuationTokens(formatted);
+            }
+            perItemTranslations[mapping.itemIndex][mapping.segmentIndex] = formatted;
           });
           for (let itemIndex = 0; itemIndex < batchItems.length; itemIndex += 1) {
             const item = batchItems[itemIndex];
@@ -1688,19 +1743,16 @@ async function translatePage(settings, options = {}) {
             const contextMeta = batchContexts[itemIndex];
             const blockTranslations = [];
             try {
-              const translatedTexts = block.map(({ original }, segmentIndex) => {
-                const translated = perItemTranslations[itemIndex]?.[segmentIndex] || original;
-                return applyOriginalFormatting(original, translated);
+              const translatedTexts = block.map((_segment, segmentIndex) => {
+                const translated = perItemTranslations[itemIndex]?.[segmentIndex];
+                return translated == null ? block[segmentIndex].original : translated;
               });
               if (translatedTexts.length !== block.length) {
                 throw new Error(
                   `Block translation length mismatch: expected ${block.length}, got ${translatedTexts.length}`
                 );
               }
-              let finalTranslations = translatedTexts;
-              if (keepPunctuationTokens) {
-                finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
-              }
+              const finalTranslations = translatedTexts;
               block.forEach(({ node, path, original, originalHash }, segmentIndex) => {
                 if (!shouldApplyTranslation(node, original, originalHash)) {
                   blockTranslations.push(node.nodeValue);
@@ -1735,6 +1787,8 @@ async function translatePage(settings, options = {}) {
                 translatedSegments: translatedTexts,
                 translationStatus: 'done',
                 translationCompletedAt: Date.now(),
+                doneSegments: translatedTexts.length,
+                totalSegments: translatedTexts.length,
                 translationRaw: translationRawField.preview,
                 translationRawRefId: translationRawField.refId,
                 translationRawTruncated: translationRawField.truncated || translationRawField.rawTruncated,
@@ -1839,6 +1893,8 @@ async function translatePage(settings, options = {}) {
             translatedSegments: translatedTexts,
             translationStatus: 'done',
             translationCompletedAt: Date.now(),
+            doneSegments: translatedTexts.length,
+            totalSegments: translatedTexts.length,
             translationRaw: translationRawField.preview,
             translationRawRefId: translationRawField.refId,
             translationRawTruncated: translationRawField.truncated || translationRawField.rawTruncated,
@@ -2350,9 +2406,13 @@ async function translate(
   const summaryOptions = debugOptions && typeof debugOptions === 'object' ? debugOptions : {};
   const entryIndex = Number.isFinite(summaryOptions.entryIndex) ? summaryOptions.entryIndex : debugEntryIndex;
   const shouldSummarize = !summaryOptions.skipSummaries;
+  const onBatchApplied = typeof summaryOptions.onBatchApplied === 'function' ? summaryOptions.onBatchApplied : null;
+  let batchCursor = 0;
 
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
+    const batchIndices = batch.map((_text, offset) => batchCursor + offset);
+    batchCursor += batch.length;
     const batchContext = context;
     const batchRequestMeta = baseRequestMeta
       ? buildRequestMeta(baseRequestMeta, {
@@ -2412,6 +2472,14 @@ async function translate(
       };
     }
     translations.push(...batchResult.translations);
+    if (onBatchApplied) {
+      await onBatchApplied({
+        batchTranslations: batchResult.translations,
+        batchIndices,
+        batchIndex: index + 1,
+        batchCount: batches.length
+      });
+    }
     if (batchResult.rawTranslation) {
       rawParts.push(batchResult.rawTranslation);
     }
@@ -4173,6 +4241,8 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
     originalSegments: block.map(({ original }) => original),
     translated: '',
     translatedSegments: [],
+    doneSegments: 0,
+    totalSegments: block.length,
     translationRaw: '',
     translationRawRefId: '',
     translationRawTruncated: false,

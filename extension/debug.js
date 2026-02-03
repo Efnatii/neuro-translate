@@ -941,6 +941,7 @@ function createEntrySkeleton(entry, entryKey) {
         <div class="status-group">
           <span class="status-label">Перевод</span>
           <span data-role="translation-status"></span>
+          <span data-role="translation-progress"></span>
         </div>
         <div class="status-group">
           <span class="status-label">Вычитка</span>
@@ -978,6 +979,7 @@ function createEntrySkeleton(entry, entryKey) {
     entry,
     titleEl: entry.querySelector('[data-role="entry-title"]'),
     translationStatusEl: entry.querySelector('[data-role="translation-status"]'),
+    translationProgressEl: entry.querySelector('[data-role="translation-progress"]'),
     proofreadStatusEl: entry.querySelector('[data-role="proofread-status"]'),
     originalEl: entry.querySelector('[data-role="original-text"]'),
     translatedBodyEl: entry.querySelector('[data-role="translated-body"]'),
@@ -992,8 +994,15 @@ function patchEntry(entry, item, entryKey) {
   if (!parts) return;
   const translationStatus = normalizeStatus(item.translationStatus, item.translated);
   const proofreadStatus = normalizeStatus(item.proofreadStatus, item.proofread, item.proofreadApplied);
+  const totalSegments = Number.isFinite(item.totalSegments) ? item.totalSegments : null;
+  const doneSegments = Number.isFinite(item.doneSegments) ? item.doneSegments : null;
+  const progressText =
+    Number.isFinite(totalSegments) && totalSegments > 0 && Number.isFinite(doneSegments)
+      ? `${doneSegments}/${totalSegments}`
+      : '';
   setTextIfChanged(parts.titleEl, `Блок ${item.index || ''}`);
   setHtmlIfChanged(parts.translationStatusEl, renderStatusBadge(translationStatus));
+  setTextIfChanged(parts.translationProgressEl, progressText);
   setHtmlIfChanged(parts.proofreadStatusEl, renderStatusBadge(proofreadStatus));
   setTextIfChanged(parts.originalEl, item.original || '');
   const translatedHtml = item.translated
