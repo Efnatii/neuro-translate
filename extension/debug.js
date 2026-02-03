@@ -705,6 +705,21 @@ function renderSummary(data, fallbackMessage = '') {
   let failed = 0;
   let sumPromptTokens = 0;
   let sumCachedTokens = 0;
+  const now = Date.now();
+  const metrics = data?.metrics && typeof data.metrics === 'object' ? data.metrics : {};
+  const batchSamples = Array.isArray(metrics.translateBatchSizes) ? metrics.translateBatchSizes : [];
+  const recentBatchWindow = 50;
+  const recentBatchSamples = batchSamples.slice(-recentBatchWindow);
+  const batchSum = recentBatchSamples.reduce((sum, sample) => sum + Number(sample?.batchSize || 0), 0);
+  const avgBatchSizeValue =
+    recentBatchSamples.length > 0 ? batchSum / recentBatchSamples.length : null;
+  const avgBatchSize = Number.isFinite(avgBatchSizeValue) ? avgBatchSizeValue.toFixed(2) : '—';
+  const rateLimitWaits = Array.isArray(metrics.rateLimitWaits) ? metrics.rateLimitWaits : [];
+  const rateLimitWindowMinutes = 5;
+  const rateLimitWindowMs = rateLimitWindowMinutes * 60 * 1000;
+  const recentWaits = rateLimitWaits.filter((entry) => entry?.ts && entry.ts >= now - rateLimitWindowMs);
+  const waitCount = recentWaits.length;
+  const waitSumMs = recentWaits.reduce((sum, entry) => sum + Number(entry?.waitMs || 0), 0);
   items.forEach((item) => {
     const status = getOverallEntryStatus(item);
     if (status === 'done') completed += 1;
@@ -726,6 +741,10 @@ function renderSummary(data, fallbackMessage = '') {
   });
   const contextFullText = (data.contextFull || data.context || '').trim();
   const contextShortText = (data.contextShort || '').trim();
+  const shortContextChars = contextShortText.length;
+  const shortContextMaxChars = Number.isFinite(metrics.shortContextMaxChars)
+    ? metrics.shortContextMaxChars
+    : shortContextChars;
   const contextFullStatus = normalizeStatus(data.contextFullStatus || data.contextStatus, contextFullText);
   const contextShortStatus = normalizeStatus(data.contextShortStatus, contextShortText);
   const progress = total ? Math.round((completed / total) * 100) : 0;
@@ -759,6 +778,36 @@ function renderSummary(data, fallbackMessage = '') {
     contextFullStatus,
     contextShortStatus
   });
+  const inProgressEntries = items.filter((item) => getOverallEntryStatus(item) === 'in_progress');
+  const inProgressRatioSum = inProgressEntries.reduce((sum, item) => {
+    const totalSegments = Number(item?.totalSegments || 0);
+    const doneSegments = Number(item?.doneSegments || 0);
+    if (!totalSegments) return sum;
+    return sum + Math.min(1, Math.max(0, doneSegments / totalSegments));
+  }, 0);
+  const avgInProgressRatio =
+    inProgressEntries.length > 0 ? ((inProgressRatioSum / inProgressEntries.length) * 100).toFixed(1) : '—';
+  const staleInProgress = inProgressEntries.some((item) => {
+    const startedAt = item?.translationStartedAt || item?.proofreadStartedAt;
+    return Number.isFinite(startedAt) && now - startedAt > 10 * 60 * 1000;
+  });
+  const recentWaits2Min = rateLimitWaits.filter((entry) => entry?.ts && entry.ts >= now - 2 * 60 * 1000);
+  const waitSum2MinMs = recentWaits2Min.reduce((sum, entry) => sum + Number(entry?.waitMs || 0), 0);
+  const healthChecks = [
+    {
+      label: 'Avg batch_size < 2 при shortContext > 600',
+      warning:
+        Number.isFinite(avgBatchSizeValue) && avgBatchSizeValue < 2 && shortContextChars > 600
+    },
+    {
+      label: 'Rate-limit wait > 10s за 2 минуты',
+      warning: waitSum2MinMs > 10000
+    },
+    {
+      label: 'Есть IN_PROGRESS > 10 минут',
+      warning: staleInProgress
+    }
+  ];
   const summaryLine = fallbackMessage
     ? `${fallbackMessage}`
     : `Контекст SHORT: ${STATUS_CONFIG[contextShortStatus]?.label || '—'} • Контекст FULL: ${STATUS_CONFIG[contextFullStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount}${cacheSummary}`;
@@ -776,6 +825,41 @@ function renderSummary(data, fallbackMessage = '') {
           ${renderStatusBadge(overallStatus)}
         </div>
       </div>
+    </div>
+    <div class="summary-metrics">
+      <div class="summary-metrics-row">
+        <span class="summary-metric-label">Avg batch_size (last ${recentBatchWindow})</span>
+        <span class="summary-metric-value">${escapeHtml(avgBatchSize)}</span>
+      </div>
+      <div class="summary-metrics-row">
+        <span class="summary-metric-label">Rate-limit waits (last ${rateLimitWindowMinutes}m)</span>
+        <span class="summary-metric-value">${escapeHtml(`${waitCount} • ${Math.round(waitSumMs)}ms`)}</span>
+      </div>
+      <div class="summary-metrics-row">
+        <span class="summary-metric-label">Short context chars (current / max)</span>
+        <span class="summary-metric-value">${escapeHtml(`${shortContextChars} / ${shortContextMaxChars}`)}</span>
+      </div>
+      <div class="summary-metrics-row">
+        <span class="summary-metric-label">Block progress (DONE / IN_PROGRESS)</span>
+        <span class="summary-metric-value">${escapeHtml(`${completed} / ${inProgress}`)}</span>
+      </div>
+      <div class="summary-metrics-row">
+        <span class="summary-metric-label">IN_PROGRESS avg doneSegments/totalSegments</span>
+        <span class="summary-metric-value">${escapeHtml(avgInProgressRatio === '—' ? '—' : `${avgInProgressRatio}%`)}</span>
+      </div>
+    </div>
+    <div class="summary-health">
+      <div class="summary-health-title">Health checks</div>
+      ${healthChecks
+        .map(
+          (check) => `
+            <div class="summary-health-row">
+              <span class="summary-health-label">${escapeHtml(check.label)}</span>
+              <span class="summary-health-status">${escapeHtml(check.warning ? 'Warning' : 'OK')}</span>
+            </div>
+          `
+        )
+        .join('')}
     </div>
     <div class="cache-summary">
       ${renderCacheRow('Translate', cacheStatsByType.translate)}
@@ -836,11 +920,17 @@ function renderEvents(data) {
           const ts = event?.timestamp ? new Date(event.timestamp).toLocaleTimeString('ru-RU') : '—';
           const tag = event?.tag || 'EVENT';
           const message = event?.message || '';
+          const payload = event?.payload;
+          const payloadText =
+            payload == null ? '' : typeof payload === 'string' ? payload : JSON.stringify(payload);
+          const fullMessage = message
+            ? `${message}${payloadText ? ` ${payloadText}` : ''}`
+            : payloadText;
           return `
             <div class="event-row">
               <span class="event-time">${escapeHtml(ts)}</span>
               <span class="event-tag">${escapeHtml(tag)}</span>
-              <span class="event-message">${escapeHtml(message)}</span>
+              <span class="event-message">${escapeHtml(fullMessage)}</span>
             </div>
           `;
         })
