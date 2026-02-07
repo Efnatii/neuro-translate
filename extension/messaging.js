@@ -88,7 +88,13 @@ async function ensureContentScriptInjected(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ['content-script.js'],
+      files: [
+        'resilience-policy.js',
+        'ui-translation-memory.js',
+        'segment-dedup.js',
+        'scheduler/page-preflight.js',
+        'content-script.js'
+      ],
       world: 'ISOLATED'
     });
     return { ok: true };

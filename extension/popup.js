@@ -11,6 +11,7 @@ const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
 const blockLengthLimitInput = document.getElementById('blockLengthLimit');
 const blockLengthValueLabel = document.getElementById('blockLengthValue');
+const batchTurboModeSelect = document.getElementById('batchTurboMode');
 const statusLabel = document.getElementById('status');
 const statusProgressBar = document.getElementById('statusProgress');
 const statusProgressFill = document.getElementById('statusProgressFill');
@@ -34,6 +35,9 @@ let pendingFailureTimeoutId = null;
 let popupPort = null;
 let popupReconnectTimer = null;
 let popupReconnectDelay = 500;
+let blockLengthUpdateTimeout = null;
+let pendingBlockLengthLimit = null;
+let lastBlockLengthLimit = null;
 
 const models = buildModelOptions();
 const defaultModelSpec = getDefaultModelSpec(models);
@@ -100,6 +104,7 @@ async function init() {
         proofreadModelList: state.proofreadModelList,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
+        batchTurboMode: state.batchTurboMode,
         singleBlockConcurrency: state.singleBlockConcurrency,
         assumeOpenAICompatibleApi: state.assumeOpenAICompatibleApi,
         blockLengthLimit: state.blockLengthLimit,
@@ -148,7 +153,9 @@ async function init() {
   renderProofreadEnabled(state.proofreadEnabled);
   renderSingleBlockConcurrency(state.singleBlockConcurrency);
   renderAssumeOpenAICompatibleApi(state.assumeOpenAICompatibleApi);
+  renderBatchTurboMode(state.batchTurboMode);
   renderBlockLengthLimit(state.blockLengthLimit);
+  lastBlockLengthLimit = clampBlockLengthLimit(Number(state.blockLengthLimit));
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   updateCanShowTranslation(currentTranslationStatus);
   renderStatus();
@@ -164,6 +171,9 @@ async function init() {
   openAiProjectInput.addEventListener('input', handleOpenAiProjectChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
+  if (batchTurboModeSelect) {
+    batchTurboModeSelect.addEventListener('change', handleBatchTurboModeChange);
+  }
   const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
   if (singleBlockConcurrencyCheckbox) {
     singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
@@ -260,6 +270,13 @@ async function handleProofreadEnabledChange() {
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
+async function handleBatchTurboModeChange() {
+  if (!batchTurboModeSelect) return;
+  const batchTurboMode = batchTurboModeSelect.value;
+  await chrome.storage.local.set({ batchTurboMode });
+  setTemporaryStatus('Batch Turbo Mode обновлён.');
+}
+
 function getSingleBlockConcurrencyCheckbox() {
   return document.getElementById('singleBlockConcurrency');
 }
@@ -294,15 +311,37 @@ async function handleAssumeOpenAICompatibleApiChange() {
 
 async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
-  await chrome.storage.local.set({ blockLengthLimit });
   renderBlockLengthLimit(blockLengthLimit);
-  await sendBlockLengthLimitUpdate(blockLengthLimit);
+  scheduleBlockLengthLimitUpdate(blockLengthLimit);
 }
 
 async function handleBlockLengthLimitCommit() {
+  const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
+  clearTimeout(blockLengthUpdateTimeout);
+  blockLengthUpdateTimeout = null;
+  await applyBlockLengthLimitUpdate(blockLengthLimit);
   const tab = await getActiveTab();
   if (!tab?.id) return;
   await chrome.tabs.reload(tab.id);
+}
+
+function scheduleBlockLengthLimitUpdate(blockLengthLimit) {
+  pendingBlockLengthLimit = blockLengthLimit;
+  clearTimeout(blockLengthUpdateTimeout);
+  blockLengthUpdateTimeout = setTimeout(() => {
+    const nextLimit = pendingBlockLengthLimit;
+    pendingBlockLengthLimit = null;
+    blockLengthUpdateTimeout = null;
+    if (nextLimit == null) return;
+    void applyBlockLengthLimitUpdate(nextLimit);
+  }, 250);
+}
+
+async function applyBlockLengthLimitUpdate(blockLengthLimit) {
+  if (blockLengthLimit === lastBlockLengthLimit) return;
+  lastBlockLengthLimit = blockLengthLimit;
+  await chrome.storage.local.set({ blockLengthLimit });
+  await sendBlockLengthLimitUpdate(blockLengthLimit);
 }
 
 async function getState() {
@@ -321,6 +360,7 @@ async function getState() {
         'proofreadModelList',
         'contextGenerationEnabled',
         'proofreadEnabled',
+        'batchTurboMode',
         'singleBlockConcurrency',
         'assumeOpenAICompatibleApi',
         'blockLengthLimit',
@@ -410,6 +450,7 @@ async function getState() {
           proofreadModelList,
           contextGenerationEnabled: data.contextGenerationEnabled,
           proofreadEnabled: data.proofreadEnabled,
+          batchTurboMode: data.batchTurboMode || 'off',
           singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
           assumeOpenAICompatibleApi: Boolean(data.assumeOpenAICompatibleApi),
           blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
@@ -604,6 +645,12 @@ function renderSingleBlockConcurrency(enabled) {
   }
 }
 
+function renderBatchTurboMode(mode) {
+  if (!batchTurboModeSelect) return;
+  const allowed = new Set(['off', 'prewarm_ui', 'prewarm_dedup_all']);
+  batchTurboModeSelect.value = allowed.has(mode) ? mode : 'off';
+}
+
 function renderAssumeOpenAICompatibleApi(enabled) {
   const checkbox = getAssumeOpenAICompatibleApiCheckbox();
   if (checkbox) {
@@ -770,6 +817,9 @@ function handleStorageChange(changes) {
     cancelScheduledFailure();
     const nextVisibility = changes.translationVisibilityByTab.newValue || {};
     renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
+  }
+  if (changes.batchTurboMode) {
+    renderBatchTurboMode(changes.batchTurboMode.newValue);
   }
 }
 
