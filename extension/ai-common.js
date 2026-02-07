@@ -24,6 +24,17 @@
     };
   };
 
+  const normalizeJsonEvent = (eventObject) => {
+    if (!eventObject || typeof eventObject !== 'object') return eventObject;
+    if (!eventObject.fields || typeof eventObject.fields !== 'object') return eventObject;
+    const normalized = { ...eventObject, ...eventObject.fields };
+    if (normalized.kind === 'throughput.429' && normalized.concurrencyLimit == null) {
+      normalized.concurrencyLimit = normalized.newConcurrencyLimit ?? null;
+    }
+    delete normalized.fields;
+    return normalized;
+  };
+
   const updateEnabled = (value) => {
     loggerState.enabled = Boolean(value);
   };
@@ -31,15 +42,16 @@
   globalThis.ntJsonLogEnabled = () => loggerState.enabled;
   globalThis.ntJsonLog = (eventObject, level = 'log') => {
     if (!loggerState.enabled) return;
+    const normalized = normalizeJsonEvent(eventObject);
     const method = console[level] ? level : 'log';
-    console[method](JSON.stringify(eventObject, createSafeReplacer()));
+    console[method](JSON.stringify(normalized, createSafeReplacer()));
   };
   globalThis.ntConsoleLog = (level, eventObjectOrArgs) => {
     if (!globalThis.ntJsonLogEnabled?.()) return;
     if (typeof globalThis.ntJsonLog !== 'function') return;
     const normalizedLevel = typeof level === 'string' ? level : 'log';
     if (eventObjectOrArgs && typeof eventObjectOrArgs === 'object' && !Array.isArray(eventObjectOrArgs)) {
-      globalThis.ntJsonLog(eventObjectOrArgs, normalizedLevel);
+      globalThis.ntJsonLog(normalizeJsonEvent(eventObjectOrArgs), normalizedLevel);
       return;
     }
     const args = Array.isArray(eventObjectOrArgs) ? eventObjectOrArgs : [eventObjectOrArgs];

@@ -1,5 +1,14 @@
 importScripts('ai-common.js');
+importScripts('guardrails.js');
+importScripts('resilience-policy.js');
 importScripts('messaging.js');
+importScripts('throughput-controller.js');
+importScripts('model-router.js');
+importScripts('llm/Operation.js');
+importScripts('llm/RequestRunner.js');
+importScripts('scheduler/task-scheduler.js');
+importScripts('batch/batch-client.js');
+importScripts('batch/batch-prewarm.js');
 importScripts('translation-service.js');
 importScripts('context-service.js');
 importScripts('proofread-service.js');
@@ -30,6 +39,7 @@ const DEFAULT_STATE = {
   proofreadModelList: ['gpt-4.1-mini:standard'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
+  batchTurboMode: 'off',
   singleBlockConcurrency: false,
   assumeOpenAICompatibleApi: false,
   blockLengthLimit: 1200,
@@ -62,6 +72,7 @@ const STATE_CACHE_KEYS = new Set([
   'proofreadModelList',
   'contextGenerationEnabled',
   'proofreadEnabled',
+  'batchTurboMode',
   'singleBlockConcurrency',
   'assumeOpenAICompatibleApi',
   'blockLengthLimit',
@@ -76,6 +87,39 @@ const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const DEBUG_PORTS = new Set();
 const POPUP_PORTS = new Set();
 let debugDbPromise = null;
+let schedulerTickTimer = null;
+const SCHEDULER_TICK_INTERVAL_MS = 4000;
+let batchPollTimer = null;
+const BATCH_POLL_INTERVAL_MS = 5 * 60 * 1000;
+const BATCH_PREWARM_STORAGE_KEY = 'batchPrewarmJobs';
+
+function getTaskScheduler() {
+  return globalThis.ntTaskScheduler || null;
+}
+
+function startSchedulerTick() {
+  if (schedulerTickTimer) return;
+  schedulerTickTimer = setInterval(() => {
+    const scheduler = getTaskScheduler();
+    if (!scheduler || typeof scheduler.getTickSnapshot !== 'function') return;
+    const snapshot = scheduler.getTickSnapshot();
+    globalThis.ntJsonLog?.({
+      kind: 'scheduler.tick',
+      ts: Date.now(),
+      inFlightByQueue: snapshot.inFlightByQueue,
+      queuedByQueue: snapshot.queuedByQueue,
+      governorStats: snapshot.governorStats,
+      backoffKeysCount: snapshot.governorStats?.filter((entry) => entry.backoffUntilMs > Date.now()).length || 0
+    });
+  }, SCHEDULER_TICK_INTERVAL_MS);
+}
+
+function startBatchPoller() {
+  if (batchPollTimer) return;
+  batchPollTimer = setInterval(() => {
+    void pollBatchPrewarmJobs();
+  }, BATCH_POLL_INTERVAL_MS);
+}
 
 function openDebugDb() {
   if (debugDbPromise) return debugDbPromise;
@@ -403,6 +447,11 @@ function applyStatePatch(patch = {}) {
       next[key] = Boolean(value);
       continue;
     }
+    if (key === 'batchTurboMode') {
+      const allowedModes = new Set(['off', 'prewarm_ui', 'prewarm_dedup_all']);
+      next[key] = allowedModes.has(value) ? value : DEFAULT_STATE.batchTurboMode;
+      continue;
+    }
     if (['blockLengthLimit', 'tpmSafetyBufferTokens'].includes(key)) {
       const numValue = Number(value);
       next[key] = Number.isFinite(numValue) ? numValue : DEFAULT_STATE[key];
@@ -659,6 +708,19 @@ function recordCooldownIfNeeded(modelSpec, reason, error) {
   }
 }
 
+function deriveTaskType(stage, requestMeta = {}) {
+  const flags = requestMeta?.flags || {};
+  if (flags.uiMode) return 'ui';
+  const triggerSource = typeof requestMeta?.triggerSource === 'string' ? requestMeta.triggerSource : '';
+  const purpose = typeof requestMeta?.purpose === 'string' ? requestMeta.purpose : '';
+  const normalizedTrigger = triggerSource.toLowerCase();
+  const normalizedPurpose = purpose.toLowerCase();
+  if (normalizedPurpose.includes('repair') || normalizedTrigger.includes('repair')) return 'repair';
+  if (normalizedPurpose.includes('validate') || normalizedTrigger.includes('validate')) return 'validate';
+  if (stage === 'proofread') return 'proofread';
+  return 'translation';
+}
+
 function buildMissingKeyReason(roleLabel, config, model) {
   return `Перевод недоступен: укажите OpenAI API ключ для модели ${model} (${roleLabel}).`;
 }
@@ -768,6 +830,9 @@ async function ensureDefaultKeysOnFreshInstall() {
   applyStatePatch({ ...DEFAULT_STATE, ...safeStored, ...patch });
 }
 
+startSchedulerTick();
+startBatchPoller();
+
 chrome.runtime.onInstalled.addListener(async (details) => {
   const reason = details?.reason;
   if (reason === 'install') {
@@ -848,6 +913,18 @@ chrome.runtime.onConnect.addListener((port) => {
         break;
       case 'PROOFREAD_TEXT':
         responsePromise = invokeHandlerAsPromise(handleProofreadText, msg, 180000);
+        break;
+      case 'START_PAGE_PLAN':
+        responsePromise = invokeHandlerAsPromise(handleStartPagePlan, msg, 5000);
+        break;
+      case 'SCHEDULER_REQUEST_SLOT':
+        responsePromise = invokeHandlerAsPromise(handleSchedulerRequestSlot, msg, 2000);
+        break;
+      case 'SCHEDULER_RECORD_OUTCOME':
+        responsePromise = invokeHandlerAsPromise(handleSchedulerRecordOutcome, msg, 2000);
+        break;
+      case 'START_BATCH_PREWARM':
+        responsePromise = invokeHandlerAsPromise(handleStartBatchPrewarm, msg, 5000);
         break;
       case 'GET_SETTINGS':
         responsePromise = invokeSettingsAsPromise(handleGetSettings, msg, 1500).then((settings) => ({
@@ -1184,6 +1261,7 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModelList: DEFAULT_STATE.proofreadModelList,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        batchTurboMode: DEFAULT_STATE.batchTurboMode,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
@@ -1233,6 +1311,7 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModelList: state.proofreadModelList,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
+        batchTurboMode: state.batchTurboMode || DEFAULT_STATE.batchTurboMode,
         singleBlockConcurrency: state.singleBlockConcurrency,
         assumeOpenAICompatibleApi: state.assumeOpenAICompatibleApi,
         blockLengthLimit: state.blockLengthLimit,
@@ -1259,6 +1338,7 @@ async function handleGetSettings(message, sendResponse) {
       proofreadModelList: DEFAULT_STATE.proofreadModelList,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      batchTurboMode: DEFAULT_STATE.batchTurboMode,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
       assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
@@ -1285,6 +1365,7 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModelList: DEFAULT_STATE.proofreadModelList,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        batchTurboMode: DEFAULT_STATE.batchTurboMode,
         singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
@@ -1304,11 +1385,47 @@ async function handleGetSettings(message, sendResponse) {
 async function executeModelFallback(stage, state, message, handler) {
   const baseRequestMeta = message?.requestMeta && typeof message.requestMeta === 'object' ? message.requestMeta : {};
   const { orderedList, originalRequestedModelList, candidateStrategy } = getCandidateModels(stage, baseRequestMeta, state);
+  const preferredSpec = originalRequestedModelList?.[0] || orderedList?.[0] || '';
+  const taskType = deriveTaskType(stage, baseRequestMeta);
+  const operationType = typeof getPromptCacheKey === 'function' ? getPromptCacheKey(stage) : stage;
+  const host = (() => {
+    try {
+      const url = baseRequestMeta?.url || '';
+      return url ? new URL(url).host : '';
+    } catch (error) {
+      return '';
+    }
+  })();
+  const router = globalThis.ntModelRouter;
+  const routerChoice = router && typeof router.selectModel === 'function'
+    ? router.selectModel({
+        type: taskType,
+        preferredModel: preferredSpec,
+        allowedModels: originalRequestedModelList,
+        allowMoreExpensiveFallback: false,
+        allowCheaperFallback: true,
+        operationType,
+        requestId: baseRequestMeta?.requestId || '',
+        estimatedTokens: message?.estimatedTokens ?? null,
+        host
+      })
+    : null;
+  let routedList = orderedList;
+  if (routerChoice?.chosenSpec) {
+    routedList = [routerChoice.chosenSpec, ...orderedList.filter((spec) => spec !== routerChoice.chosenSpec)];
+  }
+  if (message?.requestOptions?.resilience?.forceAlternateModel && routedList.length > 1) {
+    const preferredCandidate = preferredSpec || routedList[0];
+    const alternate = routedList.find((spec) => spec !== preferredCandidate);
+    if (alternate) {
+      routedList = [alternate, ...routedList.filter((spec) => spec !== alternate)];
+    }
+  }
   let attemptIndex = 0;
   let lastError = null;
   let fallbackReasonForNext = null;
 
-  for (const modelSpec of orderedList) {
+  for (const modelSpec of routedList) {
     const parsed = parseModelSpec(modelSpec);
     const modelId = parsed.id;
     const requestedTier = parsed.tier;
@@ -1332,7 +1449,8 @@ async function executeModelFallback(stage, state, message, handler) {
       const requestOptions = {
         tier,
         serviceTier: tier === 'flex' ? 'flex' : null,
-        assumeOpenAICompatibleApi: Boolean(state.assumeOpenAICompatibleApi)
+        assumeOpenAICompatibleApi: Boolean(state.assumeOpenAICompatibleApi),
+        ...(message?.requestOptions || {})
       };
       return handler({ modelId, requestOptions, requestMeta });
     };
@@ -1562,6 +1680,305 @@ async function handleProofreadText(message, sendResponse) {
       contextOverflow: Boolean(error?.isContextOverflow)
     });
   }
+}
+
+async function handleStartPagePlan(message, sendResponse) {
+  try {
+    const scheduler = getTaskScheduler();
+    if (!scheduler) {
+      sendResponse({ ok: false, error: 'scheduler-unavailable' });
+      return;
+    }
+    const tabId = message?.tabId ?? null;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'tab-id-missing' });
+      return;
+    }
+    const plan = message?.plan || {};
+    const entry = scheduler.startPlan(tabId, plan);
+    globalThis.ntJsonLog?.({
+      kind: 'preflight.summary',
+      ts: Date.now(),
+      host: plan?.host || '',
+      totals: plan?.totals || {},
+      hints: plan?.hints || {}
+    });
+    sendResponse({ ok: true, planId: entry?.planId || plan?.planId || '' });
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+async function handleSchedulerRequestSlot(message, sendResponse) {
+  try {
+    const scheduler = getTaskScheduler();
+    if (!scheduler) {
+      sendResponse({ ok: false, error: 'scheduler-unavailable' });
+      return;
+    }
+    const key = message?.key || '';
+    const estimatedTokens = Number.isFinite(message?.estimatedTokens) ? message.estimatedTokens : 0;
+    const queueType = message?.queueType || '';
+    const result = scheduler.requestSlot({ key, estimatedTokens, queueType });
+    if (result?.allowed) {
+      globalThis.ntJsonLog?.({
+        kind: 'scheduler.dispatch',
+        ts: Date.now(),
+        taskType: message?.opType || queueType || 'unknown',
+        batchSize: Number.isFinite(message?.batchSize) ? message.batchSize : null,
+        model: key.split(':')[1] || '',
+        estimatedTokens,
+        contextMode: message?.contextMode || ''
+      });
+    }
+    sendResponse({ ok: true, ...result });
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+async function handleSchedulerRecordOutcome(message, sendResponse) {
+  try {
+    const scheduler = getTaskScheduler();
+    if (!scheduler) {
+      sendResponse({ ok: false, error: 'scheduler-unavailable' });
+      return;
+    }
+    const key = message?.key || '';
+    const status = Number.isFinite(message?.status) ? message.status : null;
+    const latencyMs = Number.isFinite(message?.latencyMs) ? message.latencyMs : null;
+    const queueType = message?.queueType || '';
+    const result = scheduler.recordOutcome({ key, status, latencyMs, queueType });
+    if (status === 429) {
+      globalThis.ntJsonLog?.({
+        kind: 'scheduler.backoff',
+        ts: Date.now(),
+        key,
+        backoffMs: result?.backoffMs || 0,
+        reason: '429'
+      });
+    }
+    sendResponse({ ok: true });
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+function getBatchClient() {
+  return globalThis.ntBatchClient || null;
+}
+
+function getBatchPrewarm() {
+  return globalThis.ntBatchPrewarm || null;
+}
+
+async function loadBatchJobs() {
+  const store = await storageLocalGet({ [BATCH_PREWARM_STORAGE_KEY]: [] });
+  const jobs = store?.[BATCH_PREWARM_STORAGE_KEY];
+  return Array.isArray(jobs) ? jobs : [];
+}
+
+async function saveBatchJobs(jobs) {
+  await storageLocalSet({ [BATCH_PREWARM_STORAGE_KEY]: jobs });
+}
+
+async function handleStartBatchPrewarm(message, sendResponse) {
+  try {
+    const batchClient = getBatchClient();
+    const batchPrewarm = getBatchPrewarm();
+    if (!batchClient || !batchPrewarm) {
+      sendResponse({ ok: false, error: 'batch-unavailable' });
+      return;
+    }
+    const state = await getState();
+    if (!state?.apiKey) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'missing_api_key' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    const items = Array.isArray(message?.items) ? message.items : [];
+    if (!items.length) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'no_candidates' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    const host = message?.host || '';
+    const targetLang = message?.targetLang || '';
+    const apiBaseUrl = OPENAI_API_URL;
+    const endpoint = batchPrewarm.pickBatchEndpoint(apiBaseUrl);
+    const model = batchPrewarm.pickBatchModel(state, 'translation');
+    const { jsonlText, requestMap, requestCount, inputBytes } = batchPrewarm.buildBatchJsonl({
+      items,
+      host,
+      targetLang,
+      model,
+      endpoint,
+      segmentsPerRequest: 1
+    });
+    if (!requestCount) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'no_candidates' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    if (requestCount > batchPrewarm.MAX_BATCH_REQUESTS_PER_PAGE || inputBytes > batchPrewarm.MAX_BATCH_BYTES) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'too_large' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    const config = {
+      apiKey: state.apiKey,
+      openAiOrganization: state.openAiOrganization || '',
+      openAiProject: state.openAiProject || '',
+      apiBaseUrl
+    };
+    let batchInfo;
+    try {
+      const filePayload = await batchClient.uploadBatchFile(jsonlText, config);
+      batchInfo = await batchClient.createBatch(filePayload?.id, endpoint, config);
+      const job = {
+        batchId: batchInfo?.id,
+        host,
+        targetLang,
+        endpoint,
+        model,
+        requestCount,
+        inputBytes,
+        inputFileId: filePayload?.id,
+        outputFileId: batchInfo?.output_file_id || null,
+        status: batchInfo?.status || 'created',
+        createdAt: Date.now(),
+        requestMap
+      };
+      const jobs = await loadBatchJobs();
+      jobs.push(job);
+      await saveBatchJobs(jobs);
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.created',
+        ts: Date.now(),
+        fields: {
+          host,
+          targetLang,
+          requests: requestCount,
+          endpoint,
+          model,
+          inputBytes,
+          batch_id: batchInfo?.id || ''
+        }
+      });
+      sendResponse({ ok: true, batchId: batchInfo?.id || '' });
+    } catch (error) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'unsupported_endpoint', error: error?.message || String(error) }
+      });
+      sendResponse({ ok: true, skipped: true });
+    }
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+async function pollBatchPrewarmJobs() {
+  const batchClient = getBatchClient();
+  const batchPrewarm = getBatchPrewarm();
+  if (!batchClient || !batchPrewarm) return;
+  let jobs = [];
+  try {
+    jobs = await loadBatchJobs();
+  } catch (error) {
+    return;
+  }
+  if (!jobs.length) return;
+  const state = await getState();
+  const config = {
+    apiKey: state.apiKey,
+    openAiOrganization: state.openAiOrganization || '',
+    openAiProject: state.openAiProject || '',
+    apiBaseUrl: OPENAI_API_URL
+  };
+  const remaining = [];
+  for (const job of jobs) {
+    if (!job?.batchId) continue;
+    let batchInfo = null;
+    try {
+      batchInfo = await batchClient.pollBatch(job.batchId, config);
+    } catch (error) {
+      remaining.push(job);
+      continue;
+    }
+    const status = batchInfo?.status || job.status;
+    if (status === 'completed' && batchInfo?.output_file_id) {
+      try {
+        const outputText = await batchClient.downloadOutput(batchInfo.output_file_id, config);
+        const parsed = batchPrewarm.parseBatchOutput({ jsonlText: outputText, requestMap: job.requestMap });
+        const { tmWrites } = await batchPrewarm.applyBatchToMemory({
+          storageGet: storageLocalGet,
+          storageSet: storageLocalSet,
+          host: job.host,
+          targetLang: job.targetLang,
+          requestMap: job.requestMap,
+          parsed
+        });
+        globalThis.ntJsonLog?.({
+          kind: 'batch.prewarm.completed',
+          ts: Date.now(),
+          fields: {
+            batch_id: job.batchId,
+            ok: true,
+            errors: parsed.errors || 0,
+            tmWrites,
+            elapsedMs: Date.now() - (job.createdAt || Date.now())
+          }
+        });
+      } catch (error) {
+        globalThis.ntJsonLog?.({
+          kind: 'batch.prewarm.completed',
+          ts: Date.now(),
+          fields: {
+            batch_id: job.batchId,
+            ok: false,
+            errors: 1,
+            tmWrites: 0,
+            elapsedMs: Date.now() - (job.createdAt || Date.now())
+          }
+        });
+      }
+      continue;
+    }
+    if (['failed', 'expired', 'cancelled'].includes(status)) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.completed',
+        ts: Date.now(),
+        fields: {
+          batch_id: job.batchId,
+          ok: false,
+          errors: 1,
+          tmWrites: 0,
+          elapsedMs: Date.now() - (job.createdAt || Date.now())
+        }
+      });
+      continue;
+    }
+    remaining.push({ ...job, status, outputFileId: batchInfo?.output_file_id || job.outputFileId });
+  }
+  await saveBatchJobs(remaining);
 }
 
 async function handleTranslationProgress(message, sender) {

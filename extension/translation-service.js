@@ -43,6 +43,124 @@ function emitJsonLog(eventObject) {
   }
 }
 
+function getThroughputController() {
+  return globalThis.ntThroughputController || null;
+}
+
+function getThroughputKey(operationType, model) {
+  if (typeof globalThis.ntThroughputKey === 'function') {
+    return globalThis.ntThroughputKey(operationType, model);
+  }
+  return `${operationType || 'unknown'}:${model || 'unknown'}`;
+}
+
+function getResiliencePolicy() {
+  return globalThis.ntResiliencePolicy || null;
+}
+
+function buildResilienceKey(opType, requestMeta, apiBaseUrl = '') {
+  const blockKey = requestMeta?.blockKey || requestMeta?.requestId || '';
+  let host = '';
+  try {
+    const url = requestMeta?.url || apiBaseUrl || '';
+    host = url ? new URL(url).host : '';
+  } catch (error) {
+    host = '';
+  }
+  return `${opType || 'unknown'}::${blockKey || host || 'request'}`;
+}
+
+function classifyResilienceError(error) {
+  const guardrailKind = error?.guardrailKind;
+  if (guardrailKind === 'count_mismatch') return 'count_mismatch';
+  if (guardrailKind === 'ids_subset' || guardrailKind === 'placeholders') return 'schema';
+  const status = error?.status;
+  const message = String(error?.message || error || '').toLowerCase();
+  if (status === 429 || status === 503 || message.includes('rate limit')) return 'rate_limited';
+  if (status === 408 || error?.name === 'AbortError' || message.includes('timed out')) return 'timeout';
+  if (message.includes('length mismatch') || message.includes('count mismatch')) return 'count_mismatch';
+  if (message.includes('schema') || message.includes('json')) return 'schema';
+  if (status >= 500) return 'transient';
+  return 'other';
+}
+
+function getUsageTotalTokens(usage) {
+  if (!usage) return null;
+  if (Number.isFinite(usage.total_tokens)) return usage.total_tokens;
+  const prompt = Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : 0;
+  const completion = Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0;
+  if (prompt || completion) return prompt + completion;
+  return null;
+}
+
+function getPredictionStateStore() {
+  if (!globalThis.__NT_PREDICTION_STATE__) {
+    globalThis.__NT_PREDICTION_STATE__ = { entries: new Map() };
+  }
+  return globalThis.__NT_PREDICTION_STATE__;
+}
+
+function getPredictionStateKey(model, stage = 'repair') {
+  return `${model || 'unknown'}::${stage}`;
+}
+
+function getPredictionStateEntry(model, stage = 'repair') {
+  const store = getPredictionStateStore();
+  const key = getPredictionStateKey(model, stage);
+  if (!store.entries.has(key)) {
+    store.entries.set(key, { badStreak: 0, disabledUntilMs: 0 });
+  }
+  return store.entries.get(key);
+}
+
+function isChatCompletionsEndpoint(apiBaseUrl = '') {
+  if (!apiBaseUrl || typeof apiBaseUrl !== 'string') return false;
+  const trimmed = apiBaseUrl.trim().toLowerCase();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.pathname.toLowerCase().endsWith('/v1/chat/completions');
+  } catch (error) {
+    return trimmed.endsWith('/v1/chat/completions');
+  }
+}
+
+function logPredictionEvent(kind, payload) {
+  emitJsonLog({
+    kind,
+    ts: Date.now(),
+    ...payload
+  });
+}
+
+function updatePredictionUsage(model, usage, requestId) {
+  if (!usage) return;
+  const accepted = Number.isFinite(usage.accepted_prediction_tokens) ? usage.accepted_prediction_tokens : null;
+  const rejected = Number.isFinite(usage.rejected_prediction_tokens) ? usage.rejected_prediction_tokens : null;
+  if (accepted == null && rejected == null) return;
+  const safeAccepted = Number.isFinite(accepted) ? accepted : 0;
+  const safeRejected = Number.isFinite(rejected) ? rejected : 0;
+  const total = safeAccepted + safeRejected;
+  const rejectedRatio = total ? safeRejected / total : 0;
+  const entry = getPredictionStateEntry(model, 'repair');
+  if (rejectedRatio > 0.35 || safeRejected > safeAccepted) {
+    entry.badStreak += 1;
+  } else if (rejectedRatio < 0.15) {
+    entry.badStreak = Math.max(0, entry.badStreak - 1);
+  }
+  if (entry.badStreak >= 2) {
+    entry.disabledUntilMs = Date.now() + 30 * 60 * 1000;
+  }
+  logPredictionEvent('prediction.usage', {
+    requestId,
+    model,
+    accepted: safeAccepted,
+    rejected: safeRejected,
+    rejected_ratio: rejectedRatio,
+    disabledUntilMs: entry.disabledUntilMs
+  });
+}
+
 function maskApiKey(apiKey) {
   if (!apiKey) return '';
   const text = String(apiKey);
@@ -154,6 +272,38 @@ function logLlmParseFail({ requestId, error, rawText, ts }) {
 
 function isRetryableStatus(status) {
   return typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
+}
+
+function stripUnsupportedStructuredOutputStrict(requestPayload, model, status, errorPayload, errorText) {
+  if (!requestPayload || typeof requestPayload !== 'object') return { changed: false, removedParams: [] };
+  if (status !== 400) return { changed: false, removedParams: [] };
+  const schema = requestPayload?.response_format?.json_schema;
+  if (!schema || schema.strict === undefined) return { changed: false, removedParams: [] };
+  if (!isUnsupportedParamError(status, errorPayload, errorText, 'strict')) {
+    return { changed: false, removedParams: [] };
+  }
+  delete schema.strict;
+  if (model) markModelParamUnsupported(model, 'response_format.json_schema.strict');
+  return { changed: true, removedParams: ['response_format.json_schema.strict'] };
+}
+
+function stripUnsupportedPredictionParam(requestPayload, model, status, errorPayload, errorText, requestId, apiBaseUrl) {
+  if (!requestPayload || typeof requestPayload !== 'object') return { changed: false, removedParams: [] };
+  if (status !== 400) return { changed: false, removedParams: [] };
+  if (!requestPayload.prediction) return { changed: false, removedParams: [] };
+  if (!isUnsupportedParamError(status, errorPayload, errorText, 'prediction')) {
+    return { changed: false, removedParams: [] };
+  }
+  delete requestPayload.prediction;
+  const entry = getPredictionStateEntry(model, 'repair');
+  entry.badStreak = Math.max(entry.badStreak, 2);
+  entry.disabledUntilMs = Date.now() + 30 * 60 * 1000;
+  logPredictionEvent('prediction.skipped', {
+    requestId,
+    endpoint: apiBaseUrl,
+    reason: 'unsupported_param'
+  });
+  return { changed: true, removedParams: ['prediction'] };
 }
 
 function normalizeContextPayload(context) {
@@ -950,8 +1100,30 @@ async function translateTexts(
 
   const fallbackMode = Boolean(requestOptions?.fallbackMode || requestMeta?.flags?.fallbackMode);
   const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'translation', purpose: 'main' });
+  const policy = getResiliencePolicy();
+  const resilienceKey = policy ? buildResilienceKey('translate', baseRequestMeta, apiBaseUrl) : '';
+  const policyState = policy?.getState?.(resilienceKey) || null;
+  const patchedRequestOptions = policy?.applyModeToOptions
+    ? policy.applyModeToOptions(policyState?.modeLevel || 0, requestOptions)
+    : requestOptions;
+  const resilience = patchedRequestOptions?.resilience || {};
   const normalizedContext = normalizeContextPayload(context);
-  const contextPayload = fallbackMode ? buildFallbackContextPayload(normalizedContext) : context;
+  let contextPayload = fallbackMode ? buildFallbackContextPayload(normalizedContext) : normalizedContext;
+  if (resilience.forceNoContext) {
+    contextPayload = { ...normalizedContext, text: '', mode: 'SHORT', baseAnswer: '', baseAnswerIncluded: false };
+  } else if (resilience.forceShortContext) {
+    const shortText = normalizedContext.shortText || '';
+    contextPayload = {
+      ...normalizedContext,
+      text: shortText,
+      mode: shortText ? 'SHORT' : '',
+      baseAnswer: '',
+      baseAnswerIncluded: false
+    };
+  }
+  if (Number.isFinite(resilience.maxContextChars) && contextPayload?.text?.length > resilience.maxContextChars) {
+    contextPayload = { ...contextPayload, text: contextPayload.text.slice(0, resilience.maxContextChars) };
+  }
   const baseEffectiveContext = buildEffectiveContext(contextPayload, baseRequestMeta);
   const maxTimeoutAttempts = fallbackMode ? 1 : 2;
   const maxRetryableRetries = fallbackMode ? 0 : 3;
@@ -962,8 +1134,40 @@ async function translateTexts(
   let lastRawTranslation = '';
   const debugPayloads = [];
   const resolvedRequestOptions = fallbackMode
-    ? { ...(requestOptions || {}), fallbackMode: true, maxCompletionTokens: 1400 }
-    : requestOptions;
+    ? { ...(patchedRequestOptions || {}), fallbackMode: true, maxCompletionTokens: 1400 }
+    : patchedRequestOptions;
+  const maxAttemptsTotal = policy?.constants?.MAX_ATTEMPTS_TOTAL;
+  if (Number.isFinite(maxAttemptsTotal) && policyState?.attemptsTotal >= maxAttemptsTotal) {
+    if (resilience && resilience.modeLevel < 5) {
+      resilience.modeLevel = 5;
+      resilience.perSegment = true;
+      resilience.forceNoContext = true;
+    }
+  }
+  if (resilience?.perSegment && texts.length > 1) {
+    const perSegmentResults = await translateIndividually(
+      texts,
+      apiKey,
+      targetLanguage,
+      model,
+      '',
+      apiBaseUrl,
+      keepPunctuationTokens,
+      false,
+      false,
+      debugPayloads,
+      baseRequestMeta,
+      resolvedRequestOptions
+    );
+    if (policy && resilienceKey) {
+      policy.recordOutcome(resilienceKey, 'success');
+    }
+    return {
+      translations: perSegmentResults,
+      rawTranslation: lastRawTranslation,
+      debug: debugPayloads
+    };
+  }
   if (fallbackMode) {
     emitJsonLog({
       kind: 'translate.fallback.mode',
@@ -1061,6 +1265,9 @@ async function translateTexts(
         if (Array.isArray(result?.debug)) {
           debugPayloads.push(...result.debug);
         }
+        if (policy && resilienceKey) {
+          policy.recordOutcome(resilienceKey, 'success');
+        }
         return {
           translations: result.translations,
           rawTranslation: result.rawTranslation,
@@ -1073,6 +1280,16 @@ async function translateTexts(
         }
         if (error?.debugPayload) {
           debugPayloads.push(error.debugPayload);
+        }
+        const errorType = classifyResilienceError(error);
+        if (policy && resilienceKey) {
+          policy.recordOutcome(resilienceKey, errorType, {
+            errorType,
+            errorMessage: error?.message || String(error)
+          });
+          if (policy.shouldEscalate(resilienceKey, errorType)) {
+            policy.escalate(resilienceKey, errorType);
+          }
         }
 
         const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
@@ -1110,38 +1327,123 @@ async function translateTexts(
           continue;
         }
 
-        const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
-        if (isLengthIssue && texts.length > 1 && !fallbackMode) {
-          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
-            globalThis.ntJsonLog({
-              kind: 'translate.fallback.length_mismatch_individual',
-              ts: Date.now(),
-              message: 'Falling back to per-item translation due to length mismatch.'
-            }, 'warn');
-          }
-          appendParseIssue('fallback:per-item');
+        const splitDepth = Math.max(0, Number(resilience?.splitDepth) || 0);
+        if (
+          splitDepth > 0 &&
+          texts.length > 1 &&
+          ['count_mismatch', 'schema', 'rate_limited', 'timeout'].includes(errorType)
+        ) {
+          appendParseIssue('fallback:split');
           const retryMeta = createChildRequestMeta(baseRequestMeta, {
             stage: 'translation',
             purpose: 'retry',
             attempt: baseRequestMeta.attempt + 1,
             triggerSource: 'retry'
           });
-          const retryContextPayload = getRetryContextPayload(normalizedContext, retryMeta);
-          const translations = await translateIndividually(
-            texts,
+          const midpoint = Math.ceil(texts.length / 2);
+          const nextOptions = {
+            ...(resolvedRequestOptions || {}),
+            resilience: { ...(resilience || {}), splitDepth: splitDepth - 1 }
+          };
+          const firstResult = await translateTexts(
+            texts.slice(0, midpoint),
             apiKey,
             targetLanguage,
             model,
-            retryContextPayload,
+            contextPayload,
             apiBaseUrl,
             keepPunctuationTokens,
-            true,
-            true,
-            debugPayloads,
+            retryMeta,
+            nextOptions
+          );
+          const secondResult = await translateTexts(
+            texts.slice(midpoint),
+            apiKey,
+            targetLanguage,
+            model,
+            contextPayload,
+            apiBaseUrl,
+            keepPunctuationTokens,
+            retryMeta,
+            nextOptions
+          );
+          if (Array.isArray(firstResult?.debug)) {
+            debugPayloads.push(...firstResult.debug);
+          }
+          if (Array.isArray(secondResult?.debug)) {
+            debugPayloads.push(...secondResult.debug);
+          }
+          const combinedRaw = [firstResult.rawTranslation, secondResult.rawTranslation]
+            .filter(Boolean)
+            .join('\n\n---\n\n');
+          if (policy && resilienceKey) {
+            policy.recordOutcome(resilienceKey, 'success');
+          }
+          return {
+            translations: [...(firstResult.translations || []), ...(secondResult.translations || [])],
+            rawTranslation: combinedRaw || lastRawTranslation,
+            debug: debugPayloads
+          };
+        }
+
+        const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
+        if (isLengthIssue && texts.length > 1 && !fallbackMode) {
+          if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
+            globalThis.ntJsonLog({
+              kind: 'translate.fallback.length_mismatch_split',
+              ts: Date.now(),
+              message: 'Splitting translation request due to length mismatch.'
+            }, 'warn');
+          }
+          appendParseIssue('fallback:split');
+          const retryMeta = createChildRequestMeta(baseRequestMeta, {
+            stage: 'translation',
+            purpose: 'retry',
+            attempt: baseRequestMeta.attempt + 1,
+            triggerSource: 'retry'
+          });
+          const midpoint = Math.ceil(texts.length / 2);
+          const firstTexts = texts.slice(0, midpoint);
+          const secondTexts = texts.slice(midpoint);
+          const firstResult = await translateTexts(
+            firstTexts,
+            apiKey,
+            targetLanguage,
+            model,
+            contextPayload,
+            apiBaseUrl,
+            keepPunctuationTokens,
             retryMeta,
             resolvedRequestOptions
           );
-          return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
+          const secondResult = await translateTexts(
+            secondTexts,
+            apiKey,
+            targetLanguage,
+            model,
+            contextPayload,
+            apiBaseUrl,
+            keepPunctuationTokens,
+            retryMeta,
+            resolvedRequestOptions
+          );
+          if (Array.isArray(firstResult?.debug)) {
+            debugPayloads.push(...firstResult.debug);
+          }
+          if (Array.isArray(secondResult?.debug)) {
+            debugPayloads.push(...secondResult.debug);
+          }
+          const combinedRaw = [firstResult.rawTranslation, secondResult.rawTranslation]
+            .filter(Boolean)
+            .join('\n\n---\n\n');
+          if (policy && resilienceKey) {
+            policy.recordOutcome(resilienceKey, 'success');
+          }
+          return {
+            translations: [...(firstResult.translations || []), ...(secondResult.translations || [])],
+            rawTranslation: combinedRaw || lastRawTranslation,
+            debug: debugPayloads
+          };
         }
 
         if (isRateLimit) {
@@ -1162,6 +1464,9 @@ async function translateTexts(
     }
   } catch (error) {
     if (fallbackMode) {
+      if (policy && resilienceKey) {
+        policy.recordOutcome(resilienceKey, 'success');
+      }
       return {
         translations: texts.map((text) => text),
         rawTranslation: lastRawTranslation,
@@ -1201,7 +1506,7 @@ async function performTranslationRequest(
   let resolvedTier =
     selection?.tier ||
     normalizedRequestMeta.selectedTier ||
-    requestOptions?.tier ||
+    patchedRequestOptions?.tier ||
     'standard';
   let resolvedSpec = selection?.spec || formatSpec(resolvedModel, resolvedTier);
   if (resolvedModel) {
@@ -1659,11 +1964,14 @@ async function performTranslationRequest(
       type: 'json_schema',
       json_schema: {
         name: 'translations',
+        strict: true,
         schema: {
           type: 'object',
           properties: {
             translations: {
               type: 'array',
+              minItems: tokenizedTexts.length,
+              maxItems: tokenizedTexts.length,
               items: { type: 'string' }
             }
           },
@@ -1703,6 +2011,10 @@ async function performTranslationRequest(
     });
   }
   const requestId = normalizedRequestMeta?.requestId || createRequestId();
+  const throughputController = getThroughputController();
+  const throughputKey = throughputController ? getThroughputKey(operationType, resolvedModel) : '';
+  let lastRequestLatencyMs = null;
+  let lastRequestEstimatedTokens = estimatedPromptTokens;
   const requestHeaders = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`
@@ -1711,6 +2023,7 @@ async function performTranslationRequest(
   let response;
   let responseText = '';
   let fetchStartedAt = Date.now();
+  let throughputOutcome = 'fatal_error';
   logLlmFetchRequest({
     ts: fetchStartedAt,
     role: 'translation',
@@ -1724,12 +2037,23 @@ async function performTranslationRequest(
     responseFormat: requestPayload.response_format
   });
   try {
+    if (throughputController) {
+      await throughputController.acquire(throughputKey);
+    }
     response = await fetch(apiBaseUrl, {
       method: 'POST',
       headers: requestHeaders,
       body: requestBody,
       signal
     });
+    lastRequestLatencyMs = Date.now() - fetchStartedAt;
+    throughputOutcome = response.ok
+      ? 'success'
+      : response.status === 429
+        ? 'rate_limited'
+        : response.status === 408 || response.status >= 500
+          ? 'transient_error'
+          : 'fatal_error';
     responseText = await response.clone().text();
     logLlmRawResponse({
       ts: Date.now(),
@@ -1749,8 +2073,18 @@ async function performTranslationRequest(
       durationMs: Date.now() - fetchStartedAt
     });
   } catch (error) {
+    lastRequestLatencyMs = Date.now() - fetchStartedAt;
+    throughputOutcome = error?.name === 'AbortError' ? 'transient_error' : 'transient_error';
     logLlmFetchError({ ts: Date.now(), requestId, error });
     throw error;
+  } finally {
+    if (throughputController) {
+      throughputController.release(throughputKey, throughputOutcome);
+      throughputController.noteRequestStats(throughputKey, {
+        estimatedTokens: lastRequestEstimatedTokens,
+        latencyMs: lastRequestLatencyMs
+      });
+    }
   }
 
   if (!response.ok) {
@@ -1761,6 +2095,22 @@ async function performTranslationRequest(
     } catch (parseError) {
       errorPayload = null;
     }
+    const strictStripped = stripUnsupportedStructuredOutputStrict(
+      requestPayload,
+      resolvedModel,
+      response.status,
+      errorPayload,
+      errorText
+    );
+    const predictionStripped = stripUnsupportedPredictionParam(
+      requestPayload,
+      resolvedModel,
+      response.status,
+      errorPayload,
+      errorText,
+      requestId,
+      apiBaseUrl
+    );
     const stripped = stripUnsupportedRequestParams(
       requestPayload,
       resolvedModel,
@@ -1769,12 +2119,19 @@ async function performTranslationRequest(
       errorText,
       apiBaseUrl
     );
-    if (response.status === 400 && stripped.changed) {
-      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
+    const removedParams = [
+      ...new Set([
+        ...(stripped.removedParams || []),
+        ...(strictStripped.removedParams || []),
+        ...(predictionStripped.removedParams || [])
+      ])
+    ];
+    if (response.status === 400 && (stripped.changed || strictStripped.changed || predictionStripped.changed)) {
+      if (requestMeta && typeof requestMeta === 'object' && removedParams.length) {
         if (!requestMeta.fallbackReason) {
-          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
+          requestMeta.fallbackReason = `unsupported_param:${removedParams.join(',')}`;
         }
-        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
+        if (removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
           requestMeta.selectedTier = 'standard';
         }
       }
@@ -1784,11 +2141,12 @@ async function performTranslationRequest(
           ts: Date.now(),
           model: resolvedModel,
           status: response.status,
-          removedParams: stripped.removedParams
+          removedParams
         }, 'warn');
       }
       requestBody = JSON.stringify(requestPayload);
       fetchStartedAt = Date.now();
+      throughputOutcome = 'fatal_error';
       logLlmFetchRequest({
         ts: fetchStartedAt,
         role: 'translation',
@@ -1802,12 +2160,23 @@ async function performTranslationRequest(
         responseFormat: requestPayload.response_format
       });
       try {
+        if (throughputController) {
+          await throughputController.acquire(throughputKey);
+        }
         response = await fetch(apiBaseUrl, {
           method: 'POST',
           headers: requestHeaders,
           body: requestBody,
           signal
         });
+        lastRequestLatencyMs = Date.now() - fetchStartedAt;
+        throughputOutcome = response.ok
+          ? 'success'
+          : response.status === 429
+            ? 'rate_limited'
+            : response.status === 408 || response.status >= 500
+              ? 'transient_error'
+              : 'fatal_error';
         responseText = await response.clone().text();
         logLlmRawResponse({
           ts: Date.now(),
@@ -1827,8 +2196,18 @@ async function performTranslationRequest(
           durationMs: Date.now() - fetchStartedAt
         });
       } catch (error) {
+        lastRequestLatencyMs = Date.now() - fetchStartedAt;
+        throughputOutcome = error?.name === 'AbortError' ? 'transient_error' : 'transient_error';
         logLlmFetchError({ ts: Date.now(), requestId, error });
         throw error;
+      } finally {
+        if (throughputController) {
+          throughputController.release(throughputKey, throughputOutcome);
+          throughputController.noteRequestStats(throughputKey, {
+            estimatedTokens: lastRequestEstimatedTokens,
+            latencyMs: lastRequestLatencyMs
+          });
+        }
       }
       if (!response.ok) {
         errorText = responseText;
@@ -1903,6 +2282,11 @@ async function performTranslationRequest(
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
+  updatePredictionUsage(resolvedModel, usage, requestId);
+  const actualTokens = getUsageTotalTokens(usage);
+  if (throughputController && Number.isFinite(actualTokens)) {
+    throughputController.noteRequestStats(throughputKey, { actualTokens });
+  }
   const debugPayload = attachRequestMeta(
     {
       phase: 'TRANSLATE',
@@ -2056,8 +2440,41 @@ async function performTranslationRequest(
     }
     throw error;
   }
+  const guardrails = globalThis.ntGuardrails;
+  const guardrailMeta = {
+    stage: 'translate',
+    requestId,
+    blockKey: normalizedRequestMeta?.blockKey || '',
+    model: resolvedModel,
+    host: (() => {
+      try {
+        const url = requestMeta?.url || apiBaseUrl || '';
+        return url ? new URL(url).host : '';
+      } catch (error) {
+        return '';
+      }
+    })()
+  };
+  const countCheck = guardrails?.assertCountMatch
+    ? guardrails.assertCountMatch('translate', tokenizedTexts.length, translations.length, guardrailMeta)
+    : { ok: true };
+  if (!countCheck.ok && countCheck.error) {
+    debugPayload.parseIssues.push('guardrail:count-mismatch');
+  }
   const expectedLength = tokenizedTexts.length;
   if (Array.isArray(translations) && translations.length !== expectedLength) {
+    // Manual test (QA):
+    // 1) Open a page with many blocks.
+    // 2) Verify JSON logs no longer show translate.fallback.length_mismatch_individual.
+    // 3) Confirm request count drops and blocks stop hanging on mismatch retries.
+    emitJsonLog({
+      kind: 'structured_outputs.count_mismatch',
+      stage: 'translate',
+      expectedCount: expectedLength,
+      actualCount: translations.length,
+      model: resolvedModel,
+      requestId
+    });
     debugPayload.parseIssues.push('fallback:length-mismatch');
     debugPayload.fallbackReason = 'length_mismatch';
     if (!normalizedRequestMeta.fallbackReason) {
@@ -2068,6 +2485,53 @@ async function performTranslationRequest(
     }
     if (fallbackMode || !allowLengthRetry) {
       translations = normalizeTranslationsToLength(texts, translations);
+    } else if (expectedLength > 1) {
+      const midpoint = Math.ceil(expectedLength / 2);
+      const firstTexts = texts.slice(0, midpoint);
+      const secondTexts = texts.slice(midpoint);
+      const splitRequestMeta = createChildRequestMeta(normalizedRequestMeta, {
+        stage: 'translation',
+        purpose: 'retry',
+        attempt: normalizedRequestMeta.attempt + 1,
+        triggerSource: 'retry'
+      });
+      const firstResult = await performTranslationRequest(
+        firstTexts,
+        apiKey,
+        targetLanguage,
+        resolvedModel,
+        signal,
+        context,
+        apiBaseUrl,
+        restorePunctuation,
+        strictTargetLanguage,
+        allowRefusalRetry,
+        allowLengthRetry,
+        splitRequestMeta,
+        requestOptions
+      );
+      const secondResult = await performTranslationRequest(
+        secondTexts,
+        apiKey,
+        targetLanguage,
+        resolvedModel,
+        signal,
+        context,
+        apiBaseUrl,
+        restorePunctuation,
+        strictTargetLanguage,
+        allowRefusalRetry,
+        allowLengthRetry,
+        splitRequestMeta,
+        requestOptions
+      );
+      if (Array.isArray(firstResult?.debug)) {
+        debugPayloads.push(...firstResult.debug);
+      }
+      if (Array.isArray(secondResult?.debug)) {
+        debugPayloads.push(...secondResult.debug);
+      }
+      translations = [...(firstResult.translations || []), ...(secondResult.translations || [])];
     } else {
       const repairItems = texts.map((text, index) => ({
         id: String(index),
@@ -2123,6 +2587,23 @@ async function performTranslationRequest(
         lengthError.rawTranslation = content;
         lengthError.debugPayload = debugPayload;
         throw lengthError;
+      }
+    }
+  }
+  if (guardrails?.assertPlaceholdersMatch) {
+    for (let index = 0; index < texts.length; index += 1) {
+      const sourceText = texts[index] || '';
+      const translatedText = translations[index] || '';
+      const placeholderCheck = guardrails.assertPlaceholdersMatch(sourceText, translatedText, {
+        ...guardrailMeta,
+        stage: 'translate',
+        segmentIndex: index
+      });
+      if (!placeholderCheck.ok && placeholderCheck.error) {
+        debugPayload.parseIssues.push('guardrail:placeholders');
+        if (!fallbackMode) {
+          throw placeholderCheck.error;
+        }
       }
     }
   }
@@ -2320,6 +2801,12 @@ async function performTranslationRepairRequest(
     purpose: 'validate',
     triggerSource: 'validate'
   });
+  const policy = getResiliencePolicy();
+  const resilienceKey = policy ? buildResilienceKey('translate_repair', normalizedRequestMeta, apiBaseUrl) : '';
+  const policyState = policy?.getState?.(resilienceKey) || null;
+  const patchedRequestOptions = policy?.applyModeToOptions
+    ? policy.applyModeToOptions(policyState?.modeLevel || 0, requestOptions)
+    : requestOptions;
   const selection = resolveModelSpecForMeta(normalizedRequestMeta);
   const formatSpec = (id, tier) => {
     if (typeof formatModelSpec === 'function') {
@@ -2347,14 +2834,31 @@ async function performTranslationRepairRequest(
   }
   const resolvedRequestOptions = resolvedModel
     ? {
-        ...(requestOptions || {}),
+        ...(patchedRequestOptions || {}),
         tier: resolvedTier,
         serviceTier: resolvedTier === 'flex' ? 'flex' : null
       }
-    : requestOptions;
+    : patchedRequestOptions;
   const operationType = getPromptCacheKey('translate');
   const normalizedContext = normalizeContextPayload(context);
-  const effectiveContext = buildEffectiveContext(normalizedContext, normalizedRequestMeta);
+  const resilience = patchedRequestOptions?.resilience || {};
+  let effectiveContextPayload = normalizedContext;
+  if (resilience.forceNoContext) {
+    effectiveContextPayload = { ...normalizedContext, text: '', mode: 'SHORT', baseAnswer: '', baseAnswerIncluded: false };
+  } else if (resilience.forceShortContext) {
+    const shortText = normalizedContext.shortText || '';
+    effectiveContextPayload = {
+      ...normalizedContext,
+      text: shortText,
+      mode: shortText ? 'SHORT' : '',
+      baseAnswer: '',
+      baseAnswerIncluded: false
+    };
+  }
+  if (Number.isFinite(resilience.maxContextChars) && effectiveContextPayload?.text?.length > resilience.maxContextChars) {
+    effectiveContextPayload = { ...effectiveContextPayload, text: effectiveContextPayload.text.slice(0, resilience.maxContextChars) };
+  }
+  const effectiveContext = buildEffectiveContext(effectiveContextPayload, normalizedRequestMeta);
   const triggerSource = normalizedRequestMeta?.triggerSource || '';
   const strictShort = typeof normalizedContext.shortText === 'string' && normalizedContext.shortText.trim()
     ? normalizedContext.shortText.trim()
@@ -2795,11 +3299,14 @@ async function performTranslationRepairRequest(
       type: 'json_schema',
       json_schema: {
         name: 'translations_repair',
+        strict: true,
         schema: {
           type: 'object',
           properties: {
             translations: {
               type: 'array',
+              minItems: normalizedItems.length,
+              maxItems: normalizedItems.length,
               items: { type: 'string' }
             }
           },
@@ -2809,6 +3316,40 @@ async function performTranslationRepairRequest(
       }
     }
   };
+  const requestId = normalizedRequestMeta?.requestId || createRequestId();
+  const expectedCount = normalizedItems.length;
+  const predictionEntry = getPredictionStateEntry(resolvedModel, 'repair');
+  const predictionDisabled = predictionEntry?.disabledUntilMs && predictionEntry.disabledUntilMs > Date.now();
+  const predictedTranslations = normalizedItems.map((item) => (typeof item.draft === 'string' ? item.draft : ''));
+  const predictedMissingCount = predictedTranslations.filter((text) => !String(text || '').trim()).length;
+  const predictedMissingRatio = expectedCount ? predictedMissingCount / expectedCount : 1;
+  const canAttemptPrediction =
+    expectedCount >= 5 &&
+    predictedTranslations.length === expectedCount &&
+    predictedMissingRatio <= 0.2 &&
+    !predictionDisabled;
+  if (canAttemptPrediction) {
+    if (isChatCompletionsEndpoint(apiBaseUrl)) {
+      const predictionContent = JSON.stringify({ translations: predictedTranslations });
+      requestPayload.prediction = {
+        type: 'content',
+        content: predictionContent
+      };
+      logPredictionEvent('prediction.enabled', {
+        requestId,
+        model: resolvedModel,
+        stage: 'repair',
+        expectedCount,
+        predictedBytes: predictionContent.length
+      });
+    } else {
+      logPredictionEvent('prediction.skipped', {
+        requestId,
+        endpoint: apiBaseUrl,
+        reason: 'unsupported_endpoint'
+      });
+    }
+  }
   applyPromptCacheParams(
     requestPayload,
     apiBaseUrl,
@@ -2820,152 +3361,91 @@ async function performTranslationRepairRequest(
   const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, resolvedRequestOptions);
   const promptCacheKey = requestPayload.prompt_cache_key || '';
   const promptCacheRetention = requestPayload.prompt_cache_retention || '';
-  const requestId = normalizedRequestMeta?.requestId || createRequestId();
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`
-  };
-  let requestBody = JSON.stringify(requestPayload);
+  const throughputController = getThroughputController();
+  const throughputKey = throughputController ? getThroughputKey('translate_repair', resolvedModel) : '';
+  const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
+  let lastRequestLatencyMs = null;
+  let lastRequestEstimatedTokens = estimatedPromptTokens;
   const startedAt = Date.now();
   let response;
   let responseText = '';
-  let fetchStartedAt = Date.now();
-  logLlmFetchRequest({
-    ts: fetchStartedAt,
-    role: 'translation',
-    requestId,
-    url: apiBaseUrl,
-    method: 'POST',
-    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-    body: requestBody,
-    model: requestPayload.model,
-    temperature: requestPayload.temperature,
-    responseFormat: requestPayload.response_format
-  });
+  let responseData = null;
+  const runner = globalThis.ntRequestRunner;
+  if (!runner) {
+    throw new Error('RequestRunner unavailable');
+  }
   try {
-    response = await fetch(apiBaseUrl, {
-      method: 'POST',
-      headers: requestHeaders,
-      body: requestBody,
-      signal
+    const result = await runner.run({
+      opType: 'repair',
+      endpoint: isChatCompletionsEndpoint(apiBaseUrl) ? 'chat_completions' : 'responses',
+      modelPreferred: resolvedModel,
+      apiBaseUrl,
+      apiKey,
+      signal,
+      requestPayload,
+      allowedModels: [],
+      meta: {
+        requestId,
+        urlHost: normalizedRequestMeta?.url || '',
+        batchSize: normalizedItems.length,
+        estimatedTokens
+      },
+      throughputController,
+      throughputKey
     });
-    responseText = await response.clone().text();
+    response = result.response;
+    responseText = result.responseText || '';
+    responseData = result.responseData || null;
+    lastRequestLatencyMs = result.durationMs;
+    if (throughputController) {
+      throughputController.noteRequestStats(throughputKey, {
+        estimatedTokens: lastRequestEstimatedTokens,
+        latencyMs: lastRequestLatencyMs
+      });
+    }
     logLlmRawResponse({
       ts: Date.now(),
       stage: 'translate',
       requestId,
-      status: response.status,
-      ok: response.ok,
+      status: result.status,
+      ok: result.ok,
       responseText
     });
     logLlmFetchResponse({
       ts: Date.now(),
       requestId,
-      status: response.status,
-      ok: response.ok,
-      responseHeaders: Array.from(response.headers.entries()),
+      status: result.status,
+      ok: result.ok,
+      responseHeaders: result.responseHeaders || [],
       responseText,
-      durationMs: Date.now() - fetchStartedAt
+      durationMs: result.durationMs
     });
+    if (policy && resilienceKey) {
+      policy.recordOutcome(resilienceKey, 'success');
+    }
   } catch (error) {
     logLlmFetchError({ ts: Date.now(), requestId, error });
+    if (policy && resilienceKey) {
+      const errorType = classifyResilienceError(error);
+      policy.recordOutcome(resilienceKey, errorType, {
+        errorType,
+        errorMessage: error?.message || String(error)
+      });
+      if (policy.shouldEscalate(resilienceKey, errorType)) {
+        policy.escalate(resilienceKey, errorType);
+      }
+    }
+    const status = error?.status;
+    if (status) {
+      const errorMessage = error?.responseText || error?.message || '';
+      const repairError = new Error(`Repair request failed: ${status} ${errorMessage}`);
+      repairError.status = status;
+      throw repairError;
+    }
     throw error;
   }
 
-  if (!response.ok) {
-    let errorText = responseText;
-    let errorPayload = null;
-    try {
-      errorPayload = JSON.parse(errorText);
-    } catch (parseError) {
-      errorPayload = null;
-    }
-    const stripped = stripUnsupportedRequestParams(
-      requestPayload,
-      resolvedModel,
-      response.status,
-      errorPayload,
-      errorText,
-      apiBaseUrl
-    );
-    if (response.status === 400 && stripped.changed) {
-      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
-        if (!requestMeta.fallbackReason) {
-          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
-        }
-        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
-          requestMeta.selectedTier = 'standard';
-        }
-      }
-      if (globalThis.ntJsonLogEnabled && globalThis.ntJsonLogEnabled()) {
-        globalThis.ntJsonLog({
-          kind: 'translate.repair.unsupported_param_removed',
-          ts: Date.now(),
-          model: resolvedModel,
-          status: response.status,
-          removedParams: stripped.removedParams
-        }, 'warn');
-      }
-      requestBody = JSON.stringify(requestPayload);
-      fetchStartedAt = Date.now();
-      logLlmFetchRequest({
-        ts: fetchStartedAt,
-        role: 'translation',
-        requestId,
-        url: apiBaseUrl,
-        method: 'POST',
-        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-        body: requestBody,
-        model: requestPayload.model,
-        temperature: requestPayload.temperature,
-        responseFormat: requestPayload.response_format
-      });
-      try {
-        response = await fetch(apiBaseUrl, {
-          method: 'POST',
-          headers: requestHeaders,
-          body: requestBody,
-          signal
-        });
-        responseText = await response.clone().text();
-        logLlmRawResponse({
-          ts: Date.now(),
-          stage: 'translate',
-          requestId,
-          status: response.status,
-          ok: response.ok,
-          responseText
-        });
-        logLlmFetchResponse({
-          ts: Date.now(),
-          requestId,
-          status: response.status,
-          ok: response.ok,
-          responseHeaders: Array.from(response.headers.entries()),
-          responseText,
-          durationMs: Date.now() - fetchStartedAt
-        });
-      } catch (error) {
-        logLlmFetchError({ ts: Date.now(), requestId, error });
-        throw error;
-      }
-      if (!response.ok) {
-        errorText = responseText;
-        try {
-          errorPayload = JSON.parse(errorText);
-        } catch (parseError) {
-          errorPayload = null;
-        }
-      }
-    }
-    if (!response.ok) {
-      const error = new Error(`Repair request failed: ${response.status} ${errorText}`);
-      error.status = response.status;
-      throw error;
-    }
-  }
-
-  const data = await response.json();
+  const data = responseData || {};
   const assistantContentMeta = {};
   const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
   logLlmParseExtract({
@@ -2979,6 +3459,10 @@ async function performTranslationRepairRequest(
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
+  const actualTokens = getUsageTotalTokens(usage);
+  if (throughputController && Number.isFinite(actualTokens)) {
+    throughputController.noteRequestStats(throughputKey, { actualTokens });
+  }
   const debugPayload = attachRequestMeta(
     {
       phase: 'TRANSLATE_REPAIR',
@@ -3006,12 +3490,60 @@ async function performTranslationRepairRequest(
 
   let translations = null;
   try {
-    translations = parseTranslationsResponse(content, normalizedItems.length);
+    translations = parseTranslationsResponse(content, normalizedItems.length, { enforceLength: false });
     logLlmParseOk({ requestId, parsed: translations, ts: Date.now() });
   } catch (error) {
     logLlmParseFail({ requestId, error, rawText: content, ts: Date.now() });
     debugPayload.parseIssues.push(error?.message || 'parse-error');
     throw error;
+  }
+  if (Array.isArray(translations) && translations.length !== normalizedItems.length) {
+    emitJsonLog({
+      kind: 'structured_outputs.count_mismatch',
+      stage: 'translate_repair',
+      expectedCount: normalizedItems.length,
+      actualCount: translations.length,
+      model: resolvedModel,
+      requestId
+    });
+    if (normalizedItems.length > 1) {
+      const midpoint = Math.ceil(normalizedItems.length / 2);
+      const firstItems = normalizedItems.slice(0, midpoint);
+      const secondItems = normalizedItems.slice(midpoint);
+      const splitRequestMeta = createChildRequestMeta(normalizedRequestMeta, {
+        stage: 'translation',
+        purpose: 'validate',
+        attempt: normalizedRequestMeta.attempt + 1,
+        triggerSource: 'validate'
+      });
+      const firstResult = await performTranslationRepairRequest(
+        firstItems,
+        apiKey,
+        targetLanguage,
+        resolvedModel,
+        signal,
+        context,
+        apiBaseUrl,
+        splitRequestMeta,
+        requestOptions
+      );
+      const secondResult = await performTranslationRepairRequest(
+        secondItems,
+        apiKey,
+        targetLanguage,
+        resolvedModel,
+        signal,
+        context,
+        apiBaseUrl,
+        splitRequestMeta,
+        requestOptions
+      );
+      translations = [...(firstResult.translations || []), ...(secondResult.translations || [])];
+    } else {
+      throw new Error(
+        `translation response length mismatch: expected ${normalizedItems.length}, got ${translations.length}`
+      );
+    }
   }
 
   return {
@@ -3565,3 +4097,7 @@ function restorePunctuationTokens(text = '') {
   }
   return output;
 }
+
+globalThis.ntTranslationServiceTesting = {
+  parseTranslationsResponse
+};

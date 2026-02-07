@@ -49,10 +49,33 @@
       enabled = Boolean(value);
     };
 
+    const normalizeJsonEvent = (eventObject) => {
+      if (!eventObject || typeof eventObject !== 'object') return eventObject;
+      if (!eventObject.fields || typeof eventObject.fields !== 'object') return eventObject;
+      const normalized = { ...eventObject, ...eventObject.fields };
+      if (normalized.kind === 'throughput.429' && normalized.concurrencyLimit == null) {
+        normalized.concurrencyLimit = normalized.newConcurrencyLimit ?? null;
+      }
+      delete normalized.fields;
+      return normalized;
+    };
+
+    const handleHealthEvent = (eventObject) => {
+      const kind = eventObject?.kind;
+      if (kind === 'ui_pipeline.summary') {
+        recordHealthUiSummary(eventObject);
+      }
+      if (kind === 'dedup.summary') {
+        recordHealthDedupSummary(eventObject);
+      }
+    };
+
     globalThis.ntPageJsonLogEnabled = () => enabled;
     globalThis.ntPageJsonLog = (eventObject, level = 'log') => {
       if (!enabled) return;
-      const serialized = safeJsonStringify(eventObject);
+      const normalized = normalizeJsonEvent(eventObject);
+      handleHealthEvent(normalized);
+      const serialized = safeJsonStringify(normalized);
       if (serialized === undefined) return;
       const method = console[level] ? level : 'log';
       console[method](serialized);
@@ -71,6 +94,7 @@ let cancelRequested = false;
 let translationError = null;
 let translationProgress = { completedBlocks: 0, totalBlocks: 0 };
 let translationInProgress = false;
+let translationCallCount = 0;
 let activeTranslationEntries = [];
 let originalSnapshot = [];
 let translationVisible = false;
@@ -103,6 +127,10 @@ const DEBUG_PERSIST_MAX_INTERVAL_MS = 2000;
 let debugLastPersistAt = 0;
 let debugBroadcastWarningSentAt = 0;
 let debugStorageWarningSentAt = 0;
+const HEALTH_WINDOW_MS = 5 * 60 * 1000;
+const HEALTH_TPM_WINDOW_MS = 60 * 1000;
+const HEALTH_BATCH_SAMPLE_LIMIT = 50;
+const HEALTH_EVENT_LIMIT = 300;
 let tpmLimiter = null;
 let tpmSettings = {
   outputRatioByRole: {
@@ -111,6 +139,13 @@ let tpmSettings = {
     proofread: 0.5
   },
   safetyBufferTokens: 100
+};
+let pagePlan = null;
+let pagePlanHints = null;
+let schedulerModels = {
+  translationModel: '',
+  contextModel: '',
+  proofreadModel: ''
 };
 
 const STORAGE_KEY = 'pageTranslations';
@@ -163,6 +198,8 @@ const DEFAULT_STATE = {
   proofreadModelList: ['gpt-4.1-mini:standard'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
+  batchTurboMode: 'off',
+  proofreadMode: 'auto',
   singleBlockConcurrency: false,
   assumeOpenAICompatibleApi: false,
   blockLengthLimit: 1200,
@@ -175,6 +212,8 @@ const CALL_TAGS = {
   TRANSLATE_RETRY_FULL: 'TRANSLATE_RETRY_FULL',
   TRANSLATE_FOLLOWUP_SHORT: 'TRANSLATE_FOLLOWUP_SHORT',
   TRANSLATE_OVERFLOW_FALLBACK: 'TRANSLATE_OVERFLOW_FALLBACK',
+  TRANSLATE_UI: 'TRANSLATE_UI',
+  TRANSLATE_DEDUP_SHORT: 'TRANSLATE_DEDUP_SHORT',
   PROOFREAD_BASE_FULL: 'PROOFREAD_BASE_FULL',
   PROOFREAD_RETRY_FULL: 'PROOFREAD_RETRY_FULL',
   PROOFREAD_REWRITE_SHORT: 'PROOFREAD_REWRITE_SHORT',
@@ -204,6 +243,26 @@ const SUPPORTED_MODEL_IDS = new Set([
   'o3-mini',
   'o1-mini'
 ]);
+const UI_KEYWORDS = [
+  'log in',
+  'login',
+  'sign in',
+  'sign up',
+  'next',
+  'previous',
+  'prev',
+  'search',
+  'follow',
+  'settings',
+  'menu',
+  'home',
+  'back',
+  'submit',
+  'cancel',
+  'save',
+  'share',
+  'more'
+];
 function parseModelSpec(spec) {
   if (!spec || typeof spec !== 'string') {
     return { id: '', tier: 'standard' };
@@ -299,7 +358,187 @@ function recordBlockTimeout(blockKeys) {
       fallbackEnabled = true;
     }
   });
+  recordHealthTimeout();
   return fallbackEnabled;
+}
+
+function initHealthState() {
+  return {
+    requestsSent: 0,
+    responsesOk: 0,
+    errorsTotal: 0,
+    requestEvents: [],
+    rateLimitedEvents: [],
+    timeoutEvents: [],
+    retryEvents: [],
+    tpmEvents: [],
+    promptTokensTotal: 0,
+    completionTokensTotal: 0,
+    cachedTokensTotal: 0,
+    promptCacheRetentionUsed: false,
+    batchSizesTranslate: [],
+    batchSizesProofread: [],
+    proofreadCallsTotal: 0,
+    proofreadDeltaEditsTotal: 0,
+    proofreadDeltaUnchangedTotal: 0,
+    proofreadItemsTotal: 0,
+    uiTmHit: 0,
+    uiTmMiss: 0,
+    docDedupSavingsRatio: null,
+    backoffUntilMs: 0
+  };
+}
+
+function getHealthState() {
+  if (!debugState) return null;
+  if (!debugState.health || typeof debugState.health !== 'object') {
+    debugState.health = initHealthState();
+  }
+  return debugState.health;
+}
+
+function trimHealthEvents(health) {
+  if (!health) return;
+  const now = Date.now();
+  const trimByWindow = (list, windowMs) =>
+    Array.isArray(list) ? list.filter((event) => now - event.ts <= windowMs).slice(-HEALTH_EVENT_LIMIT) : [];
+  health.requestEvents = trimByWindow(health.requestEvents, HEALTH_WINDOW_MS);
+  health.rateLimitedEvents = trimByWindow(health.rateLimitedEvents, HEALTH_WINDOW_MS);
+  health.timeoutEvents = trimByWindow(health.timeoutEvents, HEALTH_WINDOW_MS);
+  health.retryEvents = trimByWindow(health.retryEvents, HEALTH_WINDOW_MS);
+  health.tpmEvents = trimByWindow(health.tpmEvents, HEALTH_TPM_WINDOW_MS);
+  health.batchSizesTranslate = Array.isArray(health.batchSizesTranslate)
+    ? health.batchSizesTranslate.slice(-HEALTH_BATCH_SAMPLE_LIMIT)
+    : [];
+  health.batchSizesProofread = Array.isArray(health.batchSizesProofread)
+    ? health.batchSizesProofread.slice(-HEALTH_BATCH_SAMPLE_LIMIT)
+    : [];
+}
+
+function recordHealthRequest() {
+  const health = getHealthState();
+  if (!health) return;
+  const now = Date.now();
+  health.requestsSent += 1;
+  health.requestEvents.push({ ts: now, ok: null });
+  trimHealthEvents(health);
+  schedulePersistDebugState('health:request');
+}
+
+function recordHealthResponse(ok) {
+  const health = getHealthState();
+  if (!health) return;
+  const now = Date.now();
+  if (ok) {
+    health.responsesOk += 1;
+  }
+  health.requestEvents.push({ ts: now, ok: Boolean(ok) });
+  trimHealthEvents(health);
+  schedulePersistDebugState('health:response');
+}
+
+function recordHealthError(type) {
+  const health = getHealthState();
+  if (!health) return;
+  const now = Date.now();
+  health.errorsTotal += 1;
+  health.requestEvents.push({ ts: now, ok: false });
+  if (type === 'rate_limited') {
+    health.rateLimitedEvents.push({ ts: now });
+  }
+  if (type === 'timeout') {
+    health.timeoutEvents.push({ ts: now });
+  }
+  trimHealthEvents(health);
+  schedulePersistDebugState(`health:error:${type || 'other'}`);
+}
+
+function recordHealthTimeout() {
+  const health = getHealthState();
+  if (!health) return;
+  const now = Date.now();
+  health.timeoutEvents.push({ ts: now });
+  trimHealthEvents(health);
+  schedulePersistDebugState('health:timeout');
+}
+
+function recordHealthRetry(delayMs = 0) {
+  const health = getHealthState();
+  if (!health) return;
+  const now = Date.now();
+  health.retryEvents.push({ ts: now });
+  if (delayMs > 0) {
+    health.backoffUntilMs = Math.max(health.backoffUntilMs || 0, now + delayMs);
+  }
+  trimHealthEvents(health);
+  schedulePersistDebugState('health:retry');
+}
+
+function recordHealthTokens(payloads) {
+  const health = getHealthState();
+  if (!health) return;
+  const now = Date.now();
+  const list = Array.isArray(payloads) ? payloads : [];
+  list.forEach((payload) => {
+    const usage = payload?.usage || {};
+    const promptTokens = Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : 0;
+    const completionTokens = Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0;
+    const cachedTokens = Number.isFinite(usage?.prompt_tokens_details?.cached_tokens)
+      ? usage.prompt_tokens_details.cached_tokens
+      : 0;
+    const tokens = promptTokens + completionTokens;
+    if (tokens > 0) {
+      health.tpmEvents.push({ ts: now, tokens });
+    }
+    health.promptTokensTotal += promptTokens;
+    health.completionTokensTotal += completionTokens;
+    health.cachedTokensTotal += cachedTokens;
+    if (payload?.prompt_cache_retention || payload?.request?.prompt_cache_retention) {
+      health.promptCacheRetentionUsed = true;
+    }
+  });
+  trimHealthEvents(health);
+  schedulePersistDebugState('health:tokens');
+}
+
+function recordHealthBatchSize(kind, size) {
+  const health = getHealthState();
+  if (!health || !Number.isFinite(size)) return;
+  if (kind === 'proofread') {
+    health.batchSizesProofread.push(size);
+  } else {
+    health.batchSizesTranslate.push(size);
+  }
+  trimHealthEvents(health);
+  schedulePersistDebugState('health:batch');
+}
+
+function recordHealthProofreadDelta(edits, total) {
+  const health = getHealthState();
+  if (!health) return;
+  const editsCount = Number.isFinite(edits) ? edits : 0;
+  const totalCount = Number.isFinite(total) ? total : 0;
+  health.proofreadDeltaEditsTotal += editsCount;
+  health.proofreadDeltaUnchangedTotal += Math.max(0, totalCount - editsCount);
+  health.proofreadItemsTotal += totalCount;
+  schedulePersistDebugState('health:proofread-delta');
+}
+
+function recordHealthUiSummary(fields) {
+  const health = getHealthState();
+  if (!health) return;
+  health.uiTmHit = Number.isFinite(fields?.tmHits) ? fields.tmHits : health.uiTmHit;
+  health.uiTmMiss = Number.isFinite(fields?.tmMisses) ? fields.tmMisses : health.uiTmMiss;
+  schedulePersistDebugState('health:ui-summary');
+}
+
+function recordHealthDedupSummary(fields) {
+  const health = getHealthState();
+  if (!health) return;
+  if (typeof fields?.dedupSavingsRatio === 'number') {
+    health.docDedupSavingsRatio = fields.dedupSavingsRatio;
+  }
+  schedulePersistDebugState('health:dedup-summary');
 }
 
 function isTimeoutLikeError(error) {
@@ -313,6 +552,13 @@ function isTimeoutLikeResponse(response) {
   if (!response || typeof response !== 'object') return false;
   if (response.isTimeout) return true;
   return isTimeoutLikeError(response.error);
+}
+
+function isRateLimitLikeError(error) {
+  const status = error?.status;
+  if (status === 429 || status === 503) return true;
+  const message = String(error?.message || error || '').toLowerCase();
+  return message.includes('429') || message.includes('rate') || message.includes('too many');
 }
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
@@ -708,6 +954,8 @@ function buildSettingsFromState(state) {
       proofreadModelList: DEFAULT_STATE.proofreadModelList,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      batchTurboMode: DEFAULT_STATE.batchTurboMode,
+      proofreadMode: DEFAULT_STATE.proofreadMode,
       singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
       assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
@@ -757,6 +1005,8 @@ function buildSettingsFromState(state) {
     proofreadModelList: state.proofreadModelList,
     contextGenerationEnabled: state.contextGenerationEnabled,
     proofreadEnabled: state.proofreadEnabled,
+    batchTurboMode: state.batchTurboMode || DEFAULT_STATE.batchTurboMode,
+    proofreadMode: state.proofreadMode || DEFAULT_STATE.proofreadMode,
     singleBlockConcurrency: Boolean(state.singleBlockConcurrency),
     assumeOpenAICompatibleApi: Boolean(state.assumeOpenAICompatibleApi),
     blockLengthLimit: state.blockLengthLimit,
@@ -794,10 +1044,48 @@ async function startTranslation(triggerSource = 'manual') {
   }
 
   configureTpmLimiter(settings);
+  schedulerModels = {
+    translationModel: settings.translationModel || '',
+    contextModel: settings.contextModel || '',
+    proofreadModel: settings.proofreadModel || ''
+  };
+  try {
+    const planId = createRequestId();
+    const plan = globalThis.ntPagePreflight?.buildPagePlan?.(
+      document,
+      settings.targetLanguage || 'ru',
+      settings
+    );
+    if (plan) {
+      pagePlan = { ...plan, planId };
+      pagePlanHints = plan.hints || null;
+      globalThis.ntPageJsonLog?.({
+        kind: 'preflight.summary',
+        ts: Date.now(),
+        host: plan.host || location.host || '',
+        totals: plan.totals || {},
+        hints: plan.hints || {}
+      });
+      const tabId = await getActiveTabId();
+      if (tabId) {
+        await sendRpcRequest(
+          { type: 'START_PAGE_PLAN', plan: pagePlan, tabId },
+          'START_PAGE_PLAN failed',
+          5000
+        );
+      }
+    }
+  } catch (error) {
+    globalThis.ntPageJsonLog?.({
+      kind: 'preflight.error',
+      ts: Date.now(),
+      error: error?.message || String(error)
+    });
+  }
   translationInProgress = true;
   try {
     startRpcHeartbeat();
-    await translatePage(settings, { triggerSource });
+    await translatePage(settings, { triggerSource, planHints: pagePlanHints });
   } finally {
     translationInProgress = false;
     stopRpcHeartbeat();
@@ -862,6 +1150,7 @@ async function requestSettings() {
           proofreadModel: state.proofreadModel,
           contextGenerationEnabled: state.contextGenerationEnabled,
           proofreadEnabled: state.proofreadEnabled,
+          batchTurboMode: state.batchTurboMode,
           assumeOpenAICompatibleApi: state.assumeOpenAICompatibleApi,
           blockLengthLimit: state.blockLengthLimit,
           tpmLimitsByModel: state.tpmLimitsByModel,
@@ -979,6 +1268,23 @@ function traceBlockLifecycle(entryIndex, stage, message, meta = null) {
 
 async function translatePage(settings, options = {}) {
   const translationTriggerSource = options?.triggerSource || 'manual';
+  const planHints = options?.planHints && typeof options.planHints === 'object' ? options.planHints : null;
+  const suggestedBatchSizeTranslate = Number.isFinite(planHints?.suggestedBatchSizeTranslate)
+    ? Math.max(1, planHints.suggestedBatchSizeTranslate)
+    : null;
+  const suggestedBatchSizeProofread = Number.isFinite(planHints?.suggestedBatchSizeProofread)
+    ? Math.max(1, planHints.suggestedBatchSizeProofread)
+    : null;
+  const suggestedConcurrency = Number.isFinite(planHints?.suggestedConcurrency)
+    ? Math.max(1, planHints.suggestedConcurrency)
+    : null;
+  const translationBatchTargetTokens = suggestedBatchSizeTranslate
+    ? Math.round(
+        TRANSLATION_MICROBATCH_TARGET_TOKENS *
+          Math.min(2, 0.5 + suggestedBatchSizeTranslate / 6)
+      )
+    : TRANSLATION_MICROBATCH_TARGET_TOKENS;
+  translationCallCount = 0;
   const textNodes = collectTextNodes(document.body);
   const existingDebugStore = await getTranslationDebugObject();
   const existingDebugEntry = existingDebugStore?.[location.href];
@@ -1097,6 +1403,539 @@ async function translatePage(settings, options = {}) {
     return;
   }
 
+  const uiPipelineStart = Date.now();
+  let uiUniqueTextsForPrewarm = [];
+  const uiBlockIndices = new Set();
+  const uiSegments = [];
+  const uiBlocks = [];
+  const uiStats = {
+    host: location.host || '',
+    targetLang: settings.targetLanguage || 'ru',
+    uiSegmentsTotal: 0,
+    uiUnique: 0,
+    tmHits: 0,
+    tmMisses: 0,
+    uiModelCalls: 0,
+    uiProofreadSkipped: 0,
+    uiTmSize: 0,
+    uiTmEvictions: 0
+  };
+  blocks.forEach((block, index) => {
+    const blockElement = block?.[0]?.blockElement;
+    const blockTexts = block.map(({ original }) => original);
+    if (!isUiBlock(blockElement, blockTexts)) return;
+    uiBlockIndices.add(index);
+    uiBlocks.push({ block, index, blockElement });
+    uiStats.uiSegmentsTotal += block.length;
+    uiStats.uiProofreadSkipped += 1;
+    updateDebugEntry(index + 1, {
+      uiMode: true,
+      proofreadApplied: false,
+      proofreadStatus: 'disabled'
+    });
+    block.forEach((segment, segmentIndex) => {
+      uiSegments.push({
+        blockIndex: index,
+        segmentIndex,
+        node: segment.node,
+        path: segment.path,
+        original: segment.original,
+        originalHash: segment.originalHash
+      });
+    });
+  });
+
+  if (uiSegments.length) {
+    try {
+      const uiMemory = globalThis.ntUiTranslationMemory;
+      const uiPreparedTexts = uiSegments.map((segment) => prepareTextForTranslation(segment.original));
+      const uiUniqueTexts = [];
+      const uiUniqueIndexMap = new Map();
+      uiPreparedTexts.forEach((text, index) => {
+        const normalizedKey = normalizeUiText(text);
+        if (!normalizedKey) return;
+        if (!uiUniqueIndexMap.has(normalizedKey)) {
+          uiUniqueIndexMap.set(normalizedKey, uiUniqueTexts.length);
+          uiUniqueTexts.push(text);
+        }
+        uiSegments[index].uniqueIndex = uiUniqueIndexMap.get(normalizedKey);
+      });
+      uiStats.uiUnique = uiUniqueTexts.length;
+      uiUniqueTextsForPrewarm = uiUniqueTexts.slice();
+      const tmResult = uiMemory
+        ? await uiMemory.bulkGet(uiUniqueTexts, uiStats.targetLang, uiStats.host)
+        : { translations: Array(uiUniqueTexts.length).fill(null), hits: 0, misses: uiUniqueTexts.length, size: 0, evictions: 0 };
+      uiStats.tmHits = tmResult.hits || 0;
+      uiStats.tmMisses = tmResult.misses || 0;
+      uiStats.uiTmSize = tmResult.size || 0;
+      uiStats.uiTmEvictions = tmResult.evictions || 0;
+
+      const translationsByUnique = Array.isArray(tmResult.translations)
+        ? [...tmResult.translations]
+        : Array(uiUniqueTexts.length).fill(null);
+      const missingTexts = [];
+      const missingIndices = [];
+      translationsByUnique.forEach((translation, index) => {
+        if (!translation) {
+          missingIndices.push(index);
+          missingTexts.push(uiUniqueTexts[index]);
+        }
+      });
+
+      if (missingTexts.length) {
+        const uiBatches = splitTextsByTokenEstimate(
+          missingTexts,
+          '',
+          TRANSLATION_MAX_TOKENS_PER_REQUEST
+        );
+        uiStats.uiModelCalls = uiBatches.length;
+        const uiRequestMeta = buildRequestMeta(
+          {
+            stage: 'translate',
+            purpose: 'ui',
+            triggerSource: translationTriggerSource,
+            url: location.href,
+            blockKey: uiBlocks[0]?.blockElement?.getAttribute?.(BLOCK_KEY_ATTR) || 'ui-batch'
+          },
+          {
+            contextText: '',
+            contextMode: 'NONE'
+          }
+        );
+        uiRequestMeta.flags = { ...(uiRequestMeta.flags || {}), uiMode: true };
+        const uiContextMeta = {
+          contextText: '',
+          contextMode: 'NONE',
+          contextFullText: '',
+          contextShortText: '',
+          baseAnswer: '',
+          baseAnswerIncluded: false,
+          baseAnswerPreview: '',
+          tag: CALL_TAGS.TRANSLATE_UI
+        };
+        const uiResult = await translate(
+          missingTexts,
+          uiStats.targetLang,
+          uiContextMeta,
+          false,
+          null,
+          uiRequestMeta,
+          { skipSummaries: true }
+        );
+        if (uiResult?.success && Array.isArray(uiResult.translations)) {
+          uiResult.translations.forEach((translation, idx) => {
+            const targetIndex = missingIndices[idx];
+            if (targetIndex == null) return;
+            translationsByUnique[targetIndex] = translation;
+          });
+          if (uiMemory) {
+            await uiMemory.bulkSet(missingTexts, uiResult.translations, uiStats.targetLang, uiStats.host);
+            const tmStats = uiMemory.getStats?.();
+            if (tmStats) {
+              uiStats.uiTmSize = tmStats.size ?? uiStats.uiTmSize;
+              uiStats.uiTmEvictions = tmStats.evictions ?? uiStats.uiTmEvictions;
+            }
+          }
+        }
+      }
+
+      const uiBlockTranslations = new Map();
+      uiSegments.forEach((segment) => {
+        const block = blocks[segment.blockIndex];
+        if (!block) return;
+        if (!uiBlockTranslations.has(segment.blockIndex)) {
+          uiBlockTranslations.set(segment.blockIndex, new Array(block.length).fill(null));
+        }
+        const translations = uiBlockTranslations.get(segment.blockIndex);
+        const uniqueIndex = segment.uniqueIndex;
+        const translated = uniqueIndex != null ? translationsByUnique[uniqueIndex] : null;
+        const resolvedTranslation = translated || segment.original;
+        let formatted = applyOriginalFormatting(segment.original, resolvedTranslation);
+        if (segment.node && shouldApplyTranslation(segment.node, segment.original, segment.originalHash)) {
+          if (translationVisible) {
+            segment.node.nodeValue = formatted;
+          }
+          updateActiveEntry(segment.path, segment.original, formatted, segment.originalHash);
+        }
+        translations[segment.segmentIndex] = formatted;
+      });
+
+      uiBlockTranslations.forEach((translations, blockIndex) => {
+        const block = blocks[blockIndex];
+        if (!block) return;
+        const translatedSegments = block.map((_segment, index) => translations[index] || block[index].original);
+        const blockTranslations = translatedSegments.map((text, index) => {
+          const segment = block[index];
+          if (segment.node && !shouldApplyTranslation(segment.node, segment.original, segment.originalHash)) {
+            return segment.node.nodeValue;
+          }
+          return text;
+        });
+        markBlockProcessed(block?.[0]?.blockElement, 'translate');
+        translationProgress.completedBlocks += 1;
+        updateDebugEntry(blockIndex + 1, {
+          translated: formatBlockText(blockTranslations),
+          translatedSegments,
+          translationStatus: 'done',
+          translationCompletedAt: Date.now(),
+          doneSegments: translatedSegments.length,
+          totalSegments: translatedSegments.length,
+          translationRaw: '',
+          translationRawRefId: '',
+          translationRawTruncated: false,
+          translationDebug: [],
+          proofread: [],
+          proofreadComparisons: [],
+          proofreadExecuted: false,
+          proofreadStatus: 'disabled',
+          proofreadCompletedAt: Date.now()
+        });
+      });
+
+      if (uiStats.uiProofreadSkipped > 0) {
+        globalThis.ntPageJsonLog?.({
+          kind: 'ui_proofread_skipped_count',
+          ts: Date.now(),
+          count: uiStats.uiProofreadSkipped
+        });
+      }
+    } catch (error) {
+      uiBlocks.forEach(({ index }) => {
+        updateDebugEntry(index + 1, {
+          uiMode: false,
+          proofreadApplied: settings.proofreadEnabled,
+          proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled'
+        });
+      });
+      uiBlockIndices.clear();
+      uiBlocks.length = 0;
+      uiSegments.length = 0;
+      globalThis.ntPageJsonLog?.({
+        kind: 'ui_pipeline.error',
+        ts: Date.now(),
+        error: error?.message || String(error)
+      });
+    }
+  }
+
+  const uiElapsedMs = Date.now() - uiPipelineStart;
+  if (uiStats.uiSegmentsTotal > 0) {
+    globalThis.ntPageJsonLog?.({
+      kind: 'ui_pipeline.summary',
+      ts: Date.now(),
+      fields: {
+        host: uiStats.host,
+        targetLang: uiStats.targetLang,
+        uiSegmentsTotal: uiStats.uiSegmentsTotal,
+        uiUnique: uiStats.uiUnique,
+        tmHits: uiStats.tmHits,
+        tmMisses: uiStats.tmMisses,
+        ui_tm_hit: uiStats.tmHits,
+        ui_tm_miss: uiStats.tmMisses,
+        ui_tm_size: uiStats.uiTmSize,
+        ui_tm_evictions: uiStats.uiTmEvictions,
+        uiModelCalls: uiStats.uiModelCalls,
+        uiProofreadSkipped: uiStats.uiProofreadSkipped,
+        uiTmSize: uiStats.uiTmSize,
+        uiTmEvictions: uiStats.uiTmEvictions,
+        elapsedMs: uiElapsedMs
+      }
+    });
+  }
+
+  const estimateTranslationCallsForBlocks = (candidateBlocks) => {
+    if (!Array.isArray(candidateBlocks) || !candidateBlocks.length) return 0;
+    return candidateBlocks.reduce((total, block) => {
+      const texts = block.map(({ original }) => prepareTextForTranslation(original));
+      if (!texts.length) return total;
+      const batches = splitTextsByTokenEstimate(
+        texts,
+        latestContextSummary || '',
+        TRANSLATION_MAX_TOKENS_PER_REQUEST
+      );
+      return total + Math.max(1, batches.length);
+    }, 0);
+  };
+
+  const nonUiBlocks = blocks.filter((_block, index) => !uiBlockIndices.has(index));
+  const translateCallsEstimatedBefore = estimateTranslationCallsForBlocks(nonUiBlocks);
+  const dedupStartTime = Date.now();
+  const dedupModule = globalThis.ntSegmentDedup;
+  const dedupPlan = dedupModule?.buildSegmentDedupPlan
+    ? dedupModule.buildSegmentDedupPlan({ blocks, uiBlockIndices })
+    : null;
+  const dedupStats = dedupPlan?.stats || { totalSegments: 0, uniqueSegments: 0, dedupedSegments: 0 };
+  const dedupEntries = dedupPlan?.entries ? Array.from(dedupPlan.entries.values()) : [];
+  const dedupEntriesForPrewarm = dedupEntries.slice();
+  const dedupTranslationsByKey = new Map();
+  const prefilledTranslationsByBlock = blocks.map((block) => new Array(block.length).fill(null));
+  const dedupBatchLogState = { lastTs: 0, count: 0 };
+  const logDedupBatch = (fields) => {
+    const now = Date.now();
+    if (dedupBatchLogState.count < 10 || now - dedupBatchLogState.lastTs > 2000) {
+      dedupBatchLogState.lastTs = now;
+      dedupBatchLogState.count += 1;
+      globalThis.ntPageJsonLog?.({
+        kind: 'dedup.batch',
+        ts: now,
+        fields
+      });
+    }
+  };
+  const mainTranslateBaseline = translationCallCount;
+
+  if (dedupEntries.length) {
+    const dedupEligibleEntries = dedupEntries.filter((entry) => entry.dedupEligible && entry.count >= 2);
+    const dedupTexts = dedupEligibleEntries.map((entry) => entry.sourceTextOriginal);
+    const dedupKeys = dedupEligibleEntries.map((entry) => entry.key);
+    const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
+    const translationMemory = globalThis.ntTranslationMemory;
+    let missingEntries = dedupEligibleEntries;
+    if (translationMemory?.bulkGetByKey && dedupKeys.length) {
+      try {
+        const tmResult = await translationMemory.bulkGetByKey(
+          dedupKeys,
+          settings.targetLanguage || 'ru',
+          location.host || ''
+        );
+        const tmTranslations = Array.isArray(tmResult?.translations) ? tmResult.translations : [];
+        missingEntries = dedupEligibleEntries.filter((_entry, index) => !tmTranslations[index]);
+        tmTranslations.forEach((translation, index) => {
+          if (!translation) return;
+          const key = dedupKeys[index];
+          if (!key) return;
+          dedupTranslationsByKey.set(key, translation);
+        });
+      } catch (error) {
+        missingEntries = dedupEligibleEntries;
+      }
+    }
+    const missingTexts = missingEntries.map((entry) => entry.sourceTextOriginal);
+    const missingKeys = missingEntries.map((entry) => entry.key);
+    if (missingTexts.length) {
+      const batches = splitTextsByTokenEstimate(
+        missingTexts,
+        '',
+        TRANSLATION_MAX_TOKENS_PER_REQUEST
+      );
+      let offset = 0;
+      for (const batch of batches) {
+        const batchKeys = missingKeys.slice(offset, offset + batch.length);
+        offset += batch.length;
+        logDedupBatch({
+          batchSize: batch.length,
+          expectedCount: batch.length,
+          usedContextMode: 'SHORT'
+        });
+        const requestMeta = buildRequestMeta(
+          {
+            stage: 'translate',
+            purpose: 'dedup',
+            triggerSource: translationTriggerSource,
+            url: location.href,
+            blockKey: batchKeys[0] || 'dedup-batch'
+          },
+          {
+            contextText: '',
+            contextMode: 'SHORT'
+          }
+        );
+        requestMeta.batchBlockKeys = batchKeys;
+        requestMeta.batchBlockCount = batchKeys.length;
+        traceRequestInitiator(requestMeta);
+        const result = await translate(
+          batch,
+          settings.targetLanguage || 'ru',
+          {
+            contextText: '',
+            contextMode: 'SHORT',
+            contextFullText: '',
+            contextShortText: '',
+            baseAnswer: '',
+            baseAnswerIncluded: false,
+            baseAnswerPreview: '',
+            tag: CALL_TAGS.TRANSLATE_DEDUP_SHORT
+          },
+          keepPunctuationTokens,
+          null,
+          requestMeta,
+          { skipSummaries: true }
+        );
+        if (!result?.success || !Array.isArray(result.translations)) {
+          throw new Error(result?.error || 'Не удалось выполнить дедуп перевод.');
+        }
+        if (result.translations.length !== batch.length) {
+          throw new Error(
+            `Dedup translation length mismatch: expected ${batch.length}, got ${result.translations.length}`
+          );
+        }
+        result.translations.forEach((translation, index) => {
+          const key = batchKeys[index];
+          if (!key) return;
+          dedupTranslationsByKey.set(key, translation);
+        });
+      }
+    }
+
+    if (translationMemory?.bulkSetByKey && dedupTranslationsByKey.size) {
+      const keys = Array.from(dedupTranslationsByKey.keys());
+      const values = keys.map((key) => dedupTranslationsByKey.get(key));
+      try {
+        await translationMemory.bulkSetByKey(keys, values, settings.targetLanguage || 'ru', location.host || '');
+      } catch (error) {
+        // ignore TM write failures
+      }
+    }
+
+    dedupEntries.forEach((entry) => {
+      if (!entry.dedupEligible) return;
+      const translated = dedupTranslationsByKey.get(entry.key);
+      if (!translated) return;
+      entry.occurrences.forEach(({ blockIndex, segmentIndex }) => {
+        const block = blocks[blockIndex];
+        const segment = block?.[segmentIndex];
+        if (!segment) return;
+        const { node, path, original, originalHash } = segment;
+        const resolvedTranslation = translated || original;
+        let withOriginalFormatting = applyOriginalFormatting(original, resolvedTranslation);
+        if (keepPunctuationTokens) {
+          withOriginalFormatting = restorePunctuationTokens(withOriginalFormatting);
+        }
+        prefilledTranslationsByBlock[blockIndex][segmentIndex] = withOriginalFormatting;
+        if (node && shouldApplyTranslation(node, original, originalHash)) {
+          if (translationVisible) {
+            node.nodeValue = withOriginalFormatting;
+          }
+          updateActiveEntry(path, original, withOriginalFormatting, originalHash);
+        }
+      });
+    });
+
+    prefilledTranslationsByBlock.forEach((prefilled, blockIndex) => {
+      const doneSegments = prefilled.filter((value) => value != null).length;
+      if (doneSegments > 0) {
+        updateDebugEntry(blockIndex + 1, {
+          doneSegments,
+          totalSegments: prefilled.length
+        });
+      }
+    });
+  }
+
+  let dedupSummaryLogged = false;
+  const logDedupSummary = () => {
+    if (dedupSummaryLogged) return;
+    dedupSummaryLogged = true;
+    const totalSegments = dedupStats.totalSegments || 0;
+    const uniqueSegments = dedupStats.uniqueSegments || 0;
+    const dedupedSegments = dedupStats.dedupedSegments || 0;
+    const dedupSavingsRatio = totalSegments
+      ? Math.max(0, (totalSegments - uniqueSegments) / totalSegments)
+      : 0;
+    const translateCallsActualAfter = Math.max(0, translationCallCount - mainTranslateBaseline);
+    globalThis.ntPageJsonLog?.({
+      kind: 'dedup.summary',
+      ts: Date.now(),
+      fields: {
+        host: location.host || '',
+        totalSegments,
+        uniqueSegments,
+        dedupedSegments,
+        dedupSavingsRatio,
+        translateCallsEstimatedBefore,
+        translateCallsActualAfter,
+        elapsedMs: Date.now() - dedupStartTime
+      }
+    });
+  };
+
+  const scheduleBatchPrewarm = async () => {
+    const batchMode = settings.batchTurboMode || 'off';
+    if (batchMode === 'off') return;
+    const host = location.host || '';
+    const targetLang = settings.targetLanguage || 'ru';
+    const maxRequests = 5000;
+    const items = [];
+    const seenKeys = new Set();
+    const normalizeUiKey =
+      typeof globalThis.ntNormalizeUiKey === 'function'
+        ? globalThis.ntNormalizeUiKey
+        : (text) => String(text || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    if (uiUniqueTextsForPrewarm.length) {
+      const uiMemory = globalThis.ntUiTranslationMemory;
+      let uiTranslations = [];
+      if (uiMemory?.bulkGet) {
+        try {
+          const tmResult = await uiMemory.bulkGet(uiUniqueTextsForPrewarm, targetLang, host);
+          uiTranslations = Array.isArray(tmResult?.translations) ? tmResult.translations : [];
+        } catch (error) {
+          uiTranslations = [];
+        }
+      }
+      uiUniqueTextsForPrewarm.forEach((text, index) => {
+        if (uiTranslations[index]) return;
+        const segmentKey = normalizeUiKey(text);
+        if (!segmentKey) return;
+        const dedupKey = `${segmentKey}::ui`;
+        if (seenKeys.has(dedupKey)) return;
+        seenKeys.add(dedupKey);
+        items.push({ text, segmentKey, source: 'ui' });
+      });
+    }
+
+    if (batchMode === 'prewarm_dedup_all' && dedupEntriesForPrewarm.length) {
+      const translationMemory = globalThis.ntTranslationMemory;
+      const dedupCandidates = dedupEntriesForPrewarm
+        .filter((entry) => entry?.dedupEligible)
+        .filter((entry) => entry.count >= 3 || String(entry?.sourceTextOriginal || '').length <= 60)
+        .sort((a, b) => (b.count || 0) - (a.count || 0));
+      const keys = dedupCandidates.map((entry) => entry.key);
+      let cachedTranslations = [];
+      if (translationMemory?.bulkGetByKey) {
+        try {
+          const tmResult = await translationMemory.bulkGetByKey(keys, targetLang, host);
+          cachedTranslations = Array.isArray(tmResult?.translations) ? tmResult.translations : [];
+        } catch (error) {
+          cachedTranslations = [];
+        }
+      }
+      dedupCandidates.forEach((entry, index) => {
+        if (cachedTranslations[index]) return;
+        if (!entry?.key || !entry?.sourceTextOriginal) return;
+        const dedupKey = `${entry.key}::dedup`;
+        if (seenKeys.has(dedupKey)) return;
+        seenKeys.add(dedupKey);
+        items.push({
+          text: entry.sourceTextOriginal,
+          segmentKey: entry.key,
+          source: 'dedup'
+        });
+      });
+    }
+
+    if (!items.length) {
+      globalThis.ntPageJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'no_candidates' }
+      });
+      return;
+    }
+    const limitedItems = items.slice(0, maxRequests);
+    await sendRpcRequest(
+      {
+        type: 'START_BATCH_PREWARM',
+        host,
+        targetLang,
+        items: limitedItems,
+        mode: batchMode
+      },
+      'START_BATCH_PREWARM failed',
+      5000
+    );
+  };
+
+  void scheduleBatchPrewarm();
   cancelRequested = false;
   translationError = null;
   reportProgress('Перевод запущен', 0, blocks.length, 0);
@@ -1201,7 +2040,11 @@ async function translatePage(settings, options = {}) {
     }
   };
 
-  if (settings.contextGenerationEnabled && (!latestShortContextSummary || !latestContextSummary)) {
+  if (
+    settings.contextGenerationEnabled &&
+    planHints?.suggestedContextMode !== 'NONE' &&
+    (!latestShortContextSummary || !latestContextSummary)
+  ) {
     await buildContextBundle();
   }
 
@@ -1304,11 +2147,30 @@ async function translatePage(settings, options = {}) {
         tag = CALL_TAGS.TRANSLATE_FOLLOWUP_SHORT;
       }
     }
+    if (!options.forceShort) {
+      if (planHints?.suggestedContextMode === 'SHORT' && contextMode === 'FULL') {
+        contextMode = 'SHORT';
+        if (kind === 'proofread') {
+          tag = options.followupTag || CALL_TAGS.PROOFREAD_REWRITE_SHORT;
+        } else {
+          tag = CALL_TAGS.TRANSLATE_FOLLOWUP_SHORT;
+        }
+      }
+      if (planHints?.suggestedContextMode === 'NONE') {
+        contextMode = 'NONE';
+      }
+    }
     if (contextMode === 'SHORT' && shortContextPromise) {
       await shortContextPromise;
     }
-    const contextText = contextMode === 'SHORT' ? latestShortContextSummary : latestContextSummary;
-    const baseAnswerIncluded = contextMode === 'SHORT' && Boolean(baseAnswer) && (!options.forceShort || fullSuccess);
+    const contextText =
+      contextMode === 'SHORT'
+        ? latestShortContextSummary
+        : contextMode === 'NONE'
+          ? ''
+          : latestContextSummary;
+    const baseAnswerIncluded =
+      contextMode === 'SHORT' && Boolean(baseAnswer) && (!options.forceShort || fullSuccess);
     const baseAnswerPreview = baseAnswerIncluded ? buildBaseAnswerPreview(baseAnswer) : '';
     updateDebugEntry(entry.index, {
       [attemptKey]: attemptCount + 1
@@ -1394,6 +2256,22 @@ async function translatePage(settings, options = {}) {
     ].join('|');
   };
 
+  const getPendingSegmentIndices = (item) => {
+    const plan = item?.plan;
+    if (Array.isArray(plan?.pendingSegmentIndices)) {
+      return plan.pendingSegmentIndices;
+    }
+    return item?.block ? item.block.map((_segment, index) => index) : [];
+  };
+
+  const getPreparedTextsForItem = (item) => {
+    const pendingIndices = getPendingSegmentIndices(item);
+    if (!pendingIndices.length) return [];
+    return pendingIndices.map((segmentIndex) =>
+      prepareTextForTranslation(item.block[segmentIndex]?.original || '')
+    );
+  };
+
   const buildTranslationMicroBatch = async ({ seedItem, seedContext, seedPreparedTexts }) => {
     const batchItems = [seedItem];
     if (seedItem.retryCount > 0 || seedItem.fallbackMode !== 'normal') {
@@ -1406,7 +2284,7 @@ async function translatePage(settings, options = {}) {
       texts: seedPreparedTexts,
       context: contextEstimateText
     });
-    const targetTokens = TRANSLATION_MICROBATCH_TARGET_TOKENS;
+    const targetTokens = translationBatchTargetTokens;
     const maxTokens = Math.min(
       TRANSLATION_MAX_TOKENS_PER_REQUEST,
       Math.max(targetTokens + 300, Math.round(targetTokens * 1.6))
@@ -1422,7 +2300,8 @@ async function translatePage(settings, options = {}) {
       const candidateEntry = debugEntries.find((item) => item.index === candidate.index + 1);
       const candidateContext = await peekContextForBlock(candidateEntry, 'translation');
       if (buildContextSignature(candidateContext) !== seedSignature) continue;
-      const candidatePreparedTexts = candidate.block.map(({ original }) => prepareTextForTranslation(original));
+      const candidatePreparedTexts = getPreparedTextsForItem(candidate);
+      if (!candidatePreparedTexts.length) continue;
       const candidateTokens = estimateTokensForRole('translation', {
         texts: candidatePreparedTexts,
         context: ''
@@ -1437,8 +2316,35 @@ async function translatePage(settings, options = {}) {
     return { items: batchItems, primaryContext: seedContext, contextSignature: seedSignature };
   };
 
+  const isSimpleDedupBlock = (block) => {
+    if (!Array.isArray(block) || !block.length) return false;
+    const lengths = block.map(({ original }) => String(original || '').length);
+    const total = lengths.reduce((sum, value) => sum + value, 0);
+    const avgLen = total / lengths.length;
+    const maxLen = Math.max(...lengths);
+    return maxLen <= 60 && avgLen <= 40;
+  };
+
+  const blockTranslationPlans = blocks.map((block, index) => {
+    const prefilled = prefilledTranslationsByBlock?.[index] || new Array(block.length).fill(null);
+    const pendingSegmentIndices = [];
+    prefilled.forEach((value, segmentIndex) => {
+      if (value == null) pendingSegmentIndices.push(segmentIndex);
+    });
+    const allPrefilled = pendingSegmentIndices.length === 0;
+    const uiLike = allPrefilled && isSimpleDedupBlock(block);
+    return {
+      prefilledTranslations: prefilled,
+      pendingSegmentIndices,
+      allPrefilled,
+      uiLike
+    };
+  });
+
   const singleBlockConcurrency = Boolean(settings.singleBlockConcurrency);
-  const translationConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(6, blocks.length));
+  const translationConcurrency = singleBlockConcurrency
+    ? 1
+    : Math.max(1, Math.min(6, suggestedConcurrency || blocks.length));
   let maxConcurrentTranslationJobs = translationConcurrency;
   let totalBlockRetries = 0;
   let activeTranslationWorkers = 0;
@@ -1448,7 +2354,9 @@ async function translatePage(settings, options = {}) {
   const proofreadQueue = [];
   const queuedBlockElements = new WeakSet();
   const proofreadQueueKeys = new Set();
-  let proofreadConcurrency = singleBlockConcurrency ? 1 : Math.max(1, Math.min(4, blocks.length));
+  let proofreadConcurrency = singleBlockConcurrency
+    ? 1
+    : Math.max(1, Math.min(4, suggestedConcurrency || blocks.length));
   // Duplicate translate/proofread requests could be triggered for the same block; dedupe by jobKey.
   const jobInFlight = new Map();
   const jobCompleted = new Map();
@@ -1487,13 +2395,77 @@ async function translatePage(settings, options = {}) {
     return promise;
   };
 
+  const finalizePrefilledBlock = async ({ block, index, blockElement, uiMode, uiLike }) => {
+    const prefilled = prefilledTranslationsByBlock?.[index] || new Array(block.length).fill(null);
+    const translatedTexts = block.map((_segment, segmentIndex) => {
+      const resolved = prefilled[segmentIndex];
+      return resolved == null ? block[segmentIndex].original : resolved;
+    });
+    const blockTranslations = [];
+    block.forEach(({ node, path, original, originalHash }, segmentIndex) => {
+      if (!shouldApplyTranslation(node, original, originalHash)) {
+        blockTranslations.push(node?.nodeValue ?? '');
+        return;
+      }
+      const withOriginalFormatting = translatedTexts[segmentIndex] || node?.nodeValue || '';
+      if (translationVisible) {
+        if (node && node.nodeType === Node.TEXT_NODE) {
+          node.nodeValue = withOriginalFormatting;
+        }
+      }
+      blockTranslations.push(withOriginalFormatting);
+      updateActiveEntry(path, original, withOriginalFormatting, originalHash);
+    });
+    markBlockProcessed(blockElement, 'translate');
+    traceBlockLifecycle(index + 1, 'translate', 'applied to DOM', { visible: translationVisible, dedup: true });
+    const translationRawField = await prepareRawTextField('', 'translation_raw');
+    await updateDebugEntry(index + 1, {
+      translated: formatBlockText(blockTranslations),
+      translatedSegments: translatedTexts,
+      translationStatus: 'done',
+      translationCompletedAt: Date.now(),
+      doneSegments: translatedTexts.length,
+      totalSegments: translatedTexts.length,
+      translationRaw: translationRawField.preview,
+      translationRawRefId: translationRawField.refId,
+      translationRawTruncated: translationRawField.truncated || translationRawField.rawTruncated,
+      translationDebug: [],
+      proofreadStatus: settings.proofreadEnabled && !uiMode ? 'pending' : 'disabled',
+      proofreadApplied: settings.proofreadEnabled && !uiMode
+    });
+    traceBlockLifecycle(index + 1, 'translate', 'status -> DONE');
+    translationProgress.completedBlocks += 1;
+    await maybeQueueProofread({
+      block,
+      index,
+      key: getBlockKey(block),
+      blockElement,
+      translatedTexts,
+      originalTexts: block.map(({ original }) => original),
+      uiMode,
+      uiLike,
+      settings
+    });
+  };
+
   const enqueueTranslationBlock = (block, index) => {
     const key = getBlockKey(block);
     const blockElement = block?.[0]?.blockElement;
+    const plan = blockTranslationPlans?.[index] || {};
     if (blockElement && queuedBlockElements.has(blockElement)) {
       return false;
     }
     if (isBlockProcessed(blockElement, 'translate')) {
+      return false;
+    }
+    if (plan.allPrefilled) {
+      void finalizePrefilledBlock({
+        block,
+        index,
+        blockElement,
+        uiMode: uiBlockIndices.has(index),
+        uiLike: plan.uiLike
+      });
       return false;
     }
     if (blockElement) {
@@ -1504,6 +2476,9 @@ async function translatePage(settings, options = {}) {
       index,
       key,
       blockElement,
+      uiMode: uiBlockIndices.has(index),
+      uiLike: plan.uiLike,
+      plan,
       retryCount: 0,
       availableAt: 0,
       fallbackMode: 'normal'
@@ -1562,8 +2537,17 @@ async function translatePage(settings, options = {}) {
       try {
         const seedIndex = seedItem.index;
         const seedBlock = seedItem.block;
+        const seedPlan = seedItem.plan || blockTranslationPlans?.[seedIndex] || {};
         const seedDebugEntry = debugEntries.find((item) => item.index === seedIndex + 1);
-        const seedPreparedTexts = seedBlock.map(({ original }) => prepareTextForTranslation(original));
+        const seedPendingIndices = Array.isArray(seedPlan.pendingSegmentIndices)
+          ? seedPlan.pendingSegmentIndices
+          : seedBlock.map((_segment, index) => index);
+        const seedPreparedTexts = seedPendingIndices.map((segmentIndex) =>
+          prepareTextForTranslation(seedBlock[segmentIndex]?.original || '')
+        );
+        if (!seedPreparedTexts.length) {
+          continue;
+        }
         const { uniqueTexts: seedUniqueTexts, indexMap: seedIndexMap } = deduplicateTexts(seedPreparedTexts);
         const seedContext = await selectContextForBlock(seedDebugEntry, 'translation');
         const batchPlan = await buildTranslationMicroBatch({
@@ -1594,7 +2578,8 @@ async function translatePage(settings, options = {}) {
         for (const item of batchItems) {
           await updateDebugEntry(item.index + 1, {
             translationStatus: 'in_progress',
-            proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled',
+            proofreadStatus: settings.proofreadEnabled && !item.uiMode ? 'pending' : 'disabled',
+            proofreadApplied: settings.proofreadEnabled && !item.uiMode,
             translationStartedAt: Date.now()
           });
           traceBlockLifecycle(item.index + 1, 'translate', 'block start', { blockKey: item.key });
@@ -1673,13 +2658,27 @@ async function translatePage(settings, options = {}) {
           const combinedPreparedTexts = [];
           const segmentMap = [];
           batchItems.forEach((item, itemIndex) => {
-            item.block.forEach(({ original }, segmentIndex) => {
-              combinedPreparedTexts.push(prepareTextForTranslation(original));
+            const plan = item.plan || blockTranslationPlans?.[item.index] || {};
+            const pendingIndices = Array.isArray(plan.pendingSegmentIndices)
+              ? plan.pendingSegmentIndices
+              : item.block.map((_segment, index) => index);
+            pendingIndices.forEach((segmentIndex) => {
+              const segment = item.block[segmentIndex];
+              combinedPreparedTexts.push(prepareTextForTranslation(segment?.original || ''));
               segmentMap.push({ itemIndex, segmentIndex });
             });
           });
+          if (!combinedPreparedTexts.length) {
+            continue;
+          }
           const { uniqueTexts, indexMap } = deduplicateTexts(combinedPreparedTexts);
-          const perItemTranslations = batchItems.map((item) => new Array(item.block.length).fill(null));
+          const perItemTranslations = batchItems.map((item) => {
+            const plan = item.plan || blockTranslationPlans?.[item.index] || {};
+            const prefilled = Array.isArray(plan.prefilledTranslations)
+              ? plan.prefilledTranslations
+              : new Array(item.block.length).fill(null);
+            return [...prefilled];
+          });
           const uniqueToSegments = new Map();
           combinedPreparedTexts.forEach((_text, combinedIndex) => {
             const mapping = segmentMap[combinedIndex];
@@ -1896,30 +2895,17 @@ async function translatePage(settings, options = {}) {
               });
               traceBlockLifecycle(item.index + 1, 'translate', 'status -> DONE');
               translationProgress.completedBlocks += 1;
-              if (settings.proofreadEnabled) {
-                const proofreadSegments = translatedTexts.map((text, index) => ({ id: String(index), text }));
-                const proofreadMode = detectProofreadMode(proofreadSegments, settings.targetLanguage || 'ru');
-                if (!proofreadSegments.length) {
-                  await updateDebugEntry(item.index + 1, {
-                    proofreadStatus: 'done',
-                    proofread: [],
-                    proofreadComparisons: [],
-                    proofreadExecuted: false,
-                    proofreadCompletedAt: Date.now()
-                  });
-                } else {
-                  enqueueProofreadTask({
-                    block,
-                    index: item.index,
-                    key: item.key,
-                    blockElement: item.blockElement,
-                    translatedTexts,
-                    originalTexts: block.map(({ original }) => original),
-                    proofreadSegments,
-                    proofreadMode
-                  });
-                }
-              }
+              await maybeQueueProofread({
+                block,
+                index: item.index,
+                key: item.key,
+                blockElement: item.blockElement,
+                translatedTexts,
+                originalTexts: block.map(({ original }) => original),
+                uiMode: item.uiMode,
+                uiLike: item.uiLike,
+                settings
+              });
             } catch (error) {
               globalThis.ntPageJsonLog?.({
                 kind: 'apply.error',
@@ -1938,8 +2924,16 @@ async function translatePage(settings, options = {}) {
 
         traceBlockLifecycle(seedIndex + 1, 'translate', 'parsed OK', { batchSize: 1 });
         try {
+          const pendingIndexBySegment = new Map();
+          seedPendingIndices.forEach((segmentIndex, pendingIndex) => {
+            pendingIndexBySegment.set(segmentIndex, pendingIndex);
+          });
           const translatedTexts = seedBlock.map(({ original }, index) => {
-            const translationIndex = seedIndexMap[index];
+            const pendingIndex = pendingIndexBySegment.get(index);
+            if (pendingIndex == null) {
+              return seedPlan.prefilledTranslations?.[index] || original;
+            }
+            const translationIndex = seedIndexMap[pendingIndex];
             const translated = translationIndex == null ? original : (result.translations[translationIndex] || original);
             return applyOriginalFormatting(original, translated);
           });
@@ -2003,30 +2997,17 @@ async function translatePage(settings, options = {}) {
           traceBlockLifecycle(seedIndex + 1, 'translate', 'status -> DONE');
           translationProgress.completedBlocks += 1;
 
-          if (settings.proofreadEnabled) {
-            const proofreadSegments = translatedTexts.map((text, index) => ({ id: String(index), text }));
-            const proofreadMode = detectProofreadMode(proofreadSegments, settings.targetLanguage || 'ru');
-            if (!proofreadSegments.length) {
-              await updateDebugEntry(seedIndex + 1, {
-                proofreadStatus: 'done',
-                proofread: [],
-                proofreadComparisons: [],
-                proofreadExecuted: false,
-                proofreadCompletedAt: Date.now()
-              });
-            } else {
-              enqueueProofreadTask({
-                block: seedBlock,
-                index: seedIndex,
-                key: seedItem.key,
-                blockElement: seedItem.blockElement,
-                translatedTexts,
-                originalTexts: seedBlock.map(({ original }) => original),
-                proofreadSegments,
-                proofreadMode
-              });
-            }
-          }
+          await maybeQueueProofread({
+            block: seedBlock,
+            index: seedIndex,
+            key: seedItem.key,
+            blockElement: seedItem.blockElement,
+            translatedTexts,
+            originalTexts: seedBlock.map(({ original }) => original),
+            uiMode: seedItem.uiMode,
+            uiLike: seedItem.uiLike,
+            settings
+          });
         } catch (error) {
           globalThis.ntPageJsonLog?.({
             kind: 'apply.error',
@@ -2041,20 +3022,45 @@ async function translatePage(settings, options = {}) {
         }
       } catch (error) {
         console.error('Block translation failed', error);
+        const policy = globalThis.ntResiliencePolicy;
+        const errorType = classifyResilienceError(error);
         if (isFatalBlockError(error)) {
           translationError = error;
           cancelRequested = true;
           for (const item of activeBatchItems) {
+            if (policy) {
+              const resilienceKey = buildResilienceKey('translate', { blockKey: item.key });
+              policy.recordOutcome(resilienceKey, errorType, {
+                errorType,
+                errorMessage: error?.message || String(error)
+              });
+            }
             await updateDebugEntry(item.index + 1, {
-              translationStatus: 'failed',
-              proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled',
+              translationStatus: 'cancelled',
+              proofreadStatus: settings.proofreadEnabled ? 'cancelled' : 'disabled',
               translationCompletedAt: Date.now()
             });
           }
         } else {
           for (const item of activeBatchItems) {
+            if (policy) {
+              const resilienceKey = buildResilienceKey('translate', { blockKey: item.key });
+              policy.recordOutcome(resilienceKey, errorType, {
+                errorType,
+                errorMessage: error?.message || String(error)
+              });
+              if (policy.shouldEscalate(resilienceKey, errorType)) {
+                policy.escalate(resilienceKey, errorType);
+              }
+              const state = policy.getState(resilienceKey);
+              if (state?.modeLevel >= 5 || state?.attemptsTotal >= policy.constants.MAX_ATTEMPTS_TOTAL) {
+                item.fallbackMode = 'single';
+                item.retryCount = 0;
+              }
+            }
             item.retryCount += 1;
             totalBlockRetries += 1;
+            recordHealthRetry();
             if (item.retryCount > MAX_BLOCK_RETRIES) {
               item.fallbackMode = 'single';
               item.retryCount = 0;
@@ -2277,6 +3283,7 @@ async function translatePage(settings, options = {}) {
           beforeTexts: task.translatedTexts,
           afterTexts: finalTranslations
         }).filter((comparison) => comparison.changed);
+        recordHealthProofreadDelta(proofreadComparisons.length, task.originalTexts.length);
         const baseProofreadAnswer =
           primaryContext.contextMode === 'FULL' && debugEntry && !debugEntry.proofreadBaseFullAnswer
             ? formatBlockText(finalTranslations)
@@ -2310,8 +3317,9 @@ async function translatePage(settings, options = {}) {
           beforeTexts: task.translatedTexts,
           afterTexts: task.translatedTexts
         }).filter((comparison) => comparison.changed);
+        recordHealthProofreadDelta(proofreadComparisons.length, task.originalTexts.length);
         await updateDebugEntry(task.index + 1, {
-          proofreadStatus: 'failed',
+          proofreadStatus: 'cancelled',
           proofread: [],
           proofreadComparisons,
           proofreadExecuted: true,
@@ -2426,9 +3434,14 @@ async function translatePage(settings, options = {}) {
   }
 
   blocks.forEach((block, index) => {
+    if (uiBlockIndices.has(index)) return;
     enqueueTranslationBlock(block, index);
   });
-  translationProgress.totalBlocks = translationQueue.length;
+  const prefilledBlocksCount = blockTranslationPlans.reduce((sum, plan, index) => {
+    if (uiBlockIndices.has(index)) return sum;
+    return sum + (plan?.allPrefilled ? 1 : 0);
+  }, 0);
+  translationProgress.totalBlocks = translationQueue.length + uiBlockIndices.size + prefilledBlocksCount;
   const totalBlocks = translationProgress.totalBlocks;
 
   if (totalBlocks !== blocks.length) {
@@ -2447,6 +3460,7 @@ async function translatePage(settings, options = {}) {
   if (translationError) {
     updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:error');
+    logDedupSummary();
     reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
@@ -2454,15 +3468,87 @@ async function translatePage(settings, options = {}) {
   if (cancelRequested) {
     updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:cancelled');
+    logDedupSummary();
     reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
     return;
   }
 
   updateDebugSessionEndTime();
   await flushPersistDebugState('translatePage:completed');
+  logDedupSummary();
   reportProgress('Перевод завершён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
   await flushPersistDebugState('translatePage:before-save');
   await saveTranslationsToMemory(activeTranslationEntries);
+}
+
+function buildResilienceKey(opType, requestMeta = null) {
+  const blockKey = requestMeta?.blockKey || requestMeta?.batchBlockKeys?.[0] || requestMeta?.requestId || '';
+  const host = location.host || '';
+  return `${opType || 'unknown'}::${blockKey || host || 'page'}`;
+}
+
+function classifyResilienceError(error) {
+  const status = error?.status;
+  const message = String(error?.message || error || '').toLowerCase();
+  if (status === 429 || status === 503 || message.includes('rate limit')) return 'rate_limited';
+  if (status === 408 || error?.name === 'AbortError' || message.includes('timeout')) return 'timeout';
+  if (message.includes('length mismatch') || message.includes('count mismatch')) return 'count_mismatch';
+  if (message.includes('schema') || message.includes('json')) return 'schema';
+  if (status >= 500) return 'transient';
+  return 'other';
+}
+
+function applyResilienceToContext(contextMeta, requestOptions) {
+  const resilience = requestOptions?.resilience || {};
+  if (!resilience || !contextMeta) return contextMeta;
+  const next = { ...contextMeta };
+  if (resilience.forceNoContext) {
+    return {
+      ...next,
+      contextText: '',
+      contextMode: 'SHORT',
+      contextFullText: '',
+      contextShortText: '',
+      baseAnswer: '',
+      baseAnswerIncluded: false,
+      baseAnswerPreview: ''
+    };
+  }
+  if (resilience.forceShortContext) {
+    const shortText = next.contextShortText || '';
+    next.contextText = shortText;
+    next.contextMode = 'SHORT';
+    next.baseAnswer = '';
+    next.baseAnswerIncluded = false;
+    next.baseAnswerPreview = '';
+  }
+  if (Number.isFinite(resilience.maxContextChars) && next.contextText?.length > resilience.maxContextChars) {
+    next.contextText = next.contextText.slice(0, resilience.maxContextChars);
+  }
+  return next;
+}
+
+function splitBatchesForResilience(batches, splitDepth = 0) {
+  if (!Array.isArray(batches) || splitDepth <= 0) return batches;
+  let output = [];
+  batches.forEach((batch) => {
+    let parts = [batch];
+    for (let depth = 0; depth < splitDepth; depth += 1) {
+      const next = [];
+      parts.forEach((part) => {
+        if (!part || part.length <= 1) {
+          next.push(part);
+          return;
+        }
+        const midpoint = Math.ceil(part.length / 2);
+        next.push(part.slice(0, midpoint));
+        next.push(part.slice(midpoint));
+      });
+      parts = next;
+    }
+    output = output.concat(parts);
+  });
+  return output;
 }
 
 async function translate(
@@ -2472,8 +3558,10 @@ async function translate(
   keepPunctuationTokens = false,
   debugEntryIndex = null,
   requestMeta = null,
-  debugOptions = null
+  debugOptions = null,
+  requestOptions = null
 ) {
+  translationCallCount += 1;
   const resolvedContextMeta =
     contextMeta && typeof contextMeta === 'object'
       ? contextMeta
@@ -2487,14 +3575,23 @@ async function translate(
           baseAnswerPreview: '',
           tag: CALL_TAGS.TRANSLATE_BASE_FULL
         };
-  const context = resolvedContextMeta.contextText || '';
-  const baseAnswer = resolvedContextMeta.baseAnswerIncluded ? resolvedContextMeta.baseAnswer || '' : '';
+  const policy = globalThis.ntResiliencePolicy;
+  const resilienceKey = policy ? buildResilienceKey('translate', requestMeta) : '';
+  const policyState = policy?.getState?.(resilienceKey) || null;
+  const patchedRequestOptions = policy?.applyModeToOptions
+    ? policy.applyModeToOptions(policyState?.modeLevel || 0, requestOptions)
+    : requestOptions;
+  const resilienceContextMeta = applyResilienceToContext(resolvedContextMeta, patchedRequestOptions);
+  const context = resilienceContextMeta.contextText || '';
+  const baseAnswer = resilienceContextMeta.baseAnswerIncluded ? resilienceContextMeta.baseAnswer || '' : '';
   const contextEstimateText = [context, baseAnswer].filter(Boolean).join('\n');
   const batches = splitTextsByTokenEstimate(
     Array.isArray(texts) ? texts : [texts],
     contextEstimateText,
     TRANSLATION_MAX_TOKENS_PER_REQUEST
   );
+  const splitDepth = patchedRequestOptions?.resilience?.splitDepth || 0;
+  const resilientBatches = splitBatchesForResilience(batches, splitDepth);
   const translations = [];
   const rawParts = [];
   const debugParts = [];
@@ -2505,15 +3602,15 @@ async function translate(
   const onBatchApplied = typeof summaryOptions.onBatchApplied === 'function' ? summaryOptions.onBatchApplied : null;
   let batchCursor = 0;
 
-  for (let index = 0; index < batches.length; index += 1) {
-    const batch = batches[index];
+  for (let index = 0; index < resilientBatches.length; index += 1) {
+    const batch = resilientBatches[index];
     const batchIndices = batch.map((_text, offset) => batchCursor + offset);
     batchCursor += batch.length;
     const batchContext = context;
     const batchRequestMeta = baseRequestMeta
       ? buildRequestMeta(baseRequestMeta, {
           contextText: batchContext,
-          contextMode: resolvedContextMeta.contextMode
+          contextMode: resilienceContextMeta.contextMode
         })
       : null;
     const requestBlockKeys = getRequestBlockKeys(baseRequestMeta);
@@ -2527,6 +3624,16 @@ async function translate(
       context: [batchContext, baseAnswer].filter(Boolean).join('\n')
     });
     await ensureTpmBudget('translation', estimatedTokens);
+    recordHealthBatchSize('translate', batch.length);
+    const schedulerModel = schedulerModels.translationModel || '';
+    await requestSchedulerSlot(
+      'translation',
+      estimatedTokens,
+      requestMetaForPayload,
+      schedulerModel,
+      { batchSize: batch.length, contextMode: resilienceContextMeta.contextMode }
+    );
+    const requestStartedAt = Date.now();
     let batchResult = null;
     try {
       batchResult = await withRateLimitRetry(
@@ -2539,14 +3646,15 @@ async function translate(
               targetLanguage,
               context: {
                 text: batchContext,
-                mode: resolvedContextMeta.contextMode,
-                fullText: resolvedContextMeta.contextFullText || resolvedContextMeta.contextText || '',
-                shortText: resolvedContextMeta.contextShortText || '',
+                mode: resilienceContextMeta.contextMode,
+                fullText: resilienceContextMeta.contextFullText || resilienceContextMeta.contextText || '',
+                shortText: resilienceContextMeta.contextShortText || '',
                 baseAnswer,
-                baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded
+                baseAnswerIncluded: resilienceContextMeta.baseAnswerIncluded
               },
               keepPunctuationTokens,
-              requestMeta: requestMetaForPayload || undefined
+              requestMeta: requestMetaForPayload || undefined,
+              requestOptions: patchedRequestOptions || undefined
             },
             'Не удалось выполнить перевод.'
           );
@@ -2560,7 +3668,10 @@ async function translate(
             if (response?.isRuntimeError) {
               return { success: false, error: response.error || 'Не удалось выполнить перевод.' };
             }
-            throw new Error(response?.error || 'Не удалось выполнить перевод.');
+            const error = new Error(response?.error || 'Не удалось выполнить перевод.');
+            error.status = response?.status;
+            error.healthRecorded = true;
+            throw error;
           }
           return {
             success: true,
@@ -2572,18 +3683,52 @@ async function translate(
         'Translation'
       );
     } catch (error) {
+      await recordSchedulerOutcome(
+        'translation',
+        Number.isFinite(error?.status) ? error.status : null,
+        Date.now() - requestStartedAt,
+        requestMetaForPayload,
+        schedulerModel
+      );
+      if (!error?.healthRecorded) {
+        recordHealthError(classifyResilienceError(error));
+      }
       if (isTimeoutLikeError(error)) {
         recordBlockTimeout(requestBlockKeys);
+      }
+      if (policy && resilienceKey) {
+        const errorType = classifyResilienceError(error);
+        policy.recordOutcome(resilienceKey, errorType, {
+          errorType,
+          errorMessage: error?.message || String(error)
+        });
+        if (policy.shouldEscalate(resilienceKey, errorType)) {
+          policy.escalate(resilienceKey, errorType);
+        }
       }
       throw error;
     }
     if (!batchResult?.success) {
+      await recordSchedulerOutcome(
+        'translation',
+        batchResult?.contextOverflow ? 413 : null,
+        Date.now() - requestStartedAt,
+        requestMetaForPayload,
+        schedulerModel
+      );
       return {
         success: false,
         error: batchResult?.error || 'Не удалось выполнить перевод.',
         contextOverflow: Boolean(batchResult?.contextOverflow)
       };
     }
+    await recordSchedulerOutcome(
+      'translation',
+      200,
+      Date.now() - requestStartedAt,
+      requestMetaForPayload,
+      schedulerModel
+    );
     translations.push(...batchResult.translations);
     if (onBatchApplied) {
       await onBatchApplied({
@@ -2598,11 +3743,11 @@ async function translate(
     }
     if (Array.isArray(batchResult.debug)) {
       const annotated = annotateContextUsage(batchResult.debug, {
-        contextMode: resolvedContextMeta.contextMode,
-        baseAnswerIncluded: resolvedContextMeta.baseAnswerIncluded,
-        baseAnswerPreview: resolvedContextMeta.baseAnswerPreview,
+        contextMode: resilienceContextMeta.contextMode,
+        baseAnswerIncluded: resilienceContextMeta.baseAnswerIncluded,
+        baseAnswerPreview: resilienceContextMeta.baseAnswerPreview,
         contextTextSent: batchContext,
-        tag: resolvedContextMeta.tag
+        tag: resilienceContextMeta.tag
       });
       const withRequestMeta = annotateRequestMetadata(annotated, batchRequestMeta);
       if (shouldSummarize) {
@@ -2616,6 +3761,10 @@ async function translate(
       }
     }
     recordAiResponseMetrics(batchResult?.debug || []);
+  }
+
+  if (policy && resilienceKey) {
+    policy.recordOutcome(resilienceKey, 'success');
   }
 
   return {
@@ -2647,75 +3796,136 @@ async function requestProofreading(payload) {
           baseAnswerPreview: ''
         };
   const context = contextMeta.contextText || '';
-  const baseAnswer = contextMeta.baseAnswerIncluded ? contextMeta.baseAnswer || '' : '';
   const requestMeta =
     payload?.requestMeta && typeof payload.requestMeta === 'object' ? payload.requestMeta : null;
+  const policy = globalThis.ntResiliencePolicy;
+  const resilienceKey = policy ? buildResilienceKey('proofread', requestMeta) : '';
+  const policyState = policy?.getState?.(resilienceKey) || null;
+  const patchedRequestOptions = policy?.applyModeToOptions
+    ? policy.applyModeToOptions(policyState?.modeLevel || 0, payload?.requestOptions || null)
+    : payload?.requestOptions || null;
+  const resilienceContextMeta = applyResilienceToContext(contextMeta, patchedRequestOptions);
+  const baseAnswer = resilienceContextMeta.baseAnswerIncluded ? resilienceContextMeta.baseAnswer || '' : '';
   const resolvedRequestMeta = requestMeta
     ? buildRequestMeta(requestMeta, {
-        contextText: context,
-        contextMode: contextMeta.contextMode
+        contextText: resilienceContextMeta.contextText || '',
+        contextMode: resilienceContextMeta.contextMode
       })
     : null;
   const estimatedTokens = estimateTokensForRole('proofread', {
     texts: segmentTexts,
-    context: [context, baseAnswer].filter(Boolean).join('\n'),
+    context: [resilienceContextMeta.contextText || '', baseAnswer].filter(Boolean).join('\n'),
     sourceTexts: [sourceBlock, translatedBlock]
   });
   await ensureTpmBudget('proofread', estimatedTokens);
-  return withRateLimitRetry(
-    async () => {
-      await incrementDebugAiRequestCount();
-      const response = await sendRuntimeMessage(
-        {
-          type: 'PROOFREAD_TEXT',
-          segments,
-          sourceBlock,
-          translatedBlock,
-          proofreadMode,
-          context: {
-            text: context,
-            mode: contextMeta.contextMode,
-            fullText: contextMeta.contextFullText || contextMeta.contextText || '',
-            shortText: contextMeta.contextShortText || '',
-            baseAnswer,
-            baseAnswerIncluded: contextMeta.baseAnswerIncluded
-          },
-          language: payload?.language || '',
-          requestMeta: resolvedRequestMeta || undefined
-        },
-        'Не удалось выполнить вычитку.'
-      );
-      if (!response?.success) {
-        if (response?.contextOverflow) {
-          return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
-        }
-        if (response?.isRuntimeError) {
-          return { success: false, error: response.error || 'Не удалось выполнить вычитку.' };
-        }
-        throw new Error(response?.error || 'Не удалось выполнить вычитку.');
-      }
-      recordAiResponseMetrics(response?.debug || []);
-      const annotated = annotateContextUsage(response.debug || [], {
-        contextMode: contextMeta.contextMode,
-        baseAnswerIncluded: contextMeta.baseAnswerIncluded,
-        baseAnswerPreview: contextMeta.baseAnswerPreview,
-        contextTextSent: context,
-        tag: contextMeta.tag
-      });
-      const withRequestMeta = annotateRequestMetadata(annotated, resolvedRequestMeta);
-      const summarized = await summarizeDebugPayloads(withRequestMeta, {
-        entryIndex: payload?.debugEntryIndex,
-        stage: 'proofreading'
-      });
-      return {
-        success: true,
-        translations: Array.isArray(response.translations) ? response.translations : [],
-        rawProofread: response.rawProofread || '',
-        debug: summarized
-      };
-    },
-    'Proofreading'
+  recordHealthBatchSize('proofread', segments.length);
+  const health = getHealthState();
+  if (health) {
+    health.proofreadCallsTotal += 1;
+    schedulePersistDebugState('health:proofread-call');
+  }
+  const schedulerModel = schedulerModels.proofreadModel || '';
+  await requestSchedulerSlot(
+    'proofread',
+    estimatedTokens,
+    resolvedRequestMeta,
+    schedulerModel,
+    { batchSize: segments.length, contextMode: resilienceContextMeta.contextMode }
   );
+  const requestStartedAt = Date.now();
+  try {
+    const result = await withRateLimitRetry(
+      async () => {
+        await incrementDebugAiRequestCount();
+        const response = await sendRuntimeMessage(
+          {
+            type: 'PROOFREAD_TEXT',
+            segments,
+            sourceBlock,
+            translatedBlock,
+            proofreadMode,
+            context: {
+              text: resilienceContextMeta.contextText || '',
+              mode: resilienceContextMeta.contextMode,
+              fullText: resilienceContextMeta.contextFullText || resilienceContextMeta.contextText || '',
+              shortText: resilienceContextMeta.contextShortText || '',
+              baseAnswer,
+              baseAnswerIncluded: resilienceContextMeta.baseAnswerIncluded
+            },
+            language: payload?.language || '',
+            requestMeta: resolvedRequestMeta || undefined,
+            requestOptions: patchedRequestOptions || undefined
+          },
+          'Не удалось выполнить вычитку.'
+        );
+        if (!response?.success) {
+          if (response?.contextOverflow) {
+            return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
+          }
+          if (response?.isRuntimeError) {
+            return { success: false, error: response.error || 'Не удалось выполнить вычитку.' };
+          }
+          const error = new Error(response?.error || 'Не удалось выполнить вычитку.');
+          error.status = response?.status;
+          error.healthRecorded = true;
+          throw error;
+        }
+        recordAiResponseMetrics(response?.debug || []);
+        const annotated = annotateContextUsage(response.debug || [], {
+          contextMode: resilienceContextMeta.contextMode,
+          baseAnswerIncluded: resilienceContextMeta.baseAnswerIncluded,
+          baseAnswerPreview: resilienceContextMeta.baseAnswerPreview,
+          contextTextSent: resilienceContextMeta.contextText || '',
+          tag: resilienceContextMeta.tag
+        });
+        const withRequestMeta = annotateRequestMetadata(annotated, resolvedRequestMeta);
+        const summarized = await summarizeDebugPayloads(withRequestMeta, {
+          entryIndex: payload?.debugEntryIndex,
+          stage: 'proofreading'
+        });
+        return {
+          success: true,
+          translations: Array.isArray(response.translations) ? response.translations : [],
+          rawProofread: response.rawProofread || '',
+          debug: summarized
+        };
+      },
+      'Proofreading'
+    );
+    await recordSchedulerOutcome(
+      'proofread',
+      200,
+      Date.now() - requestStartedAt,
+      resolvedRequestMeta,
+      schedulerModel
+    );
+    if (policy && resilienceKey) {
+      policy.recordOutcome(resilienceKey, 'success');
+    }
+    return result;
+  } catch (error) {
+    await recordSchedulerOutcome(
+      'proofread',
+      Number.isFinite(error?.status) ? error.status : null,
+      Date.now() - requestStartedAt,
+      resolvedRequestMeta,
+      schedulerModel
+    );
+    if (!error?.healthRecorded) {
+      recordHealthError(classifyResilienceError(error));
+    }
+    if (policy && resilienceKey) {
+      const errorType = classifyResilienceError(error);
+      policy.recordOutcome(resilienceKey, errorType, {
+        errorType,
+        errorMessage: error?.message || String(error)
+      });
+      if (policy.shouldEscalate(resilienceKey, errorType)) {
+        policy.escalate(resilienceKey, errorType);
+      }
+    }
+    throw error;
+  }
 }
 
 function ensureRpcPort() {
@@ -2942,6 +4152,67 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
   });
 }
 
+function getSchedulerKey(opType, model) {
+  return `${opType || 'unknown'}:${model || 'unknown'}`;
+}
+
+function getSchedulerQueueType(opType, requestMeta) {
+  if (opType === 'proofread') return 'proofread';
+  if (opType === 'context') return 'validate';
+  const purpose = requestMeta?.purpose || '';
+  if (purpose === 'ui') return 'uiTranslate';
+  return 'contentTranslate';
+}
+
+async function requestSchedulerSlot(opType, estimatedTokens, requestMeta, model, options = {}) {
+  const schedulerKey = getSchedulerKey(opType, model);
+  const queueType = getSchedulerQueueType(opType, requestMeta);
+  const batchSize = Number.isFinite(options?.batchSize) ? options.batchSize : null;
+  const contextMode = options?.contextMode || requestMeta?.contextMode || '';
+  const maxWaitMs = 30000;
+  let waitedMs = 0;
+  while (true) {
+    const response = await sendRpcRequest(
+      {
+        type: 'SCHEDULER_REQUEST_SLOT',
+        key: schedulerKey,
+        estimatedTokens,
+        queueType,
+        opType,
+        batchSize,
+        contextMode
+      },
+      'SCHEDULER_REQUEST_SLOT failed',
+      2000
+    );
+    if (response?.ok && response.allowed) {
+      return { allowed: true, key: schedulerKey, queueType };
+    }
+    const waitMs = Math.min(response?.waitMs || 0, 5000);
+    if (!waitMs || waitedMs + waitMs > maxWaitMs) {
+      return { allowed: true, key: schedulerKey, queueType };
+    }
+    waitedMs += waitMs;
+    await delay(waitMs + Math.floor(Math.random() * 200));
+  }
+}
+
+async function recordSchedulerOutcome(opType, status, latencyMs, requestMeta, model) {
+  const schedulerKey = getSchedulerKey(opType, model);
+  const queueType = getSchedulerQueueType(opType, requestMeta);
+  await sendRpcRequest(
+    {
+      type: 'SCHEDULER_RECORD_OUTCOME',
+      key: schedulerKey,
+      status,
+      latencyMs,
+      queueType
+    },
+    'SCHEDULER_RECORD_OUTCOME failed',
+    2000
+  );
+}
+
 function getRpcTimeoutMs(type) {
   if (type === 'TRANSLATE_TEXT') return 240000;
   if (type === 'GENERATE_CONTEXT') return 120000;
@@ -2962,6 +4233,14 @@ async function sendRuntimeMessage(payload, fallbackError) {
       });
       return sendRuntimeMessageLegacy(payload, fallbackError);
     }
+    if (rpcResponse.success === false) {
+      const errorType = isTimeoutLikeResponse(rpcResponse)
+        ? 'timeout'
+        : isRateLimitLikeError(rpcResponse)
+          ? 'rate_limited'
+          : 'other';
+      recordHealthError(errorType);
+    }
     return rpcResponse;
   }
   return {
@@ -2976,6 +4255,7 @@ function sendRuntimeMessageLegacy(payload, fallbackError) {
     chrome.runtime.sendMessage(payload, (response) => {
       const runtimeError = chrome.runtime.lastError;
       if (runtimeError) {
+        recordHealthError('other');
         resolve({
           success: false,
           error: runtimeError.message || fallbackError,
@@ -2987,6 +4267,7 @@ function sendRuntimeMessageLegacy(payload, fallbackError) {
         resolve(response);
         return;
       }
+      recordHealthError(isTimeoutLikeResponse(response) ? 'timeout' : isRateLimitLikeError(response) ? 'rate_limited' : 'other');
       resolve({
         success: false,
         error: response?.error || fallbackError
@@ -3016,6 +4297,8 @@ async function withRateLimitRetry(requestFn, label) {
         throw error;
       }
       attempt += 1;
+      recordHealthRetry(delayMs);
+      recordHealthError('rate_limited');
       console.warn(`${label} rate-limited, retrying after ${Math.ceil(delayMs / 1000)}s...`);
       await delay(delayMs);
     }
@@ -3181,6 +4464,195 @@ function detectProofreadMode(segments, targetLanguage = '') {
   return hasNoise ? 'NOISE_CLEANUP' : 'READABILITY_REWRITE';
 }
 
+function normalizeProofreadMode(mode) {
+  if (mode === 'always' || mode === 'never' || mode === 'auto') return mode;
+  return 'auto';
+}
+
+const proofreadAutoSavings = {
+  skippedBatchesCount: 0,
+  skippedSegmentsCount: 0,
+  proofreadCallsAvoidedEstimate: 0
+};
+
+function logProofreadAutoDecision(payload) {
+  if (typeof globalThis.ntPageJsonLog !== 'function') return;
+  globalThis.ntPageJsonLog(
+    {
+      kind: 'proofread.auto.decision',
+      ts: Date.now(),
+      ...payload
+    },
+    'log'
+  );
+}
+
+function logProofreadAutoSavings() {
+  if (typeof globalThis.ntPageJsonLog !== 'function') return;
+  globalThis.ntPageJsonLog(
+    {
+      kind: 'proofread.auto.savings',
+      ts: Date.now(),
+      skippedBatchesCount: proofreadAutoSavings.skippedBatchesCount,
+      skippedSegmentsCount: proofreadAutoSavings.skippedSegmentsCount,
+      proofreadCallsAvoidedEstimate: proofreadAutoSavings.proofreadCallsAvoidedEstimate
+    },
+    'log'
+  );
+}
+
+function selectProofreadSegmentsForAuto(decision, proofreadSegments) {
+  const scores = Array.isArray(decision?.segmentScores) ? decision.segmentScores : [];
+  const totalSegments = proofreadSegments.length;
+  const thresholds = decision?.thresholds || {};
+  const partialMax = Number.isFinite(thresholds.partialMax) ? thresholds.partialMax : 25;
+  if (!scores.length || decision.score > partialMax) {
+    return { mode: 'full', segments: proofreadSegments };
+  }
+  const criticalSegments = scores.filter((entry) => entry.critical);
+  if (criticalSegments.length >= Math.ceil(totalSegments * 0.3)) {
+    return { mode: 'full', segments: proofreadSegments };
+  }
+  const ordered = scores
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score);
+  const minCount = Math.min(
+    totalSegments,
+    Math.min(Math.max(3, Math.ceil(totalSegments * 0.2)), 20)
+  );
+  const selectedIndexes = new Set(
+    ordered.slice(0, Math.min(minCount, ordered.length)).map((entry) => entry.index)
+  );
+  if (!selectedIndexes.size) {
+    return { mode: 'full', segments: proofreadSegments };
+  }
+  const selectedSegments = proofreadSegments.filter((segment, index) => selectedIndexes.has(index));
+  return { mode: 'partial', segments: selectedSegments };
+}
+
+function decideProofreadBatch({ mode, targetLang, originalTexts, translatedTexts, blockMeta }) {
+  const heuristicsFn = globalThis.ntProofreadHeuristics?.shouldProofreadBatch;
+  if (typeof heuristicsFn !== 'function') {
+    return {
+      run: mode !== 'never',
+      reasons: ['heuristics_missing'],
+      score: 0,
+      stats: {},
+      segmentScores: [],
+      thresholds: { run: 0, partialMax: 0 }
+    };
+  }
+  return heuristicsFn({
+    targetLang,
+    texts: originalTexts,
+    translations: translatedTexts,
+    blockMeta
+  });
+}
+
+async function maybeQueueProofread({
+  block,
+  index,
+  key,
+  blockElement,
+  translatedTexts,
+  originalTexts,
+  uiMode,
+  uiLike,
+  settings
+}) {
+  if (!settings.proofreadEnabled) {
+    return;
+  }
+  if (uiMode) {
+    return;
+  }
+  const proofreadSegments = translatedTexts.map((text, segmentIndex) => ({ id: String(segmentIndex), text }));
+  const proofreadMode = detectProofreadMode(proofreadSegments, settings.targetLanguage || 'ru');
+  if (!proofreadSegments.length) {
+    await updateDebugEntry(index + 1, {
+      proofreadStatus: 'done',
+      proofread: [],
+      proofreadComparisons: [],
+      proofreadExecuted: false,
+      proofreadCompletedAt: Date.now()
+    });
+    return;
+  }
+  const effectiveMode = normalizeProofreadMode(settings.proofreadMode);
+  const decision = decideProofreadBatch({
+    mode: effectiveMode,
+    targetLang: settings.targetLanguage || 'ru',
+    originalTexts,
+    translatedTexts,
+    blockMeta: { uiMode, uiLike, host: location.host }
+  });
+  const hasCritical = Array.isArray(decision.segmentScores) && decision.segmentScores.some((entry) => entry.critical);
+  let runProofread = false;
+  if (effectiveMode === 'always') {
+    runProofread = true;
+  } else if (effectiveMode === 'never') {
+    runProofread = hasCritical;
+  } else {
+    runProofread = Boolean(decision.run);
+  }
+
+  let selectionMode = 'full';
+  let selectedSegments = proofreadSegments;
+  if (runProofread && effectiveMode === 'auto') {
+    const selection = selectProofreadSegmentsForAuto(decision, proofreadSegments);
+    selectionMode = selection.mode;
+    selectedSegments = selection.segments;
+  }
+  if (runProofread && !selectedSegments.length) {
+    runProofread = false;
+    selectionMode = 'none';
+  }
+
+  logProofreadAutoDecision({
+    mode: effectiveMode,
+    run: runProofread,
+    score: decision.score || 0,
+    reasons: decision.reasons || [],
+    totalSegments: proofreadSegments.length,
+    selectedSegments: runProofread ? selectedSegments.length : 0,
+    uiMode,
+    host: location.host
+  });
+
+  if (!runProofread) {
+    proofreadAutoSavings.skippedBatchesCount += 1;
+    proofreadAutoSavings.skippedSegmentsCount += proofreadSegments.length;
+    proofreadAutoSavings.proofreadCallsAvoidedEstimate += 1;
+    logProofreadAutoSavings();
+    await updateDebugEntry(index + 1, {
+      proofreadStatus: 'disabled',
+      proofreadApplied: false,
+      proofread: [],
+      proofreadComparisons: [],
+      proofreadExecuted: false,
+      proofreadCompletedAt: Date.now()
+    });
+    return;
+  }
+
+  if (selectionMode === 'partial') {
+    proofreadAutoSavings.skippedSegmentsCount += Math.max(0, proofreadSegments.length - selectedSegments.length);
+    logProofreadAutoSavings();
+  }
+
+  enqueueProofreadTask({
+    block,
+    index,
+    key,
+    blockElement,
+    translatedTexts,
+    originalTexts,
+    proofreadSegments: selectedSegments,
+    proofreadMode
+  });
+}
+
 async function requestTranslationContext(text, targetLanguage, requestMeta = null) {
   const estimatedTokens = estimateTokensForRole('context', {
     texts: [text]
@@ -3248,6 +4720,53 @@ function deduplicateTexts(texts) {
   });
 
   return { uniqueTexts, indexMap };
+}
+
+function normalizeUiText(text = '') {
+  return String(text || '').trim().replace(/\s+/g, ' ');
+}
+
+function isUiKeywordMatch(text) {
+  if (!text) return false;
+  const normalized = normalizeUiText(text).toLowerCase();
+  if (!normalized) return false;
+  return UI_KEYWORDS.some((keyword) => normalized.includes(keyword));
+}
+
+function isUiBlock(blockElement, blockTexts = []) {
+  if (!blockElement) return false;
+  const element = blockElement;
+  if (
+    element.closest?.('header, nav, footer, aside, form, button, select, option, label') ||
+    element.closest?.('[role="navigation"],[role="banner"],[role="contentinfo"],[role="menu"],[role="button"]')
+  ) {
+    return true;
+  }
+
+  const idClass = `${element.id || ''} ${element.className || ''}`.toLowerCase();
+  if (/(nav|menu|header|footer|sidebar|toolbar)/.test(idClass)) {
+    return true;
+  }
+
+  const normalizedTexts = blockTexts.map((text) => normalizeUiText(text)).filter(Boolean);
+  if (normalizedTexts.some((text) => isUiKeywordMatch(text))) {
+    return true;
+  }
+
+  const averageLength =
+    normalizedTexts.length
+      ? normalizedTexts.reduce((sum, text) => sum + text.length, 0) / normalizedTexts.length
+      : 0;
+  const hasNewlines = blockTexts.some((text) => String(text || '').includes('\n'));
+  const punctuationCount = normalizedTexts.reduce(
+    (sum, text) => sum + (text.match(/[.!?;:]/g) || []).length,
+    0
+  );
+  if (!hasNewlines && averageLength > 0 && averageLength <= 40 && punctuationCount <= 1) {
+    return true;
+  }
+
+  return false;
 }
 
 function collectTextNodes(root) {
@@ -3827,6 +5346,7 @@ async function createDebugPayloadSummary(payload, options = {}) {
     request: requestPayload.previewText,
     response: responsePayload.previewText,
     contextTextSent: contextPayload.previewText,
+    ts: Date.now(),
     rawRefId: hasRaw ? callId : '',
     requestTruncated: requestPayload.previewTruncated,
     responseTruncated: responsePayload.previewTruncated,
@@ -4424,6 +5944,7 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
     sessionEndTime: null,
     events: [],
     callHistory: [],
+    health: initHealthState(),
     updatedAt: Date.now()
   };
   await saveTranslationDebugInfo(location.href, debugState);
@@ -4687,6 +6208,7 @@ function incrementDebugAiRequestCount() {
   if (!debugState) return;
   const currentCount = Number.isFinite(debugState.aiRequestCount) ? debugState.aiRequestCount : 0;
   debugState.aiRequestCount = currentCount + 1;
+  recordHealthRequest();
   if (globalThis.ntPageJsonLogEnabled && globalThis.ntPageJsonLogEnabled()) {
     globalThis.ntPageJsonLog(
       {
@@ -4709,6 +6231,8 @@ function recordAiResponseMetrics(debugPayloads) {
   if (!debugState) return;
   const currentCount = Number.isFinite(debugState.aiResponseCount) ? debugState.aiResponseCount : 0;
   debugState.aiResponseCount = currentCount + 1;
+  recordHealthResponse(true);
+  recordHealthTokens(debugPayloads);
   schedulePersistDebugState('aiResponseMetrics');
 }
 
@@ -4882,4 +6406,16 @@ async function restoreTranslations() {
 function notifyVisibilityChange() {
   void sendBackgroundMessageSafe({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible });
 }
+
+globalThis.ntPagePreflightHelpers = {
+  collectTextNodes,
+  groupTextNodesByBlock,
+  normalizeBlocksByLength,
+  isUiBlock,
+  calculateTextLengthStats,
+  normalizeBlockLength,
+  getNodePath,
+  computeTextHash,
+  getOriginalHash
+};
 })();
