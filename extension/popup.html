@@ -335,6 +335,15 @@
         Считать прокси OpenAI-совместимым (для prompt caching)
       </label>
       <label>
+        Batch Turbo Mode (prewarm)
+        <select id="batchTurboMode">
+          <option value="off">Выключено</option>
+          <option value="prewarm_ui">Prewarm UI (UI-строки)</option>
+          <option value="prewarm_dedup_all">Prewarm All Dedup (повторы по странице)</option>
+        </select>
+        <span class="model-note">Отправляет фоновые batch-запросы для translation memory. Интерактивный перевод не ждёт batch.</span>
+      </label>
+      <label>
         <div class="range-label">
           <span>Максимальная длина блока:</span>
           <span class="range-value" id="blockLengthValue">1200</span>

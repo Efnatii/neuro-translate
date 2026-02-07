@@ -1,4 +1,5 @@
 const PROOFREAD_SCHEMA_NAME = 'proofread_translations';
+const PROOFREAD_DELTA_SCHEMA_NAME = 'proofread_delta_translations';
 const PROOFREAD_MAX_CHARS_PER_CHUNK = 4000;
 const PROOFREAD_MAX_ITEMS_PER_CHUNK = 30;
 const PROOFREAD_MISSING_RATIO_THRESHOLD = 0.2;
@@ -26,6 +27,18 @@ const PROOFREAD_SYSTEM_PROMPT = [
   'If a segment does not need edits, return the original text unchanged.',
   'Return only JSON, without commentary.'
 ].join(' ');
+const PROOFREAD_DELTA_SYSTEM_PROMPT = [
+  'Neuro-Translate Proofread Delta System Prompt v1.',
+  'Ты редактор.',
+  'Исправляй только орфографию/пунктуацию/мелкую стилистику.',
+  'Сохраняй смысл, не добавляй и не удаляй факты.',
+  'Следуй режиму PROOFREAD_MODE, указанному в payload.',
+  'Возвращай ТОЛЬКО изменённые элементы. Если элемент не изменился — не возвращай его.',
+  'Никогда не возвращай исходный массив целиком.',
+  'Не добавляй, не удаляй и не переупорядочивай сегменты. Сохраняй id.',
+  'Не изменяй плейсхолдеры, разметку или код (например, {name}, {{count}}, <tag>, **bold**).',
+  'Возвращай строго JSON без комментариев.'
+].join(' ');
 
 function shouldLogJson() {
   return typeof globalThis.ntJsonLogEnabled === 'function' && globalThis.ntJsonLogEnabled();
@@ -36,6 +49,66 @@ function emitJsonLog(eventObject) {
   if (typeof globalThis.ntJsonLog === 'function') {
     globalThis.ntJsonLog(eventObject);
   }
+}
+
+function getThroughputController() {
+  return globalThis.ntThroughputController || null;
+}
+
+function getThroughputKey(operationType, model) {
+  if (typeof globalThis.ntThroughputKey === 'function') {
+    return globalThis.ntThroughputKey(operationType, model);
+  }
+  return `${operationType || 'unknown'}:${model || 'unknown'}`;
+}
+
+function getResiliencePolicy() {
+  return globalThis.ntResiliencePolicy || null;
+}
+
+function buildResilienceKey(opType, requestMeta, apiBaseUrl = '') {
+  const blockKey = requestMeta?.blockKey || requestMeta?.requestId || '';
+  let host = '';
+  try {
+    const url = requestMeta?.url || apiBaseUrl || '';
+    host = url ? new URL(url).host : '';
+  } catch (error) {
+    host = '';
+  }
+  return `${opType || 'unknown'}::${blockKey || host || 'request'}`;
+}
+
+function classifyResilienceError(error) {
+  const status = error?.status;
+  const message = String(error?.message || error || '').toLowerCase();
+  if (status === 429 || status === 503 || message.includes('rate limit')) return 'rate_limited';
+  if (status === 408 || error?.name === 'AbortError' || message.includes('timed out')) return 'timeout';
+  if (message.includes('length mismatch') || message.includes('count mismatch')) return 'count_mismatch';
+  if (message.includes('schema') || message.includes('json')) return 'schema';
+  if (status >= 500) return 'transient';
+  return 'other';
+}
+
+function getUsageTotalTokens(usage) {
+  if (!usage) return null;
+  if (Number.isFinite(usage.total_tokens)) return usage.total_tokens;
+  const prompt = Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : 0;
+  const completion = Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0;
+  if (prompt || completion) return prompt + completion;
+  return null;
+}
+
+function stripUnsupportedStructuredOutputStrict(requestPayload, model, status, errorPayload, errorText) {
+  if (!requestPayload || typeof requestPayload !== 'object') return { changed: false, removedParams: [] };
+  if (status !== 400) return { changed: false, removedParams: [] };
+  const schema = requestPayload?.response_format?.json_schema;
+  if (!schema || schema.strict === undefined) return { changed: false, removedParams: [] };
+  if (!isUnsupportedParamError(status, errorPayload, errorText, 'strict')) {
+    return { changed: false, removedParams: [] };
+  }
+  delete schema.strict;
+  if (model) markModelParamUnsupported(model, 'response_format.json_schema.strict');
+  return { changed: true, removedParams: ['response_format.json_schema.strict'] };
 }
 
 function emitProofreadLog(kind, level, message, data) {
@@ -780,6 +853,32 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   return messages;
 }
 
+function buildProofreadDeltaPrompt(input) {
+  const items = Array.isArray(input?.items) ? input.items : [];
+  const language = input?.language ?? '';
+  const proofreadMode = input?.proofreadMode === 'NOISE_CLEANUP' ? 'NOISE_CLEANUP' : 'READABILITY_REWRITE';
+  const payload = {
+    targetLang: language,
+    rules: {
+      preserve_ids: true,
+      return_only_changed: true,
+      no_extra_items: true,
+      mode: proofreadMode
+    },
+    items
+  };
+  return [
+    {
+      role: 'system',
+      content: PROOFREAD_DELTA_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: JSON.stringify(payload)
+    }
+  ];
+}
+
 function estimatePromptTokensFromMessages(messages) {
   if (!Array.isArray(messages)) return 0;
   const totalChars = messages.reduce((sum, message) => {
@@ -925,6 +1024,19 @@ async function proofreadTranslation(
   }
 
   const baseRequestMeta = normalizeRequestMeta(requestMeta, { stage: 'proofread', purpose: 'main' });
+  const policy = getResiliencePolicy();
+  const resilienceKey = policy ? buildResilienceKey('proofread', baseRequestMeta, apiBaseUrl) : '';
+  const policyState = policy?.getState?.(resilienceKey) || null;
+  const patchedRequestOptions = policy?.applyModeToOptions
+    ? policy.applyModeToOptions(policyState?.modeLevel || 0, requestOptions)
+    : requestOptions;
+  const resilience = patchedRequestOptions?.resilience || {};
+  if (policyState?.disabledProofreadUntilMs && policyState.disabledProofreadUntilMs > Date.now()) {
+    if (policy && resilienceKey) {
+      policy.recordOutcome(resilienceKey, 'success');
+    }
+    return { translations: segments.map((segment) => segment?.text || ''), rawProofread: '' };
+  }
   const baseModelSpec = formatModelSpec(model, baseRequestMeta.selectedTier || 'standard');
   const resolveModelSelection = (purpose, triggerSource) => {
     const selection = resolveProofreadCandidateSelection(baseRequestMeta, baseModelSpec, {
@@ -999,136 +1111,51 @@ async function proofreadTranslation(
       )
     );
   };
+  const responseMode =
+    resilience?.proofreadMode === 'full'
+      ? 'full'
+      : 'delta';
 
-  for (let index = 0; index < chunks.length; index += 1) {
-    const chunk = chunks[index];
-    let result = await requestProofreadChunk(
-      chunk,
-      { sourceBlock, translatedBlock, context: normalizedContext, language, proofreadMode },
-      apiKey,
-      mainSelection.modelId,
-      apiBaseUrl,
-      {
-        strict: false,
-        requestMeta: baseRequestMeta,
-        purpose: 'main',
-        debugPayloads,
-        requestOptions: buildRequestOptionsForTier(requestOptions, mainSelection.tier)
-      }
-    );
-    rawProofreadParts.push(result.rawProofread);
-    if (Array.isArray(result.debug)) {
-      debugPayloads.push(...result.debug);
-    }
-    let quality = evaluateProofreadResult(chunk, result.itemsById, result.parseError);
-    logProofreadChunk('proofread', index, chunks.length, chunk.length, quality, result.parseError);
-    if (quality.isPoor) {
-      emitProofreadLog(
-        'proofread.chunk_incomplete',
-        'warn',
-        'Proofread chunk incomplete, retrying with strict instructions.',
-        {
-          chunkIndex: index + 1,
-          missing: quality.missingCount,
-          received: quality.receivedCount
-        }
-      );
-      appendParseIssue('retry:retryable');
-      result = await requestProofreadChunk(
+  try {
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      let result = await requestProofreadChunk(
         chunk,
-        { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
+        { sourceBlock, translatedBlock, context: normalizedContext, language, proofreadMode },
         apiKey,
-        retrySelection.modelId,
+        mainSelection.modelId,
         apiBaseUrl,
         {
-          strict: true,
-          requestMeta: createChildRequestMeta(baseRequestMeta, {
-            purpose: 'retry',
-            attempt: baseRequestMeta.attempt + 1,
-            triggerSource: 'retry',
-            selectedModel: retrySelection.modelId,
-            selectedTier: retrySelection.tier,
-            selectedModelSpec: retrySelection.selectedModelSpec,
-            candidateStrategy: retrySelection.candidateStrategy,
-            candidateOrderedList: retrySelection.orderedList,
-            originalRequestedModelList: retrySelection.originalRequestedModelList
-          }),
-          purpose: 'retry',
+          strict: false,
+          requestMeta: baseRequestMeta,
+          purpose: 'main',
           debugPayloads,
-          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
+          responseMode,
+          requestOptions: buildRequestOptionsForTier(patchedRequestOptions, mainSelection.tier)
         }
       );
       rawProofreadParts.push(result.rawProofread);
       if (Array.isArray(result.debug)) {
         debugPayloads.push(...result.debug);
       }
-      quality = evaluateProofreadResult(chunk, result.itemsById, result.parseError);
-      logProofreadChunk('proofread-retry', index, chunks.length, chunk.length, quality, result.parseError);
-    }
-
-    if (quality.isPoor && chunk.length > 1) {
-      emitProofreadLog(
-        'proofread.chunk_incomplete_retry_max_tokens',
-        'info',
-        'Proofread chunk still incomplete after strict retry, retrying with higher max tokens.',
-        {
-          chunkIndex: index + 1,
-          missing: quality.missingCount,
-          received: quality.receivedCount,
-          threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
-        }
-      );
-      appendParseIssue('retry:retryable');
-      result = await requestProofreadChunk(
-        chunk,
-        { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
-        apiKey,
-        retrySelection.modelId,
-        apiBaseUrl,
-        {
-          strict: true,
-          maxTokensOverride: 1.5,
-          extraReminder: 'Return every input id exactly once. Do not omit any ids.',
-          requestMeta: createChildRequestMeta(baseRequestMeta, {
-            purpose: 'retry',
-            attempt: baseRequestMeta.attempt + 2,
-            triggerSource: 'retry',
-            selectedModel: retrySelection.modelId,
-            selectedTier: retrySelection.tier,
-            selectedModelSpec: retrySelection.selectedModelSpec,
-            candidateStrategy: retrySelection.candidateStrategy,
-            candidateOrderedList: retrySelection.orderedList,
-            originalRequestedModelList: retrySelection.originalRequestedModelList
-          }),
-          purpose: 'retry',
-          debugPayloads,
-          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
-        }
-      );
-      rawProofreadParts.push(result.rawProofread);
-      if (Array.isArray(result.debug)) {
-        debugPayloads.push(...result.debug);
-      }
-      quality = evaluateProofreadResult(chunk, result.itemsById, result.parseError);
-      logProofreadChunk('proofread-retry-expanded', index, chunks.length, chunk.length, quality, result.parseError);
-    }
-
-    if (quality.isPoor && chunk.length > 1) {
-      emitProofreadLog(
-        'proofread.chunk_incomplete_fallback_per_item',
-        'warn',
-        'Proofread chunk still incomplete, falling back to per-item requests.',
-        {
-          chunkIndex: index + 1,
-          missing: quality.missingCount,
-          received: quality.receivedCount,
-          threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
-        }
-      );
-      appendParseIssue('fallback:per-item');
-      for (const item of chunk) {
-        const singleResult = await requestProofreadChunk(
-          [item],
+      let quality = result.isDelta
+        ? evaluateProofreadDeltaResult(chunk, result.itemsById, result.parseError)
+        : evaluateProofreadResult(chunk, result.itemsById, result.parseError);
+      logProofreadChunk('proofread', index, chunks.length, chunk.length, quality, result.parseError);
+      if (quality.isPoor) {
+        emitProofreadLog(
+          'proofread.chunk_incomplete',
+          'warn',
+          'Proofread chunk incomplete, retrying with strict instructions.',
+          {
+            chunkIndex: index + 1,
+            missing: quality.missingCount,
+            received: quality.receivedCount
+          }
+        );
+        appendParseIssue('retry:retryable');
+        result = await requestProofreadChunk(
+          chunk,
           { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
           apiKey,
           retrySelection.modelId,
@@ -1137,7 +1164,7 @@ async function proofreadTranslation(
             strict: true,
             requestMeta: createChildRequestMeta(baseRequestMeta, {
               purpose: 'retry',
-              attempt: baseRequestMeta.attempt + 3,
+              attempt: baseRequestMeta.attempt + 1,
               triggerSource: 'retry',
               selectedModel: retrySelection.modelId,
               selectedTier: retrySelection.tier,
@@ -1148,71 +1175,218 @@ async function proofreadTranslation(
             }),
             purpose: 'retry',
             debugPayloads,
-            requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
+            responseMode,
+            requestOptions: buildRequestOptionsForTier(patchedRequestOptions, retrySelection.tier)
           }
         );
-        rawProofreadParts.push(singleResult.rawProofread);
-        if (Array.isArray(singleResult.debug)) {
-          debugPayloads.push(...singleResult.debug);
+        rawProofreadParts.push(result.rawProofread);
+        if (Array.isArray(result.debug)) {
+          debugPayloads.push(...result.debug);
         }
-        const singleQuality = evaluateProofreadResult([item], singleResult.itemsById, singleResult.parseError);
-        logProofreadChunk('proofread-single', index, chunks.length, 1, singleQuality, singleResult.parseError);
-        const revision = singleResult.itemsById.get(item.id);
-        if (revision !== undefined) {
-          revisionsById.set(item.id, revision);
+        quality = result.isDelta
+          ? evaluateProofreadDeltaResult(chunk, result.itemsById, result.parseError)
+          : evaluateProofreadResult(chunk, result.itemsById, result.parseError);
+        logProofreadChunk('proofread-retry', index, chunks.length, chunk.length, quality, result.parseError);
+      }
+
+      if (quality.isPoor && chunk.length > 1) {
+        emitProofreadLog(
+          'proofread.chunk_incomplete_retry_max_tokens',
+          'info',
+          'Proofread chunk still incomplete after strict retry, retrying with higher max tokens.',
+          {
+            chunkIndex: index + 1,
+            missing: quality.missingCount,
+            received: quality.receivedCount,
+            threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
+          }
+        );
+        appendParseIssue('retry:retryable');
+        result = await requestProofreadChunk(
+          chunk,
+          { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
+          apiKey,
+          retrySelection.modelId,
+          apiBaseUrl,
+          {
+            strict: true,
+            maxTokensOverride: 1.5,
+            extraReminder: 'Return every input id exactly once. Do not omit any ids.',
+            requestMeta: createChildRequestMeta(baseRequestMeta, {
+              purpose: 'retry',
+              attempt: baseRequestMeta.attempt + 2,
+              triggerSource: 'retry',
+              selectedModel: retrySelection.modelId,
+              selectedTier: retrySelection.tier,
+              selectedModelSpec: retrySelection.selectedModelSpec,
+              candidateStrategy: retrySelection.candidateStrategy,
+              candidateOrderedList: retrySelection.orderedList,
+              originalRequestedModelList: retrySelection.originalRequestedModelList
+            }),
+            purpose: 'retry',
+            debugPayloads,
+            responseMode,
+            requestOptions: buildRequestOptionsForTier(patchedRequestOptions, retrySelection.tier)
+          }
+        );
+        rawProofreadParts.push(result.rawProofread);
+        if (Array.isArray(result.debug)) {
+          debugPayloads.push(...result.debug);
+        }
+        quality = result.isDelta
+          ? evaluateProofreadDeltaResult(chunk, result.itemsById, result.parseError)
+          : evaluateProofreadResult(chunk, result.itemsById, result.parseError);
+        logProofreadChunk('proofread-retry-expanded', index, chunks.length, chunk.length, quality, result.parseError);
+      }
+
+      if (quality.isPoor && chunk.length > 1) {
+        emitProofreadLog(
+          'proofread.chunk_incomplete_fallback_split',
+          'warn',
+          'Proofread chunk still incomplete, splitting into smaller requests.',
+          {
+            chunkIndex: index + 1,
+            missing: quality.missingCount,
+            received: quality.receivedCount,
+            threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
+          }
+        );
+        appendParseIssue('fallback:split');
+        const midpoint = Math.ceil(chunk.length / 2);
+        const splitChunks = [chunk.slice(0, midpoint), chunk.slice(midpoint)];
+        for (const splitChunk of splitChunks) {
+          if (!splitChunk.length) continue;
+          const splitResult = await requestProofreadChunk(
+            splitChunk,
+            { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
+            apiKey,
+            retrySelection.modelId,
+            apiBaseUrl,
+            {
+              strict: true,
+              requestMeta: createChildRequestMeta(baseRequestMeta, {
+                purpose: 'retry',
+                attempt: baseRequestMeta.attempt + 3,
+                triggerSource: 'retry',
+                selectedModel: retrySelection.modelId,
+                selectedTier: retrySelection.tier,
+                selectedModelSpec: retrySelection.selectedModelSpec,
+                candidateStrategy: retrySelection.candidateStrategy,
+                candidateOrderedList: retrySelection.orderedList,
+                originalRequestedModelList: retrySelection.originalRequestedModelList
+              }),
+              purpose: 'retry',
+              debugPayloads,
+              responseMode,
+              requestOptions: buildRequestOptionsForTier(patchedRequestOptions, retrySelection.tier)
+            }
+          );
+          rawProofreadParts.push(splitResult.rawProofread);
+          if (Array.isArray(splitResult.debug)) {
+            debugPayloads.push(...splitResult.debug);
+          }
+          const splitQuality = splitResult.isDelta
+            ? evaluateProofreadDeltaResult(splitChunk, splitResult.itemsById, splitResult.parseError)
+            : evaluateProofreadResult(splitChunk, splitResult.itemsById, splitResult.parseError);
+          logProofreadChunk('proofread-split', index, chunks.length, splitChunk.length, splitQuality, splitResult.parseError);
+          splitChunk.forEach((item) => {
+            if (splitResult.itemsById.has(item.id)) {
+              revisionsById.set(item.id, splitResult.itemsById.get(item.id));
+            } else if (originalById.has(item.id)) {
+              revisionsById.set(item.id, originalById.get(item.id));
+            }
+          });
+        }
+        continue;
+      }
+
+      for (const item of chunk) {
+        if (result.itemsById.has(item.id)) {
+          revisionsById.set(item.id, result.itemsById.get(item.id));
         } else if (originalById.has(item.id)) {
           revisionsById.set(item.id, originalById.get(item.id));
         }
       }
-      continue;
     }
 
-    for (const item of chunk) {
-      if (result.itemsById.has(item.id)) {
-        revisionsById.set(item.id, result.itemsById.get(item.id));
-      } else if (originalById.has(item.id)) {
-        revisionsById.set(item.id, originalById.get(item.id));
-      }
-    }
-  }
-
-  const translations = items.map((item) => {
-    const revision = revisionsById.get(String(item.id));
-    const originalText = originalById.get(String(item.id)) || '';
-    if (typeof revision === 'string') {
-      if (revision.trim()) {
-      return revision;
+    const translations = items.map((item) => {
+      const revision = revisionsById.get(String(item.id));
+      const originalText = originalById.get(String(item.id)) || '';
+      if (typeof revision === 'string') {
+        if (revision.trim()) {
+          return revision;
+        }
+        return originalText;
       }
       return originalText;
+    });
+
+    const validateRequestMeta = createChildRequestMeta(baseRequestMeta, {
+      purpose: 'validate',
+      triggerSource: 'validate',
+      selectedModel: validateSelection.modelId,
+      selectedTier: validateSelection.tier,
+      selectedModelSpec: validateSelection.selectedModelSpec,
+      candidateStrategy: validateSelection.candidateStrategy,
+      candidateOrderedList: validateSelection.orderedList,
+      originalRequestedModelList: validateSelection.originalRequestedModelList
+    });
+    const repairedTranslations = await repairProofreadSegments(
+      items,
+      translations,
+      originalById,
+      apiKey,
+      validateSelection.modelId,
+      apiBaseUrl,
+      language,
+      debugPayloads,
+      validateRequestMeta,
+      buildRequestOptionsForTier(patchedRequestOptions, validateSelection.tier)
+    );
+
+    const totalSegments = items.length;
+    let deltaEditsCount = 0;
+    repairedTranslations.forEach((text, index) => {
+      const id = String(items[index]?.id ?? index);
+      const originalText = originalById.get(id) || '';
+      if (text !== originalText) {
+        deltaEditsCount += 1;
+      }
+    });
+    const deltaUnchangedCount = Math.max(0, totalSegments - deltaEditsCount);
+    emitJsonLog({
+      kind: 'proofread.delta_applied',
+      total: totalSegments,
+      edits: deltaEditsCount,
+      unchanged: deltaUnchangedCount,
+      proofread_delta_edits: deltaEditsCount,
+      proofread_delta_unchanged: deltaUnchangedCount
+    });
+
+    const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
+    if (policy && resilienceKey) {
+      policy.recordOutcome(resilienceKey, 'success');
     }
-    return originalText;
-  });
-
-  const validateRequestMeta = createChildRequestMeta(baseRequestMeta, {
-    purpose: 'validate',
-    triggerSource: 'validate',
-    selectedModel: validateSelection.modelId,
-    selectedTier: validateSelection.tier,
-    selectedModelSpec: validateSelection.selectedModelSpec,
-    candidateStrategy: validateSelection.candidateStrategy,
-    candidateOrderedList: validateSelection.orderedList,
-    originalRequestedModelList: validateSelection.originalRequestedModelList
-  });
-  const repairedTranslations = await repairProofreadSegments(
-    items,
-    translations,
-    originalById,
-    apiKey,
-    validateSelection.modelId,
-    apiBaseUrl,
-    language,
-    debugPayloads,
-    validateRequestMeta,
-    buildRequestOptionsForTier(requestOptions, validateSelection.tier)
-  );
-
-  const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
-  return { translations: repairedTranslations, rawProofread, debug: debugPayloads };
+    return { translations: repairedTranslations, rawProofread, debug: debugPayloads };
+  } catch (error) {
+    if (policy && resilienceKey) {
+      const errorType = classifyResilienceError(error);
+      policy.recordOutcome(resilienceKey, errorType, {
+        errorType,
+        errorMessage: error?.message || String(error)
+      });
+      if (policy.shouldEscalate(resilienceKey, errorType)) {
+        const nextLevel = policy.escalate(resilienceKey, errorType);
+        if (nextLevel >= 4) {
+          policy.recordOutcome(resilienceKey, 'disable_proofread', {
+            disabledProofreadUntilMs: Date.now() + (policy.constants?.PROOFREAD_DISABLE_WINDOW_MS || 0)
+          });
+        }
+      }
+    }
+    const fallbackTranslations = items.map((item) => originalById.get(String(item.id)) || item.text || '');
+    return { translations: fallbackTranslations, rawProofread: '', debug: debugPayloads };
+  }
 }
 
 function parseJsonObjectFlexible(content = '', label = 'response') {
@@ -1438,6 +1612,18 @@ function evaluateProofreadResult(expectedItems, itemsById, parseError) {
   return { missingCount, receivedCount, missingRatio, isPoor };
 }
 
+function evaluateProofreadDeltaResult(expectedItems, itemsById, parseError) {
+  const receivedCount = itemsById.size;
+  const total = expectedItems.length;
+  return {
+    missingCount: 0,
+    receivedCount,
+    missingRatio: 0,
+    isPoor: Boolean(parseError),
+    total
+  };
+}
+
 function logProofreadChunk(label, index, totalChunks, chunkSize, quality, parseError) {
   const summary = {
     chunk: `${index + 1}/${totalChunks}`,
@@ -1470,7 +1656,9 @@ function buildProofreadBodyPreview(payload, maxLength = 800) {
 }
 
 async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
-  const { strict = false, maxTokensOverride = null, extraReminder = '' } = options;
+  const { strict = false, maxTokensOverride = null, extraReminder = '', responseMode = 'delta' } = options;
+  const useDelta = responseMode === 'delta';
+  const allowDeltaFallback = options.allowDeltaFallback !== false;
   const requestOptions = options.requestOptions || null;
   const requestMeta = normalizeRequestMeta(options.requestMeta, {
     stage: 'proofread',
@@ -1530,8 +1718,9 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       requestMeta
     );
   }
+  const promptBuilder = useDelta ? buildProofreadDeltaPrompt : buildProofreadPrompt;
   const prompt = applyPromptCaching(
-    buildProofreadPrompt(
+    promptBuilder(
       {
         items,
         sourceBlock: metadata?.sourceBlock,
@@ -1551,7 +1740,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     apiBaseUrl,
     requestOptions
   );
-  if (triggerSource === 'retry' || triggerSource === 'validate') {
+  if (!useDelta && (triggerSource === 'retry' || triggerSource === 'validate')) {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
     if (resolvedShortContextText) {
       const envelope = buildRetryValidateEnvelope(resolvedShortContextText, manualOutputsText);
@@ -1566,15 +1755,17 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     }
   }
   const itemsChars = items.reduce((sum, item) => sum + (item?.text?.length || 0), 0);
-  const inputChars =
-    itemsChars +
-    (effectiveContext?.text?.length || 0) +
-    (metadata?.sourceBlock?.length || 0) +
-    (metadata?.translatedBlock?.length || 0);
-  const approxOut =
-    Math.ceil(itemsChars / 4) +
-    Math.ceil(items.length * 12) +
-    200;
+  const inputChars = useDelta
+    ? itemsChars
+    : itemsChars +
+      (effectiveContext?.text?.length || 0) +
+      (metadata?.sourceBlock?.length || 0) +
+      (metadata?.translatedBlock?.length || 0);
+  const approxOut = useDelta
+    ? Math.ceil(items.length * 12) + 64
+    : Math.ceil(itemsChars / 4) +
+      Math.ceil(items.length * 12) +
+      200;
   const baseMaxTokens = Math.min(PROOFREAD_MAX_OUTPUT_TOKENS, Math.max(512, approxOut));
   const adjustedMaxTokens =
     maxTokensOverride == null
@@ -1592,245 +1783,179 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     response_format: {
       type: 'json_schema',
       json_schema: {
-        name: PROOFREAD_SCHEMA_NAME,
-        schema: {
-          type: 'object',
-          properties: {
-            items: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  id: { type: 'string' },
-                  text: { type: 'string' }
+        name: useDelta ? PROOFREAD_DELTA_SCHEMA_NAME : PROOFREAD_SCHEMA_NAME,
+        strict: true,
+        schema: useDelta
+          ? {
+              type: 'object',
+              properties: {
+                edits: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string' },
+                      text: { type: 'string' }
+                    },
+                    required: ['id', 'text'],
+                    additionalProperties: false
+                  }
                 },
-                required: ['id', 'text'],
-                additionalProperties: false
-              }
+                unchanged_count: { type: 'integer' }
+              },
+              required: ['edits'],
+              additionalProperties: false
             }
-          },
-          required: ['items'],
-          additionalProperties: false
-        }
+          : {
+              type: 'object',
+              properties: {
+                items: {
+                  type: 'array',
+                  minItems: items.length,
+                  maxItems: items.length,
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string' },
+                      text: { type: 'string' }
+                    },
+                    required: ['id', 'text'],
+                    additionalProperties: false
+                  }
+                }
+              },
+              required: ['items'],
+              additionalProperties: false
+            }
       }
     }
   };
+  const promptCacheKey = useDelta
+    ? `proofread_delta::${metadata?.language || ''}::v1`
+    : getPromptCacheKey('proofread');
   applyPromptCacheParams(
     requestPayload,
     apiBaseUrl,
     model,
-    getPromptCacheKey('proofread'),
+    promptCacheKey,
     requestOptions
   );
   applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
   const promptCacheSupport = getPromptCacheSupport(apiBaseUrl, requestOptions);
-  const promptCacheKey = requestPayload.prompt_cache_key || '';
+  const resolvedPromptCacheKey = requestPayload.prompt_cache_key || '';
   const promptCacheRetention = requestPayload.prompt_cache_retention || '';
   const requestId = requestMeta?.requestId || createRequestId();
-  const startedAt = Date.now();
   const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
+  const throughputController = getThroughputController();
+  const throughputKey = throughputController ? getThroughputKey('proofread', model) : '';
+  let lastRequestLatencyMs = null;
+  let lastRequestEstimatedTokens = estimatedPromptTokens;
+  const startedAt = Date.now();
   const batchSize = items.length;
   if (triggerSource !== 'retry' && triggerSource !== 'validate') {
     const limitPerMinute = clampPromptCacheLimit(12, 120, Math.round(96 / Math.max(1, batchSize)));
-    await enforcePromptCacheRateLimit(getPromptCacheKey('proofread'), requestMeta?.url || '', {
+    await enforcePromptCacheRateLimit(promptCacheKey, requestMeta?.url || '', {
       limitPerMinute,
       batchSize
     });
   }
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`
-  };
-  let requestBody = JSON.stringify(requestPayload);
   let response;
   let responseText = '';
-  let fetchStartedAt = Date.now();
-  logLlmFetchRequest({
-    ts: fetchStartedAt,
-    role: 'proofread',
-    requestId,
-    url: apiBaseUrl,
-    method: 'POST',
-    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-    body: requestBody,
-    model: requestPayload.model,
-    temperature: requestPayload.temperature,
-    responseFormat: requestPayload.response_format
-  });
+  let responseData = null;
+  const runner = globalThis.ntRequestRunner;
+  if (!runner) {
+    throw new Error('RequestRunner unavailable');
+  }
   try {
-    response = await fetch(apiBaseUrl, {
-      method: 'POST',
-      headers: requestHeaders,
-      body: requestBody
+    const result = await runner.run({
+      opType: 'proofread',
+      modelPreferred: model,
+      apiBaseUrl,
+      apiKey,
+      requestPayload,
+      meta: {
+        requestId,
+        urlHost: requestMeta?.url || '',
+        batchSize,
+        estimatedTokens: estimatedPromptTokens
+      },
+      throughputController,
+      throughputKey
     });
-    responseText = await response.clone().text();
+    response = result.response;
+    responseText = result.responseText || '';
+    responseData = result.responseData || null;
+    lastRequestLatencyMs = result.durationMs;
+    if (throughputController) {
+      throughputController.noteRequestStats(throughputKey, {
+        estimatedTokens: lastRequestEstimatedTokens,
+        latencyMs: lastRequestLatencyMs
+      });
+    }
     logLlmRawResponse({
       ts: Date.now(),
       stage: 'proofread',
       requestId,
-      status: response.status,
-      ok: response.ok,
+      status: result.status,
+      ok: result.ok,
       responseText
     });
     logLlmFetchResponse({
       ts: Date.now(),
       requestId,
-      status: response.status,
-      ok: response.ok,
-      responseHeaders: Array.from(response.headers.entries()),
+      status: result.status,
+      ok: result.ok,
+      responseHeaders: result.responseHeaders || [],
       responseText,
-      durationMs: Date.now() - fetchStartedAt
+      durationMs: result.durationMs
     });
   } catch (error) {
     logLlmFetchError({ ts: Date.now(), requestId, error });
-    throw error;
-  }
-
-  if (!response.ok) {
-    let errorText = responseText;
-    let errorPayload = null;
-    try {
-      errorPayload = JSON.parse(errorText);
-    } catch (parseError) {
-      errorPayload = null;
-    }
-    const stripped = stripUnsupportedRequestParams(
-      requestPayload,
-      model,
-      response.status,
-      errorPayload,
-      errorText,
-      apiBaseUrl
-    );
-    if (response.status === 400 && stripped.changed) {
-      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
-        if (!requestMeta.fallbackReason) {
-          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
-        }
-        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
-          requestMeta.selectedTier = 'standard';
-        }
-      }
-      if (
-        stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
-        stripped.removedParams.includes('max_completion_tokens->max_tokens')
-      ) {
-        emitProofreadLog(
-          'proofread.swap_token_limit_param',
-          'debug',
-          '[proofread] Retrying with swapped token limit parameter.',
-          {
-            model,
-            removedParams: stripped.removedParams
-          }
-        );
-      }
-      emitProofreadLog(
-        'proofread.unsupported_param_removed',
-        'warn',
-        'Unsupported param removed; retrying without it.',
-        {
-          model,
-          status: response.status,
-          removedParams: stripped.removedParams
-        }
-      );
-      requestBody = JSON.stringify(requestPayload);
-      fetchStartedAt = Date.now();
-      logLlmFetchRequest({
-        ts: fetchStartedAt,
-        role: 'proofread',
-        requestId,
-        url: apiBaseUrl,
-        method: 'POST',
-        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-        body: requestBody,
-        model: requestPayload.model,
-        temperature: requestPayload.temperature,
-        responseFormat: requestPayload.response_format
-      });
-      try {
-        response = await fetch(apiBaseUrl, {
-          method: 'POST',
-          headers: requestHeaders,
-          body: requestBody
-        });
-        responseText = await response.clone().text();
-        logLlmRawResponse({
-          ts: Date.now(),
-          stage: 'proofread',
-          requestId,
-          status: response.status,
-          ok: response.ok,
-          responseText
-        });
-        logLlmFetchResponse({
-          ts: Date.now(),
-          requestId,
-          status: response.status,
-          ok: response.ok,
-          responseHeaders: Array.from(response.headers.entries()),
-          responseText,
-          durationMs: Date.now() - fetchStartedAt
-        });
-      } catch (error) {
-        logLlmFetchError({ ts: Date.now(), requestId, error });
-        throw error;
-      }
-      if (!response.ok) {
-        errorText = responseText;
-        try {
-          errorPayload = JSON.parse(errorText);
-        } catch (parseError) {
-          errorPayload = null;
-        }
-      }
-    }
-    if (!response.ok) {
-      const retryAfterMs = parseRetryAfterMs(response, errorPayload);
-      const errorMessage =
-        errorPayload?.error?.message || errorPayload?.message || errorText || 'Unknown error';
-      const error = new Error(`Proofread request failed: ${response.status} ${errorMessage}`);
-      error.status = response.status;
-      error.retryAfterMs = retryAfterMs;
-      error.isRateLimit = response.status === 429 || response.status === 503;
-      error.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
-      error.errorCode = errorPayload?.error?.code || errorPayload?.code;
-      error.errorType = errorPayload?.error?.type || errorPayload?.type;
-      error.isUnavailable =
-        response.status === 503 ||
-        response.status === 502 ||
-        response.status === 504 ||
-        String(errorMessage || '').toLowerCase().includes('unavailable');
-      error.debugPayload = attachRequestMeta(
-        {
-          phase: 'PROOFREAD',
-          model,
-          latencyMs: Date.now() - startedAt,
-          usage: null,
-          inputChars,
-          outputChars: 0,
-          batchSize,
-          estimatedPromptTokens,
-          request: requestPayload,
-          promptCacheKey,
-          promptCacheRetention,
-          promptCacheSupport,
-          response: {
-            status: response.status,
-            statusText: response.statusText,
-            error: errorMessage
-          },
-          parseIssues: ['request-failed']
+    const status = error?.status;
+    const errorMessage = error?.responseText || error?.message || 'Unknown error';
+    const retryAfterMs = typeof globalThis.parseRetryAfterMs === 'function'
+      ? globalThis.parseRetryAfterMs(error?.response, null)
+      : null;
+    const requestError = new Error(`Proofread request failed: ${status || ''} ${errorMessage}`);
+    requestError.status = status || 0;
+    requestError.retryAfterMs = retryAfterMs;
+    requestError.isRateLimit = status === 429 || status === 503;
+    requestError.isContextOverflow = isContextOverflowErrorMessage(errorMessage);
+    requestError.errorCode = error?.errorCode;
+    requestError.errorType = error?.errorType;
+    requestError.isUnavailable =
+      status === 503 ||
+      status === 502 ||
+      status === 504 ||
+      String(errorMessage || '').toLowerCase().includes('unavailable');
+    requestError.debugPayload = attachRequestMeta(
+      {
+        phase: 'PROOFREAD',
+        model,
+        latencyMs: Date.now() - startedAt,
+        usage: null,
+        inputChars,
+        outputChars: 0,
+        batchSize,
+        estimatedPromptTokens,
+        request: requestPayload,
+        promptCacheKey: resolvedPromptCacheKey,
+        promptCacheRetention,
+        promptCacheSupport,
+        response: {
+          status: status || 0,
+          statusText: error?.response?.statusText || '',
+          error: errorMessage
         },
-        requestMeta,
-        effectiveContext
-      );
-      throw error;
-    }
+        parseIssues: ['request-failed']
+      },
+      requestMeta,
+      effectiveContext
+    );
+    throw requestError;
   }
 
-  const data = await response.json();
+  const data = responseData || {};
   const assistantContentMeta = {};
   const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
   logLlmParseExtract({
@@ -1851,7 +1976,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
         inputChars,
         outputChars: 0,
         request: requestPayload,
-        promptCacheKey,
+        promptCacheKey: resolvedPromptCacheKey,
         promptCacheRetention,
         promptCacheSupport,
         response: {
@@ -1874,11 +1999,17 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       itemsById: new Map(),
       rawProofread,
       parseError: 'no-content',
-      debug: [emptyDebugPayload]
+      debug: [emptyDebugPayload],
+      isDelta: useDelta,
+      editsCount: null
     };
   }
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
+  const actualTokens = getUsageTotalTokens(usage);
+  if (throughputController && Number.isFinite(actualTokens)) {
+    throughputController.noteRequestStats(throughputKey, { actualTokens });
+  }
   const debugPayload = attachRequestMeta(
     {
       phase: 'PROOFREAD',
@@ -1890,7 +2021,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       batchSize,
       estimatedPromptTokens,
       request: requestPayload,
-      promptCacheKey,
+      promptCacheKey: resolvedPromptCacheKey,
       promptCacheRetention,
       promptCacheSupport,
       assistant_content_source: assistantContentMeta.assistant_content_source || 'empty',
@@ -1913,7 +2044,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       estimatedPromptTokens,
       cached_tokens: cachedTokens,
       cached_percent: cacheHitRate,
-      prompt_cache_key: getPromptCacheKey('proofread'),
+      prompt_cache_key: resolvedPromptCacheKey || promptCacheKey,
       url: requestMeta?.url || ''
     }
   );
@@ -1928,15 +2059,59 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   }
   const expectedIds = items.map((item) => String(item.id));
   const expectedIdSet = new Set(expectedIds);
-  const normalizedParsedItems = normalizeProofreadItems(parsed?.items);
+  const normalizedParsedItems = useDelta
+    ? normalizeProofreadItems(parsed?.edits)
+    : normalizeProofreadItems(parsed?.items);
   const responseIds = normalizedParsedItems.map((item) => item.id);
   const responseIdSet = new Set(responseIds);
-  const hasUnknownIds = responseIds.some((id) => !expectedIdSet.has(id));
+  const guardrails = globalThis.ntGuardrails;
+  const guardrailMeta = {
+    stage: 'proofread',
+    requestId,
+    blockKey: requestMeta?.blockKey || '',
+    model,
+    host: (() => {
+      try {
+        const url = requestMeta?.url || apiBaseUrl || '';
+        return url ? new URL(url).host : '';
+      } catch (error) {
+        return '';
+      }
+    })()
+  };
+  if (guardrails?.assertIdsSubset) {
+    const idsCheck = guardrails.assertIdsSubset('proofread', expectedIdSet, responseIds, guardrailMeta);
+    if (!idsCheck.ok && idsCheck.error) {
+      debugPayload.parseIssues.push('guardrail:ids-subset');
+    }
+  }
+  const extraIds = responseIds.filter((id) => !expectedIdSet.has(id));
+  const hasUnknownIds = extraIds.length > 0;
   const hasMissingIds = expectedIds.some((id) => !responseIdSet.has(id));
   const hasDuplicateIds = responseIdSet.size !== responseIds.length;
   const hasCountMismatch = normalizedParsedItems.length !== expectedIds.length;
-  if (!parseError && (hasUnknownIds || hasMissingIds || hasDuplicateIds || hasCountMismatch)) {
+  if (guardrails?.assertCountMatch) {
+    const countCheck = guardrails.assertCountMatch('proofread', expectedIds.length, normalizedParsedItems.length, guardrailMeta);
+    if (!countCheck.ok && countCheck.error) {
+      debugPayload.parseIssues.push('guardrail:count-mismatch');
+    }
+  }
+  if (!parseError && !useDelta && (hasUnknownIds || hasMissingIds || hasDuplicateIds || hasCountMismatch)) {
+    emitJsonLog({
+      kind: 'structured_outputs.count_mismatch',
+      stage: 'proofread',
+      expectedCount: expectedIds.length,
+      actualCount: normalizedParsedItems.length,
+      missingIds: expectedIds.filter((id) => !responseIdSet.has(id)),
+      extraIds,
+      model,
+      requestId
+    });
     parseError = 'schema-mismatch:items';
+    debugPayload.parseIssues.push(parseError);
+  }
+  if (!parseError && useDelta && (hasUnknownIds || hasDuplicateIds)) {
+    parseError = 'schema-mismatch:edits';
     debugPayload.parseIssues.push(parseError);
   }
 
@@ -1947,7 +2122,36 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   }
 
   let rawProofread = content;
-  if (parseError) {
+  if (parseError && useDelta) {
+    emitJsonLog({
+      kind: 'proofread.delta_invalid',
+      reason: parseError,
+      expectedCount: expectedIds.length,
+      gotEditsCount: normalizedParsedItems.length,
+      extraIdsCount: extraIds.length,
+      model,
+      requestId
+    });
+    if (allowDeltaFallback) {
+      const fallbackResult = await requestProofreadChunk(
+        items,
+        metadata,
+        apiKey,
+        model,
+        apiBaseUrl,
+        {
+          ...options,
+          responseMode: 'full',
+          allowDeltaFallback: false
+        }
+      );
+      return {
+        ...fallbackResult,
+        rawProofread: [rawProofread, fallbackResult.rawProofread].filter(Boolean).join('\n\n---\n\n')
+      };
+    }
+  }
+  if (parseError && !useDelta) {
     debugPayload.parseIssues.push('fallback:format-repair');
     const fallbackSpec =
       requestMeta?.selectedModelSpec || formatModelSpec(model, requestMeta?.selectedTier || 'standard');
@@ -1988,13 +2192,38 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     }
   }
 
-  const normalizedItems = normalizeProofreadItems(parsed?.items);
+  const normalizedItems = normalizeProofreadItems(useDelta ? parsed?.edits : parsed?.items);
   const itemsById = new Map();
   normalizedItems.forEach((item) => {
     itemsById.set(item.id, item.text);
   });
+  if (guardrails?.assertPlaceholdersMatch) {
+    for (const item of items) {
+      const id = String(item?.id ?? '');
+      const sourceText = item?.text || '';
+      const translatedText = itemsById.get(id) || '';
+      const placeholderCheck = guardrails.assertPlaceholdersMatch(sourceText, translatedText, {
+        ...guardrailMeta,
+        stage: 'proofread',
+        segmentId: id
+      });
+      if (!placeholderCheck.ok && placeholderCheck.error) {
+        debugPayload.parseIssues.push('guardrail:placeholders');
+        if (!parseError) {
+          parseError = 'schema-mismatch:placeholders';
+        }
+      }
+    }
+  }
 
-  return { itemsById, rawProofread, parseError, debug: debugPayloads };
+  return {
+    itemsById,
+    rawProofread,
+    parseError,
+    debug: debugPayloads,
+    isDelta: useDelta,
+    editsCount: useDelta ? normalizedItems.length : null
+  };
 }
 
 async function requestProofreadFormatRepair(
@@ -2067,11 +2296,14 @@ async function requestProofreadFormatRepair(
       type: 'json_schema',
       json_schema: {
         name: `${PROOFREAD_SCHEMA_NAME}_repair`,
+        strict: true,
         schema: {
           type: 'object',
           properties: {
             items: {
               type: 'array',
+              minItems: items.length,
+              maxItems: items.length,
               items: {
                 type: 'object',
                 properties: {
@@ -2098,157 +2330,67 @@ async function requestProofreadFormatRepair(
   );
   applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
   const requestId = normalizedRequestMeta?.requestId || createRequestId();
+  const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
+  const throughputController = getThroughputController();
+  const throughputKey = throughputController ? getThroughputKey('proofread_repair', model) : '';
+  let lastRequestLatencyMs = null;
+  let lastRequestEstimatedTokens = estimatedPromptTokens;
   const startedAt = Date.now();
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`
-  };
-  let requestBody = JSON.stringify(requestPayload);
   let response;
   let responseText = '';
-  let fetchStartedAt = Date.now();
-  logLlmFetchRequest({
-    ts: fetchStartedAt,
-    role: 'proofread',
-    requestId,
-    url: apiBaseUrl,
-    method: 'POST',
-    headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-    body: requestBody,
-    model: requestPayload.model,
-    temperature: requestPayload.temperature,
-    responseFormat: requestPayload.response_format
-  });
+  let responseData = null;
+  const runner = globalThis.ntRequestRunner;
+  if (!runner) {
+    throw new Error('RequestRunner unavailable');
+  }
   try {
-    response = await fetch(apiBaseUrl, {
-      method: 'POST',
-      headers: requestHeaders,
-      body: requestBody
+    const result = await runner.run({
+      opType: 'validate',
+      modelPreferred: model,
+      apiBaseUrl,
+      apiKey,
+      requestPayload,
+      meta: {
+        requestId,
+        urlHost: normalizedRequestMeta?.url || '',
+        batchSize: items.length,
+        estimatedTokens: estimatedPromptTokens
+      },
+      throughputController,
+      throughputKey
     });
-    responseText = await response.clone().text();
+    response = result.response;
+    responseText = result.responseText || '';
+    responseData = result.responseData || null;
+    lastRequestLatencyMs = result.durationMs;
+    if (throughputController) {
+      throughputController.noteRequestStats(throughputKey, {
+        estimatedTokens: lastRequestEstimatedTokens,
+        latencyMs: lastRequestLatencyMs
+      });
+    }
     logLlmRawResponse({
       ts: Date.now(),
       stage: 'proofread',
       requestId,
-      status: response.status,
-      ok: response.ok,
+      status: result.status,
+      ok: result.ok,
       responseText
     });
     logLlmFetchResponse({
       ts: Date.now(),
       requestId,
-      status: response.status,
-      ok: response.ok,
-      responseHeaders: Array.from(response.headers.entries()),
+      status: result.status,
+      ok: result.ok,
+      responseHeaders: result.responseHeaders || [],
       responseText,
-      durationMs: Date.now() - fetchStartedAt
+      durationMs: result.durationMs
     });
   } catch (error) {
     logLlmFetchError({ ts: Date.now(), requestId, error });
-    throw error;
+    return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
   }
-
-  if (!response.ok) {
-    let errorText = responseText;
-    let errorPayload = null;
-    try {
-      errorPayload = JSON.parse(errorText);
-    } catch (parseError) {
-      errorPayload = null;
-    }
-    const stripped = stripUnsupportedRequestParams(
-      requestPayload,
-      model,
-      response.status,
-      errorPayload,
-      errorText,
-      apiBaseUrl
-    );
-    if (response.status === 400 && stripped.changed) {
-      if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
-        if (!requestMeta.fallbackReason) {
-          requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
-        }
-        if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
-          requestMeta.selectedTier = 'standard';
-        }
-      }
-      if (
-        stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
-        stripped.removedParams.includes('max_completion_tokens->max_tokens')
-      ) {
-        emitProofreadLog(
-          'proofread.swap_token_limit_param',
-          'debug',
-          '[proofread] Retrying format repair with swapped token limit parameter.',
-          {
-            model,
-            removedParams: stripped.removedParams,
-            stage: 'format_repair'
-          }
-        );
-      }
-      emitProofreadLog(
-        'proofread.unsupported_param_removed',
-        'warn',
-        'Unsupported param removed; retrying format repair without it.',
-        {
-          model,
-          status: response.status,
-          removedParams: stripped.removedParams,
-          stage: 'format_repair'
-        }
-      );
-      requestBody = JSON.stringify(requestPayload);
-      fetchStartedAt = Date.now();
-      logLlmFetchRequest({
-        ts: fetchStartedAt,
-        role: 'proofread',
-        requestId,
-        url: apiBaseUrl,
-        method: 'POST',
-        headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-        body: requestBody,
-        model: requestPayload.model,
-        temperature: requestPayload.temperature,
-        responseFormat: requestPayload.response_format
-      });
-      try {
-        response = await fetch(apiBaseUrl, {
-          method: 'POST',
-          headers: requestHeaders,
-          body: requestBody
-        });
-        responseText = await response.clone().text();
-        logLlmRawResponse({
-          ts: Date.now(),
-          stage: 'proofread',
-          requestId,
-          status: response.status,
-          ok: response.ok,
-          responseText
-        });
-        logLlmFetchResponse({
-          ts: Date.now(),
-          requestId,
-          status: response.status,
-          ok: response.ok,
-          responseHeaders: Array.from(response.headers.entries()),
-          responseText,
-          durationMs: Date.now() - fetchStartedAt
-        });
-      } catch (error) {
-        logLlmFetchError({ ts: Date.now(), requestId, error });
-        throw error;
-      }
-      if (!response.ok) {
-        return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
-      }
-    } else {
-      return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
-    }
-  }
-  const data = await response.json();
+  const data = responseData || {};
   const assistantContentMeta = {};
   const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
   logLlmParseExtract({
@@ -2259,6 +2401,10 @@ async function requestProofreadFormatRepair(
   const content = extractedContent.trim();
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
+  const actualTokens = getUsageTotalTokens(usage);
+  if (throughputController && Number.isFinite(actualTokens)) {
+    throughputController.noteRequestStats(throughputKey, { actualTokens });
+  }
   const effectiveContext = buildEffectiveContext(
     {
       text: resolvedShortContextText || '',
@@ -2453,11 +2599,14 @@ async function repairProofreadSegments(
       type: 'json_schema',
       json_schema: {
         name: `${PROOFREAD_SCHEMA_NAME}_language_repair`,
+        strict: true,
         schema: {
           type: 'object',
           properties: {
             items: {
               type: 'array',
+              minItems: repairItems.length,
+              maxItems: repairItems.length,
               items: {
                 type: 'object',
                 properties: {
@@ -2484,155 +2633,57 @@ async function repairProofreadSegments(
   );
   applyModelRequestParams(requestPayload, model, requestOptions, apiBaseUrl);
   const requestId = repairRequestMeta?.requestId || createRequestId();
+  const estimatedPromptTokens = estimatePromptTokensFromMessages(prompt);
+  const throughputController = getThroughputController();
+  const throughputKey = throughputController ? getThroughputKey('proofread_repair', model) : '';
+  let lastRequestLatencyMs = null;
+  let lastRequestEstimatedTokens = estimatedPromptTokens;
   const startedAt = Date.now();
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`
-  };
-  let requestBody = JSON.stringify(requestPayload);
   try {
-    let response;
-    let responseText = '';
-    let fetchStartedAt = Date.now();
-    logLlmFetchRequest({
-      ts: fetchStartedAt,
-      role: 'proofread',
-      requestId,
-      url: apiBaseUrl,
-      method: 'POST',
-      headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-      body: requestBody,
-      model: requestPayload.model,
-      temperature: requestPayload.temperature,
-      responseFormat: requestPayload.response_format
+    const runner = globalThis.ntRequestRunner;
+    if (!runner) {
+      throw new Error('RequestRunner unavailable');
+    }
+    const result = await runner.run({
+      opType: 'repair',
+      modelPreferred: model,
+      apiBaseUrl,
+      apiKey,
+      requestPayload,
+      meta: {
+        requestId,
+        urlHost: repairRequestMeta?.url || '',
+        batchSize: repairItems.length,
+        estimatedTokens: estimatedPromptTokens
+      },
+      throughputController,
+      throughputKey
     });
-    try {
-      response = await fetch(apiBaseUrl, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: requestBody
+    lastRequestLatencyMs = result.durationMs;
+    if (throughputController) {
+      throughputController.noteRequestStats(throughputKey, {
+        estimatedTokens: lastRequestEstimatedTokens,
+        latencyMs: lastRequestLatencyMs
       });
-      responseText = await response.clone().text();
-      logLlmRawResponse({
-        ts: Date.now(),
-        stage: 'proofread',
-        requestId,
-        status: response.status,
-        ok: response.ok,
-        responseText
-      });
-      logLlmFetchResponse({
-        ts: Date.now(),
-        requestId,
-        status: response.status,
-        ok: response.ok,
-        responseHeaders: Array.from(response.headers.entries()),
-        responseText,
-        durationMs: Date.now() - fetchStartedAt
-      });
-    } catch (error) {
-      logLlmFetchError({ ts: Date.now(), requestId, error });
-      throw error;
     }
-    if (!response.ok) {
-      let errorText = responseText;
-      let errorPayload = null;
-      try {
-        errorPayload = JSON.parse(errorText);
-      } catch (parseError) {
-        errorPayload = null;
-      }
-      const stripped = stripUnsupportedRequestParams(
-        requestPayload,
-        model,
-        response.status,
-        errorPayload,
-        errorText,
-        apiBaseUrl
-      );
-      if (response.status === 400 && stripped.changed) {
-        if (requestMeta && typeof requestMeta === 'object' && stripped.removedParams.length) {
-          if (!requestMeta.fallbackReason) {
-            requestMeta.fallbackReason = `unsupported_param:${stripped.removedParams.join(',')}`;
-          }
-          if (stripped.removedParams.includes('service_tier') && requestMeta.selectedTier === 'flex') {
-            requestMeta.selectedTier = 'standard';
-          }
-        }
-        if (
-          stripped.removedParams.includes('max_tokens->max_completion_tokens') ||
-          stripped.removedParams.includes('max_completion_tokens->max_tokens')
-        ) {
-          emitProofreadLog(
-            'proofread.swap_token_limit_param',
-            'debug',
-            '[proofread] Retrying proofread repair with swapped token limit parameter.',
-            {
-              model,
-              removedParams: stripped.removedParams,
-              stage: 'repair'
-            }
-          );
-        }
-        emitProofreadLog(
-          'proofread.unsupported_param_removed',
-          'warn',
-          'Unsupported param removed; retrying proofread repair without it.',
-          {
-            model,
-            status: response.status,
-            removedParams: stripped.removedParams,
-            stage: 'repair'
-          }
-        );
-        requestBody = JSON.stringify(requestPayload);
-        fetchStartedAt = Date.now();
-        logLlmFetchRequest({
-          ts: fetchStartedAt,
-          role: 'proofread',
-          requestId,
-          url: apiBaseUrl,
-          method: 'POST',
-          headers: { ...requestHeaders, Authorization: `Bearer ${maskApiKey(apiKey)}` },
-          body: requestBody,
-          model: requestPayload.model,
-          temperature: requestPayload.temperature,
-          responseFormat: requestPayload.response_format
-        });
-        try {
-          response = await fetch(apiBaseUrl, {
-            method: 'POST',
-            headers: requestHeaders,
-            body: requestBody
-          });
-          responseText = await response.clone().text();
-          logLlmRawResponse({
-            ts: Date.now(),
-            stage: 'proofread',
-            requestId,
-            status: response.status,
-            ok: response.ok,
-            responseText
-          });
-          logLlmFetchResponse({
-            ts: Date.now(),
-            requestId,
-            status: response.status,
-            ok: response.ok,
-            responseHeaders: Array.from(response.headers.entries()),
-            responseText,
-            durationMs: Date.now() - fetchStartedAt
-          });
-        } catch (error) {
-          logLlmFetchError({ ts: Date.now(), requestId, error });
-          throw error;
-        }
-      }
-    }
-    if (!response.ok) {
-      return translations;
-    }
-    const data = await response.json();
+    logLlmRawResponse({
+      ts: Date.now(),
+      stage: 'proofread',
+      requestId,
+      status: result.status,
+      ok: result.ok,
+      responseText: result.responseText || ''
+    });
+    logLlmFetchResponse({
+      ts: Date.now(),
+      requestId,
+      status: result.status,
+      ok: result.ok,
+      responseHeaders: result.responseHeaders || [],
+      responseText: result.responseText || '',
+      durationMs: result.durationMs
+    });
+    const data = result.responseData || {};
     const assistantContentMeta = {};
     const extractedContent = extractAssistantTextFromChatCompletion(data, assistantContentMeta);
     logLlmParseExtract({
@@ -2643,6 +2694,10 @@ async function repairProofreadSegments(
     const content = extractedContent.trim();
     const latencyMs = Date.now() - startedAt;
     const usage = normalizeUsage(data?.usage);
+    const actualTokens = getUsageTotalTokens(usage);
+    if (throughputController && Number.isFinite(actualTokens)) {
+      throughputController.noteRequestStats(throughputKey, { actualTokens });
+    }
     const debugPayload = attachRequestMeta(
       {
         phase: 'PROOFREAD_REPAIR',

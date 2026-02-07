@@ -1,6 +1,7 @@
 const metaEl = document.getElementById('meta');
 const contextEl = document.getElementById('context');
 const summaryEl = document.getElementById('summary');
+const healthEl = document.getElementById('health');
 const entriesEl = document.getElementById('entries');
 const eventsEl = document.getElementById('events');
 const clearDebugButton = document.getElementById('clear-debug');
@@ -48,6 +49,11 @@ const debugInstrumentation = {
   enabled: isDebugInstrumentationEnabled(),
   lastRefByKey: new Map(),
   lastUserActionTs: 0
+};
+const healthUiState = {
+  lastCompleted: 0,
+  lastTs: 0,
+  emaBlocksPerMin: 0
 };
 
 init();
@@ -589,6 +595,10 @@ function renderEmpty(message) {
     contextStatus: 'pending',
     context: ''
   }, message);
+  renderHealthPanel({
+    items: [],
+    health: null
+  });
 }
 
 function scheduleDebugPatch(url, data) {
@@ -613,6 +623,7 @@ function patchDebug(url, data) {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
   renderSummary(data, '');
+  renderHealthPanel(data);
   renderEvents(data);
   patchContext(data);
 
@@ -783,6 +794,191 @@ function renderSummary(data, fallbackMessage = '') {
       ${renderCacheRow('Context', cacheStatsByType.context)}
     </div>
   `;
+}
+
+function renderHealthPanel(data) {
+  if (!healthEl) return;
+  const items = Array.isArray(data.items) ? data.items : [];
+  const health = data?.health && typeof data.health === 'object' ? data.health : null;
+  const now = Date.now();
+  let completed = 0;
+  let inProgress = 0;
+  let total = items.length;
+  let oldestInProgressMs = 0;
+  let fallbackProofreadEdits = 0;
+  let fallbackProofreadItems = 0;
+  items.forEach((item) => {
+    const status = getOverallEntryStatus(item);
+    if (status === 'done') completed += 1;
+    if (status === 'in_progress') inProgress += 1;
+    if (status === 'in_progress') {
+      const startedAt = Number.isFinite(item?.translationStartedAt) ? item.translationStartedAt : null;
+      if (startedAt) {
+        const ageMs = Math.max(0, now - startedAt);
+        oldestInProgressMs = Math.max(oldestInProgressMs, ageMs);
+      }
+    }
+    if (Array.isArray(item?.proofreadComparisons)) {
+      fallbackProofreadEdits += item.proofreadComparisons.length;
+      fallbackProofreadItems += Number.isFinite(item?.translatedSegments?.length)
+        ? item.translatedSegments.length
+        : item.proofreadComparisons.length;
+    }
+  });
+  const oldestInProgressSec = oldestInProgressMs ? Math.round(oldestInProgressMs / 1000) : 0;
+  const completionDelta = Math.max(0, completed - (healthUiState.lastCompleted || 0));
+  if (healthUiState.lastTs) {
+    const deltaMinutes = Math.max(0.001, (now - healthUiState.lastTs) / 60000);
+    const instantRate = completionDelta / deltaMinutes;
+    const alpha = 0.2;
+    healthUiState.emaBlocksPerMin =
+      healthUiState.emaBlocksPerMin === 0
+        ? instantRate
+        : healthUiState.emaBlocksPerMin + alpha * (instantRate - healthUiState.emaBlocksPerMin);
+  }
+  healthUiState.lastCompleted = completed;
+  healthUiState.lastTs = now;
+  const blocksDonePerMin = healthUiState.emaBlocksPerMin || 0;
+
+  const requestEvents = Array.isArray(health?.requestEvents) ? health.requestEvents : [];
+  const recentWindowMs = 5 * 60 * 1000;
+  const recentRequests = requestEvents.filter((event) => now - event.ts <= recentWindowMs);
+  const recentOk = recentRequests.filter((event) => event.ok === true);
+  const requestSuccessRatio =
+    recentRequests.length > 0 ? recentOk.length / recentRequests.length : null;
+  const requestsSent = Number.isFinite(health?.requestsSent)
+    ? health.requestsSent
+    : Number.isFinite(data.aiRequestCount)
+      ? data.aiRequestCount
+      : 0;
+  const responsesOk = Number.isFinite(health?.responsesOk)
+    ? health.responsesOk
+    : Number.isFinite(data.aiResponseCount)
+      ? data.aiResponseCount
+      : 0;
+  const errorsTotal = Number.isFinite(health?.errorsTotal) ? health.errorsTotal : 0;
+  const rateLimitedCount = countRecentEvents(health?.rateLimitedEvents, recentWindowMs, now);
+  const timeoutsCount = countRecentEvents(health?.timeoutEvents, recentWindowMs, now);
+  const retryCount = countRecentEvents(health?.retryEvents, recentWindowMs, now);
+
+  const tpmWindowMs = 60 * 1000;
+  const tpmEvents = Array.isArray(health?.tpmEvents) ? health.tpmEvents : [];
+  const recentTpmEvents = tpmEvents.filter((event) => now - event.ts <= tpmWindowMs);
+  const recentTokens = recentTpmEvents.reduce((sum, event) => sum + (event.tokens || 0), 0);
+  const estTpm = recentTokens ? Math.round((recentTokens * 60000) / tpmWindowMs) : 0;
+  const promptTokensTotal = Number.isFinite(health?.promptTokensTotal) ? health.promptTokensTotal : 0;
+  const completionTokensTotal = Number.isFinite(health?.completionTokensTotal) ? health.completionTokensTotal : 0;
+  const cachedTokensTotal = Number.isFinite(health?.cachedTokensTotal) ? health.cachedTokensTotal : 0;
+  const promptCacheHitPercent =
+    promptTokensTotal > 0 ? (cachedTokensTotal / promptTokensTotal) * 100 : 0;
+  const promptCacheRetentionUsed = Boolean(health?.promptCacheRetentionUsed);
+  const avgBatchTranslate = averageRecent(health?.batchSizesTranslate, 50);
+  const avgBatchProofread = averageRecent(health?.batchSizesProofread, 50);
+
+  const proofreadCallsTotal = Number.isFinite(health?.proofreadCallsTotal) ? health.proofreadCallsTotal : 0;
+  const proofreadDeltaEditsTotal = Number.isFinite(health?.proofreadDeltaEditsTotal)
+    ? health.proofreadDeltaEditsTotal
+    : fallbackProofreadEdits;
+  const proofreadDeltaUnchangedTotal = Number.isFinite(health?.proofreadDeltaUnchangedTotal)
+    ? health.proofreadDeltaUnchangedTotal
+    : Math.max(0, fallbackProofreadItems - fallbackProofreadEdits);
+  const proofreadItemsTotal = Number.isFinite(health?.proofreadItemsTotal)
+    ? health.proofreadItemsTotal
+    : fallbackProofreadItems;
+  const editsRatio =
+    proofreadItemsTotal > 0 ? proofreadDeltaEditsTotal / Math.max(1, proofreadItemsTotal) : 0;
+
+  const docDedupSavingsRatio =
+    typeof health?.docDedupSavingsRatio === 'number' ? health.docDedupSavingsRatio : null;
+  const uiTmHit = Number.isFinite(health?.uiTmHit) ? health.uiTmHit : 0;
+  const uiTmMiss = Number.isFinite(health?.uiTmMiss) ? health.uiTmMiss : 0;
+
+  const backoffActive = Number.isFinite(health?.backoffUntilMs) && health.backoffUntilMs > now;
+
+  const warnings = [];
+  if (oldestInProgressSec > 600) {
+    warnings.push('oldest_in_progress > 600s');
+  }
+  if (requestSuccessRatio != null && requestSuccessRatio < 0.8) {
+    warnings.push('success_ratio < 0.8');
+  }
+  if (rateLimitedCount > 0 && !backoffActive) {
+    warnings.push('429 without backoff');
+  }
+  if (avgBatchProofread === 1 && proofreadCallsTotal >= 5) {
+    warnings.push('proofread batch size = 1');
+  }
+
+  const badgesHtml = `
+    <span class="health-badge ${warnings.length ? 'health-badge--warn' : 'health-badge--ok'}">
+      ${warnings.length ? 'WARN' : 'OK'}
+    </span>
+    ${warnings.length ? `<span class="health-badge health-badge--warn">${escapeHtml(warnings.join(' • '))}</span>` : ''}
+  `;
+
+  healthEl.innerHTML = `
+    <div class="health-header">
+      <div class="health-title">Health</div>
+      <div class="health-badges">${badgesHtml}</div>
+    </div>
+    <div class="health-grid">
+      <div class="health-card">
+        <div class="health-card-title">Progress</div>
+        <div class="health-item"><span class="health-label">blocks_done / in_progress / total</span><span class="health-value">${escapeHtml(`${completed} / ${inProgress} / ${total}`)}</span></div>
+        <div class="health-item"><span class="health-label">blocks_done_per_min (EMA)</span><span class="health-value">${escapeHtml(blocksDonePerMin.toFixed(2))}</span></div>
+        <div class="health-item"><span class="health-label">oldest_in_progress_age_sec</span><span class="health-value">${escapeHtml(String(oldestInProgressSec))}</span></div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-title">Request health</div>
+        <div class="health-item"><span class="health-label">requests_sent</span><span class="health-value">${escapeHtml(String(requestsSent))}</span></div>
+        <div class="health-item"><span class="health-label">responses_ok</span><span class="health-value">${escapeHtml(String(responsesOk))}</span></div>
+        <div class="health-item"><span class="health-label">errors_total</span><span class="health-value">${escapeHtml(String(errorsTotal))}</span></div>
+        <div class="health-item"><span class="health-label">rate_limited_429_count (5m)</span><span class="health-value">${escapeHtml(String(rateLimitedCount))}</span></div>
+        <div class="health-item"><span class="health-label">timeouts_count (5m)</span><span class="health-value">${escapeHtml(String(timeoutsCount))}</span></div>
+        <div class="health-item"><span class="health-label">retry_count (5m)</span><span class="health-value">${escapeHtml(String(retryCount))}</span></div>
+        <div class="health-item"><span class="health-label">request_success_ratio</span><span class="health-value">${requestSuccessRatio == null ? '—' : escapeHtml(requestSuccessRatio.toFixed(2))}</span></div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-title">Tokens & batching</div>
+        <div class="health-item"><span class="health-label">est_tpm (60s)</span><span class="health-value">${escapeHtml(String(estTpm))}</span></div>
+        <div class="health-item"><span class="health-label">prompt_tokens_total</span><span class="health-value">${escapeHtml(String(promptTokensTotal))}</span></div>
+        <div class="health-item"><span class="health-label">completion_tokens_total</span><span class="health-value">${escapeHtml(String(completionTokensTotal))}</span></div>
+        <div class="health-item"><span class="health-label">avg_batch_size_translate</span><span class="health-value">${avgBatchTranslate ? escapeHtml(avgBatchTranslate.toFixed(2)) : '—'}</span></div>
+        <div class="health-item"><span class="health-label">avg_batch_size_proofread</span><span class="health-value">${avgBatchProofread ? escapeHtml(avgBatchProofread.toFixed(2)) : '—'}</span></div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-title">Caching</div>
+        <div class="health-item"><span class="health-label">prompt_cache_hit%</span><span class="health-value">${escapeHtml(promptCacheHitPercent.toFixed(1))}%</span></div>
+        <div class="health-item"><span class="health-label">cached_tokens_total</span><span class="health-value">${escapeHtml(String(cachedTokensTotal))}</span></div>
+        <div class="health-item"><span class="health-label">prompt_cache_retention_used</span><span class="health-value">${promptCacheRetentionUsed ? 'true' : 'false'}</span></div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-title">Proofread efficiency</div>
+        <div class="health-item"><span class="health-label">proofread_calls_total</span><span class="health-value">${escapeHtml(String(proofreadCallsTotal))}</span></div>
+        <div class="health-item"><span class="health-label">proofread_delta_edits_total</span><span class="health-value">${escapeHtml(String(proofreadDeltaEditsTotal))}</span></div>
+        <div class="health-item"><span class="health-label">proofread_delta_unchanged_total</span><span class="health-value">${escapeHtml(String(proofreadDeltaUnchangedTotal))}</span></div>
+        <div class="health-item"><span class="health-label">edits_ratio</span><span class="health-value">${escapeHtml(editsRatio.toFixed(2))}</span></div>
+      </div>
+      <div class="health-card">
+        <div class="health-card-title">Dedup/TM</div>
+        <div class="health-item"><span class="health-label">doc_dedup_savings_ratio</span><span class="health-value">${docDedupSavingsRatio == null ? '—' : escapeHtml(docDedupSavingsRatio.toFixed(2))}</span></div>
+        <div class="health-item"><span class="health-label">ui_tm_hit / ui_tm_miss</span><span class="health-value">${escapeHtml(`${uiTmHit} / ${uiTmMiss}`)}</span></div>
+      </div>
+    </div>
+  `;
+}
+
+function countRecentEvents(list, windowMs, now) {
+  if (!Array.isArray(list)) return 0;
+  return list.filter((event) => now - event.ts <= windowMs).length;
+}
+
+function averageRecent(list, limit) {
+  if (!Array.isArray(list) || !list.length) return 0;
+  const slice = limit ? list.slice(-limit) : list;
+  if (!slice.length) return 0;
+  const total = slice.reduce((sum, value) => sum + (Number(value) || 0), 0);
+  return total / slice.length;
 }
 
 function setTextIfChanged(element, value) {
