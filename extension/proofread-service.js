@@ -24,6 +24,7 @@ const PROOFREAD_SYSTEM_PROMPT = [
   'Do not add, remove, or reorder items. Keep ids unchanged.',
   'If a segment does not need edits, return the original text unchanged.'
 ].join(' ');
+const PROOFREAD_PROMPT_BUILDER = new PromptBuilder({ systemRulesBase: PROOFREAD_SYSTEM_PROMPT });
 
 function normalizeContextPayload(context) {
   if (!context) {
@@ -262,21 +263,20 @@ function formatManualOutputs(payloads) {
 }
 
 function buildRetryValidateEnvelope(shortText, manualOutputsText) {
-  return [
-    '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
-    '[USAGE RULES]',
-    '- SHORT CONTEXT is minimal global context; use it only for terminology, disambiguation, style/tone consistency.',
-    '- PREVIOUS MANUAL ATTEMPTS are hints only: keep good fixes, but correct any mistakes or rule violations.',
-    '- Do NOT copy the envelope, context, source block, or translated block into the output.',
-    '- Preserve placeholders, markup/code, numbers/units, URLs, and punctuation tokens exactly.',
-    '- Output MUST be valid JSON that matches the required schema exactly.',
-    '- Keep ids unchanged. Do not add/remove/reorder items.',
-    '[SHORT CONTEXT (GLOBAL)]',
-    shortText,
-    '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-    manualOutputsText,
-    '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
-  ].join('\n');
+  const rules = [
+    'SHORT CONTEXT is minimal global context; use it only for terminology, disambiguation, style/tone consistency.',
+    'PREVIOUS MANUAL ATTEMPTS are hints only: keep good fixes, but correct any mistakes or rule violations.',
+    'Do NOT copy the envelope, context, source block, or translated block into the output.',
+    'Preserve placeholders, markup/code, numbers/units, URLs, and punctuation tokens exactly.',
+    'Output MUST be valid JSON that matches the required schema exactly.',
+    'Keep ids unchanged. Do not add/remove/reorder items.'
+  ];
+  return ntJoinTaggedBlocks([
+    { tag: NT_PROMPT_TAGS.RULES, content: rules.join('\n') },
+    { tag: NT_PROMPT_TAGS.CONTEXT_MODE, content: shortText ? 'SHORT' : 'NONE' },
+    { tag: NT_PROMPT_TAGS.CONTEXT, content: shortText || '' },
+    { tag: NT_PROMPT_TAGS.DEBUG_HINTS, content: manualOutputsText || '' }
+  ]);
 }
 
 async function resolveRetryValidateBundle({ requestMeta, debugPayloadsOptional, normalizedContext, effectiveContext }) {
@@ -513,70 +513,34 @@ function buildProofreadPrompt(input, strict = false, extraReminder = '') {
   const normalizedContext = normalizeContextPayload(input?.context);
   const contextText = normalizedContext.text || '';
   const contextMode = normalizedContext.mode === 'SHORT' ? 'SHORT' : 'FULL';
-  const baseAnswerText =
+  const debugHints =
     normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer
-      ? `PREVIOUS BASE ANSWER (FULL): <<<BASE_ANSWER_START>>>${normalizedContext.baseAnswer}<<<BASE_ANSWER_END>>>`
+      ? `Previous base answer (full): ${normalizedContext.baseAnswer}`
       : '';
 
-  const messages = [
+  const userPrompt = PROOFREAD_PROMPT_BUILDER.buildProofreadUserPrompt({
+    items,
+    sourceBlock,
+    translatedBlock,
+    contextText,
+    contextMode,
+    language,
+    proofreadMode,
+    strict,
+    extraReminder,
+    debugHints
+  });
+
+  return [
     {
       role: 'system',
-      content: [
-        PROOFREAD_SYSTEM_PROMPT,
-        strict
-          ? 'Strict mode: return every input id exactly once in the output items array.'
-          : '',
-        extraReminder,
-        'Return only JSON, without commentary.'
-      ]
-        .filter(Boolean)
-        .join(' ')
+      content: PROOFREAD_SYSTEM_PROMPT
     },
-  ];
-
-  messages.push({
-    role: 'user',
-    content: [`PROOFREAD_MODE: ${proofreadMode}.`, language ? `Target language: ${language}` : '']
-      .filter(Boolean)
-      .join('\n')
-  });
-
-  if (contextText) {
-    messages.push({
+    {
       role: 'user',
-      content: [
-        language ? `Target language: ${language}` : '',
-        `Context (${contextMode}): <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
-      ]
-        .filter(Boolean)
-        .join('\n')
-    });
-  }
-
-  if (baseAnswerText) {
-    messages.push({
-      role: 'assistant',
-      content: baseAnswerText
-    });
-  }
-
-  messages.push({
-    role: 'user',
-    content: [
-      language ? `Target language: ${language}` : '',
-      sourceBlock ? `Source block: <<<SOURCE_BLOCK_START>>>${sourceBlock}<<<SOURCE_BLOCK_END>>>` : '',
-      translatedBlock
-        ? `Translated block: <<<TRANSLATED_BLOCK_START>>>${translatedBlock}<<<TRANSLATED_BLOCK_END>>>`
-        : '',
-      `Expected items count: ${items.length}.`,
-      'Segments to proofread (JSON array of {id, text}):',
-      JSON.stringify(items)
-    ]
-      .filter(Boolean)
-      .join('\n')
-  });
-
-  return messages;
+      content: userPrompt
+    }
+  ];
 }
 
 async function proofreadTranslation(
@@ -590,7 +554,8 @@ async function proofreadTranslation(
   model,
   apiBaseUrl = OPENAI_API_URL,
   requestMeta = null,
-  requestOptions = null
+  requestOptions = null,
+  requestSignal = null
 ) {
   if (!Array.isArray(segments) || !segments.length) {
     return { translations: [], rawProofread: '' };
@@ -645,7 +610,8 @@ async function proofreadTranslation(
         requestMeta: baseRequestMeta,
         purpose: 'main',
         debugPayloads,
-        requestOptions: buildRequestOptionsForTier(requestOptions, mainSelection.tier)
+        requestOptions: buildRequestOptionsForTier(requestOptions, mainSelection.tier),
+        requestSignal
       }
     );
     rawProofreadParts.push(result.rawProofread);
@@ -681,7 +647,8 @@ async function proofreadTranslation(
           }),
           purpose: 'retry',
           debugPayloads,
-          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
+          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier),
+          requestSignal
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -722,7 +689,8 @@ async function proofreadTranslation(
           }),
           purpose: 'retry',
           debugPayloads,
-          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
+          requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier),
+          requestSignal
         }
       );
       rawProofreadParts.push(result.rawProofread);
@@ -762,7 +730,8 @@ async function proofreadTranslation(
             }),
             purpose: 'retry',
             debugPayloads,
-            requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier)
+            requestOptions: buildRequestOptionsForTier(requestOptions, retrySelection.tier),
+            requestSignal
           }
         );
         rawProofreadParts.push(singleResult.rawProofread);
@@ -822,7 +791,8 @@ async function proofreadTranslation(
     language,
     debugPayloads,
     validateRequestMeta,
-    buildRequestOptionsForTier(requestOptions, validateSelection.tier)
+    buildRequestOptionsForTier(requestOptions, validateSelection.tier),
+    requestSignal
   );
 
   const rawProofread = rawProofreadParts.filter(Boolean).join('\n\n---\n\n');
@@ -1064,6 +1034,7 @@ function buildProofreadBodyPreview(payload, maxLength = 800) {
 async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl, options = {}) {
   const { strict = false, maxTokensOverride = null, extraReminder = '' } = options;
   const requestOptions = options.requestOptions || null;
+  const requestSignal = options.requestSignal || null;
   const requestMeta = normalizeRequestMeta(options.requestMeta, {
     stage: 'proofread',
     purpose: options.purpose || 'main'
@@ -1217,7 +1188,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify(requestPayload)
+    body: JSON.stringify(requestPayload),
+    signal: requestSignal
   });
 
   if (!response.ok) {
@@ -1264,7 +1236,8 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`
         },
-        body: JSON.stringify(requestPayload)
+        body: JSON.stringify(requestPayload),
+        signal: requestSignal
       });
       if (!response.ok) {
         errorText = await response.text();
@@ -1421,6 +1394,30 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     itemsById.set(item.id, item.text);
   });
 
+  const expectedIds = items.map((item) => String(item.id));
+  const receivedIds = Array.from(itemsById.keys());
+  const missingIds = expectedIds.filter((id) => !itemsById.has(id));
+  const extraIds = receivedIds.filter((id) => !expectedIds.includes(id));
+  const validationErrors = [];
+  if (normalizedItems.length !== items.length) {
+    validationErrors.push(`proofread items length mismatch: expected ${items.length}, got ${normalizedItems.length}`);
+  }
+  if (missingIds.length) {
+    validationErrors.push(`missing ids: ${missingIds.join(', ')}`);
+  }
+  if (extraIds.length) {
+    validationErrors.push(`unexpected ids: ${extraIds.join(', ')}`);
+  }
+  if (validationErrors.length) {
+    debugPayload.validationErrors = validationErrors;
+    debugPayload.contractViolation = {
+      expectedCount: items.length,
+      receivedCount: normalizedItems.length,
+      missingIds,
+      extraIds
+    };
+  }
+
   return { itemsById, rawProofread, parseError, debug: debugPayloads };
 }
 
@@ -1454,22 +1451,14 @@ async function requestProofreadFormatRepair(
   const prompt = applyPromptCaching([
     {
       role: 'system',
-      content: [
-        'You are a formatter.',
-        'Convert the provided text into valid JSON that matches the required schema.',
-        'Do not change meaning or wording.',
-        'Return only JSON.'
-      ].join(' ')
+      content: 'You are a formatter.'
     },
     {
       role: 'user',
-      content: [
-        `Return JSON with an "items" array of ${items.length} objects.`,
-        'Each object must contain "id" and "text". Keep ids unchanged.',
-        'Schema example: {"items":[{"id":"0","text":"..."}]}',
-        'Original response:',
-        rawResponse
-      ].join('\n')
+      content: PROOFREAD_PROMPT_BUILDER.buildProofreadFormatRepairUserPrompt({
+        rawResponse,
+        itemCount: items.length
+      })
     }
   ], apiBaseUrl);
   if (triggerSource === 'retry' || triggerSource === 'validate') {
@@ -1527,7 +1516,8 @@ async function requestProofreadFormatRepair(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify(requestPayload)
+    body: JSON.stringify(requestPayload),
+    signal: requestSignal
   });
 
   if (!response.ok) {
@@ -1574,7 +1564,8 @@ async function requestProofreadFormatRepair(
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`
         },
-        body: JSON.stringify(requestPayload)
+        body: JSON.stringify(requestPayload),
+        signal: requestSignal
       });
       if (!response.ok) {
         return { parsed: null, rawProofread: rawResponse, parseError: 'format-repair-failed', debug: [] };
@@ -1637,7 +1628,8 @@ async function repairProofreadSegments(
   language,
   debugPayloads,
   requestMeta,
-  requestOptions = null
+  requestOptions = null,
+  requestSignal = null
 ) {
   const repairItems = [];
   const repairIndices = [];
@@ -1675,25 +1667,14 @@ async function repairProofreadSegments(
   const prompt = applyPromptCaching([
     {
       role: 'system',
-      content: [
-        'You are a translation proofreader.',
-        'Fix the draft so the result is fully in the target language, without any source-language fragments.',
-        'Do not change meaning. Preserve placeholders, markup, code, numbers, units, and punctuation tokens.',
-        PUNCTUATION_TOKEN_HINT,
-        'Return only JSON.'
-      ].join(' ')
+      content: ['You are a translation proofreader.', PUNCTUATION_TOKEN_HINT].join(' ')
     },
     {
       role: 'user',
-      content: [
-        language ? `Target language: ${language}` : '',
-        'Return JSON with an "items" array of {id, text}.',
-        'Use the same ids as input and keep the order.',
-        'Items (JSON array of {id, source, draft}):',
-        JSON.stringify(repairItems)
-      ]
-        .filter(Boolean)
-        .join('\n')
+      content: PROOFREAD_PROMPT_BUILDER.buildProofreadLanguageRepairUserPrompt({
+        items: repairItems,
+        language
+      })
     }
   ], apiBaseUrl);
   if (repairRequestMeta.triggerSource === 'retry' || repairRequestMeta.triggerSource === 'validate') {
@@ -1752,7 +1733,8 @@ async function repairProofreadSegments(
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`
       },
-      body: JSON.stringify(requestPayload)
+      body: JSON.stringify(requestPayload),
+      signal: requestSignal
     });
     if (!response.ok) {
       let errorText = await response.text();
@@ -1798,7 +1780,8 @@ async function repairProofreadSegments(
             'Content-Type': 'application/json',
             Authorization: `Bearer ${apiKey}`
           },
-          body: JSON.stringify(requestPayload)
+          body: JSON.stringify(requestPayload),
+          signal: requestSignal
         });
       }
     }

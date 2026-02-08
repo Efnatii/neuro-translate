@@ -20,50 +20,227 @@
   }
   globalThis.__neuroTranslateContentScriptLoaded = true;
 
-let cancelRequested = false;
-let translationError = null;
-let translationProgress = { completedBlocks: 0, totalBlocks: 0 };
-let translationInProgress = false;
-let activeTranslationEntries = [];
-let originalSnapshot = [];
-let translationVisible = false;
-let latestContextSummary = '';
-let latestShortContextSummary = '';
-let shortContextPromise = null;
-const contextState = {
-  full: {
-    status: 'empty',
-    signature: '',
-    text: '',
-    promise: null
-  },
-  short: {
-    status: 'empty',
-    signature: '',
-    text: '',
-    promise: null
+  // PageState centralizes mutable UI/translation state so logic is not spread across globals.
+  class PageState {
+    constructor() {
+      this.translationVisible = false;
+      this.inProgress = false;
+      this.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
+      this.error = null;
+      this.activeEntries = [];
+      this.originalSnapshot = [];
+      this.contextState = {
+        full: { status: 'empty', signature: '', text: '', promise: null },
+        short: { status: 'empty', signature: '', text: '', promise: null }
+      };
+      this.debugState = null;
+      this.cancelRequested = false;
+    }
+
+    setVisible(visible) {
+      this.translationVisible = Boolean(visible);
+    }
+
+    setProgress(progress) {
+      this.progress = { ...this.progress, ...(progress || {}) };
+    }
+
+    setError(error) {
+      this.error = error || null;
+    }
+
+    reset() {
+      this.inProgress = false;
+      this.error = null;
+      this.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
+      this.activeEntries = [];
+      this.originalSnapshot = [];
+      this.translationVisible = false;
+      this.cancelRequested = false;
+    }
+
+    toSerializable() {
+      return {
+        translationVisible: this.translationVisible,
+        inProgress: this.inProgress,
+        progress: { ...this.progress },
+        error: this.error,
+        contextState: {
+          full: { ...this.contextState.full },
+          short: { ...this.contextState.short }
+        }
+      };
+    }
   }
-};
-let debugEntries = [];
-let debugState = null;
-let debugSessionId = '';
-let debugPersistTimer = null;
-let debugPersistInFlight = false;
-let debugPersistDirty = false;
-const DEBUG_PERSIST_DEBOUNCE_MS = 250;
-const DEBUG_PERSIST_MAX_INTERVAL_MS = 2000;
-let debugLastPersistAt = 0;
-let debugBroadcastWarningSentAt = 0;
-let debugStorageWarningSentAt = 0;
-let tpmLimiter = null;
-let tpmSettings = {
-  outputRatioByRole: {
-    translation: 0.6,
-    context: 0.4,
-    proofread: 0.5
-  },
-  safetyBufferTokens: 100
-};
+
+  // BlockExtractor wraps DOM text collection and snapshotting logic.
+  class BlockExtractor {
+    extract(root = document.body) {
+      const textNodes = collectTextNodes(root);
+      return textNodes.map((node) => ({
+        nodeRef: node,
+        text: node.nodeValue || '',
+        meta: { path: getNodePath(node) }
+      }));
+    }
+
+    takeSnapshot(nodesWithPath) {
+      return nodesWithPath.map(({ path, original, originalHash }) => ({
+        path,
+        original,
+        originalHash
+      }));
+    }
+  }
+
+  // BlockQueue ensures blocks transition to final states and enforces lease timeouts.
+  class BlockQueue {
+    constructor({ leaseTimeoutMs, maxRetries }) {
+      this.leaseTimeoutMs = leaseTimeoutMs;
+      this.maxRetries = maxRetries;
+      this.queue = [];
+      this.statusByKey = new Map();
+    }
+
+    get length() {
+      return this.queue.length;
+    }
+
+    enqueue(item) {
+      if (!item?.key) return false;
+      const status = this.statusByKey.get(item.key);
+      if (status === 'DONE' || status === 'ERROR' || status === 'CANCELLED') {
+        return false;
+      }
+      this.queue.push(item);
+      this.statusByKey.set(item.key, 'PENDING');
+      return true;
+    }
+
+    next() {
+      const item = this.queue.shift();
+      if (item?.key) {
+        this.statusByKey.set(item.key, 'IN_FLIGHT');
+      }
+      return item;
+    }
+
+    markDone(key) {
+      if (key) this.statusByKey.set(key, 'DONE');
+    }
+
+    markError(key) {
+      if (key) this.statusByKey.set(key, 'ERROR');
+    }
+
+    markCancelled(key) {
+      if (key) this.statusByKey.set(key, 'CANCELLED');
+    }
+  }
+
+  // DomPatcher encapsulates DOM mutation and visibility toggles.
+  class DomPatcher {
+    toggleVisibility(visible, entries, originals) {
+      if (visible) {
+        entries.forEach(({ path, translated }) => {
+          const node = findNodeByPath(path);
+          if (node && typeof translated === 'string') {
+            node.nodeValue = translated;
+          }
+        });
+      } else {
+        originals.forEach(({ path, original }) => {
+          const node = findNodeByPath(path);
+          if (node && typeof original === 'string') {
+            node.nodeValue = original;
+          }
+        });
+      }
+    }
+  }
+
+  // DebugStore buffers debug entries and owns persistence scheduling.
+  class DebugStore {
+    constructor() {
+      this.entries = [];
+      this.state = null;
+      this.sessionId = '';
+      this.persistTimer = null;
+      this.persistInFlight = false;
+      this.persistDirty = false;
+      this.lastPersistAt = 0;
+      this.broadcastWarningSentAt = 0;
+      this.storageWarningSentAt = 0;
+    }
+  }
+
+  // TranslationSession orchestrates jobs, state, queues, and notifications.
+  class TranslationSession {
+    constructor() {
+      this.state = new PageState();
+      this.blockExtractor = new BlockExtractor();
+      this.domPatcher = new DomPatcher();
+      this.debugStore = new DebugStore();
+      this.jobId = null;
+      this.tabId = null;
+      this.status = null;
+      this.context = { latestFull: '', latestShort: '', shortPromise: null };
+      this.tpm = {
+        limiter: null,
+        settings: {
+          outputRatioByRole: { translation: 0.6, context: 0.4, proofread: 0.5 },
+          safetyBufferTokens: 100
+        }
+      };
+      this.notifications = globalThis.ntNotifications || null;
+    }
+
+    start() {
+      return startTranslation('manual');
+    }
+
+    cancel() {
+      return cancelTranslation();
+    }
+
+    toggle() {
+      return setTranslationVisibility(!this.state.translationVisible);
+    }
+
+    refreshContext() {
+      return refreshContextFromUi();
+    }
+  }
+
+  const session = new TranslationSession();
+
+  // Local notification center fallback when ntNotifications is not available.
+  const localNotifications = (() => {
+    const listeners = new Map();
+    return {
+      on(type, handler) {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(handler);
+        return () => listeners.get(type)?.delete(handler);
+      },
+      emit(type, payload) {
+        const set = listeners.get(type);
+        if (!set) return;
+        for (const handler of set) {
+          try {
+            handler(payload);
+          } catch (error) {
+            // ignore handler errors
+          }
+        }
+      }
+    };
+  })();
+  session.notifications = session.notifications || localNotifications;
+
+  const notificationBus = session.notifications;
+  const DEBUG_PERSIST_DEBOUNCE_MS = 250;
+  const DEBUG_PERSIST_MAX_INTERVAL_MS = 2000;
 
 const STORAGE_KEY = 'pageTranslations';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
@@ -78,6 +255,8 @@ const DEBUG_CALLS_TOTAL_LIMIT = 1200;
 const DEBUG_EVENTS_LIMIT = 200;
 const DEBUG_PAYLOADS_PER_ENTRY_LIMIT = 120;
 const MAX_BLOCK_RETRIES = 15;
+const BLOCK_LEASE_TIMEOUT_MS = 180000;
+const MAX_BLOCK_LEASE_RETRIES = 1;
 const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
@@ -154,11 +333,11 @@ function formatModelSpec(id, tier) {
 }
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
+let ntRpcClient = null;
 const RPC_HEARTBEAT_INTERVAL_MS = 20000;
 const RPC_PORT_ROTATE_MS = 240000;
 let rpcHeartbeatTimer = null;
 let rpcPortCreatedAt = 0;
-const ntRpcPending = new Map();
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -210,15 +389,15 @@ runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'GET_TRANSLATION_VISIBILITY') {
     Promise.resolve()
       .then(async () => {
-        const storedEntries = activeTranslationEntries.length
+        const storedEntries = session.state.activeEntries.length
           ? []
           : await getStoredTranslations(location.href);
         const hasTranslations = Boolean(
-          activeTranslationEntries.length > 0 ||
+          session.state.activeEntries.length > 0 ||
           storedEntries.length > 0
         );
         if (typeof sendResponse === 'function') {
-          sendResponse({ visible: translationVisible, hasTranslations });
+          sendResponse({ visible: session.state.translationVisible, hasTranslations });
         }
       });
     return true;
@@ -231,6 +410,23 @@ runtime.onMessage.addListener((message, _sender, sendResponse) => {
       clearTimeout(entry.timeoutId);
       entry.resolve(message.settings && typeof message.settings === 'object' ? message.settings : null);
     }
+  }
+});
+
+function refreshContextFromUi() {
+  session.context.latestFull = '';
+  session.context.latestShort = '';
+  session.context.shortPromise = null;
+  session.state.contextState.full = { status: 'empty', signature: '', text: '', promise: null };
+  session.state.contextState.short = { status: 'empty', signature: '', text: '', promise: null };
+}
+
+window.addEventListener('pageshow', (event) => {
+  if (!event?.persisted) return;
+  rotateRpcPort('bfcache');
+  ensureRpcPort();
+  if (session.state.inProgress) {
+    startRpcHeartbeat();
   }
 });
 
@@ -344,8 +540,8 @@ async function notifyDebugUpdate() {
   const response = await sendBackgroundMessageSafe({ type: 'DEBUG_NOTIFY', sourceUrl: location.href });
   if (!response?.delivered) {
     const now = Date.now();
-    if (now - debugBroadcastWarningSentAt > 30000) {
-      debugBroadcastWarningSentAt = now;
+    if (now - session.debugStore.broadcastWarningSentAt > 30000) {
+      session.debugStore.broadcastWarningSentAt = now;
       console.warn('Debug UI not connected, skipping broadcast.');
     }
   }
@@ -517,8 +713,14 @@ function buildSettingsFromState(state) {
 }
 
 async function startTranslation(triggerSource = 'manual') {
-  if (translationInProgress) {
-    reportProgress('Перевод уже выполняется', translationProgress.completedBlocks, translationProgress.totalBlocks);
+  if (session.state.inProgress) {
+    reportProgress(
+      'Перевод уже выполняется',
+      session.state.progress.completedBlocks,
+      session.state.progress.totalBlocks,
+      session.state.progress.inProgressBlocks || 0,
+      'translation'
+    );
     return;
   }
 
@@ -530,23 +732,24 @@ async function startTranslation(triggerSource = 'manual') {
   if (!settings?.allowed) {
     reportProgress(
       settings?.disallowedReason || 'Перевод недоступен для этой страницы',
-      translationProgress.completedBlocks,
-      translationProgress.totalBlocks
+      session.state.progress.completedBlocks,
+      session.state.progress.totalBlocks
     );
     return;
   }
 
-  if (!translationVisible) {
+  if (!session.state.translationVisible) {
     await setTranslationVisibility(true);
   }
 
+  startJobSession();
   configureTpmLimiter(settings);
-  translationInProgress = true;
+  session.state.inProgress = true;
   try {
     startRpcHeartbeat();
     await translatePage(settings, { triggerSource });
   } finally {
-    translationInProgress = false;
+    session.state.inProgress = false;
     stopRpcHeartbeat();
   }
 }
@@ -635,6 +838,28 @@ function createRequestId() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function getActiveJobId() {
+  return typeof session.jobId === 'string' ? session.jobId : '';
+}
+
+function startJobSession() {
+  session.jobId = createRequestId();
+  void sendBackgroundMessageSafe({ type: 'JOB_STARTED', jobId: session.jobId });
+}
+
+function endJobSession(type, details = {}) {
+  const jobId = getActiveJobId();
+  if (!jobId) return;
+  void sendBackgroundMessageSafe({ type, jobId, ...details });
+  session.jobId = null;
+}
+
+function createCancelledError(message) {
+  const error = new Error(message || 'Operation cancelled');
+  error.isCancelled = true;
+  return error;
+}
+
 function computeContextHash(contextText = '') {
   if (!contextText) return 0;
   return computeTextHash(contextText);
@@ -702,7 +927,7 @@ function annotateRequestMetadata(payloads, meta = {}) {
 }
 
 function traceRequestInitiator(meta) {
-  if (!debugState) return;
+  if (!session.debugStore.state) return;
   console.debug('Neuro Translate request initiated', meta);
   console.trace('Neuro Translate request trace');
 }
@@ -756,19 +981,15 @@ async function translatePage(settings, options = {}) {
     existingContextShortRecord?.value?.text ||
     '';
   const contextSignature = buildContextStateSignature(contextCacheSignature, settings);
-  originalSnapshot = nodesWithPath.map(({ path, original, originalHash }) => ({
-    path,
-    original,
-    originalHash
-  }));
-  activeTranslationEntries = [];
-  debugEntries = [];
-  debugState = null;
-  primeContextState(contextState.full, contextSignature, existingContextFullText);
-  primeContextState(contextState.short, contextSignature, existingContextShortText);
-  latestContextSummary = contextState.full.text || '';
-  latestShortContextSummary = contextState.short.text || '';
-  shortContextPromise = null;
+  session.state.originalSnapshot = session.blockExtractor.takeSnapshot(nodesWithPath);
+  session.state.activeEntries = [];
+  session.debugStore.entries = [];
+  session.debugStore.state = null;
+  primeContextState(session.state.contextState.full, contextSignature, existingContextFullText);
+  primeContextState(session.state.contextState.short, contextSignature, existingContextShortText);
+  session.context.latestFull = session.state.contextState.full.text || '';
+  session.context.latestShort = session.state.contextState.short.text || '';
+  session.context.shortPromise = null;
   await resetTranslationDebugInfo(location.href);
 
   const textStats = calculateTextLengthStats(nodesWithPath);
@@ -794,38 +1015,38 @@ async function translatePage(settings, options = {}) {
     return blockKey;
   };
   const blockKeys = blocks.map((block) => getBlockKey(block));
-  translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
+  session.state.progress = { completedBlocks: 0, totalBlocks: blocks.length };
   const initialContextFullStatus = settings.contextGenerationEnabled
-    ? latestContextSummary
+    ? session.context.latestFull
       ? 'done'
       : 'pending'
     : 'disabled';
   const initialContextShortStatus = settings.contextGenerationEnabled
-    ? latestShortContextSummary
+    ? session.context.latestShort
       ? 'done'
       : 'pending'
     : 'disabled';
   await initializeDebugState(blocks, settings, {
-    initialContextFull: latestContextSummary || existingContextFullText,
+    initialContextFull: session.context.latestFull || existingContextFullText,
     initialContextFullStatus,
-    initialContextShort: latestShortContextSummary || existingContextShortText,
+    initialContextShort: session.context.latestShort || existingContextShortText,
     initialContextShortStatus
   }, { blockKeys });
-  if (latestContextSummary) {
-    await updateDebugContextFull(latestContextSummary, 'done');
+  if (session.context.latestFull) {
+    await updateDebugContextFull(session.context.latestFull, 'done');
   }
-  if (latestShortContextSummary) {
-    await updateDebugContextShort(latestShortContextSummary, 'done');
+  if (session.context.latestShort) {
+    await updateDebugContextShort(session.context.latestShort, 'done');
   }
 
   if (!blocks.length) {
-    reportProgress('Перевод не требуется', 0, 0);
+    reportProgress('Перевод не требуется', 0, 0, 0, 'done');
     return;
   }
 
-  cancelRequested = false;
-  translationError = null;
-  reportProgress('Перевод запущен', 0, blocks.length, 0);
+  session.state.cancelRequested = false;
+  session.state.error = null;
+  reportProgress('Перевод запущен', 0, blocks.length, 0, 'translation');
 
   const pageText = settings.contextGenerationEnabled ? buildPageText(nodesWithPath) : '';
 
@@ -846,15 +1067,15 @@ async function translatePage(settings, options = {}) {
   const buildContextBundle = async () => {
     if (!settings.contextGenerationEnabled) return;
     if (!pageText) {
-      await updateDebugContextShort(latestShortContextSummary, 'done');
-      await updateDebugContextFull(latestContextSummary, 'done');
+      await updateDebugContextShort(session.context.latestShort, 'done');
+      await updateDebugContextFull(session.context.latestFull, 'done');
       return;
     }
 
-    if (!latestShortContextSummary) {
+    if (!session.context.latestShort) {
       // Guard: reuse ready context for the same signature instead of recomputing on each debug refresh.
       const shortResult = getOrBuildContext({
-        state: contextState.short,
+        state: session.state.contextState.short,
         signature: contextSignature,
         build: () =>
           requestShortContext(
@@ -863,36 +1084,36 @@ async function translatePage(settings, options = {}) {
             buildContextRequestMeta(pageText, 'SHORT')
           )
       });
-      if (shortResult.started || contextState.short.status === 'building') {
+      if (shortResult.started || session.state.contextState.short.status === 'building') {
         await updateDebugContextShortStatus('in_progress');
-        reportProgress('Генерация SHORT контекста', 0, blocks.length, 0);
+        reportProgress('Генерация SHORT контекста', 0, blocks.length, 0, 'context');
       }
       if (shortResult.promise) {
-        shortContextPromise = shortResult.promise
+        session.context.shortPromise = shortResult.promise
           .then(async (shortContext) => {
-            latestShortContextSummary = shortContext;
-            if (latestShortContextSummary && contextCacheKey) {
+            session.context.latestShort = shortContext;
+            if (session.context.latestShort && contextCacheKey) {
               const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
               await setContextCacheEntry(contextCacheKey, {
                 ...currentEntry,
-                contextShort: latestShortContextSummary,
+                contextShort: session.context.latestShort,
                 contextFull: currentEntry.contextFull || currentEntry.context || '',
                 signature: contextCacheSignature,
                 updatedAt: Date.now()
               });
             }
-            await updateDebugContextShort(latestShortContextSummary, 'done');
+            await updateDebugContextShort(session.context.latestShort, 'done');
           })
           .catch(async (error) => {
             console.warn('Short context generation failed, continuing without it.', error);
-            await updateDebugContextShort(latestShortContextSummary, 'failed');
+            await updateDebugContextShort(session.context.latestShort, 'failed');
           });
       }
     }
 
-    if (!latestContextSummary) {
+    if (!session.context.latestFull) {
       const fullResult = getOrBuildContext({
-        state: contextState.full,
+        state: session.state.contextState.full,
         signature: contextSignature,
         build: () =>
           requestTranslationContext(
@@ -901,33 +1122,33 @@ async function translatePage(settings, options = {}) {
             buildContextRequestMeta(pageText, 'FULL')
           )
       });
-      if (fullResult.started || contextState.full.status === 'building') {
+      if (fullResult.started || session.state.contextState.full.status === 'building') {
         await updateDebugContextFullStatus('in_progress');
-        reportProgress('Генерация FULL контекста', 0, blocks.length, 0);
+        reportProgress('Генерация FULL контекста', 0, blocks.length, 0, 'context');
       }
       if (fullResult.promise) {
         try {
-          latestContextSummary = await fullResult.promise;
-          if (latestContextSummary && contextCacheKey) {
+          session.context.latestFull = await fullResult.promise;
+          if (session.context.latestFull && contextCacheKey) {
             const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
             await setContextCacheEntry(contextCacheKey, {
               ...currentEntry,
-              contextFull: latestContextSummary,
+              contextFull: session.context.latestFull,
               contextShort: currentEntry.contextShort || '',
               signature: contextCacheSignature,
               updatedAt: Date.now()
             });
           }
-          await updateDebugContextFull(latestContextSummary, 'done');
+          await updateDebugContextFull(session.context.latestFull, 'done');
         } catch (error) {
           console.warn('Context generation failed, continuing without it.', error);
-          await updateDebugContextFull(latestContextSummary, 'failed');
+          await updateDebugContextFull(session.context.latestFull, 'failed');
         }
       }
     }
   };
 
-  if (settings.contextGenerationEnabled && (!latestShortContextSummary || !latestContextSummary)) {
+  if (settings.contextGenerationEnabled && (!session.context.latestShort || !session.context.latestFull)) {
     await buildContextBundle();
   }
 
@@ -948,11 +1169,11 @@ async function translatePage(settings, options = {}) {
     if (!requestMeta) return;
     if (requestMeta.triggerSource !== 'retry' && requestMeta.triggerSource !== 'validate') return;
     if (!settings.contextGenerationEnabled) return;
-    if (latestShortContextSummary) return;
-    if (shortContextPromise) {
-      await shortContextPromise;
-      latestShortContextSummary = contextState.short.text || '';
-      if (latestShortContextSummary) return;
+    if (session.context.latestShort) return;
+    if (session.context.shortPromise) {
+      await session.context.shortPromise;
+      session.context.latestShort = session.state.contextState.short.text || '';
+      if (session.context.latestShort) return;
     }
     if (!pageText) return;
     const contextRequestMeta = buildContextRequestMeta(pageText, 'SHORT', {
@@ -960,36 +1181,36 @@ async function translatePage(settings, options = {}) {
       triggerSource: requestMeta.triggerSource || 'retry'
     });
     const shortResult = getOrBuildContext({
-      state: contextState.short,
+      state: session.state.contextState.short,
       signature: contextSignature,
       build: () => requestShortContext(pageText, settings.targetLanguage || 'ru', contextRequestMeta)
     });
-    if (shortResult.started || contextState.short.status === 'building') {
+    if (shortResult.started || session.state.contextState.short.status === 'building') {
       await updateDebugContextShortStatus('in_progress');
     }
     if (!shortResult.promise) return;
-    shortContextPromise = shortResult.promise
+    session.context.shortPromise = shortResult.promise
       .then(async (shortContext) => {
-        latestShortContextSummary = shortContext;
-        if (latestShortContextSummary && contextCacheKey) {
+        session.context.latestShort = shortContext;
+        if (session.context.latestShort && contextCacheKey) {
           const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
           await setContextCacheEntry(contextCacheKey, {
             ...currentEntry,
-            contextShort: latestShortContextSummary,
+            contextShort: session.context.latestShort,
             contextFull: currentEntry.contextFull || currentEntry.context || '',
             signature: contextCacheSignature,
             updatedAt: Date.now()
           });
         }
-        await updateDebugContextShort(latestShortContextSummary, 'done');
-        return latestShortContextSummary;
+        await updateDebugContextShort(session.context.latestShort, 'done');
+        return session.context.latestShort;
       })
       .catch(async (error) => {
         console.warn('Short context generation failed, continuing without it.', error);
-        await updateDebugContextShort(latestShortContextSummary, 'failed');
-        return latestShortContextSummary;
+        await updateDebugContextShort(session.context.latestShort, 'failed');
+        return session.context.latestShort;
       });
-    await shortContextPromise;
+    await session.context.shortPromise;
   };
 
   const selectContextForBlock = async (entry, kind, options = {}) => {
@@ -997,8 +1218,8 @@ async function translatePage(settings, options = {}) {
       return {
         contextMode: 'FULL',
         contextText: '',
-        contextFullText: latestContextSummary || '',
-        contextShortText: latestShortContextSummary || '',
+        contextFullText: session.context.latestFull || '',
+        contextShortText: session.context.latestShort || '',
         baseAnswer: '',
         baseAnswerIncluded: false,
         baseAnswerPreview: '',
@@ -1019,10 +1240,10 @@ async function translatePage(settings, options = {}) {
     } else {
       contextMode = 'SHORT';
     }
-    if (contextMode === 'SHORT' && shortContextPromise) {
-      await shortContextPromise;
+    if (contextMode === 'SHORT' && session.context.shortPromise) {
+      await session.context.shortPromise;
     }
-    const contextText = contextMode === 'SHORT' ? latestShortContextSummary : latestContextSummary;
+    const contextText = contextMode === 'SHORT' ? session.context.latestShort : session.context.latestFull;
     const baseAnswerIncluded = contextMode === 'SHORT' && Boolean(baseAnswer) && (!options.forceShort || fullSuccess);
     const baseAnswerPreview = baseAnswerIncluded ? buildBaseAnswerPreview(baseAnswer) : '';
     updateDebugEntry(entry.index, {
@@ -1031,8 +1252,8 @@ async function translatePage(settings, options = {}) {
     return {
       contextMode,
       contextText: typeof contextText === 'string' ? contextText : '',
-      contextFullText: latestContextSummary || '',
-      contextShortText: latestShortContextSummary || '',
+      contextFullText: session.context.latestFull || '',
+      contextShortText: session.context.latestShort || '',
       baseAnswer,
       baseAnswerIncluded,
       baseAnswerPreview,
@@ -1046,7 +1267,10 @@ async function translatePage(settings, options = {}) {
   let activeTranslationWorkers = 0;
   let activeProofreadWorkers = 0;
   let translationQueueDone = false;
-  const translationQueue = [];
+  const translationQueue = new BlockQueue({
+    leaseTimeoutMs: BLOCK_LEASE_TIMEOUT_MS,
+    maxRetries: MAX_BLOCK_LEASE_RETRIES
+  });
   const proofreadQueue = [];
   const queuedBlockElements = new WeakSet();
   const proofreadQueueKeys = new Set();
@@ -1058,13 +1282,13 @@ async function translatePage(settings, options = {}) {
   const isBlockProcessed = (blockElement, stage) => {
     if (!blockElement?.getAttribute) return false;
     const attr = stage === 'proofread' ? PROOFREAD_ATTR : TRANSLATED_ATTR;
-    return blockElement.getAttribute(attr) === debugSessionId;
+    return blockElement.getAttribute(attr) === session.debugStore.sessionId;
   };
 
   const markBlockProcessed = (blockElement, stage) => {
     if (!blockElement?.setAttribute) return;
     const attr = stage === 'proofread' ? PROOFREAD_ATTR : TRANSLATED_ATTR;
-    blockElement.setAttribute(attr, debugSessionId);
+    blockElement.setAttribute(attr, session.debugStore.sessionId);
   };
 
   const runJobOnce = (jobKey, execute, isValid) => {
@@ -1089,6 +1313,29 @@ async function translatePage(settings, options = {}) {
     return promise;
   };
 
+  const createLeaseTimeoutError = (stage) => {
+    const error = new Error(`${stage} timed out`);
+    error.isLeaseTimeout = true;
+    return error;
+  };
+
+  const withLeaseTimeout = async (promise, timeoutMs, stage) => {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return promise;
+    }
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(createLeaseTimeoutError(stage));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
   const enqueueTranslationBlock = (block, index) => {
     const key = getBlockKey(block);
     const blockElement = block?.[0]?.blockElement;
@@ -1101,12 +1348,13 @@ async function translatePage(settings, options = {}) {
     if (blockElement) {
       queuedBlockElements.add(blockElement);
     }
-    translationQueue.push({
+    translationQueue.enqueue({
       block,
       index,
       key,
       blockElement,
       retryCount: 0,
+      leaseTimeoutCount: 0,
       availableAt: 0,
       fallbackMode: 'normal'
     });
@@ -1118,7 +1366,10 @@ async function translatePage(settings, options = {}) {
       return false;
     }
     proofreadQueueKeys.add(task.key);
-    proofreadQueue.push(task);
+    proofreadQueue.push({
+      leaseTimeoutCount: 0,
+      ...task
+    });
     return true;
   };
 
@@ -1145,18 +1396,18 @@ async function translatePage(settings, options = {}) {
 
   const translationWorker = async () => {
     while (true) {
-      if (cancelRequested) return;
-      const queuedItem = translationQueue.shift();
+      if (session.state.cancelRequested) return;
+      const queuedItem = translationQueue.next();
       if (!queuedItem) {
         return;
       }
       if (queuedItem.availableAt && queuedItem.availableAt > Date.now()) {
-        translationQueue.push(queuedItem);
+        translationQueue.enqueue(queuedItem);
         await delay(Math.min(queuedItem.availableAt - Date.now(), 200));
         continue;
       }
       while (activeTranslationWorkers >= maxConcurrentTranslationJobs) {
-        if (cancelRequested) return;
+        if (session.state.cancelRequested) return;
         await delay(50);
       }
       activeTranslationWorkers += 1;
@@ -1168,7 +1419,7 @@ async function translatePage(settings, options = {}) {
           proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled',
           translationStartedAt: Date.now()
         });
-        reportProgress('Перевод выполняется');
+        reportProgress('Перевод выполняется', undefined, undefined, undefined, 'translation');
         const preparedTexts = block.map(({ original }) =>
           prepareTextForTranslation(original)
         );
@@ -1176,7 +1427,7 @@ async function translatePage(settings, options = {}) {
         const blockTranslations = [];
 
         const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
-        const debugEntry = debugEntries.find((item) => item.index === currentIndex + 1);
+        const debugEntry = session.debugStore.entries.find((item) => item.index === currentIndex + 1);
         const primaryContext = await selectContextForBlock(debugEntry, 'translation');
         const baseRequestMeta = {
           blockKey: queuedItem.key,
@@ -1185,7 +1436,8 @@ async function translatePage(settings, options = {}) {
           attempt: primaryContext.attemptIndex,
           triggerSource: translationTriggerSource,
           url: location.href,
-          contextCacheKey
+          contextCacheKey,
+          jobId: getActiveJobId()
         };
         const mainRequestMeta = buildRequestMeta(baseRequestMeta, {
           contextText: primaryContext.contextText,
@@ -1211,19 +1463,23 @@ async function translatePage(settings, options = {}) {
             });
             traceRequestInitiator(perTextRequestMeta);
             await ensureShortContextReadyForTrigger(perTextRequestMeta);
-            const perTextResult = await translate(
-              [text],
-              settings.targetLanguage || 'ru',
-              {
-                contextText: fallbackContext.contextText,
-                contextMode: fallbackContext.contextMode,
-                baseAnswer: fallbackContext.baseAnswer,
-                baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-                baseAnswerPreview: fallbackContext.baseAnswerPreview
-              },
-              keepPunctuationTokens,
-              currentIndex + 1,
-              perTextRequestMeta
+            const perTextResult = await withLeaseTimeout(
+              translate(
+                [text],
+                settings.targetLanguage || 'ru',
+                {
+                  contextText: fallbackContext.contextText,
+                  contextMode: fallbackContext.contextMode,
+                  baseAnswer: fallbackContext.baseAnswer,
+                  baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
+                  baseAnswerPreview: fallbackContext.baseAnswerPreview
+                },
+                keepPunctuationTokens,
+                currentIndex + 1,
+                perTextRequestMeta
+              ),
+              BLOCK_LEASE_TIMEOUT_MS,
+              'translation'
             );
             if (!perTextResult?.success || perTextResult.translations.length !== 1) {
               throw new Error(perTextResult?.error || 'Не удалось выполнить перевод.');
@@ -1240,19 +1496,23 @@ async function translatePage(settings, options = {}) {
             translateJobKey,
             async () => {
               await ensureShortContextReadyForTrigger(mainRequestMeta);
-              return translate(
-                uniqueTexts,
-                settings.targetLanguage || 'ru',
-                {
-                  contextText: primaryContext.contextText,
-                  contextMode: primaryContext.contextMode,
-                  baseAnswer: primaryContext.baseAnswer,
-                  baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-                  baseAnswerPreview: primaryContext.baseAnswerPreview
-                },
-                keepPunctuationTokens,
-                currentIndex + 1,
-                mainRequestMeta
+              return withLeaseTimeout(
+                translate(
+                  uniqueTexts,
+                  settings.targetLanguage || 'ru',
+                  {
+                    contextText: primaryContext.contextText,
+                    contextMode: primaryContext.contextMode,
+                    baseAnswer: primaryContext.baseAnswer,
+                    baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+                    baseAnswerPreview: primaryContext.baseAnswerPreview
+                  },
+                  keepPunctuationTokens,
+                  currentIndex + 1,
+                  mainRequestMeta
+                ),
+                BLOCK_LEASE_TIMEOUT_MS,
+                'translation'
               );
             },
             (resolved) => resolved?.success
@@ -1286,19 +1546,23 @@ async function translatePage(settings, options = {}) {
               translateJobKey,
               async () => {
                 await ensureShortContextReadyForTrigger(retryRequestMeta);
-                return translate(
-                  uniqueTexts,
-                  settings.targetLanguage || 'ru',
-                  {
-                    contextText: fallbackContext.contextText,
-                    contextMode: fallbackContext.contextMode,
-                    baseAnswer: fallbackContext.baseAnswer,
-                    baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-                    baseAnswerPreview: fallbackContext.baseAnswerPreview
-                  },
-                  keepPunctuationTokens,
-                  currentIndex + 1,
-                  retryRequestMeta
+                return withLeaseTimeout(
+                  translate(
+                    uniqueTexts,
+                    settings.targetLanguage || 'ru',
+                    {
+                      contextText: fallbackContext.contextText,
+                      contextMode: fallbackContext.contextMode,
+                      baseAnswer: fallbackContext.baseAnswer,
+                      baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
+                      baseAnswerPreview: fallbackContext.baseAnswerPreview
+                    },
+                    keepPunctuationTokens,
+                    currentIndex + 1,
+                    retryRequestMeta
+                  ),
+                  BLOCK_LEASE_TIMEOUT_MS,
+                  'translation'
                 );
               },
               (resolved) => resolved?.success
@@ -1336,13 +1600,14 @@ async function translatePage(settings, options = {}) {
             return;
           }
           const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-          if (translationVisible) {
+          if (session.state.translationVisible) {
             node.nodeValue = withOriginalFormatting;
           }
           blockTranslations.push(withOriginalFormatting);
           updateActiveEntry(path, original, withOriginalFormatting, originalHash);
         });
         markBlockProcessed(queuedItem.blockElement, 'translate');
+        translationQueue.markDone(queuedItem.key);
         const baseTranslationAnswer =
           primaryContext.contextMode === 'FULL' && debugEntry && !debugEntry.translationBaseFullAnswer
             ? formatBlockText(finalTranslations)
@@ -1366,7 +1631,7 @@ async function translatePage(settings, options = {}) {
             : {}),
           ...(baseTranslationCallId ? { translationBaseFullCallId: baseTranslationCallId } : {})
         });
-        translationProgress.completedBlocks += 1;
+        session.state.progress.completedBlocks += 1;
 
         if (settings.proofreadEnabled) {
           const proofreadSegments = translatedTexts.map((text, index) => ({ id: String(index), text }));
@@ -1394,14 +1659,69 @@ async function translatePage(settings, options = {}) {
         }
       } catch (error) {
         console.error('Block translation failed', error);
+        if (error?.isCancelled || session.state.cancelRequested) {
+          await updateDebugEntry(currentIndex + 1, {
+            translationStatus: 'cancelled',
+            proofreadStatus: settings.proofreadEnabled ? 'cancelled' : 'disabled',
+            translationCompletedAt: Date.now()
+          });
+          translationQueue.markCancelled(queuedItem.key);
+          reportProgress(
+            'Перевод отменён',
+            session.state.progress.completedBlocks,
+            totalBlocks,
+            activeTranslationWorkers
+          );
+          continue;
+        }
+        if (error?.isLeaseTimeout) {
+          queuedItem.leaseTimeoutCount = (queuedItem.leaseTimeoutCount || 0) + 1;
+          if (queuedItem.leaseTimeoutCount <= MAX_BLOCK_LEASE_RETRIES) {
+            queuedItem.availableAt = Date.now() + 2000;
+            await updateDebugEntry(currentIndex + 1, {
+              translationStatus: 'retrying',
+              translationLastError: 'Lease timeout'
+            });
+            recordDebugEvent('RETRY', {
+              stage: 'translation',
+              summary: `Lease timeout, retrying block ${currentIndex + 1}`,
+              details: {
+                blockIndex: currentIndex + 1,
+                leaseTimeoutCount: queuedItem.leaseTimeoutCount
+              }
+            });
+            reportProgress(
+              'Повтор перевода блока',
+              session.state.progress.completedBlocks,
+              totalBlocks,
+              activeTranslationWorkers
+            );
+            translationQueue.enqueue(queuedItem);
+            continue;
+          }
+          await updateDebugEntry(currentIndex + 1, {
+            translationStatus: 'timeout',
+            translationLastError: 'Lease timeout',
+            translationCompletedAt: Date.now()
+          });
+          translationQueue.markError(queuedItem.key);
+          reportProgress(
+            'Таймаут перевода блока',
+            session.state.progress.completedBlocks,
+            totalBlocks,
+            activeTranslationWorkers
+          );
+          continue;
+        }
         if (isFatalBlockError(error)) {
-          translationError = error;
-          cancelRequested = true;
+          session.state.error = error;
+          session.state.cancelRequested = true;
           await updateDebugEntry(currentIndex + 1, {
             translationStatus: 'failed',
             proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled',
             translationCompletedAt: Date.now()
           });
+          translationQueue.markError(queuedItem.key);
         } else {
           queuedItem.retryCount += 1;
           totalBlockRetries += 1;
@@ -1423,23 +1743,33 @@ async function translatePage(settings, options = {}) {
             translationRetryCount: queuedItem.retryCount,
             translationLastError: String(error?.message || error)
           });
+          recordDebugEvent('RETRY', {
+            stage: 'translation',
+            summary: `Retrying block ${currentIndex + 1} in ${Math.ceil(delayMs / 1000)}s`,
+            details: {
+              blockIndex: currentIndex + 1,
+              retryCount: queuedItem.retryCount,
+              delayMs,
+              error: String(error?.message || error)
+            }
+          });
           reportProgress(
             'Повтор перевода блока',
-            translationProgress.completedBlocks,
+            session.state.progress.completedBlocks,
             totalBlocks,
             activeTranslationWorkers
           );
-          translationQueue.push(queuedItem);
+          translationQueue.enqueue(queuedItem);
           continue;
         }
       } finally {
         activeTranslationWorkers = Math.max(0, activeTranslationWorkers - 1);
       }
 
-      if (translationError) {
+      if (session.state.error) {
         reportProgress(
           'Ошибка перевода',
-          translationProgress.completedBlocks,
+          session.state.progress.completedBlocks,
           totalBlocks,
           activeTranslationWorkers
         );
@@ -1448,7 +1778,7 @@ async function translatePage(settings, options = {}) {
 
       reportProgress(
         'Перевод выполняется',
-        translationProgress.completedBlocks,
+        session.state.progress.completedBlocks,
         totalBlocks,
         activeTranslationWorkers
       );
@@ -1457,7 +1787,7 @@ async function translatePage(settings, options = {}) {
 
   const proofreadWorker = async () => {
     while (true) {
-      if (cancelRequested) return;
+      if (session.state.cancelRequested) return;
       const task = proofreadQueue.shift();
       if (!task) {
         if (translationQueueDone) return;
@@ -1468,7 +1798,7 @@ async function translatePage(settings, options = {}) {
       activeProofreadWorkers += 1;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress', proofreadExecuted: true });
-        const debugEntry = debugEntries.find((item) => item.index === task.index + 1);
+        const debugEntry = session.debugStore.entries.find((item) => item.index === task.index + 1);
         const primaryContext = await selectContextForBlock(debugEntry, 'proofread');
         const baseRequestMeta = {
           blockKey: task.key,
@@ -1477,7 +1807,8 @@ async function translatePage(settings, options = {}) {
           attempt: primaryContext.attemptIndex,
           triggerSource: translationTriggerSource,
           url: location.href,
-          contextCacheKey
+          contextCacheKey,
+          jobId: getActiveJobId()
         };
         const mainRequestMeta = buildRequestMeta(baseRequestMeta, {
           contextText: primaryContext.contextText,
@@ -1489,22 +1820,26 @@ async function translatePage(settings, options = {}) {
           proofreadJobKey,
           async () => {
             await ensureShortContextReadyForTrigger(mainRequestMeta);
-            return requestProofreading({
-              segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
-              sourceBlock: formatBlockText(task.originalTexts),
-              translatedBlock: formatBlockText(task.translatedTexts),
-              proofreadMode: task.proofreadMode,
-              contextMeta: {
-                contextText: primaryContext.contextText,
-                contextMode: primaryContext.contextMode,
-                baseAnswer: primaryContext.baseAnswer,
-                baseAnswerIncluded: primaryContext.baseAnswerIncluded,
-                baseAnswerPreview: primaryContext.baseAnswerPreview
-              },
-              language: settings.targetLanguage || 'ru',
-              debugEntryIndex: task.index + 1,
-              requestMeta: mainRequestMeta
-            });
+            return withLeaseTimeout(
+              requestProofreading({
+                segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
+                sourceBlock: formatBlockText(task.originalTexts),
+                translatedBlock: formatBlockText(task.translatedTexts),
+                proofreadMode: task.proofreadMode,
+                contextMeta: {
+                  contextText: primaryContext.contextText,
+                  contextMode: primaryContext.contextMode,
+                  baseAnswer: primaryContext.baseAnswer,
+                  baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+                  baseAnswerPreview: primaryContext.baseAnswerPreview
+                },
+                language: settings.targetLanguage || 'ru',
+                debugEntryIndex: task.index + 1,
+                requestMeta: mainRequestMeta
+              }),
+              BLOCK_LEASE_TIMEOUT_MS,
+              'proofread'
+            );
           },
           (resolved) => resolved?.success
         );
@@ -1539,22 +1874,26 @@ async function translatePage(settings, options = {}) {
             proofreadJobKey,
             async () => {
               await ensureShortContextReadyForTrigger(retryRequestMeta);
-              return requestProofreading({
-                segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
-                sourceBlock: formatBlockText(task.originalTexts),
-                translatedBlock: formatBlockText(task.translatedTexts),
-                proofreadMode: task.proofreadMode,
-                contextMeta: {
-                  contextText: fallbackContext.contextText,
-                  contextMode: fallbackContext.contextMode,
-                  baseAnswer: fallbackContext.baseAnswer,
-                  baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
-                  baseAnswerPreview: fallbackContext.baseAnswerPreview
-                },
-                language: settings.targetLanguage || 'ru',
-                debugEntryIndex: task.index + 1,
-                requestMeta: retryRequestMeta
-              });
+              return withLeaseTimeout(
+                requestProofreading({
+                  segments: task.proofreadSegments || task.translatedTexts.map((text, index) => ({ id: String(index), text })),
+                  sourceBlock: formatBlockText(task.originalTexts),
+                  translatedBlock: formatBlockText(task.translatedTexts),
+                  proofreadMode: task.proofreadMode,
+                  contextMeta: {
+                    contextText: fallbackContext.contextText,
+                    contextMode: fallbackContext.contextMode,
+                    baseAnswer: fallbackContext.baseAnswer,
+                    baseAnswerIncluded: fallbackContext.baseAnswerIncluded,
+                    baseAnswerPreview: fallbackContext.baseAnswerPreview
+                  },
+                  language: settings.targetLanguage || 'ru',
+                  debugEntryIndex: task.index + 1,
+                  requestMeta: retryRequestMeta
+                }),
+                BLOCK_LEASE_TIMEOUT_MS,
+                'proofread'
+              );
             },
             (resolved) => resolved?.success
           );
@@ -1634,9 +1973,35 @@ async function translatePage(settings, options = {}) {
             : {}),
           ...(baseProofreadCallId ? { proofreadBaseFullCallId: baseProofreadCallId } : {})
         });
-        reportProgress('Вычитка выполняется');
+        reportProgress('Вычитка выполняется', undefined, undefined, undefined, 'proofread');
       } catch (error) {
         console.warn('Proofreading failed, keeping original translations.', error);
+        if (error?.isCancelled || session.state.cancelRequested) {
+          await updateDebugEntry(task.index + 1, {
+            proofreadStatus: 'cancelled',
+            proofread: [],
+            proofreadExecuted: true,
+            proofreadCompletedAt: Date.now()
+          });
+          reportProgress('Вычитка отменена', undefined, undefined, undefined, 'cancelled');
+          continue;
+        }
+        if (error?.isLeaseTimeout) {
+          task.leaseTimeoutCount = (task.leaseTimeoutCount || 0) + 1;
+          if (task.leaseTimeoutCount <= MAX_BLOCK_LEASE_RETRIES) {
+            proofreadQueue.push(task);
+            reportProgress('Повтор вычитки блока', undefined, undefined, undefined, 'proofread');
+            continue;
+          }
+          await updateDebugEntry(task.index + 1, {
+            proofreadStatus: 'timeout',
+            proofread: [],
+            proofreadExecuted: true,
+            proofreadCompletedAt: Date.now()
+          });
+          reportProgress('Таймаут вычитки блока', undefined, undefined, undefined, 'error');
+          continue;
+        }
         const proofreadComparisons = buildProofreadComparisons({
           originalTexts: task.originalTexts,
           beforeTexts: task.translatedTexts,
@@ -1649,7 +2014,7 @@ async function translatePage(settings, options = {}) {
           proofreadExecuted: true,
           proofreadCompletedAt: Date.now()
         });
-        reportProgress('Вычитка выполняется');
+        reportProgress('Вычитка выполняется', undefined, undefined, undefined, 'proofread');
       } finally {
         activeProofreadWorkers = Math.max(0, activeProofreadWorkers - 1);
       }
@@ -1688,7 +2053,7 @@ async function translatePage(settings, options = {}) {
   }
 
   function getActiveTranslationEntry(path, original, originalHash) {
-    const entry = activeTranslationEntries.find((item) => isSamePath(item.path, path));
+    const entry = session.state.activeEntries.find((item) => isSamePath(item.path, path));
     if (!entry) return null;
     const resolvedOriginalHash = getOriginalHash(original, originalHash);
     if (
@@ -1721,7 +2086,7 @@ async function translatePage(settings, options = {}) {
         return;
       }
       const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-      if (translationVisible) {
+      if (session.state.translationVisible) {
         node.nodeValue = withOriginalFormatting;
       }
       updateActiveEntry(path, original, withOriginalFormatting, originalHash);
@@ -1738,11 +2103,11 @@ async function translatePage(settings, options = {}) {
   blocks.forEach((block, index) => {
     enqueueTranslationBlock(block, index);
   });
-  translationProgress.totalBlocks = translationQueue.length;
-  const totalBlocks = translationProgress.totalBlocks;
+  session.state.progress.totalBlocks = translationQueue.length;
+  const totalBlocks = session.state.progress.totalBlocks;
 
   if (totalBlocks !== blocks.length) {
-    reportProgress('Перевод запущен', translationProgress.completedBlocks, totalBlocks, 0);
+    reportProgress('Перевод запущен', session.state.progress.completedBlocks, totalBlocks, 0, 'translation');
   }
 
   const workers = Array.from({ length: translationConcurrency }, () => translationWorker());
@@ -1754,25 +2119,28 @@ async function translatePage(settings, options = {}) {
   });
   await Promise.all([...proofreadWorkers, translationCompletion]);
 
-  if (translationError) {
+  if (session.state.error) {
     updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:error');
-    reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
+    reportProgress('Ошибка перевода', session.state.progress.completedBlocks, totalBlocks, activeTranslationWorkers, 'error');
+    endJobSession('JOB_ERROR', { error: session.state.error?.message || 'translation_error' });
     return;
   }
 
-  if (cancelRequested) {
+  if (session.state.cancelRequested) {
     updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:cancelled');
-    reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
+    reportProgress('Перевод отменён', session.state.progress.completedBlocks, totalBlocks, activeTranslationWorkers, 'cancelled');
+    endJobSession('JOB_CANCELLED', {});
     return;
   }
 
   updateDebugSessionEndTime();
   await flushPersistDebugState('translatePage:completed');
-  reportProgress('Перевод завершён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
+  reportProgress('Перевод завершён', session.state.progress.completedBlocks, totalBlocks, activeTranslationWorkers, 'done');
+  endJobSession('JOB_DONE', {});
   await flushPersistDebugState('translatePage:before-save');
-  await saveTranslationsToMemory(activeTranslationEntries);
+  await saveTranslationsToMemory(session.state.activeEntries);
 }
 
 async function translate(
@@ -1828,6 +2196,7 @@ async function translate(
         const response = await sendRuntimeMessage(
           {
             type: 'TRANSLATE_TEXT',
+            jobId: getActiveJobId(),
             texts: batch,
             targetLanguage,
             context: {
@@ -1844,6 +2213,9 @@ async function translate(
           'Не удалось выполнить перевод.'
         );
         if (!response?.success) {
+          if (response?.isCancelled) {
+            throw createCancelledError(response?.error || 'Перевод отменён.');
+          }
           if (response?.contextOverflow) {
             return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
           }
@@ -1851,6 +2223,16 @@ async function translate(
             return { success: false, error: response.error || 'Не удалось выполнить перевод.' };
           }
           throw new Error(response?.error || 'Не удалось выполнить перевод.');
+        }
+        if (batch.length && Array.isArray(response.translations) && response.translations.length !== batch.length) {
+          recordDebugEvent('CONTRACT_VIOLATION', {
+            stage: 'translation',
+            summary: `Translation response length mismatch: expected ${batch.length}, got ${response.translations.length}`,
+            details: {
+              expectedCount: batch.length,
+              receivedCount: response.translations.length
+            }
+          });
         }
         return {
           success: true,
@@ -1939,6 +2321,7 @@ async function requestProofreading(payload) {
       const response = await sendRuntimeMessage(
         {
           type: 'PROOFREAD_TEXT',
+          jobId: getActiveJobId(),
           segments,
           sourceBlock,
           translatedBlock,
@@ -1957,6 +2340,9 @@ async function requestProofreading(payload) {
         'Не удалось выполнить вычитку.'
       );
       if (!response?.success) {
+        if (response?.isCancelled) {
+          throw createCancelledError(response?.error || 'Вычитка отменена.');
+        }
         if (response?.contextOverflow) {
           return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
         }
@@ -1964,6 +2350,17 @@ async function requestProofreading(payload) {
           return { success: false, error: response.error || 'Не удалось выполнить вычитку.' };
         }
         throw new Error(response?.error || 'Не удалось выполнить вычитку.');
+      }
+      if (segments.length && Array.isArray(response.translations) && response.translations.length !== segments.length) {
+        recordDebugEvent('CONTRACT_VIOLATION', {
+          stage: 'proofread',
+          summary: `Proofread response length mismatch: expected ${segments.length}, got ${response.translations.length}`,
+          details: {
+            expectedCount: segments.length,
+            receivedCount: response.translations.length,
+            expectedIds: segments.map((segment) => String(segment?.id ?? ''))
+          }
+        });
       }
       recordAiResponseMetrics(response?.debug || []);
       const annotated = annotateContextUsage(response.debug || [], {
@@ -1993,37 +2390,18 @@ function ensureRpcPort() {
   try {
     ntRpcPort = chrome.runtime.connect({ name: NT_RPC_PORT_NAME });
     rpcPortCreatedAt = Date.now();
+    ntRpcClient = new NtRpcClient({ port: ntRpcPort, defaultTimeoutMs: 30000 });
   } catch (error) {
     console.warn('Failed to connect RPC port', error);
     ntRpcPort = null;
+    ntRpcClient = null;
     return null;
   }
-
-  ntRpcPort.onMessage.addListener((msg) => {
-    if (!msg || typeof msg !== 'object') return;
-    const rpcId = msg.rpcId;
-    if (typeof rpcId !== 'string') return;
-    const entry = ntRpcPending.get(rpcId);
-    if (!entry) return;
-    ntRpcPending.delete(rpcId);
-    clearTimeout(entry.timeoutId);
-    entry.resolve(msg.response);
-  });
-
   ntRpcPort.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError;
     console.warn('RPC port disconnected', err?.message || '');
-    for (const [rpcId, entry] of ntRpcPending.entries()) {
-      clearTimeout(entry.timeoutId);
-      entry.resolve({
-        success: false,
-        error: err?.message || 'RPC port disconnected',
-        isRuntimeError: true,
-        rpcUnavailable: true
-      });
-    }
-    ntRpcPending.clear();
     ntRpcPort = null;
+    ntRpcClient = null;
     rpcPortCreatedAt = 0;
   });
 
@@ -2033,7 +2411,12 @@ function ensureRpcPort() {
 function startRpcHeartbeat() {
   if (rpcHeartbeatTimer) return;
   rpcHeartbeatTimer = setInterval(() => {
-    sendRpcRequest({ type: 'RPC_HEARTBEAT' }, 'RPC heartbeat failed', 2000).then(() => {});
+    sendRpcRequest(
+      { method: 'heartbeat', payload: null },
+      'RPC heartbeat failed',
+      2000,
+      { stage: 'heartbeat' }
+    ).then(() => {});
   }, RPC_HEARTBEAT_INTERVAL_MS);
 }
 
@@ -2056,6 +2439,7 @@ function rotateRpcPort(reason = '') {
     }
   }
   ntRpcPort = null;
+  ntRpcClient = null;
   rpcPortCreatedAt = 0;
   console.info('RPC port rotated', { reason });
 }
@@ -2064,81 +2448,72 @@ function getRpcPortAgeMs() {
   return rpcPortCreatedAt ? Date.now() - rpcPortCreatedAt : 0;
 }
 
-function sendRpcRequest(payload, fallbackError, timeoutMs) {
+async function sendRpcRequest({ method, payload }, fallbackError, timeoutMs, meta = {}) {
   let rotated = false;
   if (shouldRotateRpcPort()) {
     rotateRpcPort('age');
     rotated = true;
   }
-  let port = ensureRpcPort();
-  if (!port) {
-    return Promise.resolve({
+  const port = ensureRpcPort();
+  if (!port || !ntRpcClient) {
+    return {
       success: false,
       error: fallbackError,
       isRuntimeError: true,
       rpcUnavailable: true,
       rpcRotated: rotated,
       rpcPortAgeMs: getRpcPortAgeMs()
-    });
+    };
   }
-  const rpcId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  return new Promise((resolve) => {
-    let timeoutId = setTimeout(() => {
-      ntRpcPending.delete(rpcId);
-      resolve({
-        success: false,
-        error: fallbackError || 'RPC timeout',
-        isRuntimeError: true
-      });
-    }, timeoutMs);
-    ntRpcPending.set(rpcId, { resolve, timeoutId });
-    try {
-      port.postMessage({ rpcId, ...payload });
-    } catch (error) {
-      ntRpcPending.delete(rpcId);
-      clearTimeout(timeoutId);
-      console.warn('RPC postMessage failed', error);
-      rotateRpcPort('postMessage-failed');
-      rotated = true;
-      port = ensureRpcPort();
-      if (!port) {
-        resolve({
-          success: false,
-          error: fallbackError,
-          isRuntimeError: true,
-          rpcUnavailable: true,
-          rpcRotated: rotated,
-          rpcPortAgeMs: getRpcPortAgeMs()
-        });
-        return;
+  try {
+    const startTs = Date.now();
+    recordDebugEvent('RPC_REQUEST', {
+      stage: meta?.stage || '',
+      summary: `RPC request ${method}`,
+      details: {
+        method,
+        type: payload?.type || '',
+        tabId: meta?.tabId ?? null
       }
-      const retryRpcId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-      timeoutId = setTimeout(() => {
-        ntRpcPending.delete(retryRpcId);
-        resolve({
-          success: false,
-          error: fallbackError || 'RPC timeout',
-          isRuntimeError: true
-        });
-      }, timeoutMs);
-      ntRpcPending.set(retryRpcId, { resolve, timeoutId });
-      try {
-        port.postMessage({ rpcId: retryRpcId, ...payload });
-      } catch (retryError) {
-        ntRpcPending.delete(retryRpcId);
-        clearTimeout(timeoutId);
-        console.warn('RPC postMessage failed', retryError);
-        resolve({
-          success: false,
-          error: fallbackError,
-          isRuntimeError: true,
-          rpcUnavailable: true,
-          rpcRotated: rotated,
-          rpcPortAgeMs: getRpcPortAgeMs()
-        });
+    });
+    const response = await ntRpcClient.call(method, payload, { timeoutMs, meta });
+    recordDebugEvent('RPC_RESPONSE', {
+      stage: meta?.stage || '',
+      summary: `RPC response ${method} ${response?.success ? 'ok' : 'error'}`,
+      durationMs: Date.now() - startTs,
+      details: {
+        method,
+        success: Boolean(response?.success),
+        error: response?.error || ''
       }
+    });
+    return response;
+  } catch (error) {
+    const code = error?.code || '';
+    const rpcUnavailable = code === 'rpc_disconnected' || code === 'rpc_post_failed';
+    if (rpcUnavailable) {
+      rotateRpcPort(code);
     }
-  });
+    recordDebugEvent('RPC_RESPONSE', {
+      stage: meta?.stage || '',
+      summary: `RPC response ${method} error`,
+      durationMs: 0,
+      details: {
+        method,
+        success: false,
+        error: error?.message || fallbackError || 'RPC failed',
+        code
+      }
+    });
+    return {
+      success: false,
+      error: error?.message || fallbackError || 'RPC failed',
+      isRuntimeError: true,
+      rpcUnavailable,
+      rpcRotated: rotated,
+      rpcPortAgeMs: getRpcPortAgeMs()
+    };
+  }
 }
 
 function getRpcTimeoutMs(type) {
@@ -2148,9 +2523,61 @@ function getRpcTimeoutMs(type) {
   return 30000;
 }
 
+function getRpcMethodForType(type) {
+  switch (type) {
+    case 'TRANSLATE_TEXT':
+      return 'translate_text';
+    case 'GENERATE_CONTEXT':
+      return 'generate_context';
+    case 'GENERATE_SHORT_CONTEXT':
+      return 'generate_short_context';
+    case 'PROOFREAD_TEXT':
+      return 'proofread_text';
+    case 'GET_TAB_ID':
+      return 'get_tab_id';
+    default:
+      return '';
+  }
+}
+
+function getRpcStageForType(type) {
+  switch (type) {
+    case 'TRANSLATE_TEXT':
+      return 'translation';
+    case 'GENERATE_CONTEXT':
+    case 'GENERATE_SHORT_CONTEXT':
+      return 'context';
+    case 'PROOFREAD_TEXT':
+      return 'proofread';
+    case 'GET_TAB_ID':
+      return 'tab_id';
+    default:
+      return '';
+  }
+}
+
+function buildRpcMetaFromPayload(payload) {
+  const requestMeta = payload?.requestMeta || {};
+  const stage = requestMeta.stage || getRpcStageForType(payload?.type);
+  return {
+    tabId: requestMeta.tabId ?? null,
+    url: requestMeta.url || location.href,
+    stage
+  };
+}
+
 async function sendRuntimeMessage(payload, fallbackError) {
   const timeoutMs = getRpcTimeoutMs(payload?.type);
-  const rpcResponse = await sendRpcRequest(payload, fallbackError, timeoutMs);
+  const method = getRpcMethodForType(payload?.type);
+  const meta = buildRpcMetaFromPayload(payload);
+  // Chrome runtime messaging is JSON-serialized, so payloads must avoid functions/undefined/cycles.
+  const rpcResponse = method
+    ? await sendRpcRequest({ method, payload }, fallbackError, timeoutMs, meta)
+    : {
+        success: false,
+        error: fallbackError || 'Unknown RPC method',
+        isRuntimeError: true
+      };
   if (rpcResponse && typeof rpcResponse === 'object') {
     if (rpcResponse.rpcUnavailable) {
       console.warn('Falling back to runtime.sendMessage...', {
@@ -2210,11 +2637,22 @@ async function withRateLimitRetry(requestFn, label) {
     try {
       return await requestFn();
     } catch (error) {
+      if (error?.isCancelled || session.state.cancelRequested) {
+        throw error;
+      }
       const delayMs = parseRateLimitDelayMs(error);
-      if (!delayMs || attempt >= RATE_LIMIT_RETRY_ATTEMPTS || cancelRequested) {
+      if (!delayMs || attempt >= RATE_LIMIT_RETRY_ATTEMPTS || session.state.cancelRequested) {
         throw error;
       }
       attempt += 1;
+      recordDebugEvent('RETRY', {
+        stage: label,
+        summary: `${label} rate limited, retrying in ${Math.ceil(delayMs / 1000)}s`,
+        details: {
+          attempt,
+          delayMs
+        }
+      });
       console.warn(`${label} rate-limited, retrying after ${Math.ceil(delayMs / 1000)}s...`);
       await delay(delayMs);
     }
@@ -2378,6 +2816,7 @@ async function requestTranslationContext(text, targetLanguage, requestMeta = nul
   const response = await sendRuntimeMessage(
     {
       type: 'GENERATE_CONTEXT',
+      jobId: getActiveJobId(),
       text,
       targetLanguage,
       requestMeta: requestMeta || undefined
@@ -2385,6 +2824,9 @@ async function requestTranslationContext(text, targetLanguage, requestMeta = nul
     'Не удалось сгенерировать контекст.'
   );
   if (!response?.success) {
+    if (response?.isCancelled) {
+      throw createCancelledError(response?.error || 'Контекст отменён.');
+    }
     if (response?.isRuntimeError) {
       return '';
     }
@@ -2403,6 +2845,7 @@ async function requestShortContext(text, targetLanguage, requestMeta = null) {
   const response = await sendRuntimeMessage(
     {
       type: 'GENERATE_SHORT_CONTEXT',
+      jobId: getActiveJobId(),
       text,
       targetLanguage,
       requestMeta: requestMeta || undefined
@@ -2410,6 +2853,9 @@ async function requestShortContext(text, targetLanguage, requestMeta = null) {
     'Не удалось сгенерировать короткий контекст.'
   );
   if (!response?.success) {
+    if (response?.isCancelled) {
+      throw createCancelledError(response?.error || 'Контекст отменён.');
+    }
     if (response?.isRuntimeError) {
       return '';
     }
@@ -2554,16 +3000,16 @@ function delay(ms) {
 
 function configureTpmLimiter(settings = {}) {
   const limitsByRole = settings?.tpmLimitsByRole || {};
-  tpmSettings = {
+  session.tpm.settings = {
     outputRatioByRole: {
-      ...tpmSettings.outputRatioByRole,
+      ...session.tpm.settings.outputRatioByRole,
       ...(settings?.outputRatioByRole || {})
     },
     safetyBufferTokens: Number.isFinite(settings?.tpmSafetyBufferTokens)
       ? settings.tpmSafetyBufferTokens
-      : tpmSettings.safetyBufferTokens
+      : session.tpm.settings.safetyBufferTokens
   };
-  tpmLimiter = createTpmLimiter(limitsByRole, tpmSettings.safetyBufferTokens);
+  session.tpm.limiter = createTpmLimiter(limitsByRole, session.tpm.settings.safetyBufferTokens);
 }
 
 function createTpmLimiter(limitsByRole = {}, safetyBufferTokens = 0) {
@@ -2637,7 +3083,7 @@ function estimateTokensForRole(role, { texts = [], context = '', sourceTexts = [
     .filter((item) => typeof item === 'string' && item.length)
     .reduce((sum, item) => sum + item.length, 0);
   const inputTokens = Math.max(1, Math.ceil(inputChars / 4));
-  const ratio = Number(tpmSettings?.outputRatioByRole?.[role]);
+  const ratio = Number(session.tpm.settings?.outputRatioByRole?.[role]);
   const outputRatio = Number.isFinite(ratio) ? ratio : 0.5;
   const estimatedOutput = Math.ceil(inputTokens * outputRatio);
   return inputTokens + estimatedOutput;
@@ -2670,15 +3116,15 @@ function splitTextsByTokenEstimate(texts, context, maxTokens) {
 }
 
 async function ensureTpmBudget(role, tokens) {
-  if (!tpmLimiter || !Number.isFinite(tokens) || tokens <= 0) {
+  if (!session.tpm.limiter || !Number.isFinite(tokens) || tokens <= 0) {
     return;
   }
-  await tpmLimiter.waitForBudget(role, tokens);
+  await session.tpm.limiter.waitForBudget(role, tokens);
 }
 
 function recalculateBlockCount(blockLengthLimit) {
-  if (translationInProgress) {
-    return { updated: false, totalBlocks: translationProgress.totalBlocks || 0 };
+  if (session.state.inProgress) {
+    return { updated: false, totalBlocks: session.state.progress.totalBlocks || 0 };
   }
   const textNodes = collectTextNodes(document.body);
   const nodesWithPath = textNodes.map((node) => ({
@@ -2691,12 +3137,12 @@ function recalculateBlockCount(blockLengthLimit) {
   const maxBlockLength = normalizeBlockLength(blockLengthLimit, textStats.averageNodeLength);
   const blockGroups = groupTextNodesByBlock(nodesWithPath);
   const blocks = normalizeBlocksByLength(blockGroups, maxBlockLength);
-  translationProgress = { completedBlocks: 0, totalBlocks: blocks.length };
+  session.state.progress = { completedBlocks: 0, totalBlocks: blocks.length };
   if (!blocks.length) {
-    reportProgress('Перевод не требуется', 0, 0);
+    reportProgress('Перевод не требуется', 0, 0, 0, 'done');
     return { updated: true, totalBlocks: 0, message: 'Перевод не требуется' };
   }
-  reportProgress('Готово к переводу', 0, blocks.length, 0);
+  reportProgress('Готово к переводу', 0, blocks.length, 0, 'translation');
   return { updated: true, totalBlocks: blocks.length, message: 'Готово к переводу' };
 }
 
@@ -2896,7 +3342,55 @@ function buildShortContextFallback(context = '') {
   return normalized.trimEnd();
 }
 
-function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0) {
+function normalizeStatusError(error) {
+  if (!error) return null;
+  if (typeof error === 'string') {
+    return { code: 'error', message: error };
+  }
+  if (typeof error === 'object') {
+    const code = error.code || error.name || 'error';
+    const message = error.message || 'Unknown error';
+    return { code: String(code), message: String(message) };
+  }
+  return { code: 'error', message: String(error) };
+}
+
+function emitTranslationStatus(stage, progress, error) {
+  const jobId = getActiveJobId();
+  const tabId = typeof session.tabId === 'number' ? session.tabId : null;
+  const status = {
+    jobId,
+    tabId,
+    url: location.href,
+    stage,
+    progress,
+    lastUpdateTs: Date.now(),
+    ...(error ? { error: normalizeStatusError(error) } : {})
+  };
+  session.status = status;
+  recordDebugEvent('TRANSLATION_STATUS', {
+    stage,
+    summary: `stage=${stage} completed=${progress?.completed ?? 0}/${progress?.total ?? 0} inFlight=${progress?.inFlight ?? 0}`,
+    details: {
+      progress,
+      error: status.error || null
+    }
+  });
+  const envelope =
+    typeof globalThis.ntCreateMessage === 'function'
+      ? globalThis.ntCreateMessage('TRANSLATION_STATUS', status, { tabId, url: status.url, stage })
+      : {
+          type: 'TRANSLATION_STATUS',
+          payload: status,
+          meta: { tabId, url: status.url, stage },
+          ts: Date.now(),
+          id: `nt_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+          v: 1
+        };
+  chrome.runtime.sendMessage(envelope, () => {});
+}
+
+function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0, stage = '') {
   const snapshot = getProgressSnapshot();
   const resolvedCompleted = Number.isFinite(snapshot?.completedBlocks)
     ? snapshot.completedBlocks
@@ -2905,18 +3399,21 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
   const resolvedInProgress = Number.isFinite(snapshot?.inProgressBlocks)
     ? snapshot.inProgressBlocks
     : inProgressBlocks || 0;
-  translationProgress = {
+  session.state.progress = {
     completedBlocks: resolvedCompleted,
     totalBlocks: resolvedTotal,
     inProgressBlocks: resolvedInProgress
   };
-  void sendBackgroundMessageSafe({
-    type: 'TRANSLATION_PROGRESS',
-    message,
-    completedBlocks: resolvedCompleted,
-    totalBlocks: resolvedTotal,
-    inProgressBlocks: resolvedInProgress
-  });
+  const resolvedStage = stage || session.status?.stage || 'idle';
+  emitTranslationStatus(
+    resolvedStage,
+    {
+      completed: resolvedCompleted,
+      total: resolvedTotal,
+      inFlight: resolvedInProgress
+    },
+    resolvedStage === 'error' ? session.state.error : null
+  );
 }
 
 function annotateContextUsage(payloads, { contextMode, baseAnswerIncluded, baseAnswerPreview, contextTextSent }) {
@@ -2969,7 +3466,7 @@ async function createDebugPayloadSummary(payload, options = {}) {
   if (!payload || typeof payload !== 'object') return payload;
   const entryIndex = Number.isFinite(options.entryIndex) ? options.entryIndex : null;
   const stage = options.stage === 'proofreading' ? 'proofreading' : 'translation';
-  const callId = `${debugSessionId || 'session'}:${stage}:${entryIndex ?? 'unknown'}:${Date.now()}_${Math.random()
+  const callId = `${session.debugStore.sessionId || 'session'}:${stage}:${entryIndex ?? 'unknown'}:${Date.now()}_${Math.random()
     .toString(16)
     .slice(2)}`;
   const requestPayload = buildRawPayload(payload.request);
@@ -2993,12 +3490,53 @@ async function createDebugPayloadSummary(payload, options = {}) {
     request: requestPayload.previewText,
     response: responsePayload.previewText,
     contextTextSent: contextPayload.previewText,
+    timestamp: Number.isFinite(payload.timestamp) ? payload.timestamp : Date.now(),
     rawRefId: hasRaw ? callId : '',
     requestTruncated: requestPayload.previewTruncated,
     responseTruncated: responsePayload.previewTruncated,
     contextTruncated: contextPayload.previewTruncated,
     rawTruncated: requestPayload.rawTruncated || responsePayload.rawTruncated || contextPayload.rawTruncated
   };
+  const latencyMs = Number.isFinite(summary.latencyMs) ? summary.latencyMs : null;
+  if (Number.isFinite(latencyMs)) {
+    const endTs = Date.now();
+    const startTs = Math.max(0, endTs - latencyMs);
+    recordDebugEvent('OPENAI_REQUEST', {
+      ts: startTs,
+      stage,
+      summary: `${summary.phase || stage} request (${summary.model || 'model'})`,
+      details: {
+        model: summary.model || '',
+        phase: summary.phase || '',
+        requestId: summary.requestId || '',
+        attempt: summary.attempt ?? null
+      }
+    });
+    recordDebugEvent('OPENAI_RESPONSE', {
+      ts: endTs,
+      stage,
+      summary: `${summary.phase || stage} response (${summary.model || 'model'})`,
+      durationMs: latencyMs,
+      details: {
+        model: summary.model || '',
+        phase: summary.phase || '',
+        requestId: summary.requestId || '',
+        attempt: summary.attempt ?? null
+      }
+    });
+  }
+  if (summary.validationErrors || summary.contractViolation) {
+    const errors = Array.isArray(summary.validationErrors)
+      ? summary.validationErrors
+      : summary.validationErrors
+        ? [String(summary.validationErrors)]
+        : [];
+    recordDebugEvent('CONTRACT_VIOLATION', {
+      stage,
+      summary: errors.length ? errors.join(' | ') : 'Contract violation detected',
+      details: summary.contractViolation || { errors }
+    });
+  }
   if (entryIndex) {
     appendCallRecord(entryIndex, stage, summary);
   }
@@ -3011,7 +3549,7 @@ async function prepareRawTextField(value, type) {
     return { preview: '', refId: '', truncated: false, rawTruncated: false };
   }
   const payload = buildRawPayload(serialized);
-  const refId = `${debugSessionId || 'session'}:${type}:${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const refId = `${session.debugStore.sessionId || 'session'}:${type}:${Date.now()}_${Math.random().toString(16).slice(2)}`;
   await storeDebugRawSafe({
     id: refId,
     ts: Date.now(),
@@ -3035,8 +3573,8 @@ async function summarizeDebugPayloads(payloads, { entryIndex, stage } = {}) {
 }
 
 function getProgressSnapshot() {
-  if (Array.isArray(debugEntries) && debugEntries.length) {
-    return computeTranslationProgress(debugEntries);
+  if (Array.isArray(session.debugStore.entries) && session.debugStore.entries.length) {
+    return computeTranslationProgress(session.debugStore.entries);
   }
   return null;
 }
@@ -3115,7 +3653,7 @@ async function restoreFromMemory() {
       if (!shouldApplyTranslation(node, originalValue, resolvedOriginalHash)) {
         return;
       }
-      activeTranslationEntries.push({
+      session.state.activeEntries.push({
         path,
         original: originalValue,
         originalHash: resolvedOriginalHash,
@@ -3126,7 +3664,7 @@ async function restoreFromMemory() {
     }
   });
   if (restoredSnapshot.length) {
-    originalSnapshot = restoredSnapshot;
+    session.state.originalSnapshot = restoredSnapshot;
     await setTranslationVisibility(true);
   }
 }
@@ -3242,17 +3780,17 @@ function getFirstLetterCase(text) {
 }
 
 function updateActiveEntry(path, original, translated, originalHash) {
-  const existingIndex = activeTranslationEntries.findIndex((entry) => isSamePath(entry.path, path));
+  const existingIndex = session.state.activeEntries.findIndex((entry) => isSamePath(entry.path, path));
   const resolvedOriginalHash = getOriginalHash(original, originalHash);
   if (existingIndex >= 0) {
-    activeTranslationEntries[existingIndex] = {
+    session.state.activeEntries[existingIndex] = {
       path,
       original,
       originalHash: resolvedOriginalHash,
       translated
     };
   } else {
-    activeTranslationEntries.push({
+    session.state.activeEntries.push({
       path,
       original,
       originalHash: resolvedOriginalHash,
@@ -3372,6 +3910,7 @@ function pruneDebugEntry(entry, options = {}) {
     return nextItem;
   });
   const trimmedCallHistory = limitDebugArray(entry.callHistory, options.maxCallHistory || 200);
+  const trimmedEvents = limitDebugArray(entry.events, options.maxEvents || DEBUG_EVENTS_LIMIT);
   return {
     ...entry,
     context: contextFullPreview.text,
@@ -3380,7 +3919,8 @@ function pruneDebugEntry(entry, options = {}) {
     contextFullTruncated: entry.contextFullTruncated || contextFullPreview.truncated,
     contextShortTruncated: entry.contextShortTruncated || contextShortPreview.truncated,
     items: trimmedItems,
-    callHistory: trimmedCallHistory
+    callHistory: trimmedCallHistory,
+    events: trimmedEvents
   };
 }
 
@@ -3433,8 +3973,8 @@ async function saveTranslationDebugInfo(url, data) {
       }
     }
     const now = Date.now();
-    if (now - debugStorageWarningSentAt > 30000) {
-      debugStorageWarningSentAt = now;
+    if (now - session.debugStore.storageWarningSentAt > 30000) {
+      session.debugStore.storageWarningSentAt = now;
       console.warn('Failed to persist debug info.', error?.message || 'debug-storage-write-failed');
     }
   }
@@ -3481,6 +4021,7 @@ async function resetTranslationDebugInfo(url) {
     sessionStartTime: entry.sessionStartTime ?? null,
     sessionEndTime: entry.sessionEndTime ?? null,
     callHistory: Array.isArray(entry.callHistory) ? entry.callHistory : [],
+    events: Array.isArray(entry.events) ? entry.events : [],
     updatedAt: Date.now()
   };
   try {
@@ -3492,7 +4033,7 @@ async function resetTranslationDebugInfo(url) {
 
 async function initializeDebugState(blocks, settings = {}, initial = {}, options = {}) {
   const proofreadEnabled = Boolean(settings.proofreadEnabled);
-  debugSessionId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  session.debugStore.sessionId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const blockKeys = Array.isArray(options?.blockKeys) ? options.blockKeys : [];
   const initialContextFull = typeof initial.initialContextFull === 'string' ? initial.initialContextFull : '';
   const initialContextShort = typeof initial.initialContextShort === 'string' ? initial.initialContextShort : '';
@@ -3502,7 +4043,7 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
   const initialContextShortStatus =
     initial.initialContextShortStatus ||
     (settings.contextGenerationEnabled ? 'pending' : 'disabled');
-  debugEntries = blocks.map((block, index) => ({
+  session.debugStore.entries = blocks.map((block, index) => ({
     index: index + 1,
     blockKey: blockKeys[index] || '',
     original: formatBlockText(block.map(({ original }) => original)),
@@ -3541,8 +4082,8 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
   }));
   const contextFullPreview = { text: initialContextFull, truncated: false };
   const contextShortPreview = { text: initialContextShort, truncated: false };
-  const contextFullRefId = initialContextFull ? `${debugSessionId}:context:full` : '';
-  const contextShortRefId = initialContextShort ? `${debugSessionId}:context:short` : '';
+  const contextFullRefId = initialContextFull ? `${session.debugStore.sessionId}:context:full` : '';
+  const contextShortRefId = initialContextShort ? `${session.debugStore.sessionId}:context:short` : '';
   if (contextFullRefId) {
     await storeDebugRawSafe({
       id: contextFullRefId,
@@ -3557,7 +4098,7 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
       value: { type: 'context', text: truncateText(initialContextShort, DEBUG_RAW_MAX_CHARS).text }
     });
   }
-  debugState = {
+  session.debugStore.state = {
     context: contextFullPreview.text || '',
     contextStatus: initialContextFullStatus,
     contextFull: contextFullPreview.text || '',
@@ -3568,75 +4109,76 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
     contextShortRefId,
     contextFullTruncated: contextFullPreview.truncated,
     contextShortTruncated: contextShortPreview.truncated,
-    items: debugEntries,
+    items: session.debugStore.entries,
     aiRequestCount: 0,
     aiResponseCount: 0,
     sessionStartTime: Math.floor(Date.now() / 1000),
     sessionEndTime: null,
     callHistory: [],
+    events: [],
     updatedAt: Date.now()
   };
-  await saveTranslationDebugInfo(location.href, debugState);
+  await saveTranslationDebugInfo(location.href, session.debugStore.state);
 }
 
 function schedulePersistDebugState(reason = '') {
-  if (!debugState) return;
-  debugPersistDirty = true;
+  if (!session.debugStore.state) return;
+  session.debugStore.persistDirty = true;
   const now = Date.now();
-  if (now - debugLastPersistAt > DEBUG_PERSIST_MAX_INTERVAL_MS) {
-    if (debugPersistTimer) {
-      clearTimeout(debugPersistTimer);
-      debugPersistTimer = null;
+  if (now - session.debugStore.lastPersistAt > DEBUG_PERSIST_MAX_INTERVAL_MS) {
+    if (session.debugStore.persistTimer) {
+      clearTimeout(session.debugStore.persistTimer);
+      session.debugStore.persistTimer = null;
     }
     void flushPersistDebugState(`max-interval:${reason}`);
     return;
   }
-  if (debugPersistTimer) return;
-  debugPersistTimer = setTimeout(() => {
-    debugPersistTimer = null;
+  if (session.debugStore.persistTimer) return;
+  session.debugStore.persistTimer = setTimeout(() => {
+    session.debugStore.persistTimer = null;
     void flushPersistDebugState(`debounce:${reason}`);
   }, DEBUG_PERSIST_DEBOUNCE_MS);
 }
 
 async function flushPersistDebugState(reason = '') {
-  if (!debugState) return;
-  if (debugPersistTimer) {
-    clearTimeout(debugPersistTimer);
-    debugPersistTimer = null;
+  if (!session.debugStore.state) return;
+  if (session.debugStore.persistTimer) {
+    clearTimeout(session.debugStore.persistTimer);
+    session.debugStore.persistTimer = null;
   }
-  if (debugPersistInFlight) {
-    debugPersistDirty = true;
+  if (session.debugStore.persistInFlight) {
+    session.debugStore.persistDirty = true;
     return;
   }
-  debugPersistInFlight = true;
-  debugPersistDirty = false;
-  debugState.updatedAt = Date.now();
-  debugState.items = debugEntries;
+  session.debugStore.persistInFlight = true;
+  session.debugStore.persistDirty = false;
+  session.debugStore.state.updatedAt = Date.now();
+  session.debugStore.state.items = session.debugStore.entries;
   try {
-    await saveTranslationDebugInfo(location.href, debugState);
+    await saveTranslationDebugInfo(location.href, session.debugStore.state);
   } catch (error) {
     console.warn('Failed to persist debug info.', error);
   } finally {
     await notifyDebugUpdate().catch(() => {});
-    debugPersistInFlight = false;
-    debugLastPersistAt = Date.now();
+    session.debugStore.persistInFlight = false;
+    session.debugStore.lastPersistAt = Date.now();
   }
-  if (debugPersistDirty) {
-    debugPersistDirty = false;
+  if (session.debugStore.persistDirty) {
+    session.debugStore.persistDirty = false;
     await flushPersistDebugState(`dirty:${reason}`);
   }
 }
 
 function updateDebugContextFull(context, status) {
-  if (!debugState) return;
-  const value = typeof context === 'string' ? context : debugState.contextFull || '';
+  if (!session.debugStore.state) return;
+  const value = typeof context === 'string' ? context : session.debugStore.state.contextFull || '';
   const preview = { text: value, truncated: false };
-  debugState.contextFull = preview.text;
-  debugState.context = preview.text;
-  debugState.contextFullTruncated = preview.truncated;
+  session.debugStore.state.contextFull = preview.text;
+  session.debugStore.state.context = preview.text;
+  session.debugStore.state.contextFullTruncated = preview.truncated;
   if (value) {
-    const refId = debugState.contextFullRefId || `${debugSessionId || 'session'}:context:full`;
-    debugState.contextFullRefId = refId;
+    const refId = session.debugStore.state.contextFullRefId || `${session.debugStore.sessionId || 'session'}:context:full`;
+    session.debugStore.state.contextFullRefId = refId;
     void storeDebugRawSafe({
       id: refId,
       ts: Date.now(),
@@ -3644,21 +4186,21 @@ function updateDebugContextFull(context, status) {
     });
   }
   if (status) {
-    debugState.contextFullStatus = status;
-    debugState.contextStatus = status;
+    session.debugStore.state.contextFullStatus = status;
+    session.debugStore.state.contextStatus = status;
   }
   schedulePersistDebugState('updateDebugContextFull');
 }
 
 function updateDebugContextShort(context, status) {
-  if (!debugState) return;
-  const value = typeof context === 'string' ? context : debugState.contextShort || '';
+  if (!session.debugStore.state) return;
+  const value = typeof context === 'string' ? context : session.debugStore.state.contextShort || '';
   const preview = { text: value, truncated: false };
-  debugState.contextShort = preview.text;
-  debugState.contextShortTruncated = preview.truncated;
+  session.debugStore.state.contextShort = preview.text;
+  session.debugStore.state.contextShortTruncated = preview.truncated;
   if (value) {
-    const refId = debugState.contextShortRefId || `${debugSessionId || 'session'}:context:short`;
-    debugState.contextShortRefId = refId;
+    const refId = session.debugStore.state.contextShortRefId || `${session.debugStore.sessionId || 'session'}:context:short`;
+    session.debugStore.state.contextShortRefId = refId;
     void storeDebugRawSafe({
       id: refId,
       ts: Date.now(),
@@ -3666,21 +4208,21 @@ function updateDebugContextShort(context, status) {
     });
   }
   if (status) {
-    debugState.contextShortStatus = status;
+    session.debugStore.state.contextShortStatus = status;
   }
   schedulePersistDebugState('updateDebugContextShort');
 }
 
 function updateDebugContextFullStatus(status) {
-  if (!debugState) return;
-  debugState.contextFullStatus = status;
-  debugState.contextStatus = status;
+  if (!session.debugStore.state) return;
+  session.debugStore.state.contextFullStatus = status;
+  session.debugStore.state.contextStatus = status;
   schedulePersistDebugState('updateDebugContextFullStatus');
 }
 
 function updateDebugContextShortStatus(status) {
-  if (!debugState) return;
-  debugState.contextShortStatus = status;
+  if (!session.debugStore.state) return;
+  session.debugStore.state.contextShortStatus = status;
   schedulePersistDebugState('updateDebugContextShortStatus');
 }
 
@@ -3693,13 +4235,36 @@ function updateDebugContextStatus(status) {
 }
 
 function updateDebugSessionEndTime() {
-  if (!debugState) return;
-  debugState.sessionEndTime = Math.floor(Date.now() / 1000);
+  if (!session.debugStore.state) return;
+  session.debugStore.state.sessionEndTime = Math.floor(Date.now() / 1000);
   schedulePersistDebugState('sessionEndTime');
 }
 
+function recordDebugEvent(type, payload = {}) {
+  if (!session.debugStore.state) return;
+  const list = Array.isArray(session.debugStore.state.events) ? session.debugStore.state.events : [];
+  const ts = Number.isFinite(payload.ts) ? payload.ts : Date.now();
+  const event = {
+    id: `${ts}_${Math.random().toString(16).slice(2)}`,
+    type: String(type || 'EVENT'),
+    ts,
+    jobId: payload.jobId || getActiveJobId() || '',
+    tabId: typeof payload.tabId === 'number' ? payload.tabId : session.tabId ?? null,
+    stage: payload.stage || '',
+    summary: payload.summary || '',
+    durationMs: Number.isFinite(payload.durationMs) ? payload.durationMs : null,
+    details: payload.details || null
+  };
+  list.push(event);
+  if (list.length > DEBUG_EVENTS_LIMIT) {
+    list.splice(0, list.length - DEBUG_EVENTS_LIMIT);
+  }
+  session.debugStore.state.events = list;
+  schedulePersistDebugState(`event:${event.type}`);
+}
+
 function updateDebugEntry(index, updates = {}) {
-  const entry = debugEntries.find((item) => item.index === index);
+  const entry = session.debugStore.entries.find((item) => item.index === index);
   if (!entry) return;
   if (Array.isArray(updates.translationDebug) && updates.translationDebug.length > DEBUG_PAYLOADS_PER_ENTRY_LIMIT) {
     updates.translationDebug = updates.translationDebug.slice(-DEBUG_PAYLOADS_PER_ENTRY_LIMIT);
@@ -3711,20 +4276,40 @@ function updateDebugEntry(index, updates = {}) {
   schedulePersistDebugState('updateDebugEntry');
 }
 
-function registerCallHistory(entry, record) {
-  if (!debugState || !entry || !record) return;
-  if (!Array.isArray(debugState.callHistory)) {
-    debugState.callHistory = [];
+async function markInFlightEntriesCancelled() {
+  const now = Date.now();
+  const entries = Array.isArray(session.debugStore.entries) ? session.debugStore.entries : [];
+  for (const entry of entries) {
+    if (!entry?.index) continue;
+    const updates = {};
+    if (entry.translationStatus === 'in_progress' || entry.translationStatus === 'retrying') {
+      updates.translationStatus = 'cancelled';
+      updates.translationCompletedAt = now;
+    }
+    if (entry.proofreadStatus === 'in_progress') {
+      updates.proofreadStatus = 'cancelled';
+      updates.proofreadCompletedAt = now;
+    }
+    if (Object.keys(updates).length) {
+      await updateDebugEntry(entry.index, updates);
+    }
   }
-  debugState.callHistory.push({
+}
+
+function registerCallHistory(entry, record) {
+  if (!session.debugStore.state || !entry || !record) return;
+  if (!Array.isArray(session.debugStore.state.callHistory)) {
+    session.debugStore.state.callHistory = [];
+  }
+  session.debugStore.state.callHistory.push({
     id: record.id,
     entryIndex: entry.index,
     stage: record.stage
   });
-  while (debugState.callHistory.length > DEBUG_CALLS_TOTAL_LIMIT) {
-    const oldest = debugState.callHistory.shift();
+  while (session.debugStore.state.callHistory.length > DEBUG_CALLS_TOTAL_LIMIT) {
+    const oldest = session.debugStore.state.callHistory.shift();
     if (!oldest) break;
-    const targetEntry = debugEntries.find((item) => item.index === oldest.entryIndex);
+    const targetEntry = session.debugStore.entries.find((item) => item.index === oldest.entryIndex);
     if (!targetEntry) continue;
     const callsKey = oldest.stage === 'proofreading' ? 'proofreadCalls' : 'translationCalls';
     targetEntry[callsKey] = (targetEntry[callsKey] || []).filter((call) => call.id !== oldest.id);
@@ -3732,7 +4317,7 @@ function registerCallHistory(entry, record) {
 }
 
 function appendCallRecord(index, stage, payload) {
-  const entry = debugEntries.find((item) => item.index === index);
+  const entry = session.debugStore.entries.find((item) => item.index === index);
   if (!entry) return;
   const callsKey = stage === 'proofreading' ? 'proofreadCalls' : 'translationCalls';
   const counterKey = stage === 'proofreading' ? 'proofreadCallCounter' : 'translationCallCounter';
@@ -3761,7 +4346,7 @@ function appendCallRecord(index, stage, payload) {
 }
 
 function appendDebugPayload(index, key, payload) {
-  const entry = debugEntries.find((item) => item.index === index);
+  const entry = session.debugStore.entries.find((item) => item.index === index);
   if (!entry) return;
   const existing = Array.isArray(entry[key]) ? entry[key] : [];
   const next = [...existing, payload];
@@ -3774,16 +4359,16 @@ function appendDebugPayload(index, key, payload) {
 }
 
 function incrementDebugAiRequestCount() {
-  if (!debugState) return;
-  const currentCount = Number.isFinite(debugState.aiRequestCount) ? debugState.aiRequestCount : 0;
-  debugState.aiRequestCount = currentCount + 1;
+  if (!session.debugStore.state) return;
+  const currentCount = Number.isFinite(session.debugStore.state.aiRequestCount) ? session.debugStore.state.aiRequestCount : 0;
+  session.debugStore.state.aiRequestCount = currentCount + 1;
   schedulePersistDebugState('aiRequestCount');
 }
 
 function recordAiResponseMetrics(debugPayloads) {
-  if (!debugState) return;
-  const currentCount = Number.isFinite(debugState.aiResponseCount) ? debugState.aiResponseCount : 0;
-  debugState.aiResponseCount = currentCount + 1;
+  if (!session.debugStore.state) return;
+  const currentCount = Number.isFinite(session.debugStore.state.aiResponseCount) ? session.debugStore.state.aiResponseCount : 0;
+  session.debugStore.state.aiResponseCount = currentCount + 1;
   schedulePersistDebugState('aiResponseMetrics');
 }
 
@@ -3830,30 +4415,47 @@ function restoreOriginal(entries) {
 }
 
 async function cancelTranslation() {
-  cancelRequested = true;
+  session.state.cancelRequested = true;
   stopRpcHeartbeat();
   updateDebugSessionEndTime();
+  await markInFlightEntriesCancelled();
+  if (getActiveJobId()) {
+    const tabId = await getActiveTabId();
+    await sendRpcRequest(
+      { method: 'cancel_job', payload: { jobId: getActiveJobId(), tabId } },
+      'Cancel job failed',
+      2000,
+      { stage: 'cancel' }
+    );
+  }
   await flushPersistDebugState('cancelTranslation');
-  const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+  const entriesToRestore = session.state.activeEntries.length ? session.state.activeEntries : session.state.originalSnapshot;
   if (entriesToRestore.length) {
     restoreOriginal(entriesToRestore);
   }
   await clearStoredTranslations(location.href);
   await resetTranslationDebugInfo(location.href);
-  activeTranslationEntries = [];
-  originalSnapshot = [];
-  debugState = null;
-  translationProgress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
-  translationVisible = false;
+  session.state.activeEntries = [];
+  session.state.originalSnapshot = [];
+  session.debugStore.state = null;
+  session.state.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
+  session.state.translationVisible = false;
   notifyVisibilityChange();
-  reportProgress('Перевод отменён', 0, 0, 0);
+  reportProgress('Перевод отменён', 0, 0, 0, 'cancelled');
   const tabId = await getActiveTabId();
-  void sendBackgroundMessageSafe({ type: 'TRANSLATION_CANCELLED', tabId });
+  const jobId = getActiveJobId();
+  void sendBackgroundMessageSafe({ type: 'TRANSLATION_CANCELLED', tabId, jobId });
+  endJobSession('JOB_CANCELLED', { tabId });
 }
 
 function getActiveTabId() {
   return (async () => {
-    const response = await sendRpcRequest({ type: 'GET_TAB_ID' }, 'GET_TAB_ID failed', 2000);
+    const response = await sendRpcRequest(
+      { method: 'get_tab_id', payload: { type: 'GET_TAB_ID' } },
+      'GET_TAB_ID failed',
+      2000,
+      { stage: 'tab_id' }
+    );
     if (response?.tabId != null) {
       return response.tabId;
     }
@@ -3869,34 +4471,39 @@ function getActiveTabId() {
 }
 
 async function setTranslationVisibility(visible) {
-  translationVisible = visible;
-  if (translationVisible) {
+  session.state.translationVisible = visible;
+  if (session.state.translationVisible) {
     await restoreTranslations();
   } else {
-    let entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+    let entriesToRestore = session.state.activeEntries.length ? session.state.activeEntries : session.state.originalSnapshot;
     if (!entriesToRestore.length) {
       await hydrateStoredTranslations();
-      entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
+      entriesToRestore = session.state.activeEntries.length ? session.state.activeEntries : session.state.originalSnapshot;
     }
     if (entriesToRestore.length) {
       restoreOriginal(entriesToRestore);
     }
   }
+  session.domPatcher.toggleVisibility(
+    session.state.translationVisible,
+    session.state.activeEntries,
+    session.state.originalSnapshot
+  );
   notifyVisibilityChange();
 }
 
 async function hydrateStoredTranslations() {
-  if (activeTranslationEntries.length) return;
+  if (session.state.activeEntries.length) return;
   const storedEntries = await getStoredTranslations(location.href);
   if (!storedEntries.length) return;
-  activeTranslationEntries = storedEntries.map(({ path, translated, original, originalHash }) => ({
+  session.state.activeEntries = storedEntries.map(({ path, translated, original, originalHash }) => ({
     path,
     translated,
     original,
     originalHash
   }));
-  if (!originalSnapshot.length) {
-    originalSnapshot = storedEntries.map(({ path, original, originalHash }) => ({
+  if (!session.state.originalSnapshot.length) {
+    session.state.originalSnapshot = storedEntries.map(({ path, original, originalHash }) => ({
       path,
       original,
       originalHash
@@ -3905,7 +4512,7 @@ async function hydrateStoredTranslations() {
 }
 
 async function restoreTranslations() {
-  const storedEntries = activeTranslationEntries.length ? activeTranslationEntries : await getStoredTranslations(location.href);
+  const storedEntries = session.state.activeEntries.length ? session.state.activeEntries : await getStoredTranslations(location.href);
   if (!storedEntries.length) return;
 
   const restoredSnapshot = [];
@@ -3945,16 +4552,16 @@ async function restoreTranslations() {
   }
 
   if (updatedEntries.length) {
-    originalSnapshot = updatedEntries.map(({ path, original, originalHash }) => ({
+    session.state.originalSnapshot = updatedEntries.map(({ path, original, originalHash }) => ({
       path,
       original,
       originalHash
     }));
-    activeTranslationEntries = updatedEntries;
+    session.state.activeEntries = updatedEntries;
   }
 }
 
 function notifyVisibilityChange() {
-  void sendBackgroundMessageSafe({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: translationVisible });
+  void sendBackgroundMessageSafe({ type: 'UPDATE_TRANSLATION_VISIBILITY', visible: session.state.translationVisible });
 }
 })();
