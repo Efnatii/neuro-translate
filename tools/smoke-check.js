@@ -5,7 +5,7 @@ const path = require('path');
 const repoRoot = process.cwd();
 const extensionRoot = path.join(repoRoot, 'extension');
 const manifestPath = path.join(extensionRoot, 'manifest.json');
-const quarantineRoot = path.join(extensionRoot, '_quarantine');
+const quarantineRoot = path.join(extensionRoot, 'quarantine');
 
 const checkedEntrypoints = [];
 const errors = [];
@@ -46,7 +46,7 @@ const addError = (message) => {
 
 const assertExists = (relativePath, reason) => {
   if (!relativePath) return;
-  if (relativePath.startsWith('_quarantine/')) {
+  if (relativePath.startsWith('quarantine/')) {
     addError(`Quarantine reference found (${reason}): ${relativePath}`);
     return;
   }
@@ -92,7 +92,7 @@ const parseImportScripts = (filePath, content) => {
 
 const ensureNoQuarantineInManifest = (manifest) => {
   const manifestText = JSON.stringify(manifest);
-  if (manifestText.includes('_quarantine/')) {
+  if (manifestText.includes('quarantine/')) {
     addError('Quarantine path referenced in manifest.json');
   }
 };
@@ -175,7 +175,7 @@ const run = () => {
     });
 
   if (fs.existsSync(quarantineRoot)) {
-    const quarantineReference = checkedEntrypoints.some((entry) => entry.includes('_quarantine/'));
+    const quarantineReference = checkedEntrypoints.some((entry) => entry.includes('quarantine/'));
     if (quarantineReference) {
       addError('Quarantine file referenced by entrypoints.');
     }

@@ -23,7 +23,7 @@ Record the confirmation commit/date below when verified:
 Move a file back to its original location, preserving the relative path. Example:
 
 ```bash
-git mv extension/_quarantine/package.json extension/package.json
+git mv extension/quarantine/package.json extension/package.json
 ```
 
 Then re-run:
