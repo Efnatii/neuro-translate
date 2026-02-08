@@ -250,12 +250,10 @@ function formatManualOutputs(payloads) {
           responseText = String(payload.response);
         }
       }
-      const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
       const header = `Manual attempt ${index + 1}${payload?.phase ? ` (${payload.phase})` : ''}`;
       return [
         header,
-        responseText ? `Response: ${responseText}` : 'Response: (empty)',
-        parseIssues ? `Parse issues: ${parseIssues}` : ''
+        responseText ? `Response: ${responseText}` : 'Response: (empty)'
       ]
         .filter(Boolean)
         .join('\n');
@@ -634,35 +632,6 @@ async function proofreadTranslation(
   const baseEffectiveContext = buildEffectiveContext(normalizedContext, baseRequestMeta);
   // Proofread retries are distinct LLM calls; avoid full context unless explicitly forced.
   const retryContextPayload = getRetryContextPayload(normalizedContext, baseRequestMeta);
-  const appendParseIssue = (issue) => {
-    if (!issue) return;
-    const last = debugPayloads[debugPayloads.length - 1];
-    if (last) {
-      if (!Array.isArray(last.parseIssues)) {
-        last.parseIssues = [];
-      }
-      last.parseIssues.push(issue);
-      return;
-    }
-    debugPayloads.push(
-      attachRequestMeta(
-        {
-          phase: 'PROOFREAD',
-          model: mainSelection.modelId,
-          latencyMs: null,
-          usage: null,
-          inputChars: null,
-          outputChars: null,
-          request: null,
-          response: null,
-          parseIssues: [issue]
-        },
-        baseRequestMeta,
-        baseEffectiveContext
-      )
-    );
-  };
-
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
     let result = await requestProofreadChunk(
@@ -691,7 +660,6 @@ async function proofreadTranslation(
         missing: quality.missingCount,
         received: quality.receivedCount
       });
-      appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
         { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
@@ -731,7 +699,6 @@ async function proofreadTranslation(
         received: quality.receivedCount,
         threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
-      appendParseIssue('retry:retryable');
       result = await requestProofreadChunk(
         chunk,
         { sourceBlock, translatedBlock, context: retryContextPayload, language, proofreadMode },
@@ -773,7 +740,6 @@ async function proofreadTranslation(
         received: quality.receivedCount,
         threshold: PROOFREAD_MISSING_RATIO_THRESHOLD
       });
-      appendParseIssue('fallback:per-item');
       for (const item of chunk) {
         const singleResult = await requestProofreadChunk(
           [item],
@@ -1338,8 +1304,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
             status: response.status,
             statusText: response.statusText,
             error: errorMessage
-          },
-          parseIssues: ['request-failed']
+          }
         },
         requestMeta,
         effectiveContext
@@ -1369,8 +1334,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           model: data?.model ?? model,
           emptyContent: true,
           bodyPreview: buildProofreadBodyPreview(data)
-        },
-        parseIssues: ['no-content', 'api-empty-content']
+        }
       },
       requestMeta,
       effectiveContext
@@ -1395,8 +1359,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       inputChars,
       outputChars: content?.length || 0,
       request: requestPayload,
-      response: content,
-      parseIssues: []
+      response: content
     },
     requestMeta,
     effectiveContext
@@ -1409,12 +1372,10 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     parsed = parseJsonObjectFlexible(content, 'proofread');
   } catch (error) {
     parseError = error?.message || 'parse-error';
-    debugPayload.parseIssues.push(parseError);
   }
 
   let rawProofread = content;
   if (parseError) {
-    debugPayload.parseIssues.push('fallback:format-repair');
     const fallbackSpec =
       requestMeta?.selectedModelSpec || formatModelSpec(model, requestMeta?.selectedTier || 'standard');
     const validateSelection = resolveProofreadCandidateSelection(requestMeta, fallbackSpec, {
@@ -1644,8 +1605,7 @@ async function requestProofreadFormatRepair(
       inputChars: rawResponse?.length || 0,
       outputChars: content?.length || 0,
       request: requestPayload,
-      response: content,
-      parseIssues: []
+      response: content
     },
     normalizedRequestMeta,
     effectiveContext
@@ -1657,7 +1617,6 @@ async function requestProofreadFormatRepair(
     parsed = parseJsonObjectFlexible(content, 'proofread-format-repair');
   } catch (error) {
     parseError = error?.message || 'parse-error';
-    debugPayload.parseIssues.push(parseError);
   }
 
   return {
@@ -1693,42 +1652,6 @@ async function repairProofreadSegments(
 
   if (!repairItems.length) {
     return translations;
-  }
-
-  if (Array.isArray(debugPayloads)) {
-    const last = debugPayloads[debugPayloads.length - 1];
-    if (last) {
-      if (!Array.isArray(last.parseIssues)) {
-        last.parseIssues = [];
-      }
-      last.parseIssues.push('fallback:language-repair');
-    } else {
-      const validateRequestMeta = normalizeRequestMeta(requestMeta, {
-        stage: 'proofread',
-        purpose: 'validate',
-        triggerSource: 'validate'
-      });
-      debugPayloads.push(
-        attachRequestMeta(
-          {
-            phase: 'PROOFREAD',
-            model,
-            latencyMs: null,
-            usage: null,
-            inputChars: null,
-            outputChars: null,
-            request: null,
-            response: null,
-            parseIssues: ['fallback:language-repair']
-          },
-          validateRequestMeta,
-          buildEffectiveContext(
-            { text: '', mode: '', baseAnswer: '', baseAnswerIncluded: false },
-            validateRequestMeta
-          )
-        )
-      );
-    }
   }
 
   const repairRequestMeta = createChildRequestMeta(requestMeta || {}, {
@@ -1895,8 +1818,7 @@ async function repairProofreadSegments(
         inputChars: repairItems.reduce((sum, item) => sum + (item?.draft?.length || 0), 0),
         outputChars: content?.length || 0,
         request: requestPayload,
-        response: content,
-        parseIssues: ['fallback:language-repair']
+        response: content
       },
       repairRequestMeta,
       buildEffectiveContext(

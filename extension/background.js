@@ -20,8 +20,6 @@ const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
 const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
 const DEFAULT_STATE = {
   apiKey: '',
-  openAiOrganization: '',
-  openAiProject: '',
   translationModel: 'gpt-4.1-mini',
   contextModel: 'gpt-4.1-mini',
   proofreadModel: 'gpt-4.1-mini',
@@ -30,7 +28,6 @@ const DEFAULT_STATE = {
   proofreadModelList: ['gpt-4.1-mini:standard'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
-  singleBlockConcurrency: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -49,10 +46,14 @@ const DEBUG_DB_VERSION = 1;
 const DEBUG_RAW_STORE = 'raw';
 const DEBUG_RAW_MAX_RECORDS = 1500;
 const DEBUG_RAW_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Obsolete storage keys from removed settings (OpenAI org/project, single-block concurrency).
+const OBSOLETE_STORAGE_KEYS = [
+  'openAi' + 'Organization',
+  'openAi' + 'Project',
+  'single' + 'Block' + 'Concurrency'
+];
 const STATE_CACHE_KEYS = new Set([
   'apiKey',
-  'openAiOrganization',
-  'openAiProject',
   'translationModel',
   'contextModel',
   'proofreadModel',
@@ -61,7 +62,6 @@ const STATE_CACHE_KEYS = new Set([
   'proofreadModelList',
   'contextGenerationEnabled',
   'proofreadEnabled',
-  'singleBlockConcurrency',
   'blockLengthLimit',
   'tpmLimitsByModel',
   'outputRatioByRole',
@@ -371,11 +371,7 @@ function applyStatePatch(patch = {}) {
 
   for (const [key, value] of Object.entries(patch || {})) {
     if (!STATE_CACHE_KEYS.has(key)) continue;
-    if (
-      ['apiKey', 'openAiOrganization', 'openAiProject', 'translationModel', 'contextModel', 'proofreadModel'].includes(
-        key
-      )
-    ) {
+    if (['apiKey', 'translationModel', 'contextModel', 'proofreadModel'].includes(key)) {
       next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
       continue;
     }
@@ -397,7 +393,7 @@ function applyStatePatch(patch = {}) {
       }
       continue;
     }
-    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency'].includes(key)) {
+    if (['contextGenerationEnabled', 'proofreadEnabled'].includes(key)) {
       next[key] = Boolean(value);
       continue;
     }
@@ -766,17 +762,43 @@ async function ensureDefaultKeysOnFreshInstall() {
   applyStatePatch({ ...DEFAULT_STATE, ...safeStored, ...patch });
 }
 
+async function removeObsoleteStorageKeys() {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.storage.local.remove(OBSOLETE_STORAGE_KEYS, () => {
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        resolve();
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 chrome.runtime.onInstalled.addListener(async (details) => {
   const reason = details?.reason;
   if (reason === 'install') {
     await ensureDefaultKeysOnFreshInstall();
   } else {
+    try {
+      await removeObsoleteStorageKeys();
+    } catch (error) {
+      console.warn('Failed to remove obsolete storage keys on update.', error);
+    }
     await getState();
   }
   await warmUpContentScripts(reason || 'installed');
 });
 
 chrome.runtime.onStartup.addListener(async () => {
+  try {
+    await removeObsoleteStorageKeys();
+  } catch (error) {
+    console.warn('Failed to remove obsolete storage keys on startup.', error);
+  }
   await warmUpContentScripts('startup');
 });
 
@@ -1123,7 +1145,6 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModelList: DEFAULT_STATE.proofreadModelList,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
-        singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
           translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -1171,7 +1192,6 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModelList: state.proofreadModelList,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
-        singleBlockConcurrency: state.singleBlockConcurrency,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByRole,
         outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
@@ -1196,7 +1216,6 @@ async function handleGetSettings(message, sendResponse) {
       proofreadModelList: DEFAULT_STATE.proofreadModelList,
       contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
       proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
-      singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
       blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
       tpmLimitsByRole: {
         translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
@@ -1221,7 +1240,6 @@ async function handleGetSettings(message, sendResponse) {
         proofreadModelList: DEFAULT_STATE.proofreadModelList,
         contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
         proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
-        singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
         blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
         tpmLimitsByRole: {
           translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),

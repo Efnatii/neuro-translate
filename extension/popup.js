@@ -1,6 +1,4 @@
 const apiKeyInput = document.getElementById('apiKey');
-const openAiOrganizationInput = document.getElementById('openAiOrganization');
-const openAiProjectInput = document.getElementById('openAiProject');
 const translationModelListContainer = document.getElementById('translationModelList');
 const contextModelListContainer = document.getElementById('contextModelList');
 const proofreadModelListContainer = document.getElementById('proofreadModelList');
@@ -9,7 +7,6 @@ const contextModelCount = document.getElementById('contextModelCount');
 const proofreadModelCount = document.getElementById('proofreadModelCount');
 const contextGenerationCheckbox = document.getElementById('contextGeneration');
 const proofreadEnabledCheckbox = document.getElementById('proofreadEnabled');
-const singleBlockConcurrencyCheckbox = document.getElementById('singleBlockConcurrency');
 const blockLengthLimitInput = document.getElementById('blockLengthLimit');
 const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
@@ -22,8 +19,6 @@ const openDebugButton = document.getElementById('openDebug');
 const POPUP_PORT_NAME = 'popup';
 
 let keySaveTimeout = null;
-let organizationSaveTimeout = null;
-let projectSaveTimeout = null;
 let activeTabId = null;
 let translationVisible = false;
 let canShowTranslation = false;
@@ -91,8 +86,6 @@ async function init() {
       type: 'SYNC_STATE_CACHE',
       state: {
         apiKey: state.apiKey,
-        openAiOrganization: state.openAiOrganization,
-        openAiProject: state.openAiProject,
         translationModel: state.translationModel,
         contextModel: state.contextModel,
         proofreadModel: state.proofreadModel,
@@ -101,7 +94,6 @@ async function init() {
         proofreadModelList: state.proofreadModelList,
         contextGenerationEnabled: state.contextGenerationEnabled,
         proofreadEnabled: state.proofreadEnabled,
-        singleBlockConcurrency: state.singleBlockConcurrency,
         blockLengthLimit: state.blockLengthLimit,
         tpmLimitsByModel: state.tpmLimitsByModel,
         outputRatioByRole: state.outputRatioByRole,
@@ -112,8 +104,6 @@ async function init() {
     // Best-effort sync for Edge; ignore failures.
   }
   apiKeyInput.value = state.apiKey || '';
-  openAiOrganizationInput.value = state.openAiOrganization || '';
-  openAiProjectInput.value = state.openAiProject || '';
   renderModelChecklist(translationModelListContainer, state.translationModelList, () =>
     handleModelChecklistChange({
       container: translationModelListContainer,
@@ -146,7 +136,6 @@ async function init() {
   updateModelSummaryCount(proofreadModelListContainer, proofreadModelCount);
   renderContextGeneration(state.contextGenerationEnabled);
   renderProofreadEnabled(state.proofreadEnabled);
-  renderSingleBlockConcurrency(state.singleBlockConcurrency);
   renderBlockLengthLimit(state.blockLengthLimit);
   currentTranslationStatus = state.translationStatusByTab?.[activeTabId] || null;
   updateCanShowTranslation(currentTranslationStatus);
@@ -159,11 +148,8 @@ async function init() {
   connectPopupPort();
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
-  openAiOrganizationInput.addEventListener('input', handleOpenAiOrganizationChange);
-  openAiProjectInput.addEventListener('input', handleOpenAiProjectChange);
   contextGenerationCheckbox.addEventListener('change', handleContextGenerationChange);
   proofreadEnabledCheckbox.addEventListener('change', handleProofreadEnabledChange);
-  singleBlockConcurrencyCheckbox.addEventListener('change', handleSingleBlockConcurrencyChange);
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
   cancelButton.addEventListener('click', sendCancel);
@@ -209,24 +195,6 @@ function handleApiKeyChange() {
   }, 300);
 }
 
-function handleOpenAiOrganizationChange() {
-  clearTimeout(organizationSaveTimeout);
-  const openAiOrganization = openAiOrganizationInput.value.trim();
-  organizationSaveTimeout = setTimeout(async () => {
-    await chrome.storage.local.set({ openAiOrganization });
-    setTemporaryStatus('Организация OpenAI сохранена.');
-  }, 300);
-}
-
-function handleOpenAiProjectChange() {
-  clearTimeout(projectSaveTimeout);
-  const openAiProject = openAiProjectInput.value.trim();
-  projectSaveTimeout = setTimeout(async () => {
-    await chrome.storage.local.set({ openAiProject });
-    setTemporaryStatus('Проект OpenAI сохранён.');
-  }, 300);
-}
-
 async function handleModelChecklistChange({ container, modelListKey, modelKey, countLabel, statusMessage }) {
   const modelList = getSelectedModelList(container);
   const selectedModel = parseModelSpec(modelList[0] || defaultModelSpec).id;
@@ -252,15 +220,6 @@ async function handleProofreadEnabledChange() {
   setTemporaryStatus(proofreadEnabled ? 'Вычитка перевода включена.' : 'Вычитка перевода отключена.');
 }
 
-async function handleSingleBlockConcurrencyChange() {
-  const singleBlockConcurrency = singleBlockConcurrencyCheckbox.checked;
-  await chrome.storage.local.set({ singleBlockConcurrency });
-  setTemporaryStatus(
-    singleBlockConcurrency
-      ? 'Ограничение параллельности включено.'
-      : 'Ограничение параллельности отключено.'
-  );
-}
 
 async function handleBlockLengthLimitChange() {
   const blockLengthLimit = clampBlockLengthLimit(Number(blockLengthLimitInput.value));
@@ -280,8 +239,6 @@ async function getState() {
     chrome.storage.local.get(
       [
         'apiKey',
-        'openAiOrganization',
-        'openAiProject',
         'model',
         'translationModel',
         'contextModel',
@@ -291,7 +248,6 @@ async function getState() {
         'proofreadModelList',
         'contextGenerationEnabled',
         'proofreadEnabled',
-        'singleBlockConcurrency',
         'blockLengthLimit',
         'chunkLengthLimit',
         'translationStatusByTab',
@@ -369,8 +325,6 @@ async function getState() {
         }
         resolve({
           apiKey: data.apiKey || '',
-          openAiOrganization: data.openAiOrganization || '',
-          openAiProject: data.openAiProject || '',
           translationModel,
           contextModel,
           proofreadModel,
@@ -379,7 +333,6 @@ async function getState() {
           proofreadModelList,
           contextGenerationEnabled: data.contextGenerationEnabled,
           proofreadEnabled: data.proofreadEnabled,
-          singleBlockConcurrency: Boolean(data.singleBlockConcurrency),
           blockLengthLimit: data.blockLengthLimit ?? data.chunkLengthLimit,
           translationStatusByTab: data.translationStatusByTab || {},
           translationVisibilityByTab: data.translationVisibilityByTab || {},
@@ -565,9 +518,6 @@ function renderProofreadEnabled(enabled) {
   proofreadEnabledCheckbox.checked = Boolean(enabled);
 }
 
-function renderSingleBlockConcurrency(enabled) {
-  singleBlockConcurrencyCheckbox.checked = Boolean(enabled);
-}
 
 function renderBlockLengthLimit(limit) {
   const fallback = Number(blockLengthLimitInput.min) || 600;

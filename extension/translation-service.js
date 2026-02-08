@@ -612,34 +612,6 @@ async function translateTexts(
   let lastRetryDelayMs = null;
   let lastRawTranslation = '';
   const debugPayloads = [];
-  const appendParseIssue = (issue) => {
-    if (!issue) return;
-    const last = debugPayloads[debugPayloads.length - 1];
-    if (last) {
-      if (!Array.isArray(last.parseIssues)) {
-        last.parseIssues = [];
-      }
-      last.parseIssues.push(issue);
-      return;
-    }
-    debugPayloads.push(
-      attachRequestMeta(
-        {
-          phase: 'TRANSLATE',
-          model,
-          latencyMs: null,
-          usage: null,
-          inputChars: null,
-          outputChars: null,
-          request: null,
-          response: null,
-          parseIssues: [issue]
-        },
-        baseRequestMeta,
-        baseEffectiveContext
-      )
-    );
-  };
   const timeoutMs = DEFAULT_TRANSLATION_TIMEOUT_MS;
 
   while (true) {
@@ -693,7 +665,6 @@ async function translateTexts(
       const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
       if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
         timeoutAttempts += 1;
-        appendParseIssue('retry:timeout');
         console.warn('Translation attempt timed out, retrying...');
         continue;
       }
@@ -705,7 +676,6 @@ async function translateTexts(
         const retryDelayMs = calculateRetryDelayMs(retryableRetries, error?.retryAfterMs);
         lastRetryDelayMs = retryDelayMs;
         const retryLabel = isRateLimit ? 'rate-limited' : 'temporarily unavailable';
-        appendParseIssue('retry:retryable');
         console.warn(`Translation attempt ${retryLabel}, retrying after ${retryDelayMs}ms...`);
         await sleep(retryDelayMs);
         continue;
@@ -714,7 +684,6 @@ async function translateTexts(
       const isLengthIssue = error?.message?.toLowerCase?.().includes('length mismatch');
       if (isLengthIssue && texts.length > 1) {
         console.warn('Falling back to per-item translation due to length mismatch.');
-        appendParseIssue('fallback:per-item');
         const retryMeta = createChildRequestMeta(baseRequestMeta, {
           stage: 'translation',
           purpose: 'retry',
@@ -1072,7 +1041,6 @@ async function performTranslationRequest(
               extractedText = String(extracted);
             }
           }
-          const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
           const validationErrors = Array.isArray(payload?.validationErrors)
             ? payload.validationErrors.join(', ')
             : payload?.validationErrors || '';
@@ -1081,7 +1049,6 @@ async function performTranslationRequest(
             headerParts.join(' | '),
             responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
             extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
-            parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
             validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
             payloadError ? `ERROR: ${payloadError}` : ''
           ]
@@ -1101,7 +1068,7 @@ async function performTranslationRequest(
           const missingFields = manualPayloads.map((payload) => ({
             hasResponse: payload?.response != null,
             hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
-            hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
+            hasErrors: payload?.validationErrors || payload?.error
           }));
           console.warn('Retry/validate manual outputs missing despite manual attempts.', {
             triggerSource,
@@ -1336,7 +1303,6 @@ async function performTranslationRequest(
             statusText: response.statusText,
             error: errorMessage
           },
-          parseIssues: ['request-failed'],
           contextShortSource:
             triggerSource === 'retry' || triggerSource === 'validate' ? contextShortSource : undefined
         },
@@ -1364,7 +1330,6 @@ async function performTranslationRequest(
       outputChars: content?.length || 0,
       request: requestPayload,
       response: content,
-      parseIssues: [],
       contextShortSource:
         triggerSource === 'retry' || triggerSource === 'validate' ? contextShortSource : undefined
     },
@@ -1461,7 +1426,6 @@ async function performTranslationRequest(
     translations = parseTranslationsResponse(content, texts.length);
   } catch (error) {
     if (error && typeof error === 'object') {
-      debugPayload.parseIssues.push(error?.message || 'parse-error');
       error.debugPayload = debugPayload;
     }
     if (error && typeof error === 'object') {
@@ -1480,7 +1444,7 @@ async function performTranslationRequest(
     await persistManualTranslateOutputs({
       rawResponse: content,
       extractedResult: translations,
-      errors: debugPayload?.parseIssues?.length ? debugPayload.parseIssues.join(', ') : ''
+      errors: ''
     });
   }
   const refusalIndices = translations
@@ -1949,7 +1913,6 @@ async function performTranslationRepairRequest(
               extractedText = String(extracted);
             }
           }
-          const parseIssues = Array.isArray(payload?.parseIssues) ? payload.parseIssues.join(', ') : '';
           const validationErrors = Array.isArray(payload?.validationErrors)
             ? payload.validationErrors.join(', ')
             : payload?.validationErrors || '';
@@ -1958,7 +1921,6 @@ async function performTranslationRepairRequest(
             headerParts.join(' | '),
             responseText ? `RESPONSE (raw): ${responseText}` : 'RESPONSE (raw): (empty)',
             extractedText ? `EXTRACTED/PARSED: ${extractedText}` : '',
-            parseIssues ? `PARSE ISSUES: ${parseIssues}` : '',
             validationErrors ? `VALIDATION ERRORS: ${validationErrors}` : '',
             payloadError ? `ERROR: ${payloadError}` : ''
           ]
@@ -1978,7 +1940,7 @@ async function performTranslationRepairRequest(
           const missingFields = manualPayloads.map((payload) => ({
             hasResponse: payload?.response != null,
             hasExtracted: payload?.extractedResult != null || payload?.translations != null || payload?.parsed != null,
-            hasErrors: payload?.parseIssues || payload?.validationErrors || payload?.error
+            hasErrors: payload?.validationErrors || payload?.error
           }));
           console.warn('Retry/validate manual outputs missing despite manual attempts.', {
             triggerSource,
@@ -2218,7 +2180,6 @@ async function performTranslationRepairRequest(
       outputChars: content?.length || 0,
       request: requestPayload,
       response: content,
-      parseIssues: [],
       contextShortSource:
         triggerSource === 'retry' || triggerSource === 'validate' ? contextShortSource : undefined
     },
@@ -2230,7 +2191,6 @@ async function performTranslationRepairRequest(
   try {
     translations = parseTranslationsResponse(content, normalizedItems.length);
   } catch (error) {
-    debugPayload.parseIssues.push(error?.message || 'parse-error');
     throw error;
   }
 
@@ -2265,39 +2225,6 @@ async function repairTranslationsForLanguage(
     return translations;
   }
 
-  if (Array.isArray(debugPayloads)) {
-    const last = debugPayloads[debugPayloads.length - 1];
-    if (last) {
-      if (!Array.isArray(last.parseIssues)) {
-        last.parseIssues = [];
-      }
-      last.parseIssues.push('fallback:language-repair');
-    } else {
-      const validateRequestMeta = normalizeRequestMeta(requestMeta, {
-        stage: 'translation',
-        purpose: 'validate',
-        triggerSource: 'validate'
-      });
-      debugPayloads.push(
-        attachRequestMeta(
-          {
-            phase: 'TRANSLATE',
-            model,
-            latencyMs: null,
-            usage: null,
-            inputChars: null,
-            outputChars: null,
-            request: null,
-            response: null,
-            parseIssues: ['fallback:language-repair']
-          },
-          validateRequestMeta,
-          buildEffectiveContext(context, validateRequestMeta)
-        )
-      );
-    }
-  }
-
   try {
     const retryContextPayload = getRetryContextPayload(normalizeContextPayload(context), requestMeta);
     const repairRequestMeta = createChildRequestMeta(requestMeta, {
@@ -2318,10 +2245,6 @@ async function repairTranslationsForLanguage(
       requestOptions
     );
     if (repairResult?.debug && Array.isArray(debugPayloads)) {
-      if (!Array.isArray(repairResult.debug.parseIssues)) {
-        repairResult.debug.parseIssues = [];
-      }
-      repairResult.debug.parseIssues.push('fallback:language-repair');
       debugPayloads.push(repairResult.debug);
     }
     repairIndices.forEach((index, position) => {

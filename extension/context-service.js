@@ -338,8 +338,7 @@ async function generateTranslationContext(
       inputChars: text.length,
       outputChars: trimmed.length,
       request: requestPayload,
-      response: content,
-      parseIssues: []
+      response: content
     },
     requestMeta
   );
@@ -480,8 +479,7 @@ async function generateShortTranslationContext(
       inputChars: text.length,
       outputChars: trimmed.length,
       request: requestPayload,
-      response: content,
-      parseIssues: []
+      response: content
     },
     requestMeta
   );
