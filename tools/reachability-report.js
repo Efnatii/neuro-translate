@@ -8,7 +8,7 @@ const manifestPath = path.join(extensionRoot, 'manifest.json');
 const outputJsonPath = path.join(repoRoot, 'tools', 'reachability-report.json');
 const outputMdPath = path.join(repoRoot, 'tools', 'reachability-report.md');
 
-const EXCLUDED_DIRS = new Set(['node_modules', 'dist', 'build', '.git', '_quarantine']);
+const EXCLUDED_DIRS = new Set(['node_modules', 'dist', 'build', '.git', 'quarantine']);
 const EXCLUDED_EXTENSIONS = new Set(['.map', '.ts', '.psd', '.blend', '.bak']);
 
 const toPosix = (value) => value.split(path.sep).join('/');
