@@ -3,7 +3,8 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "check": "node scripts/check-no-todo.js && vitest run"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

@@ -68,6 +68,8 @@ const SHORT_CONTEXT_SYSTEM_PROMPT = [
   'Use short bullet points where helpful.',
   'Target length: 5-10 bullet points maximum.'
 ].join('\n');
+const CONTEXT_PROMPT_BUILDER = new PromptBuilder({ systemRulesBase: CONTEXT_SYSTEM_PROMPT });
+const SHORT_CONTEXT_PROMPT_BUILDER = new PromptBuilder({ systemRulesBase: SHORT_CONTEXT_SYSTEM_PROMPT });
 
 function resolveContextModelSpec(requestMeta, fallbackModelSpec) {
   const triggerSource =
@@ -209,10 +211,23 @@ async function generateTranslationContext(
   model,
   apiBaseUrl = OPENAI_API_URL,
   requestMeta = null,
-  requestOptions = null
+  requestOptions = null,
+  requestSignal = null
 ) {
   if (!text?.trim()) return { context: '', debug: [] };
+  const controller = new AbortController();
+  let removeAbortListener = () => {};
+  if (requestSignal) {
+    if (requestSignal.aborted) {
+      controller.abort(requestSignal.reason || 'cancelled');
+    } else {
+      const onAbort = () => controller.abort(requestSignal.reason || 'cancelled');
+      requestSignal.addEventListener('abort', onAbort, { once: true });
+      removeAbortListener = () => requestSignal.removeEventListener('abort', onAbort);
+    }
+  }
 
+  try {
   const fallbackSpec =
     requestMeta?.selectedModelSpec ||
     formatModelSpec(model, requestMeta?.selectedTier || requestOptions?.tier || 'standard');
@@ -245,16 +260,11 @@ async function generateTranslationContext(
     },
     {
       role: 'user',
-      content: [
-        `Target language: ${targetLanguage}.`,
-        'Return translation context in numbered sections 1-10 as specified.',
-        'Emphasize sections 1, 6, 8: include domain/genre + style + audience + format + formality in section 1;',
-        'include a mini-glossary and an ambiguity watchlist in section 6;',
-        'include a compact style guide (tone, pacing, calques, address preferences) in section 8.',
-        'Prefer dense bullet points; avoid repetition; keep total length ~25 lines.',
-        'Text:',
-        text
-      ].join('\n')
+      content: CONTEXT_PROMPT_BUILDER.buildContextUserPrompt({
+        text,
+        targetLanguage,
+        mode: 'FULL'
+      })
     }
   ], apiBaseUrl);
 
@@ -271,7 +281,8 @@ async function generateTranslationContext(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify(requestPayload)
+    body: JSON.stringify(requestPayload),
+    signal: controller.signal
   });
 
   if (!response.ok) {
@@ -309,7 +320,8 @@ async function generateTranslationContext(
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`
         },
-        body: JSON.stringify(requestPayload)
+        body: JSON.stringify(requestPayload),
+        signal: controller.signal
       });
       if (!response.ok) {
         errorText = await response.text();
@@ -344,6 +356,9 @@ async function generateTranslationContext(
   );
 
   return { context: trimmed, debug: [debugPayload] };
+  } finally {
+    removeAbortListener();
+  }
 }
 
 async function generateShortTranslationContext(
@@ -353,10 +368,23 @@ async function generateShortTranslationContext(
   model,
   apiBaseUrl = OPENAI_API_URL,
   requestMeta = null,
-  requestOptions = null
+  requestOptions = null,
+  requestSignal = null
 ) {
   if (!text?.trim()) return { context: '', debug: [] };
+  const controller = new AbortController();
+  let removeAbortListener = () => {};
+  if (requestSignal) {
+    if (requestSignal.aborted) {
+      controller.abort(requestSignal.reason || 'cancelled');
+    } else {
+      const onAbort = () => controller.abort(requestSignal.reason || 'cancelled');
+      requestSignal.addEventListener('abort', onAbort, { once: true });
+      removeAbortListener = () => requestSignal.removeEventListener('abort', onAbort);
+    }
+  }
 
+  try {
   const fallbackSpec =
     requestMeta?.selectedModelSpec ||
     formatModelSpec(model, requestMeta?.selectedTier || requestOptions?.tier || 'standard');
@@ -389,13 +417,11 @@ async function generateShortTranslationContext(
     },
     {
       role: 'user',
-      content: [
-        `Target language: ${targetLanguage}.`,
-        'Generate a short, actionable translation context from the source text.',
-        'Keep it compact and useful for translation disambiguation.',
-        'Text:',
-        text
-      ].join('\n')
+      content: SHORT_CONTEXT_PROMPT_BUILDER.buildContextUserPrompt({
+        text,
+        targetLanguage,
+        mode: 'SHORT'
+      })
     }
   ], apiBaseUrl);
 
@@ -412,7 +438,8 @@ async function generateShortTranslationContext(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify(requestPayload)
+    body: JSON.stringify(requestPayload),
+    signal: controller.signal
   });
 
   if (!response.ok) {
@@ -450,7 +477,8 @@ async function generateShortTranslationContext(
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`
         },
-        body: JSON.stringify(requestPayload)
+        body: JSON.stringify(requestPayload),
+        signal: controller.signal
       });
       if (!response.ok) {
         errorText = await response.text();
@@ -485,4 +513,7 @@ async function generateShortTranslationContext(
   );
 
   return { context: trimmed, debug: [debugPayload] };
+  } finally {
+    removeAbortListener();
+  }
 }

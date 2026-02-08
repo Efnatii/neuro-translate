@@ -21,6 +21,7 @@ const TRANSLATE_SYSTEM_PROMPT = [
   'Never include page context text in the translations unless it is explicitly part of the source segments.',
   'Self-check: if output equals source (case-insensitive), verify it is allowlisted or already in the target language; otherwise translate or transliterate into the target script.'
 ].join(' ');
+const TRANSLATION_PROMPT_BUILDER = new PromptBuilder({ systemRulesBase: TRANSLATE_SYSTEM_PROMPT });
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -98,6 +99,22 @@ function buildShortContextFromNormalized(normalized) {
   if (shortCandidate) return shortCandidate.trim();
   const fallbackSource = normalized.text || normalized.fullText || '';
   return buildShortContextFallback(fallbackSource).trim();
+}
+
+function buildRetryValidateEnvelope(shortContext, manualOutputsText) {
+  const rules = [
+    'Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
+    'Use PREVIOUS MANUAL ATTEMPTS as hints; correct any mistakes or rule violations.',
+    'Do not copy context or this envelope into the output.',
+    'Allow verbatim copies only for allowlisted tokens (placeholders, markup, code, URLs, IDs, numbers/units, punctuation tokens) or text already in the target language.',
+    'Output must be only JSON translations and follow the required schema exactly.'
+  ];
+  return ntJoinTaggedBlocks([
+    { tag: NT_PROMPT_TAGS.RULES, content: rules.join('\n') },
+    { tag: NT_PROMPT_TAGS.CONTEXT_MODE, content: shortContext ? 'SHORT' : 'NONE' },
+    { tag: NT_PROMPT_TAGS.CONTEXT, content: shortContext || '' },
+    { tag: NT_PROMPT_TAGS.DEBUG_HINTS, content: manualOutputsText || '' }
+  ]);
 }
 
 function createRequestId() {
@@ -531,62 +548,30 @@ function buildTranslationPrompt({ tokenizedTexts, targetLanguage, contextPayload
   const normalizedContext = normalizeContextPayload(contextPayload);
   const contextText = normalizedContext.text || '';
   const contextMode = normalizedContext.mode === 'SHORT' ? 'SHORT' : 'FULL';
-  const hasContext = Boolean(contextText);
-  const baseAnswerText =
+  const debugHints =
     normalizedContext.baseAnswerIncluded && normalizedContext.baseAnswer
-      ? `PREVIOUS BASE ANSWER (FULL): <<<BASE_ANSWER_START>>>${normalizedContext.baseAnswer}<<<BASE_ANSWER_END>>>`
+      ? `Previous base answer (full): ${normalizedContext.baseAnswer}`
       : '';
 
-  const messages = [
-    {
-      role: 'system',
-      content: [
-        TRANSLATE_SYSTEM_PROMPT,
-        strictTargetLanguage
-          ? `Every translation must be in ${targetLanguage}. If a phrase would normally remain in the source language, transliterate it into ${targetLanguage} instead.`
-          : null,
-        `Target language: ${targetLanguage}.`
-      ]
-        .filter(Boolean)
-        .join(' ')
-    }
-  ];
-
-  if (hasContext) {
-    messages.push({
-      role: 'user',
-      content: [
-        `Target language: ${targetLanguage}.`,
-        `Page ${contextMode} context: <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
-      ]
-        .filter(Boolean)
-        .join('\n')
-    });
-  }
-
-  if (baseAnswerText) {
-    messages.push({
-      role: 'assistant',
-      content: baseAnswerText
-    });
-  }
-
-  messages.push({
-    role: 'user',
-    content: [
-      `Target language: ${targetLanguage}.`,
-      `Return only a JSON object with a "translations" array containing exactly ${tokenizedTexts.length} items in the same order as provided.`,
-      'Do not add commentary.',
-      'Segments:',
-      '<<<SEGMENTS_START>>>',
-      ...tokenizedTexts.map((text) => text),
-      '<<<SEGMENTS_END>>>'
-    ]
-      .filter(Boolean)
-      .join('\n')
+  const userPrompt = TRANSLATION_PROMPT_BUILDER.buildTranslationUserPrompt({
+    segments: tokenizedTexts,
+    targetLanguage,
+    contextMode,
+    contextText,
+    strictTargetLanguage,
+    debugHints
   });
 
-  return messages;
+  return [
+    {
+      role: 'system',
+      content: TRANSLATE_SYSTEM_PROMPT
+    },
+    {
+      role: 'user',
+      content: userPrompt
+    }
+  ];
 }
 
 async function translateTexts(
@@ -598,7 +583,8 @@ async function translateTexts(
   apiBaseUrl = OPENAI_API_URL,
   keepPunctuationTokens = false,
   requestMeta = null,
-  requestOptions = null
+  requestOptions = null,
+  requestSignal = null
 ) {
   if (!Array.isArray(texts) || !texts.length) return { translations: [], rawTranslation: '' };
 
@@ -614,9 +600,21 @@ async function translateTexts(
   const debugPayloads = [];
   const timeoutMs = DEFAULT_TRANSLATION_TIMEOUT_MS;
 
+  const createExternalAbortHandler = (controller) => {
+    if (!requestSignal) return () => {};
+    if (requestSignal.aborted) {
+      controller.abort(requestSignal.reason || 'cancelled');
+      return () => {};
+    }
+    const onAbort = () => controller.abort(requestSignal.reason || 'cancelled');
+    requestSignal.addEventListener('abort', onAbort, { once: true });
+    return () => requestSignal.removeEventListener('abort', onAbort);
+  };
+
   while (true) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const removeAbortListener = createExternalAbortHandler(controller);
 
     try {
       const attemptMeta =
@@ -654,6 +652,11 @@ async function translateTexts(
         debug: debugPayloads
       };
     } catch (error) {
+      if (requestSignal?.aborted) {
+        const cancelError = new Error('Translation cancelled');
+        cancelError.isCancelled = true;
+        throw cancelError;
+      }
       lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
       if (error?.rawTranslation) {
         lastRawTranslation = error.rawTranslation;
@@ -703,7 +706,8 @@ async function translateTexts(
           true,
           debugPayloads,
           retryMeta,
-          requestOptions
+          requestOptions,
+          requestSignal
         );
         return { translations, rawTranslation: lastRawTranslation, debug: debugPayloads };
       }
@@ -722,6 +726,7 @@ async function translateTexts(
       throw lastError;
     } finally {
       clearTimeout(timeout);
+      removeAbortListener();
     }
   }
 }
@@ -1156,25 +1161,7 @@ async function performTranslationRequest(
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
     if (resolvedShortContextText) {
-      const envelope = [
-        '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
-        '[USAGE RULES]',
-        '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
-        '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
-        '- Do not keep any non-target language/script text unchanged. If a prior/manual attempt left a segment in the source script, fix it by translating or transliterating into the target script.',
-        '- Allow verbatim copies only for allowlisted tokens (placeholders, markup, code, URLs, IDs, numbers/units, punctuation tokens) or text already in the target language.',
-        '- If any manual output says "same as source" or copies the source text while it is not in target language/script, correct it.',
-        '- Never copy or quote this envelope or context into the output.',
-        '- Never copy the envelope into output; output must be only JSON translations.',
-        '- Output MUST follow the required JSON schema exactly.',
-        '',
-        '[SHORT CONTEXT (GLOBAL)]',
-        resolvedShortContextText,
-        '',
-        '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-        manualOutputsText,
-        '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
-      ].join('\n');
+      const envelope = buildRetryValidateEnvelope(resolvedShortContextText, manualOutputsText);
       if (Array.isArray(prompt)) {
         const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
         if (firstUserIndex >= 0) {
@@ -1425,6 +1412,12 @@ async function performTranslationRequest(
   try {
     translations = parseTranslationsResponse(content, texts.length);
   } catch (error) {
+    if (error?.message && String(error.message).includes('length mismatch')) {
+      debugPayload.validationErrors = [String(error.message)];
+      debugPayload.contractViolation = {
+        expectedCount: texts.length
+      };
+    }
     if (error && typeof error === 'object') {
       error.debugPayload = debugPayload;
     }
@@ -1446,6 +1439,15 @@ async function performTranslationRequest(
       extractedResult: translations,
       errors: ''
     });
+  }
+  if (texts.length && translations.length !== texts.length) {
+    debugPayload.validationErrors = [
+      `translation response length mismatch: expected ${texts.length}, got ${translations.length}`
+    ];
+    debugPayload.contractViolation = {
+      expectedCount: texts.length,
+      receivedCount: translations.length
+    };
   }
   const refusalIndices = translations
     .map((translation, index) => (isRefusalOrLimitTranslation(translation) ? index : null))
@@ -2002,63 +2004,21 @@ async function performTranslationRepairRequest(
   const prompt = applyPromptCaching([
     {
       role: 'system',
-      content: [
-        'You are a professional translator.',
-        'You receive source text and a draft translation that may contain untranslated fragments.',
-        'Fix the draft so the output is fully in the target language/script with no source-language fragments.',
-        'Preserve meaning, formatting, punctuation tokens, placeholders, markup, code, URLs, IDs, numbers, units, and links.',
-        'Do not add or remove information. Do not add commentary.',
-        'TARGET LANGUAGE RULE: Every segment must be in the target language and its typical script for the target locale.',
-        'NO-UNTRANSLATED-SEGMENTS RULE: Do not leave any source text unchanged unless it is allowlisted content (placeholders, markup, code, URLs, IDs, numbers/units, or punctuation tokens) or already in the target language.',
-        'If a term should not be translated semantically (name/brand/title/UI/unknown), you MUST transliterate it into the target script. Do NOT leave it in the source script.',
-        'Self-check: if output equals source (case-insensitive), verify it is allowlisted or already in the target language; otherwise translate or transliterate into the target script.',
-        `Target language: ${targetLanguage}.`,
-        PUNCTUATION_TOKEN_HINT
-      ].join(' ')
+      content: ['You are a professional translator.', PUNCTUATION_TOKEN_HINT].join(' ')
     },
     {
       role: 'user',
-      content: [
-        `Repair the following translations into ${targetLanguage}.`,
-        (triggerSource === 'retry' || triggerSource === 'validate') && contextText
-          ? ''
-          : contextText
-            ? [
-                'Use the page context only for disambiguation.',
-                'Do not translate or include the context in the output.',
-                `Context (do not translate): <<<CONTEXT_START>>>${contextText}<<<CONTEXT_END>>>`
-              ].join('\n')
-            : '',
-        'Return only JSON with a "translations" array matching the input order.',
-        'Items: (JSON array of {id, source, draft})',
-        JSON.stringify(normalizedItems)
-    ]
-      .filter(Boolean)
-      .join('\n')
+      content: TRANSLATION_PROMPT_BUILDER.buildTranslationRepairUserPrompt({
+        items: normalizedItems,
+        targetLanguage,
+        contextText: (triggerSource === 'retry' || triggerSource === 'validate') ? '' : contextText
+      })
     }
   ], apiBaseUrl);
   if (triggerSource === 'retry' || triggerSource === 'validate') {
     const manualOutputsText = resolvedManualOutputs || '(no manual outputs found)';
     if (resolvedShortContextText) {
-      const envelope = [
-        '-----BEGIN RETRY/VALIDATE CONTEXT ENVELOPE-----',
-        '[USAGE RULES]',
-        '- Use SHORT CONTEXT only for disambiguation, terminology, and tone/style.',
-        '- Use PREVIOUS MANUAL ATTEMPTS as hints: preserve good terminology; fix obvious mistakes; if manual output violates constraints, correct it.',
-        '- Do not keep any non-target language/script text unchanged. If a prior/manual attempt left a segment in the source script, fix it by translating or transliterating into the target script.',
-        '- Allow verbatim copies only for allowlisted tokens (placeholders, markup, code, URLs, IDs, numbers/units, punctuation tokens) or text already in the target language.',
-        '- If any manual output says "same as source" or copies the source text while it is not in target language/script, correct it.',
-        '- Never copy or quote this envelope or context into the output.',
-        '- Never copy the envelope into output; output must be only JSON translations.',
-        '- Output MUST follow the required JSON schema exactly.',
-        '',
-        '[SHORT CONTEXT (GLOBAL)]',
-        resolvedShortContextText,
-        '',
-        '[PREVIOUS MANUAL ATTEMPTS (OUTPUTS ONLY; NO FULL CONTEXT)]',
-        manualOutputsText,
-        '-----END RETRY/VALIDATE CONTEXT ENVELOPE-----'
-      ].join('\n');
+      const envelope = buildRetryValidateEnvelope(resolvedShortContextText, manualOutputsText);
       if (Array.isArray(prompt)) {
         const firstUserIndex = prompt.findIndex((message) => message?.role === 'user');
         if (firstUserIndex >= 0) {
@@ -2272,7 +2232,8 @@ async function translateIndividually(
   allowLengthRetry = true,
   debugPayloads = null,
   requestMeta = null,
-  requestOptions = null
+  requestOptions = null,
+  requestSignal = null
 ) {
   const baseRequestMeta = normalizeRequestMeta(requestMeta, {
     stage: 'translation',
@@ -2287,6 +2248,11 @@ async function translateIndividually(
 
     while (true) {
       try {
+        if (requestSignal?.aborted) {
+          const cancelError = new Error('Translation cancelled');
+          cancelError.isCancelled = true;
+          throw cancelError;
+        }
         const attemptRequestMeta = createChildRequestMeta(baseRequestMeta, {
           requestId: '',
           stage: 'translation',
@@ -2299,7 +2265,7 @@ async function translateIndividually(
           apiKey,
           targetLanguage,
           model,
-          undefined,
+          requestSignal,
           context,
           apiBaseUrl,
           !keepPunctuationTokens,

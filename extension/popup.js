@@ -12,11 +12,13 @@ const blockLengthValueLabel = document.getElementById('blockLengthValue');
 const statusLabel = document.getElementById('status');
 const statusProgressBar = document.getElementById('statusProgress');
 const statusProgressFill = document.getElementById('statusProgressFill');
+const connectionStatusLabel = document.getElementById('connectionStatus');
 const cancelButton = document.getElementById('cancel');
 const translateButton = document.getElementById('translate');
 const toggleTranslationButton = document.getElementById('toggleTranslation');
 const openDebugButton = document.getElementById('openDebug');
 const POPUP_PORT_NAME = 'popup';
+const UI_HEARTBEAT_INTERVAL_MS = 18000;
 
 let keySaveTimeout = null;
 let activeTabId = null;
@@ -30,6 +32,8 @@ let pendingFailureTimeoutId = null;
 let popupPort = null;
 let popupReconnectTimer = null;
 let popupReconnectDelay = 500;
+let popupPortConnected = false;
+let popupHeartbeatTimer = null;
 
 const models = buildModelOptions();
 const defaultModelSpec = getDefaultModelSpec(models);
@@ -81,7 +85,7 @@ async function init() {
   activeTabId = tab?.id || null;
 
   const state = await getState();
-  try {
+  ntSafeChromeCall(() =>
     chrome.runtime.sendMessage({
       type: 'SYNC_STATE_CACHE',
       state: {
@@ -99,10 +103,9 @@ async function init() {
         outputRatioByRole: state.outputRatioByRole,
         tpmSafetyBufferTokens: state.tpmSafetyBufferTokens
       }
-    });
-  } catch (error) {
-    // Best-effort sync for Edge; ignore failures.
-  }
+    }),
+    null
+  );
   apiKeyInput.value = state.apiKey || '';
   renderModelChecklist(translationModelListContainer, state.translationModelList, () =>
     handleModelChecklistChange({
@@ -142,6 +145,7 @@ async function init() {
   renderStatus();
   renderTranslationVisibility(state.translationVisibilityByTab?.[activeTabId]);
   await syncTranslationVisibility();
+  renderConnectionStatus();
 
   chrome.storage.onChanged.addListener(handleStorageChange);
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
@@ -164,17 +168,44 @@ function connectPopupPort() {
   try {
     popupPort = chrome.runtime.connect({ name: POPUP_PORT_NAME });
   } catch (error) {
+    popupPortConnected = false;
+    renderConnectionStatus();
     schedulePopupReconnect();
     return;
   }
   popupReconnectDelay = 500;
+  popupPortConnected = true;
+  renderConnectionStatus();
+  startPopupHeartbeat();
   popupPort.onMessage.addListener((message) => {
     handleRuntimeMessage(message, {});
   });
   popupPort.onDisconnect.addListener(() => {
     popupPort = null;
+    popupPortConnected = false;
+    stopPopupHeartbeat();
+    renderConnectionStatus();
     schedulePopupReconnect();
   });
+}
+
+function startPopupHeartbeat() {
+  if (!popupPort || popupHeartbeatTimer) return;
+  // WHY: send occasional port messages to revive MV3 service workers after idle/BFCache without keep-alive loops.
+  popupHeartbeatTimer = setInterval(() => {
+    if (!popupPort) return;
+    try {
+      popupPort.postMessage({ type: 'UI_HEARTBEAT', ts: Date.now() });
+    } catch (error) {
+      // Ignore heartbeat failures; reconnect logic handles drops.
+    }
+  }, UI_HEARTBEAT_INTERVAL_MS);
+}
+
+function stopPopupHeartbeat() {
+  if (!popupHeartbeatTimer) return;
+  clearInterval(popupHeartbeatTimer);
+  popupHeartbeatTimer = null;
 }
 
 function schedulePopupReconnect() {
@@ -668,6 +699,7 @@ async function handleToggleTranslationVisibility() {
 
 function handleStorageChange(changes) {
   if (changes.translationStatusByTab) {
+    if (popupPortConnected) return;
     cancelScheduledFailure();
     const nextStatuses = changes.translationStatusByTab.newValue || {};
     currentTranslationStatus = activeTabId ? nextStatuses[activeTabId] : null;
@@ -675,6 +707,7 @@ function handleStorageChange(changes) {
     renderStatus();
   }
   if (changes.translationVisibilityByTab) {
+    if (popupPortConnected) return;
     cancelScheduledFailure();
     const nextVisibility = changes.translationVisibilityByTab.newValue || {};
     renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
@@ -685,13 +718,36 @@ async function handleRuntimeMessage(message, sender) {
   if (!message?.type) {
     return;
   }
-  if (message.type === 'TRANSLATION_CANCELLED') {
-    if (typeof message.tabId === 'number' && activeTabId && message.tabId !== activeTabId) {
+  if (message.type === 'TRANSLATION_STATUS') {
+    const payload = message.payload || message;
+    const status = payload?.status && typeof payload.status === 'object' ? payload.status : payload;
+    const statusTabId = typeof payload?.tabId === 'number' ? payload.tabId : status?.tabId;
+    if (typeof statusTabId === 'number' && activeTabId && statusTabId !== activeTabId) {
       return;
     }
+    if (!status || typeof status !== 'object') return;
     cancelScheduledFailure();
-    if (typeof message.tabId === 'number') {
-      await handleTranslationCancelled(message.tabId);
+    if (status.stage === 'cancelled' && typeof statusTabId === 'number') {
+      await handleTranslationCancelled(statusTabId);
+      return;
+    }
+    currentTranslationStatus = status;
+    updateCanShowTranslation(currentTranslationStatus);
+    renderStatus();
+    return;
+  }
+  if (message.type === 'STATE_PATCH') {
+    const patch = message.payload || message;
+    const values = patch?.values || null;
+    if (values && typeof values === 'object') {
+      applyStatePatchValues(values);
+    }
+    return;
+  }
+  if (message.type === 'STATE_SNAPSHOT') {
+    const snapshot = message.payload?.state || message.state || null;
+    if (snapshot && typeof snapshot === 'object') {
+      applyStatePatchValues(snapshot);
     }
     return;
   }
@@ -706,11 +762,12 @@ async function handleRuntimeMessage(message, sender) {
   if (message.type !== 'TRANSLATION_VISIBILITY_CHANGED') {
     return;
   }
-  if (activeTabId && typeof message.tabId === 'number' && message.tabId !== activeTabId) {
+  const payload = message.payload || message;
+  if (activeTabId && typeof payload?.tabId === 'number' && payload.tabId !== activeTabId) {
     return;
   }
   cancelScheduledFailure();
-  renderTranslationVisibility(Boolean(message.visible));
+  renderTranslationVisibility(Boolean(payload?.visible));
 }
 
 async function handleTranslationCancelled(tabId) {
@@ -730,6 +787,56 @@ function renderStatus() {
   renderProgressBar();
 }
 
+function renderConnectionStatus() {
+  if (!connectionStatusLabel) return;
+  connectionStatusLabel.textContent = popupPortConnected ? 'connected' : 'fallback mode';
+}
+
+function applyStatePatchValues(values) {
+  if (!values || typeof values !== 'object') return;
+  if (Object.prototype.hasOwnProperty.call(values, 'apiKey')) {
+    apiKeyInput.value = values.apiKey || '';
+  }
+  const modelListUpdates = [
+    ['translationModelList', translationModelListContainer, translationModelCount, 'translationModel'],
+    ['contextModelList', contextModelListContainer, contextModelCount, 'contextModel'],
+    ['proofreadModelList', proofreadModelListContainer, proofreadModelCount, 'proofreadModel']
+  ];
+  modelListUpdates.forEach(([listKey, container, countLabel, modelKey]) => {
+    if (!Object.prototype.hasOwnProperty.call(values, listKey)) return;
+    const listValue = values[listKey];
+    renderModelChecklist(container, listValue, () =>
+      handleModelChecklistChange({
+        container,
+        modelListKey: listKey,
+        modelKey,
+        countLabel,
+        statusMessage: 'Модель сохранена.'
+      })
+    );
+    updateModelSummaryCount(container, countLabel);
+  });
+  if (Object.prototype.hasOwnProperty.call(values, 'contextGenerationEnabled')) {
+    renderContextGeneration(values.contextGenerationEnabled);
+  }
+  if (Object.prototype.hasOwnProperty.call(values, 'proofreadEnabled')) {
+    renderProofreadEnabled(values.proofreadEnabled);
+  }
+  if (Object.prototype.hasOwnProperty.call(values, 'blockLengthLimit')) {
+    renderBlockLengthLimit(values.blockLengthLimit);
+  }
+  if (Object.prototype.hasOwnProperty.call(values, 'translationStatusByTab')) {
+    const nextStatuses = values.translationStatusByTab || {};
+    currentTranslationStatus = activeTabId ? nextStatuses[activeTabId] : null;
+    updateCanShowTranslation(currentTranslationStatus);
+    renderStatus();
+  }
+  if (Object.prototype.hasOwnProperty.call(values, 'translationVisibilityByTab')) {
+    const nextVisibility = values.translationVisibilityByTab || {};
+    renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
+  }
+}
+
 function getBaseStatusMessage() {
   if (temporaryStatusMessage) {
     return temporaryStatusMessage;
@@ -742,23 +849,31 @@ function formatTranslationStatus(status) {
   if (!status) {
     return defaultText;
   }
-
-  const completedBlocks = status.completedBlocks ?? status.completedChunks ?? 0;
-  const totalBlocks = status.totalBlocks ?? status.totalChunks ?? 0;
-  const inProgressBlocks = status.inProgressBlocks ?? status.inProgressChunks ?? 0;
-  const { message } = status;
-  if (!message) {
-    return defaultText;
+  const stageMessages = {
+    idle: defaultText,
+    context: 'Статус: готовим контекст.',
+    translation: 'Статус: переводим страницу.',
+    proofread: 'Статус: проверяем перевод.',
+    apply: 'Статус: применяем перевод.',
+    done: 'Статус: перевод завершён.',
+    cancelled: 'Статус: перевод отменён.',
+    error: 'Статус: ошибка перевода.'
+  };
+  const stage = typeof status.stage === 'string' ? status.stage : 'idle';
+  let message = stageMessages[stage] || defaultText;
+  if (stage === 'error' && status.error?.message) {
+    message = `Статус: ошибка перевода — ${status.error.message}`;
   }
-  if (!totalBlocks) {
+  const { completed, total, inFlight } = getProgressCounts(status);
+  if (!total) {
     return message;
   }
-  return `${message} ${completedBlocks}(+${inProgressBlocks}) из ${totalBlocks}`;
+  return `${message} ${completed}(+${inFlight}) из ${total}`;
 }
 
 function updateCanShowTranslation(status) {
-  const completedBlocks = status?.completedBlocks ?? status?.completedChunks ?? 0;
-  canShowTranslation = completedBlocks > 0;
+  const { completed } = getProgressCounts(status);
+  canShowTranslation = completed > 0;
 }
 
 function renderProgressBar() {
@@ -776,15 +891,21 @@ function getProgressInfo(status) {
   if (!status) {
     return { percent: 0, label: 'Прогресс: 0%' };
   }
-  const completedBlocks = status.completedBlocks ?? status.completedChunks ?? 0;
-  const inProgressBlocks = status.inProgressBlocks ?? status.inProgressChunks ?? 0;
-  const totalBlocks = status.totalBlocks ?? status.totalChunks ?? 0;
-  if (!totalBlocks) {
+  const { completed, total, inFlight } = getProgressCounts(status);
+  if (!total) {
     return { percent: 0, label: 'Прогресс: 0%' };
   }
-  const current = Math.min(totalBlocks, completedBlocks + inProgressBlocks);
-  const percent = Math.max(0, Math.min(100, Math.round((current / totalBlocks) * 100)));
+  const current = Math.min(total, completed + inFlight);
+  const percent = Math.max(0, Math.min(100, Math.round((current / total) * 100)));
   return { percent, label: `Прогресс: ${percent}%` };
+}
+
+function getProgressCounts(status) {
+  const progress = status?.progress && typeof status.progress === 'object' ? status.progress : {};
+  const completed = Number.isFinite(progress.completed) ? progress.completed : 0;
+  const total = Number.isFinite(progress.total) ? progress.total : 0;
+  const inFlight = Number.isFinite(progress.inFlight) ? progress.inFlight : 0;
+  return { completed, total, inFlight };
 }
 
 function setTemporaryStatus(message, durationMs = 2500) {
@@ -889,11 +1010,16 @@ async function sendBlockLengthLimitUpdate(blockLengthLimit) {
   const response = result.response;
   if (response?.updated && typeof response.totalBlocks === 'number') {
     const nextStatus = {
-      completedBlocks: 0,
-      totalBlocks: response.totalBlocks,
-      inProgressBlocks: 0,
-      message: response.message || 'Готово к переводу',
-      timestamp: Date.now()
+      jobId: '',
+      tabId: activeTabId ?? 0,
+      url: connection.tab?.url || '',
+      stage: 'idle',
+      progress: {
+        completed: 0,
+        total: response.totalBlocks,
+        inFlight: 0
+      },
+      lastUpdateTs: Date.now()
     };
     currentTranslationStatus = nextStatus;
     updateCanShowTranslation(currentTranslationStatus);

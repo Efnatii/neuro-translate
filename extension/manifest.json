@@ -3,7 +3,7 @@
   "name": "Neuro Translate",
   "version": "0.1.0",
   "description": "Translate pages on demand using GPT-5-Nano.",
-  "permissions": ["storage", "scripting", "tabs"],
+  "permissions": ["storage", "scripting", "tabs", "notifications"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
@@ -15,7 +15,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content-script.js"],
+      "js": ["core/message-schema.js", "core/rpc.js", "content-script.js"],
       "run_at": "document_idle"
     }
   ]

@@ -1,4 +1,6 @@
 const NT_PING_TYPE = 'NT_PING';
+const MESSAGE_LOG_THROTTLE_MS = 10000;
+const messageLogState = new Map();
 
 function isSupportedTabUrl(url) {
   if (!url) return false;
@@ -102,6 +104,7 @@ function requestContentScriptInjection(tabId) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: 'ENSURE_CONTENT_SCRIPT', tabId }, (response) => {
       if (chrome.runtime.lastError) {
+        logSendMessageFailure('runtime.sendMessage', chrome.runtime.lastError.message);
         resolve({ ok: false, reason: chrome.runtime.lastError.message });
         return;
       }
@@ -148,12 +151,22 @@ function sendMessageToTab(tabId, message, expectResponse = false) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, (response) => {
       if (chrome.runtime.lastError) {
+        logSendMessageFailure('tabs.sendMessage', chrome.runtime.lastError.message);
         resolve({ ok: false, reason: chrome.runtime.lastError.message });
         return;
       }
       resolve({ ok: true, response: expectResponse ? response : undefined });
     });
   });
+}
+
+function logSendMessageFailure(code, reason) {
+  const key = `${code}:${reason || 'unknown'}`;
+  const last = messageLogState.get(key) || 0;
+  const now = Date.now();
+  if (now - last < MESSAGE_LOG_THROTTLE_MS) return;
+  messageLogState.set(key, now);
+  console.warn(`[Messaging] ${code} failed`, { reason });
 }
 
 async function sendMessageToTabSafe(tab, message, options = {}) {

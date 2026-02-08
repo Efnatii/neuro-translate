@@ -3,10 +3,18 @@ const contextEl = document.getElementById('context');
 const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
 const clearDebugButton = document.getElementById('clear-debug');
+const exportDebugButton = document.getElementById('export-debug');
+const copyLatestPromptButton = document.getElementById('copy-latest-prompt');
+const timelineListEl = document.getElementById('timeline-list');
+const timelineFilterJobEl = document.getElementById('timeline-filter-job');
+const timelineFilterTabEl = document.getElementById('timeline-filter-tab');
+const timelineFilterStageEl = document.getElementById('timeline-filter-stage');
+const timelineFilterSearchEl = document.getElementById('timeline-filter-search');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const CONTEXT_CACHE_KEY = 'contextCacheByPage';
 const DEBUG_PORT_NAME = 'debug';
+const UI_HEARTBEAT_INTERVAL_MS = 18000;
 const DEBUG_DB_NAME = 'nt_debug';
 const DEBUG_DB_VERSION = 1;
 const DEBUG_RAW_STORE = 'raw';
@@ -23,8 +31,12 @@ let refreshTimer = null;
 let refreshInFlight = false;
 let autoLoadInFlight = false;
 let debugPort = null;
+let translationProgressStatus = null;
+let latestSummaryData = null;
+let latestSummaryFallbackMessage = '';
 let debugReconnectTimer = null;
 let debugReconnectDelay = 500;
+let debugHeartbeatTimer = null;
 const proofreadUiState = new Map();
 const debugUiState = {
   openKeys: new Set(),
@@ -40,6 +52,7 @@ const rawCache = new Map();
 const rawPending = new Map();
 let latestDebugSnapshot = null;
 let latestDebugUrl = '';
+let latestSanitizedSnapshot = null;
 let debugPatchScheduled = false;
 const debugInstrumentation = {
   enabled: isDebugInstrumentationEnabled(),
@@ -81,6 +94,29 @@ async function init() {
       clearDebugData();
     });
   }
+
+  if (exportDebugButton) {
+    addDebugListener(exportDebugButton, 'click', (event) => {
+      event.preventDefault();
+      exportDebugSnapshot();
+    });
+  }
+
+  if (copyLatestPromptButton) {
+    addDebugListener(copyLatestPromptButton, 'click', (event) => {
+      event.preventDefault();
+      void copyLatestPrompt();
+    });
+  }
+
+  [timelineFilterJobEl, timelineFilterTabEl, timelineFilterStageEl, timelineFilterSearchEl].forEach((input) => {
+    if (!input) return;
+    addDebugListener(input, 'input', () => {
+      if (latestSanitizedSnapshot) {
+        renderTimeline(latestSanitizedSnapshot);
+      }
+    });
+  });
 
   if (entriesEl) {
     addDebugListener(entriesEl, 'click', (event) => {
@@ -326,8 +362,10 @@ function connectDebugPort() {
   }
   debugReconnectDelay = 500;
   debugPort.onMessage.addListener(handleDebugPortMessage);
+  startDebugHeartbeat();
   debugPort.onDisconnect.addListener(() => {
     debugPort = null;
+    stopDebugHeartbeat();
     scheduleDebugReconnect();
   });
   if (sourceUrl) {
@@ -337,6 +375,25 @@ function connectDebugPort() {
       // ignore
     }
   }
+}
+
+function startDebugHeartbeat() {
+  if (!debugPort || debugHeartbeatTimer) return;
+  // WHY: ping the MV3 service worker occasionally so state snapshots recover after idle/BFCache.
+  debugHeartbeatTimer = setInterval(() => {
+    if (!debugPort) return;
+    try {
+      debugPort.postMessage({ type: 'UI_HEARTBEAT', ts: Date.now() });
+    } catch (error) {
+      // Ignore heartbeat failures; reconnect logic handles drops.
+    }
+  }, UI_HEARTBEAT_INTERVAL_MS);
+}
+
+function stopDebugHeartbeat() {
+  if (!debugHeartbeatTimer) return;
+  clearInterval(debugHeartbeatTimer);
+  debugHeartbeatTimer = null;
 }
 
 function scheduleDebugReconnect() {
@@ -350,6 +407,17 @@ function scheduleDebugReconnect() {
 
 function handleDebugPortMessage(message) {
   if (!message || typeof message !== 'object') return;
+  if (message.type === 'TRANSLATION_STATUS') {
+    const payload = message.payload || message;
+    const status = payload?.status && typeof payload.status === 'object' ? payload.status : payload;
+    if (status && typeof status === 'object') {
+      translationProgressStatus = status;
+      if (latestSummaryData) {
+        renderSummary(latestSummaryData, latestSummaryFallbackMessage);
+      }
+    }
+    return;
+  }
   if (message.type === 'DEBUG_UPDATED') {
     if (!sourceUrl || message.sourceUrl !== sourceUrl) return;
     if (debugPort) {
@@ -520,6 +588,7 @@ function renderEmpty(message) {
     contextStatus: 'pending',
     context: ''
   }, message);
+  renderTimeline({ events: [] });
 }
 
 function scheduleDebugPatch(url, data) {
@@ -537,16 +606,52 @@ function scheduleDebugPatch(url, data) {
   });
 }
 
+function sanitizeDebugSnapshot(data) {
+  if (!data || typeof data !== 'object') return data;
+  let cloned = null;
+  try {
+    cloned = JSON.parse(JSON.stringify(data));
+  } catch (error) {
+    cloned = { ...data };
+  }
+  const maskValue = (value) => {
+    if (value == null) return value;
+    if (typeof value === 'string' && value.trim()) {
+      return '***';
+    }
+    return value;
+  };
+  const walk = (value) => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach((entry) => walk(entry));
+      return;
+    }
+    Object.keys(value).forEach((key) => {
+      if (key === 'apiKey') {
+        value[key] = maskValue(value[key]);
+        return;
+      }
+      walk(value[key]);
+    });
+  };
+  walk(cloned);
+  return cloned;
+}
+
 function patchDebug(url, data) {
   // Причина моргания: пересоздание <details> через innerHTML сбрасывало open и затем восстанавливалось.
   // Используем механизм из стабильной части: один раз создаём DOM-скелет и патчим только leaf-контент.
   captureUiState();
-  const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
+  const safeData = sanitizeDebugSnapshot(data);
+  latestSanitizedSnapshot = safeData;
+  const updatedAt = safeData.updatedAt ? new Date(safeData.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
-  renderSummary(data, '');
-  patchContext(data);
+  renderSummary(safeData, '');
+  patchContext(safeData);
+  renderTimeline(safeData);
 
-  const items = Array.isArray(data.items) ? data.items : [];
+  const items = Array.isArray(safeData.items) ? safeData.items : [];
   if (!items.length) {
     entriesEl.innerHTML = '<div class="empty">Нет данных о блоках перевода.</div>';
     debugDomState.entriesByKey.clear();
@@ -628,6 +733,8 @@ async function autoLoadVisibleRawButtons() {
 
 function renderSummary(data, fallbackMessage = '') {
   if (!summaryEl) return;
+  latestSummaryData = data;
+  latestSummaryFallbackMessage = fallbackMessage;
   const items = Array.isArray(data.items) ? data.items : [];
   const total = items.length;
   const overallStatuses = items.map((item) => getOverallEntryStatus(item));
@@ -651,7 +758,7 @@ function renderSummary(data, fallbackMessage = '') {
   });
   const summaryLine = fallbackMessage
     ? `${fallbackMessage}`
-    : `Контекст SHORT: ${STATUS_CONFIG[contextShortStatus]?.label || '—'} • Контекст FULL: ${STATUS_CONFIG[contextFullStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount}`;
+    : `Контекст SHORT: ${STATUS_CONFIG[contextShortStatus]?.label || '—'} • Контекст FULL: ${STATUS_CONFIG[contextFullStatus]?.label || '—'} • Готово блоков: ${completed}/${total} • В работе: ${inProgress} • Ошибки: ${failed} • Запросов к ИИ: ${aiRequestCount} • Ответов ИИ: ${aiResponseCount}${formatTranslationProgress(translationProgressStatus)}`;
   summaryEl.innerHTML = `
     <div class="summary-header">
       <div class="summary-meta">${summaryLine}</div>
@@ -668,6 +775,218 @@ function renderSummary(data, fallbackMessage = '') {
       </div>
     </div>
   `;
+}
+
+function formatTranslationProgress(status) {
+  if (!status || typeof status !== 'object') return '';
+  const progress = status.progress && typeof status.progress === 'object' ? status.progress : {};
+  const completedBlocks = Number.isFinite(progress.completed) ? progress.completed : 0;
+  const totalBlocks = Number.isFinite(progress.total) ? progress.total : 0;
+  const inProgressBlocks = Number.isFinite(progress.inFlight) ? progress.inFlight : 0;
+  const stage = typeof status.stage === 'string' ? status.stage : '';
+  if (!totalBlocks && !completedBlocks && !inProgressBlocks && !stage) return '';
+  const base = totalBlocks
+    ? `Прогресс перевода: ${completedBlocks}(+${inProgressBlocks})/${totalBlocks}`
+    : `Прогресс перевода: ${completedBlocks}(+${inProgressBlocks})`;
+  const stageLabel = stage ? ` • этап: ${stage}` : '';
+  return ` • ${base}${stageLabel}`;
+}
+
+function formatTimelineTimestamp(ts) {
+  if (!Number.isFinite(ts)) return '—';
+  return new Date(ts).toLocaleTimeString('ru-RU');
+}
+
+function formatTimelineDuration(durationMs) {
+  if (!Number.isFinite(durationMs)) return '';
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  return `${(durationMs / 1000).toFixed(2)}s`;
+}
+
+function getTimelineFilters() {
+  return {
+    jobId: timelineFilterJobEl?.value?.trim() || '',
+    tabId: timelineFilterTabEl?.value?.trim() || '',
+    stage: timelineFilterStageEl?.value?.trim() || '',
+    search: timelineFilterSearchEl?.value?.trim().toLowerCase() || ''
+  };
+}
+
+function matchesTimelineFilters(event, filters) {
+  if (!event) return false;
+  if (filters.jobId && String(event.jobId || '').indexOf(filters.jobId) === -1) return false;
+  if (filters.tabId && String(event.tabId || '').indexOf(filters.tabId) === -1) return false;
+  if (filters.stage && String(event.stage || '').toLowerCase() !== filters.stage.toLowerCase()) return false;
+  if (filters.search) {
+    const haystack = [
+      event.type,
+      event.stage,
+      event.summary,
+      event.jobId,
+      event.tabId,
+      event.details ? JSON.stringify(event.details) : ''
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    if (!haystack.includes(filters.search)) return false;
+  }
+  return true;
+}
+
+function renderTimeline(data) {
+  if (!timelineListEl) return;
+  const events = Array.isArray(data?.events) ? data.events : [];
+  if (!events.length) {
+    timelineListEl.innerHTML = '<div class="timeline-empty">Нет событий.</div>';
+    return;
+  }
+  const filters = getTimelineFilters();
+  const filtered = events.filter((event) => matchesTimelineFilters(event, filters));
+  if (!filtered.length) {
+    timelineListEl.innerHTML = '<div class="timeline-empty">Нет событий по выбранным фильтрам.</div>';
+    return;
+  }
+  const sorted = [...filtered].sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
+  const html = sorted
+    .map((event) => {
+      const isViolation = event.type === 'CONTRACT_VIOLATION';
+      const duration = formatTimelineDuration(event.durationMs);
+      const summary = event.summary || event.type || 'event';
+      return `
+        <div class="timeline-event${isViolation ? ' timeline-event--violation' : ''}">
+          <div class="timeline-event__meta">
+            <div>${escapeHtml(formatTimelineTimestamp(event.ts))}</div>
+            <div>${escapeHtml(event.type || '')}</div>
+          </div>
+          <div class="timeline-event__meta">
+            <div>job: ${escapeHtml(event.jobId || '—')}</div>
+            <div>tab: ${escapeHtml(event.tabId ?? '—')}</div>
+          </div>
+          <div class="timeline-event__meta">
+            <div>stage: ${escapeHtml(event.stage || '—')}</div>
+            <div>duration: ${escapeHtml(duration || '—')}</div>
+          </div>
+          <div class="timeline-event__summary${isViolation ? ' timeline-event__summary--violation' : ''}">
+            ${escapeHtml(summary)}
+          </div>
+          <div class="timeline-event__meta">
+            ${event.details ? escapeHtml(JSON.stringify(event.details)) : '—'}
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+  timelineListEl.innerHTML = html;
+}
+
+function collectDebugPayloads(snapshot) {
+  const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+  const payloads = [];
+  items.forEach((item) => {
+    if (Array.isArray(item.translationDebug)) {
+      item.translationDebug.forEach((payload) => payloads.push(payload));
+    }
+    if (Array.isArray(item.proofreadDebug)) {
+      item.proofreadDebug.forEach((payload) => payloads.push(payload));
+    }
+  });
+  return payloads;
+}
+
+function selectLatestPayload(snapshot) {
+  const payloads = collectDebugPayloads(snapshot);
+  if (!payloads.length) return null;
+  return payloads.reduce((latest, current) => {
+    const latestTs = Number(latest?.timestamp) || 0;
+    const currentTs = Number(current?.timestamp) || 0;
+    if (currentTs > latestTs) return current;
+    return latest || current;
+  }, payloads[0]);
+}
+
+function extractPromptFromRequest(requestPayload) {
+  if (!requestPayload) return '';
+  let parsed = requestPayload;
+  if (typeof requestPayload === 'string') {
+    try {
+      parsed = JSON.parse(requestPayload);
+    } catch (error) {
+      return requestPayload;
+    }
+  }
+  if (parsed && typeof parsed === 'object') {
+    if (Array.isArray(parsed.messages)) {
+      return JSON.stringify(parsed.messages, null, 2);
+    }
+    if (parsed.prompt) {
+      return typeof parsed.prompt === 'string' ? parsed.prompt : JSON.stringify(parsed.prompt, null, 2);
+    }
+  }
+  try {
+    return JSON.stringify(parsed, null, 2);
+  } catch (error) {
+    return String(requestPayload);
+  }
+}
+
+async function copyLatestPrompt() {
+  const snapshot = latestSanitizedSnapshot;
+  if (!snapshot) return;
+  const latestPayload = selectLatestPayload(snapshot);
+  if (!latestPayload) return;
+  let requestRaw = latestPayload.request || '';
+  if (latestPayload.rawRefId) {
+    try {
+      const record = await getRawRecord(latestPayload.rawRefId);
+      const rawRequest = record?.value?.request;
+      if (rawRequest) {
+        requestRaw = rawRequest;
+      }
+    } catch (error) {
+      // ignore and fall back
+    }
+  }
+  const promptText = extractPromptFromRequest(requestRaw);
+  if (!promptText) return;
+  try {
+    await navigator.clipboard.writeText(promptText);
+  } catch (error) {
+    const textarea = document.createElement('textarea');
+    textarea.value = promptText;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try {
+      document.execCommand('copy');
+    } catch (copyError) {
+      // ignore
+    } finally {
+      textarea.remove();
+    }
+  }
+}
+
+function exportDebugSnapshot() {
+  const snapshot = latestSanitizedSnapshot;
+  if (!snapshot) return;
+  const payload = {
+    url: sourceUrl,
+    exportedAt: new Date().toISOString(),
+    snapshot,
+    timeline: Array.isArray(snapshot.events) ? snapshot.events : []
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `neuro-translate-debug-${Date.now()}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 }
 
 function setTextIfChanged(element, value) {

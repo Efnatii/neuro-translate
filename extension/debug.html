@@ -599,6 +599,94 @@
       border-color: #fecaca;
       color: #991b1b;
     }
+    .timeline {
+      margin: 16px 0 24px;
+      padding: 16px;
+      border-radius: 16px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+    }
+    .timeline-header {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .timeline-title {
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .timeline-filters {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 8px;
+    }
+    .timeline-filters label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #475569;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .timeline-filters input,
+    .timeline-filters select {
+      width: 100%;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: #0f172a;
+      background: #fff;
+    }
+    .timeline-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .timeline-event {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 10px 12px;
+      display: grid;
+      grid-template-columns: 160px 120px 120px 1fr 90px;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .timeline-event--violation {
+      border-color: #fecaca;
+      background: #fff1f2;
+      color: #991b1b;
+    }
+    .timeline-event__meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      color: #475569;
+    }
+    .timeline-event__summary {
+      font-weight: 600;
+      color: #0f172a;
+    }
+    .timeline-event__summary--violation {
+      color: #b91c1c;
+    }
+    .timeline-empty {
+      font-size: 12px;
+      color: #94a3b8;
+      font-style: italic;
+      padding: 8px;
+    }
+    @media (max-width: 900px) {
+      .timeline-event {
+        grid-template-columns: 1fr;
+        align-items: start;
+      }
+    }
     @media (max-width: 700px) {
       .summary-header {
         flex-direction: column;
@@ -618,12 +706,52 @@
   <h1>Отладка перевода</h1>
   <div class="meta" id="meta"></div>
   <div class="debug-actions">
+    <button class="debug-button" id="export-debug" type="button">
+      Export JSON
+    </button>
+    <button class="debug-button" id="copy-latest-prompt" type="button">
+      Copy latest prompt
+    </button>
     <button class="debug-button debug-button--danger" id="clear-debug" type="button">
       Очистить отладочные данные
     </button>
   </div>
   <div class="summary" id="summary"></div>
   <div class="context" id="context"></div>
+  <section class="timeline" id="timeline">
+    <div class="timeline-header">
+      <div class="timeline-title">Event timeline</div>
+      <div class="timeline-filters">
+        <div>
+          <label for="timeline-filter-job">Job ID</label>
+          <input id="timeline-filter-job" type="text" placeholder="jobId" />
+        </div>
+        <div>
+          <label for="timeline-filter-tab">Tab ID</label>
+          <input id="timeline-filter-tab" type="text" placeholder="tabId" />
+        </div>
+        <div>
+          <label for="timeline-filter-stage">Stage</label>
+          <select id="timeline-filter-stage">
+            <option value="">All stages</option>
+            <option value="context">context</option>
+            <option value="translation">translation</option>
+            <option value="proofread">proofread</option>
+            <option value="proofreading">proofreading</option>
+            <option value="apply">apply</option>
+            <option value="done">done</option>
+            <option value="cancelled">cancelled</option>
+            <option value="error">error</option>
+          </select>
+        </div>
+        <div>
+          <label for="timeline-filter-search">Search</label>
+          <input id="timeline-filter-search" type="text" placeholder="text search" />
+        </div>
+      </div>
+    </div>
+    <div class="timeline-list" id="timeline-list"></div>
+  </section>
   <div id="entries"></div>
   <script src="debug.js"></script>
 </body>

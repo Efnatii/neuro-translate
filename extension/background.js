@@ -1,8 +1,22 @@
+importScripts('core/message-schema.js');
+importScripts('core/migrations.js');
+importScripts('core/notification-center.js');
+importScripts('core/port-hub.js');
+importScripts('core/state-store.js');
+importScripts('core/rpc.js');
+importScripts('core/openai-client.js');
+importScripts('core/llm-service-base.js');
+importScripts('core/user-notifier.js');
+importScripts('core/prompt-tags.js');
+importScripts('core/prompt-builder.js');
 importScripts('ai-common.js');
 importScripts('messaging.js');
 importScripts('translation-service.js');
 importScripts('context-service.js');
 importScripts('proofread-service.js');
+importScripts('services/translation-service.js');
+importScripts('services/context-service.js');
+importScripts('services/proofread-service.js');
 
 const DEFAULT_TPM_LIMITS_BY_MODEL = {
   default: 200000,
@@ -18,6 +32,7 @@ const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
   proofread: 0.5
 };
 const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
+const STATE_SCHEMA_VERSION = 2;
 const DEFAULT_STATE = {
   apiKey: '',
   translationModel: 'gpt-4.1-mini',
@@ -28,10 +43,14 @@ const DEFAULT_STATE = {
   proofreadModelList: ['gpt-4.1-mini:standard'],
   contextGenerationEnabled: false,
   proofreadEnabled: false,
+  notificationsEnabled: false,
   blockLengthLimit: 1200,
   tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
-  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS,
+  stateVersion: STATE_SCHEMA_VERSION,
+  translationStatusByTab: {},
+  translationJobById: {}
 };
 
 let STATE_CACHE = null;
@@ -62,10 +81,12 @@ const STATE_CACHE_KEYS = new Set([
   'proofreadModelList',
   'contextGenerationEnabled',
   'proofreadEnabled',
+  'notificationsEnabled',
   'blockLengthLimit',
   'tpmLimitsByModel',
   'outputRatioByRole',
-  'tpmSafetyBufferTokens'
+  'tpmSafetyBufferTokens',
+  'stateVersion'
 ]);
 
 const CONTENT_READY_BY_TAB = new Map();
@@ -74,6 +95,129 @@ const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const DEBUG_PORTS = new Set();
 const POPUP_PORTS = new Set();
 let debugDbPromise = null;
+let STATE_STORE_READY = false;
+const NT_TRANSLATION_SERVICE = new TranslationService({ client: globalThis.ntOpenAiClient });
+const NT_CONTEXT_SERVICE = new ContextService({ client: globalThis.ntOpenAiClient });
+const NT_PROOFREAD_SERVICE = new ProofreadService({ client: globalThis.ntOpenAiClient });
+const NT_RPC_SERVER = new NtRpcServer({ portHub: globalThis.ntPortHub, notifications: globalThis.ntNotifications });
+const ACTIVE_JOBS = new Map();
+
+function createJobController(jobId, meta = {}) {
+  if (!jobId) return null;
+  const existing = ACTIVE_JOBS.get(jobId);
+  if (existing?.abortController) {
+    try {
+      existing.abortController.abort('replaced');
+    } catch (error) {
+      // ignore
+    }
+  }
+  const abortController = new AbortController();
+  const entry = {
+    tabId: meta.tabId ?? null,
+    startedAt: Date.now(),
+    abortController,
+    stage: meta.stage || ''
+  };
+  ACTIVE_JOBS.set(jobId, entry);
+  return entry;
+}
+
+function releaseJobController(jobId, abortController) {
+  const existing = ACTIVE_JOBS.get(jobId);
+  if (existing?.abortController === abortController) {
+    ACTIVE_JOBS.delete(jobId);
+  }
+}
+
+function isCancelledError(error) {
+  return Boolean(error?.isCancelled || error?.name === 'AbortError');
+}
+
+async function runJobHandler(stage, payload, meta, handler, timeoutMs) {
+  const jobId = payload?.jobId;
+  if (!jobId) {
+    return { success: false, error: 'Missing jobId.', isRuntimeError: true };
+  }
+  const jobEntry = createJobController(jobId, { tabId: meta?.tabId, stage });
+  if (!jobEntry) {
+    return { success: false, error: 'Failed to register job.', isRuntimeError: true };
+  }
+  try {
+    const message = {
+      ...(payload && typeof payload === 'object' ? payload : {}),
+      abortSignal: jobEntry.abortController.signal
+    };
+    return await invokeHandlerAsPromise(handler, mergeRpcMeta(message, meta), timeoutMs);
+  } finally {
+    releaseJobController(jobId, jobEntry.abortController);
+  }
+}
+
+function registerRpcHandlers() {
+  NT_RPC_SERVER.registerHandler(
+    'heartbeat',
+    async () => ({ ok: true, ts: Date.now() }),
+    { timeoutMs: 2000 }
+  );
+  NT_RPC_SERVER.registerHandler(
+    'translate_text',
+    async (payload, meta) => runJobHandler('translation', payload, meta, handleTranslateText, 240000),
+    { timeoutMs: 250000 }
+  );
+  NT_RPC_SERVER.registerHandler(
+    'generate_context',
+    async (payload, meta) => runJobHandler('context', payload, meta, handleGenerateContext, 120000),
+    { timeoutMs: 130000 }
+  );
+  NT_RPC_SERVER.registerHandler(
+    'generate_short_context',
+    async (payload, meta) => runJobHandler('context', payload, meta, handleGenerateShortContext, 120000),
+    { timeoutMs: 130000 }
+  );
+  NT_RPC_SERVER.registerHandler(
+    'proofread_text',
+    async (payload, meta) => runJobHandler('proofread', payload, meta, handleProofreadText, 180000),
+    { timeoutMs: 190000 }
+  );
+  NT_RPC_SERVER.registerHandler(
+    'cancel_job',
+    async (payload) => {
+      const jobId = payload?.jobId;
+      if (!jobId) {
+        return { success: false, error: 'Missing jobId.', isRuntimeError: true };
+      }
+      const entry = ACTIVE_JOBS.get(jobId);
+      if (!entry) {
+        return { success: false, error: 'Job not found.', isRuntimeError: true };
+      }
+      try {
+        entry.abortController.abort('cancelled');
+      } catch (error) {
+        // ignore
+      }
+      ACTIVE_JOBS.delete(jobId);
+      if (globalThis.ntPortHub && globalThis.ntCreateMessage) {
+        const envelope = globalThis.ntCreateMessage(
+          'JOB_CANCELLED',
+          { jobId, tabId: entry.tabId ?? null },
+          { tabId: entry.tabId ?? null }
+        );
+        globalThis.ntPortHub.broadcastUi(envelope);
+        sendRuntimeMessageSafe(envelope);
+      }
+      return { success: true, cancelled: true };
+    },
+    { timeoutMs: 5000 }
+  );
+  NT_RPC_SERVER.registerHandler(
+    'get_tab_id',
+    async (_payload, meta) => ({ ok: true, tabId: meta?.tabId ?? null }),
+    { timeoutMs: 2000 }
+  );
+}
+
+registerRpcHandlers();
 
 function openDebugDb() {
   if (debugDbPromise) return debugDbPromise;
@@ -166,13 +310,19 @@ async function getDebugRaw(id) {
 }
 
 function registerUiPort(port, kind) {
-  const set = kind === UI_PORT_NAMES.debug ? DEBUG_PORTS : POPUP_PORTS;
-  set.add(port);
-  port.onDisconnect.addListener(() => {
-    set.delete(port);
-  });
   port.onMessage.addListener((message) => {
     if (!message || typeof message !== 'object') return;
+    if (message.type === 'UI_HEARTBEAT') {
+      try {
+        const ack = globalThis.ntCreateMessage
+          ? globalThis.ntCreateMessage('UI_HEARTBEAT_ACK', { ts: Date.now() })
+          : { type: 'UI_HEARTBEAT_ACK', ts: Date.now() };
+        port.postMessage(ack);
+      } catch (error) {
+        // Ignore heartbeat post failures to avoid log spam.
+      }
+      return;
+    }
     if (kind !== UI_PORT_NAMES.debug) return;
     if (message.type === 'DEBUG_GET_SNAPSHOT') {
       const sourceUrl = typeof message.sourceUrl === 'string' ? message.sourceUrl : '';
@@ -208,6 +358,14 @@ function registerUiPort(port, kind) {
 }
 
 function broadcastToPorts(ports, message) {
+  if (globalThis.ntPortHub) {
+    if (ports === DEBUG_PORTS) {
+      return globalThis.ntPortHub.broadcast('debug', message);
+    }
+    if (ports === POPUP_PORTS) {
+      return globalThis.ntPortHub.broadcast('popup', message);
+    }
+  }
   if (!ports.size) return false;
   let delivered = false;
   for (const port of ports) {
@@ -283,6 +441,27 @@ function invokeHandlerAsPromise(handler, message, timeoutMs = 240000) {
   });
 }
 
+function mergeRpcMeta(payload, meta) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const requestMeta = payload.requestMeta && typeof payload.requestMeta === 'object' ? payload.requestMeta : {};
+  const mergedMeta = {
+    ...requestMeta
+  };
+  if (meta?.tabId != null && mergedMeta.tabId == null) {
+    mergedMeta.tabId = meta.tabId;
+  }
+  if (meta?.url && !mergedMeta.url) {
+    mergedMeta.url = meta.url;
+  }
+  if (meta?.stage && !mergedMeta.stage) {
+    mergedMeta.stage = meta.stage;
+  }
+  return {
+    ...payload,
+    requestMeta: mergedMeta
+  };
+}
+
 function invokeSettingsAsPromise(handler, message, timeoutMs = 1500) {
   return new Promise((resolve) => {
     let settled = false;
@@ -341,6 +520,10 @@ function storageLocalGet(keysOrDefaults, timeoutMs = 6000) {
   });
 }
 
+function storageLocalGetAll(timeoutMs = 6000) {
+  return storageLocalGet(null, timeoutMs);
+}
+
 function storageLocalSet(items, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     let hasCompleted = false;
@@ -365,6 +548,110 @@ function storageLocalSet(items, timeoutMs = 3000) {
     }
   });
 }
+
+function broadcastStateSnapshot(state) {
+  if (!state) return;
+  const snapshot = { state, ts: Date.now() };
+  const envelope = globalThis.ntCreateMessage
+    ? globalThis.ntCreateMessage('STATE_SNAPSHOT', snapshot)
+    : { type: 'STATE_SNAPSHOT', payload: snapshot };
+  if (globalThis.ntPortHub) {
+    globalThis.ntPortHub.broadcastUi(envelope);
+  }
+  sendRuntimeMessageSafe(envelope);
+}
+
+async function runStateMigrations() {
+  if (typeof migrateState !== 'function') {
+    return { migratedState: null, changed: false, fromVersion: STATE_SCHEMA_VERSION, toVersion: STATE_SCHEMA_VERSION };
+  }
+  let storedState = {};
+  try {
+    storedState = await storageLocalGetAll(8000);
+  } catch (error) {
+    console.warn('Failed to load stored state for migrations.', error);
+    storedState = {};
+  }
+  const result = migrateState(storedState);
+  const migratedState = result?.migratedState && typeof result.migratedState === 'object' ? result.migratedState : {};
+  const changed = Boolean(result?.changed);
+  const fromVersion = Number.isFinite(result?.fromVersion) ? result.fromVersion : STATE_SCHEMA_VERSION;
+  const toVersion = Number.isFinite(result?.toVersion) ? result.toVersion : STATE_SCHEMA_VERSION;
+  if (changed) {
+    try {
+      await storageLocalSet(migratedState, 8000);
+      if (fromVersion < 2 && OBSOLETE_STORAGE_KEYS.length) {
+        chrome.storage.local.remove(OBSOLETE_STORAGE_KEYS, () => {
+          if (chrome.runtime.lastError) {
+            console.warn('Failed to remove obsolete storage keys.', chrome.runtime.lastError);
+          }
+        });
+      }
+    } catch (error) {
+      console.warn('Failed to persist migrated state.', error);
+    }
+  }
+  return { migratedState, changed, fromVersion, toVersion };
+}
+
+async function ensureStateStoreLoaded() {
+  if (!globalThis.ntStateStore) return null;
+  if (STATE_STORE_READY) return globalThis.ntStateStore.get();
+  const migrationResult = await runStateMigrations();
+  const loaded = await globalThis.ntStateStore.load({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+  STATE_STORE_READY = true;
+  globalThis.ntStateStore.subscribe(({ patch }) => {
+    if (patch?.values) {
+      applyStatePatch(patch.values);
+    }
+  });
+  applyStatePatch(loaded);
+  if (migrationResult?.changed) {
+    broadcastStateSnapshot(globalThis.ntStateStore.get());
+  }
+  return loaded;
+}
+
+function broadcastStatePatch(patch, meta) {
+  if (!patch) return;
+  if (globalThis.ntPortHub && globalThis.ntCreateMessage) {
+    const envelope = globalThis.ntCreateMessage('STATE_PATCH', patch, meta);
+    globalThis.ntPortHub.broadcastUi(envelope);
+    sendRuntimeMessageSafe(envelope);
+  }
+}
+
+async function updateState(partial, meta) {
+  if (globalThis.ntStateStore) {
+    await ensureStateStoreLoaded();
+    const patch = await globalThis.ntStateStore.set(partial, meta);
+    broadcastStatePatch(patch, meta);
+    return patch;
+  }
+  await storageLocalSet(partial);
+  applyStatePatch(partial);
+  const patch = {
+    changedKeys: Object.keys(partial || {}),
+    values: partial || {},
+    ts: Date.now()
+  };
+  broadcastStatePatch(patch, meta);
+  return patch;
+}
+
+function areNotificationsEnabled() {
+  if (globalThis.ntStateStore) {
+    const state = globalThis.ntStateStore.get();
+    return Boolean(state?.notificationsEnabled);
+  }
+  return Boolean(STATE_CACHE?.notificationsEnabled || DEFAULT_STATE.notificationsEnabled);
+}
+
+const STATE_STORE_READY_PROMISE = ensureStateStoreLoaded().catch((error) => {
+  console.warn('Failed to load state store on startup.', error);
+  return null;
+});
+globalThis.ntStateStoreReadyPromise = STATE_STORE_READY_PROMISE;
 
 function applyStatePatch(patch = {}) {
   const next = STATE_CACHE && typeof STATE_CACHE === 'object' ? { ...STATE_CACHE } : { ...DEFAULT_STATE };
@@ -393,13 +680,18 @@ function applyStatePatch(patch = {}) {
       }
       continue;
     }
-    if (['contextGenerationEnabled', 'proofreadEnabled'].includes(key)) {
+    if (['contextGenerationEnabled', 'proofreadEnabled', 'notificationsEnabled'].includes(key)) {
       next[key] = Boolean(value);
       continue;
     }
     if (['blockLengthLimit', 'tpmSafetyBufferTokens'].includes(key)) {
       const numValue = Number(value);
       next[key] = Number.isFinite(numValue) ? numValue : DEFAULT_STATE[key];
+      continue;
+    }
+    if (key === 'stateVersion') {
+      const numValue = Number(value);
+      next[key] = Number.isFinite(numValue) ? numValue : DEFAULT_STATE.stateVersion;
       continue;
     }
     if (['tpmLimitsByModel', 'outputRatioByRole'].includes(key)) {
@@ -665,7 +957,9 @@ async function getState() {
   try {
     let stored;
     try {
-      stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+      stored = globalThis.ntStateStore
+        ? await ensureStateStoreLoaded()
+        : await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
     } catch (error) {
       if (error?.message === 'storageLocalGet timeout') {
         console.warn('storageLocalGet timed out, retrying with extended timeout.', error);
@@ -719,7 +1013,7 @@ async function getState() {
       !areModelListsEqual(merged.contextModelList, previousModels.contextModelList) ||
       !areModelListsEqual(merged.proofreadModelList, previousModels.proofreadModelList)
     ) {
-      await storageLocalSet({
+      await updateState({
         translationModel: merged.translationModel,
         contextModel: merged.contextModel,
         proofreadModel: merged.proofreadModel,
@@ -742,8 +1036,7 @@ async function getState() {
 async function saveState(partial) {
   const current = await getState();
   const next = { ...current, ...partial };
-  await storageLocalSet(next);
-  applyStatePatch(next);
+  await updateState(next);
   return next;
 }
 
@@ -757,7 +1050,7 @@ async function ensureDefaultKeysOnFreshInstall() {
     }
   }
   if (Object.keys(patch).length > 0) {
-    await storageLocalSet(patch);
+    await updateState(patch);
   }
   applyStatePatch({ ...DEFAULT_STATE, ...safeStored, ...patch });
 }
@@ -799,6 +1092,7 @@ chrome.runtime.onStartup.addListener(async () => {
   } catch (error) {
     console.warn('Failed to remove obsolete storage keys on startup.', error);
   }
+  await ensureStateStoreLoaded();
   await warmUpContentScripts('startup');
 });
 
@@ -814,72 +1108,15 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 chrome.runtime.onConnect.addListener((port) => {
   if (!port) return;
+  if (globalThis.ntPortHub) {
+    globalThis.ntPortHub.registerPort(port);
+  }
   if (port.name === UI_PORT_NAMES.debug || port.name === UI_PORT_NAMES.popup) {
     registerUiPort(port, port.name);
     return;
   }
   if (port.name !== NT_RPC_PORT_NAME) return;
-  const tabId = port.sender?.tab?.id ?? null;
-  port.onMessage.addListener((msg) => {
-    if (!msg || typeof msg !== 'object') return;
-    const rpcId = msg.rpcId;
-    if (typeof rpcId !== 'string') return;
-    const type = msg.type;
-    const postResponse = (response) => {
-      try {
-        port.postMessage({ rpcId, response });
-      } catch (error) {
-        console.warn('Failed to post RPC response.', { error, rpcId, type, tabId });
-      }
-    };
-
-    let responsePromise;
-    switch (type) {
-      case 'RPC_HEARTBEAT':
-        responsePromise = Promise.resolve({ ok: true, ts: Date.now() });
-        break;
-      case 'TRANSLATE_TEXT':
-        responsePromise = invokeHandlerAsPromise(handleTranslateText, msg, 240000);
-        break;
-      case 'GENERATE_CONTEXT':
-        responsePromise = invokeHandlerAsPromise(handleGenerateContext, msg, 120000);
-        break;
-      case 'GENERATE_SHORT_CONTEXT':
-        responsePromise = invokeHandlerAsPromise(handleGenerateShortContext, msg, 120000);
-        break;
-      case 'PROOFREAD_TEXT':
-        responsePromise = invokeHandlerAsPromise(handleProofreadText, msg, 180000);
-        break;
-      case 'GET_SETTINGS':
-        responsePromise = invokeSettingsAsPromise(handleGetSettings, msg, 1500).then((settings) => ({
-          ok: true,
-          settings
-        }));
-        break;
-      case 'GET_TAB_ID':
-        responsePromise = Promise.resolve({ ok: true, tabId });
-        break;
-      default:
-        responsePromise = Promise.resolve({
-          success: false,
-          error: `Unknown RPC type: ${type}`,
-          isRuntimeError: true
-        });
-        break;
-    }
-
-    Promise.resolve(responsePromise)
-      .then((response) => {
-        postResponse(response);
-      })
-      .catch((error) => {
-        postResponse({
-          success: false,
-          error: error?.message || String(error),
-          isRuntimeError: true
-        });
-      });
-  });
+  NT_RPC_SERVER.registerPort(port);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -924,6 +1161,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const delivered = broadcastToPorts(DEBUG_PORTS, { type: 'DEBUG_UPDATED', sourceUrl });
     sendResponse({ ok: true, delivered });
     return true;
+  }
+
+  if (message?.type === 'JOB_STARTED' || message?.type === 'JOB_DONE' ||
+      message?.type === 'JOB_ERROR' || message?.type === 'JOB_CANCELLED') {
+    const tabId = sender?.tab?.id ?? message?.tabId ?? null;
+    const payload = {
+      type: message.type,
+      jobId: message.jobId || '',
+      tabId,
+      error: message.error || ''
+    };
+    if (globalThis.ntPortHub && globalThis.ntCreateMessage) {
+      const envelope = globalThis.ntCreateMessage(message.type, payload, { tabId });
+      globalThis.ntPortHub.broadcastUi(envelope);
+      sendRuntimeMessageSafe(envelope);
+    } else {
+      broadcastToPorts(POPUP_PORTS, payload);
+      sendRuntimeMessageSafe(payload);
+    }
   }
 
   if (message?.type === 'GET_SETTINGS') {
@@ -1053,6 +1309,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     });
     return true;
+  }
+
+  if (message?.type === 'TRANSLATION_STATUS') {
+    handleTranslationStatus(message, sender);
   }
 
   if (message?.type === 'TRANSLATION_PROGRESS') {
@@ -1312,6 +1572,9 @@ async function executeModelFallback(stage, state, message, handler) {
       try {
         return await attemptWithTier('flex', attemptFallbackReason);
       } catch (error) {
+        if (isCancelledError(error)) {
+          throw error;
+        }
         lastError = error;
         const reason = classifyFallbackReason(error);
         recordCooldownIfNeeded(formatModelSpec(modelId, 'flex'), reason, error);
@@ -1340,6 +1603,9 @@ async function executeModelFallback(stage, state, message, handler) {
       try {
         return await attemptWithTier('standard', attemptFallbackReason);
       } catch (error) {
+        if (isCancelledError(error)) {
+          throw error;
+        }
         lastError = error;
         const reason = classifyFallbackReason(error);
         recordCooldownIfNeeded(formatModelSpec(modelId, 'standard'), reason, error);
@@ -1353,6 +1619,10 @@ async function executeModelFallback(stage, state, message, handler) {
 
 async function handleTranslateText(message, sendResponse) {
   try {
+    if (!message?.jobId) {
+      sendResponse({ success: false, error: 'Missing jobId.', isRuntimeError: true });
+      return;
+    }
     const state = await getState();
     const primaryModel = getPrimaryModelId(state.translationModelList, state.translationModel);
     const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
@@ -1361,19 +1631,20 @@ async function handleTranslateText(message, sendResponse) {
       return;
     }
 
+    const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('translate', state, message, async ({ modelId, requestOptions, requestMeta }) => {
-      const { translations, rawTranslation, debug } = await translateTexts(
-        message.texts,
+      return NT_TRANSLATION_SERVICE.translateSegments({
+        segments: message.texts,
+        targetLanguage: message.targetLanguage,
+        contextPayload: message.context,
+        modelSpec: modelId,
         apiKey,
-        message.targetLanguage,
-        modelId,
-        message.context,
         apiBaseUrl,
-        message.keepPunctuationTokens,
+        keepPunctuationTokens: message.keepPunctuationTokens,
         requestMeta,
-        requestOptions
-      );
-      return { translations, rawTranslation, debug };
+        requestOptions,
+        requestSignal
+      });
     });
     sendResponse({ success: true, translations: result.translations, rawTranslation: result.rawTranslation, debug: result.debug });
   } catch (error) {
@@ -1381,13 +1652,18 @@ async function handleTranslateText(message, sendResponse) {
     sendResponse({
       success: false,
       error: error?.message || 'Unknown error',
-      contextOverflow: Boolean(error?.isContextOverflow)
+      contextOverflow: Boolean(error?.isContextOverflow),
+      isCancelled: isCancelledError(error)
     });
   }
 }
 
 async function handleGenerateContext(message, sendResponse) {
   try {
+    if (!message?.jobId) {
+      sendResponse({ success: false, error: 'Missing jobId.', isRuntimeError: true });
+      return;
+    }
     const state = await getState();
     const primaryModel = getPrimaryModelId(state.contextModelList, state.contextModel);
     const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
@@ -1411,27 +1687,36 @@ async function handleGenerateContext(message, sendResponse) {
       ...message,
       requestMeta: contextRequestMeta
     };
+    const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
-      const { context, debug } = await generateTranslationContext(
-        message.text,
+      return NT_CONTEXT_SERVICE.buildContext({
+        text: message.text,
+        targetLanguage: message.targetLanguage,
+        modelSpec: modelId,
         apiKey,
-        message.targetLanguage,
-        modelId,
         apiBaseUrl,
         requestMeta,
-        requestOptions
-      );
-      return { context, debug };
+        requestOptions,
+        requestSignal
+      });
     });
     sendResponse({ success: true, context: result.context, debug: result.debug });
   } catch (error) {
     console.error('Context generation failed', error);
-    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+    sendResponse({
+      success: false,
+      error: error?.message || 'Unknown error',
+      isCancelled: isCancelledError(error)
+    });
   }
 }
 
 async function handleGenerateShortContext(message, sendResponse) {
   try {
+    if (!message?.jobId) {
+      sendResponse({ success: false, error: 'Missing jobId.', isRuntimeError: true });
+      return;
+    }
     const state = await getState();
     const primaryModel = getPrimaryModelId(state.contextModelList, state.contextModel);
     const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
@@ -1455,27 +1740,36 @@ async function handleGenerateShortContext(message, sendResponse) {
       ...message,
       requestMeta: contextRequestMeta
     };
+    const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
-      const { context, debug } = await generateShortTranslationContext(
-        message.text,
+      return NT_CONTEXT_SERVICE.buildShortContext({
+        text: message.text,
+        targetLanguage: message.targetLanguage,
+        modelSpec: modelId,
         apiKey,
-        message.targetLanguage,
-        modelId,
         apiBaseUrl,
         requestMeta,
-        requestOptions
-      );
-      return { context, debug };
+        requestOptions,
+        requestSignal
+      });
     });
     sendResponse({ success: true, context: result.context, debug: result.debug });
   } catch (error) {
     console.error('Short context generation failed', error);
-    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+    sendResponse({
+      success: false,
+      error: error?.message || 'Unknown error',
+      isCancelled: isCancelledError(error)
+    });
   }
 }
 
 async function handleProofreadText(message, sendResponse) {
   try {
+    if (!message?.jobId) {
+      sendResponse({ success: false, error: 'Missing jobId.', isRuntimeError: true });
+      return;
+    }
     const state = await getState();
     const primaryModel = getPrimaryModelId(state.proofreadModelList, state.proofreadModel);
     const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
@@ -1484,21 +1778,22 @@ async function handleProofreadText(message, sendResponse) {
       return;
     }
 
+    const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('proofread', state, message, async ({ modelId, requestOptions, requestMeta }) => {
-      const { translations, rawProofread, debug } = await proofreadTranslation(
-        message.segments,
-        message.sourceBlock,
-        message.translatedBlock,
-        message.context,
-        message.proofreadMode,
-        message.language,
+      return NT_PROOFREAD_SERVICE.proofreadSegments({
+        segments: message.segments,
+        sourceBlock: message.sourceBlock,
+        translatedBlock: message.translatedBlock,
+        contextPayload: message.context,
+        mode: message.proofreadMode,
+        language: message.language,
+        modelSpec: modelId,
         apiKey,
-        modelId,
         apiBaseUrl,
         requestMeta,
-        requestOptions
-      );
-      return { translations, rawProofread, debug };
+        requestOptions,
+        requestSignal
+      });
     });
     sendResponse({
       success: true,
@@ -1511,38 +1806,153 @@ async function handleProofreadText(message, sendResponse) {
     sendResponse({
       success: false,
       error: error?.message || 'Unknown error',
-      contextOverflow: Boolean(error?.isContextOverflow)
+      contextOverflow: Boolean(error?.isContextOverflow),
+      isCancelled: isCancelledError(error)
     });
   }
+}
+
+function coerceProgressValue(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function normalizeTranslationStatus(rawStatus, fallback = {}) {
+  const status = rawStatus && typeof rawStatus === 'object' ? rawStatus : {};
+  const progressSource =
+    status.progress && typeof status.progress === 'object'
+      ? status.progress
+      : status;
+  const progress = {
+    completed: coerceProgressValue(
+      progressSource.completed ?? progressSource.completedBlocks ?? progressSource.completedChunks,
+      0
+    ),
+    total: coerceProgressValue(progressSource.total ?? progressSource.totalBlocks ?? progressSource.totalChunks, 0),
+    inFlight: coerceProgressValue(
+      progressSource.inFlight ?? progressSource.inProgressBlocks ?? progressSource.inProgressChunks,
+      0
+    )
+  };
+  const tabId =
+    typeof status.tabId === 'number'
+      ? status.tabId
+      : typeof fallback.tabId === 'number'
+        ? fallback.tabId
+        : null;
+  return {
+    jobId: String(status.jobId ?? fallback.jobId ?? ''),
+    tabId,
+    url: String(status.url ?? fallback.url ?? ''),
+    stage: String(status.stage ?? fallback.stage ?? 'translation'),
+    progress,
+    lastUpdateTs: coerceProgressValue(status.lastUpdateTs ?? Date.now(), Date.now()),
+    ...(status.error ? { error: status.error } : {})
+  };
+}
+
+function getTranslationStageLabel(stage) {
+  const stageLabels = {
+    idle: 'Перевод не выполняется',
+    context: 'Готовим контекст',
+    translation: 'Переводим',
+    proofread: 'Проверяем перевод',
+    apply: 'Применяем перевод',
+    done: 'Перевод завершён',
+    cancelled: 'Перевод отменён',
+    error: 'Ошибка перевода'
+  };
+  return stageLabels[stage] || '';
+}
+
+async function persistTranslationStatus(status, { tabId, source } = {}) {
+  const resolvedTabId = typeof tabId === 'number' ? tabId : status?.tabId;
+  if (!resolvedTabId) return;
+  const currentState = globalThis.ntStateStore
+    ? await ensureStateStoreLoaded()
+    : await storageLocalGet({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = currentState || {};
+  translationStatusByTab[resolvedTabId] = status;
+  await updateState({ translationStatusByTab }, { tabId: resolvedTabId, source });
+  if (globalThis.ntPortHub && globalThis.ntCreateMessage) {
+    const envelope = globalThis.ntCreateMessage(
+      'TRANSLATION_STATUS',
+      { tabId: resolvedTabId, status },
+      { tabId: resolvedTabId }
+    );
+    globalThis.ntPortHub.broadcastUi(envelope);
+    sendRuntimeMessageSafe(envelope);
+  }
+  if (areNotificationsEnabled() && globalThis.ntUserNotifier) {
+    const totalBlocks = status?.progress?.total || 0;
+    const completedBlocks = status?.progress?.completed || 0;
+    const inFlightBlocks = status?.progress?.inFlight || 0;
+    const current = Math.min(totalBlocks, completedBlocks + inFlightBlocks);
+    const percent = totalBlocks ? Math.round((current / totalBlocks) * 100) : 0;
+    const message = getTranslationStageLabel(status?.stage);
+    globalThis.ntUserNotifier.notifyProgress(resolvedTabId, percent, message);
+    if (totalBlocks && completedBlocks >= totalBlocks && inFlightBlocks === 0) {
+      globalThis.ntUserNotifier.notifyDone(resolvedTabId);
+    }
+  }
+}
+
+async function handleTranslationStatus(message, sender) {
+  const payload = message?.payload || message?.status || message;
+  const statusPayload = payload?.status && typeof payload.status === 'object' ? payload.status : payload;
+  const tabId =
+    typeof payload?.tabId === 'number'
+      ? payload.tabId
+      : typeof statusPayload?.tabId === 'number'
+        ? statusPayload.tabId
+        : sender?.tab?.id;
+  if (!tabId) return;
+  const normalized = normalizeTranslationStatus(statusPayload, {
+    tabId,
+    url: sender?.tab?.url || statusPayload?.url || '',
+    stage: statusPayload?.stage || payload?.stage || 'translation'
+  });
+  await persistTranslationStatus(normalized, { tabId, source: 'translation-status' });
 }
 
 async function handleTranslationProgress(message, sender) {
   const tabId = sender?.tab?.id;
   if (!tabId) return;
-
-  const status = {
-    completedBlocks: message.completedBlocks || 0,
-    totalBlocks: message.totalBlocks || 0,
-    inProgressBlocks: message.inProgressBlocks || 0,
-    message: message.message || '',
-    timestamp: Date.now()
-  };
-  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
-  translationStatusByTab[tabId] = status;
-  await storageLocalSet({ translationStatusByTab });
+  const normalized = normalizeTranslationStatus(
+    {
+      jobId: message?.jobId || '',
+      tabId,
+      url: sender?.tab?.url || '',
+      stage: message?.stage || 'translation',
+      progress: {
+        completed: message?.completedBlocks || 0,
+        total: message?.totalBlocks || 0,
+        inFlight: message?.inProgressBlocks || 0
+      },
+      lastUpdateTs: Date.now()
+    },
+    { tabId, stage: message?.stage || 'translation', url: sender?.tab?.url || '' }
+  );
+  await persistTranslationStatus(normalized, { tabId, source: 'translation-progress' });
 }
 
 async function handleGetTranslationStatus(sendResponse, tabId) {
-  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
+  const currentState = globalThis.ntStateStore
+    ? await ensureStateStoreLoaded()
+    : await storageLocalGet({ translationStatusByTab: {} });
+  const { translationStatusByTab = {} } = currentState || {};
   sendResponse(translationStatusByTab[tabId] || null);
 }
 
 async function handleTranslationVisibility(message, sender) {
   const tabId = sender?.tab?.id;
   if (!tabId) return;
-  const { translationVisibilityByTab = {} } = await storageLocalGet({ translationVisibilityByTab: {} });
+  const currentState = globalThis.ntStateStore
+    ? await ensureStateStoreLoaded()
+    : await storageLocalGet({ translationVisibilityByTab: {} });
+  const { translationVisibilityByTab = {} } = currentState || {};
   translationVisibilityByTab[tabId] = Boolean(message.visible);
-  await storageLocalSet({ translationVisibilityByTab });
+  await updateState({ translationVisibilityByTab }, { tabId, source: 'translation-visibility' });
   const payload = {
     type: 'TRANSLATION_VISIBILITY_CHANGED',
     tabId,
@@ -1555,14 +1965,38 @@ async function handleTranslationVisibility(message, sender) {
 async function handleTranslationCancelled(message, sender) {
   const tabId = message?.tabId ?? sender?.tab?.id;
   if (!tabId) return;
-  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await storageLocalGet({
-    translationStatusByTab: {},
-    translationVisibilityByTab: {}
-  });
+  const jobId = message?.jobId || '';
+  const currentState = globalThis.ntStateStore
+    ? await ensureStateStoreLoaded()
+    : await storageLocalGet({ translationStatusByTab: {}, translationVisibilityByTab: {} });
+  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = currentState || {};
+  const previousStatus = translationStatusByTab[tabId] || null;
   delete translationStatusByTab[tabId];
   translationVisibilityByTab[tabId] = false;
-  await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
-  const payload = { type: 'TRANSLATION_CANCELLED', tabId };
+  await updateState({ translationStatusByTab, translationVisibilityByTab }, { tabId, source: 'translation-cancelled' });
+  const cancelledStatus = normalizeTranslationStatus(
+    {
+      ...(previousStatus || {}),
+      jobId: previousStatus?.jobId || jobId,
+      tabId,
+      stage: 'cancelled',
+      lastUpdateTs: Date.now()
+    },
+    { tabId, jobId, stage: 'cancelled', url: previousStatus?.url || '' }
+  );
+  if (globalThis.ntPortHub && globalThis.ntCreateMessage) {
+    const envelope = globalThis.ntCreateMessage(
+      'TRANSLATION_STATUS',
+      { tabId, status: cancelledStatus },
+      { tabId }
+    );
+    globalThis.ntPortHub.broadcastUi(envelope);
+    sendRuntimeMessageSafe(envelope);
+  }
+  const payload = { type: 'TRANSLATION_CANCELLED', tabId, jobId };
   broadcastToPorts(POPUP_PORTS, payload);
   sendRuntimeMessageSafe(payload);
+  if (areNotificationsEnabled() && globalThis.ntUserNotifier) {
+    globalThis.ntUserNotifier.notifyError(tabId, 'Перевод отменён');
+  }
 }

@@ -1,6 +1,16 @@
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const PUNCTUATION_TOKEN_HINT =
   'Tokens like ⟦PUNC_DQUOTE⟧ replace double quotes; keep them unchanged, in place, and with exact casing.';
+
+function ntSafeChromeCall(fn, fallback = undefined) {
+  try {
+    return typeof fn === 'function' ? fn() : fallback;
+  } catch (error) {
+    return fallback;
+  }
+}
+
+globalThis.ntSafeChromeCall = ntSafeChromeCall;
 function createModelRegistry() {
   const entries = [];
   const baseModelIds = [];
