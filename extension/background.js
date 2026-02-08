@@ -1,3 +1,4 @@
+importScripts('settings.js');
 importScripts('ai-common.js');
 importScripts('guardrails.js');
 importScripts('resilience-policy.js');
@@ -13,21 +14,17 @@ importScripts('translation-service.js');
 importScripts('context-service.js');
 importScripts('proofread-service.js');
 
-const DEFAULT_TPM_LIMITS_BY_MODEL = {
-  default: 200000,
-  'gpt-4.1-mini': 200000,
-  'gpt-4.1': 300000,
-  'gpt-4o-mini': 200000,
-  'gpt-4o': 300000,
-  'o4-mini': 200000
-};
-const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
+const NT_SETTINGS = globalThis.NT_SETTINGS || {};
+const DEFAULT_TPM_LIMITS_BY_MODEL = NT_SETTINGS.DEFAULT_TPM_LIMITS_BY_MODEL || { default: 200000 };
+const DEFAULT_OUTPUT_RATIO_BY_ROLE = NT_SETTINGS.DEFAULT_OUTPUT_RATIO_BY_ROLE || {
   translation: 0.6,
   context: 0.4,
   proofread: 0.5
 };
-const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
-const DEFAULT_STATE = {
+const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = Number.isFinite(NT_SETTINGS.DEFAULT_TPM_SAFETY_BUFFER_TOKENS)
+  ? NT_SETTINGS.DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+  : 100;
+const DEFAULT_STATE = NT_SETTINGS.DEFAULT_STATE || {
   apiKey: '',
   openAiOrganization: '',
   openAiProject: '',
@@ -47,6 +44,22 @@ const DEFAULT_STATE = {
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
   tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
+const STATE_CACHE_KEYS = NT_SETTINGS.STATE_CACHE_KEYS || new Set(Object.keys(DEFAULT_STATE));
+const sanitizeSettings =
+  NT_SETTINGS.sanitizeSettings ||
+  ((raw, defaults = {}) => ({ ...(defaults || {}), ...(raw && typeof raw === 'object' ? raw : {}) }));
+const pickStateForCache =
+  NT_SETTINGS.pickStateForCache ||
+  ((state) => {
+    const source = state && typeof state === 'object' ? state : {};
+    const output = {};
+    for (const key of STATE_CACHE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) {
+        output[key] = source[key];
+      }
+    }
+    return output;
+  });
 
 let STATE_CACHE = null;
 let STATE_CACHE_READY = false;
@@ -60,32 +73,16 @@ const DEBUG_DB_VERSION = 1;
 const DEBUG_RAW_STORE = 'raw';
 const DEBUG_RAW_MAX_RECORDS = 1500;
 const DEBUG_RAW_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-const STATE_CACHE_KEYS = new Set([
-  'apiKey',
-  'openAiOrganization',
-  'openAiProject',
-  'translationModel',
-  'contextModel',
-  'proofreadModel',
-  'translationModelList',
-  'contextModelList',
-  'proofreadModelList',
-  'contextGenerationEnabled',
-  'proofreadEnabled',
-  'batchTurboMode',
-  'singleBlockConcurrency',
-  'assumeOpenAICompatibleApi',
-  'blockLengthLimit',
-  'tpmLimitsByModel',
-  'outputRatioByRole',
-  'tpmSafetyBufferTokens'
-]);
 
 const CONTENT_READY_BY_TAB = new Map();
 const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const DEBUG_PORTS = new Set();
 const POPUP_PORTS = new Set();
+const ntProgressByTab = {};
+const ntPreflightByTab = {};
+const ntProgressStateByTab = {};
+const lastProgressPublishedAt = new Map();
 let debugDbPromise = null;
 let schedulerTickTimer = null;
 const SCHEDULER_TICK_INTERVAL_MS = 4000;
@@ -93,9 +90,75 @@ let batchPollTimer = null;
 const BATCH_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const BATCH_PREWARM_STORAGE_KEY = 'batchPrewarmJobs';
 
+async function migrateStoredStateIfNeeded() {
+  try {
+    const raw = await storageLocalGet({
+      apiKey: null,
+      openAiOrganization: null,
+      openAiProject: null,
+      translationModel: null,
+      contextModel: null,
+      proofreadModel: null,
+      translationModelList: null,
+      contextModelList: null,
+      proofreadModelList: null,
+      contextGenerationEnabled: null,
+      proofreadEnabled: null,
+      batchTurboMode: null,
+      singleBlockConcurrency: null,
+      assumeOpenAICompatibleApi: null,
+      blockLengthLimit: null,
+      chunkLengthLimit: null,
+      model: null,
+      tpmLimitsByModel: null,
+      outputRatioByRole: null,
+      tpmSafetyBufferTokens: null
+    });
+    const legacyModel = raw?.model;
+    const legacyChunkLimit = raw?.chunkLengthLimit;
+    const translationModel = raw?.translationModel || legacyModel || '';
+    const contextModel = raw?.contextModel || translationModel || legacyModel || '';
+    const proofreadModel = raw?.proofreadModel || translationModel || legacyModel || '';
+    const blockLengthLimit = raw?.blockLengthLimit ?? legacyChunkLimit ?? null;
+
+    const normalizeList = (value) => {
+      if (Array.isArray(value)) return value;
+      if (typeof value === 'string' && value.trim()) return [value.trim()];
+      return [];
+    };
+
+    const migrated = {
+      ...raw,
+      translationModel,
+      contextModel,
+      proofreadModel,
+      blockLengthLimit,
+      translationModelList: normalizeList(raw?.translationModelList),
+      contextModelList: normalizeList(raw?.contextModelList),
+      proofreadModelList: normalizeList(raw?.proofreadModelList)
+    };
+    const normalized = sanitizeSettings(migrated, DEFAULT_STATE);
+    const canonical = pickStateForCache(normalized);
+    const legacyPresent = legacyModel != null || legacyChunkLimit != null;
+    const changed =
+      legacyPresent ||
+      Object.keys(canonical).some((key) => {
+        if (!Object.prototype.hasOwnProperty.call(raw, key)) return true;
+        return raw[key] !== canonical[key];
+      });
+    if (changed) {
+      await storageLocalSet(canonical);
+    }
+  } catch (error) {
+    console.warn('Failed to migrate stored state.', error);
+  }
+}
+
 function getTaskScheduler() {
   return globalThis.ntTaskScheduler || null;
 }
+
+void migrateStoredStateIfNeeded();
 
 function startSchedulerTick() {
   if (schedulerTickTimer) return;
@@ -304,6 +367,18 @@ function invokeHandlerAsPromise(handler, message, timeoutMs = 240000) {
       });
     };
     const timeoutId = setTimeout(() => {
+      const timeoutEvent = {
+        kind: 'rpc.bg.timeout',
+        rpcId: message?.rpcId ?? null,
+        type: message?.type ?? null,
+        timeoutMs,
+        ts: Date.now()
+      };
+      if (typeof globalThis.ntJsonLog === 'function') {
+        globalThis.ntJsonLog(timeoutEvent);
+      } else {
+        console.info('Background RPC timeout', timeoutEvent);
+      }
       safeResolve({ success: false, error: 'Background RPC timeout', isRuntimeError: true });
     }, timeoutMs);
     try {
@@ -414,8 +489,9 @@ function storageLocalSet(items, timeoutMs = 3000) {
 
 function applyStatePatch(patch = {}) {
   const next = STATE_CACHE && typeof STATE_CACHE === 'object' ? { ...STATE_CACHE } : { ...DEFAULT_STATE };
+  const sanitizedPatch = sanitizeSettings(patch, {});
 
-  for (const [key, value] of Object.entries(patch || {})) {
+  for (const [key, value] of Object.entries(sanitizedPatch || {})) {
     if (!STATE_CACHE_KEYS.has(key)) continue;
     if (
       ['apiKey', 'openAiOrganization', 'openAiProject', 'translationModel', 'contextModel', 'proofreadModel'].includes(
@@ -733,26 +809,17 @@ async function getState() {
   try {
     let stored;
     try {
-      stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+      stored = await storageLocalGet({ ...DEFAULT_STATE });
     } catch (error) {
       if (error?.message === 'storageLocalGet timeout') {
         console.warn('storageLocalGet timed out, retrying with extended timeout.', error);
-        stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null }, 8000);
+        stored = await storageLocalGet({ ...DEFAULT_STATE }, 8000);
       } else {
         throw error;
       }
     }
-    const safeStored = stored && typeof stored === 'object' ? stored : {};
+    const safeStored = sanitizeSettings(stored, DEFAULT_STATE);
     const merged = { ...DEFAULT_STATE, ...safeStored };
-    if (!merged.blockLengthLimit && safeStored.chunkLengthLimit) {
-      merged.blockLengthLimit = safeStored.chunkLengthLimit;
-    }
-    if (!merged.translationModel && safeStored.model) {
-      merged.translationModel = safeStored.model;
-    }
-    if (!merged.contextModel && safeStored.model) {
-      merged.contextModel = safeStored.model;
-    }
     const previousModels = {
       translationModel: merged.translationModel,
       contextModel: merged.contextModel,
@@ -765,15 +832,15 @@ async function getState() {
     const fallbackContextModel = merged.contextModel || DEFAULT_STATE.contextModel;
     const fallbackProofreadModel = merged.proofreadModel || DEFAULT_STATE.proofreadModel;
     merged.translationModelList = normalizeModelList(
-      merged.translationModelList || merged.translationModel || safeStored.model,
+      merged.translationModelList || merged.translationModel,
       fallbackTranslationModel
     );
     merged.contextModelList = normalizeModelList(
-      merged.contextModelList || merged.contextModel || safeStored.model,
+      merged.contextModelList || merged.contextModel,
       fallbackContextModel
     );
     merged.proofreadModelList = normalizeModelList(
-      merged.proofreadModelList || merged.proofreadModel || safeStored.model,
+      merged.proofreadModelList || merged.proofreadModel,
       fallbackProofreadModel
     );
     merged.translationModel = parseModelSpec(merged.translationModelList[0]).id || fallbackTranslationModel;
@@ -809,8 +876,8 @@ async function getState() {
 
 async function saveState(partial) {
   const current = await getState();
-  const next = { ...current, ...partial };
-  await storageLocalSet(next);
+  const next = sanitizeSettings({ ...current, ...partial }, DEFAULT_STATE);
+  await storageLocalSet(pickStateForCache(next));
   applyStatePatch(next);
   return next;
 }
@@ -854,7 +921,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     if (!STATE_CACHE_KEYS.has(key)) continue;
     patch[key] = change?.newValue;
   }
-  applyStatePatch(patch);
+  applyStatePatch(sanitizeSettings(patch, {}));
 });
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -903,16 +970,16 @@ chrome.runtime.onConnect.addListener((port) => {
         responsePromise = Promise.resolve({ ok: true, ts: Date.now() });
         break;
       case 'TRANSLATE_TEXT':
-        responsePromise = invokeHandlerAsPromise(handleTranslateText, msg, 240000);
+        responsePromise = invokeHandlerAsPromise(handleTranslateText, msg, 480000);
         break;
       case 'GENERATE_CONTEXT':
-        responsePromise = invokeHandlerAsPromise(handleGenerateContext, msg, 120000);
+        responsePromise = invokeHandlerAsPromise(handleGenerateContext, msg, 180000);
         break;
       case 'GENERATE_SHORT_CONTEXT':
-        responsePromise = invokeHandlerAsPromise(handleGenerateShortContext, msg, 120000);
+        responsePromise = invokeHandlerAsPromise(handleGenerateShortContext, msg, 180000);
         break;
       case 'PROOFREAD_TEXT':
-        responsePromise = invokeHandlerAsPromise(handleProofreadText, msg, 180000);
+        responsePromise = invokeHandlerAsPromise(handleProofreadText, msg, 360000);
         break;
       case 'START_PAGE_PLAN':
         responsePromise = invokeHandlerAsPromise(handleStartPagePlan, msg, 5000);
@@ -1121,6 +1188,89 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'NT_GET_PROGRESS') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    sendResponse({ ok: true, snapshot: tabId ? ntProgressByTab?.[tabId] || null : null });
+    return true;
+  }
+
+  if (message?.type === 'NT_SET_TOTAL') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    const channel = message?.channel === 'prewarm' ? 'prewarm' : 'page';
+    setTotals(tabId, message?.totals || {}, channel);
+    const reason =
+      typeof message?.reason === 'string' && message.reason.trim()
+        ? message.reason.trim()
+        : 'setTotal';
+    publishProgress(tabId, reason, { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'NT_PROGRESS_PULSE') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    const channel = message?.channel === 'prewarm' ? 'prewarm' : 'page';
+    const totalsSource = message?.totals || {};
+    const totalsPatch = {};
+    const total = Number.isFinite(message?.total) ? message.total : totalsSource.total;
+    const done = Number.isFinite(message?.done) ? message.done : totalsSource.done;
+    const failed = Number.isFinite(message?.failed) ? message.failed : totalsSource.failed;
+    const inFlight = Number.isFinite(message?.inFlight) ? message.inFlight : totalsSource.inFlight;
+    const queued = Number.isFinite(message?.queued) ? message.queued : totalsSource.queued;
+    if (Number.isFinite(total)) totalsPatch.total = total;
+    if (Number.isFinite(done)) totalsPatch.done = done;
+    if (Number.isFinite(failed)) totalsPatch.failed = failed;
+    if (Number.isFinite(inFlight)) totalsPatch.inFlight = inFlight;
+    if (Number.isFinite(queued)) totalsPatch.queued = queued;
+    const reason =
+      typeof message?.reason === 'string' && message.reason.trim()
+        ? message.reason.trim()
+        : 'pulse';
+    if (!Object.keys(totalsPatch).length && reason === 'start_cmd') {
+      const existingInFlight =
+        ntProgressStateByTab[tabId]?.channels?.[channel]?.totals?.inFlight ?? 0;
+      totalsPatch.inFlight = Math.max(existingInFlight, 1);
+    }
+    if (Object.keys(totalsPatch).length) {
+      setTotals(tabId, totalsPatch, channel);
+    }
+    publishProgress(tabId, reason, { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'NT_REPORT_PREFLIGHT') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    ntPreflightByTab[tabId] = message?.debug || null;
+    publishProgress(tabId, 'preflight', { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'NT_REPORT_ERROR') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    setLastError(tabId, message || {});
+    publishProgress(tabId, 'error', { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (message?.type === 'SYNC_STATE_CACHE') {
     try {
       applyStatePatch(message?.state || {});
@@ -1175,6 +1325,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleTranslationProgress(message, sender);
   }
 
+  if (message?.type === 'NT_SELF_CHECK') {
+    handleSelfCheck(sendResponse, message);
+    return true;
+  }
+
   if (message?.type === 'TRANSLATION_CANCELLED') {
     handleTranslationCancelled(message, sender);
   }
@@ -1193,6 +1348,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   CONTENT_READY_BY_TAB.delete(tabId);
+  delete ntProgressByTab[tabId];
+  delete ntProgressStateByTab[tabId];
+  delete ntPreflightByTab[tabId];
+  lastProgressPublishedAt.delete(tabId);
+  void storageLocalSet({ ntProgressByTab });
 });
 
 async function warmUpContentScripts(reason) {
@@ -1995,6 +2155,154 @@ async function handleTranslationProgress(message, sender) {
   const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
   translationStatusByTab[tabId] = status;
   await storageLocalSet({ translationStatusByTab });
+  setTotals(tabId, {
+    total: status.totalBlocks,
+    done: status.completedBlocks,
+    inFlight: status.inProgressBlocks,
+    queued: Math.max(0, (status.totalBlocks || 0) - (status.completedBlocks || 0) - (status.inProgressBlocks || 0))
+  });
+  publishProgress(tabId, 'translationProgress');
+}
+
+function buildProgressSnapshot(tabId, reason) {
+  const stored = ntProgressStateByTab[tabId] || {};
+  const channels = stored.channels || {};
+  const page = channels.page || {};
+  const prewarm = channels.prewarm || {};
+  const pageTotals = page.totals || {};
+  const prewarmTotals = prewarm.totals || {};
+  const totals = stored.totals || pageTotals;
+  const lastError = stored.lastError || page.lastError || null;
+  const busy =
+    (pageTotals.inFlight || 0) +
+      (pageTotals.queued || 0) +
+      (prewarmTotals.inFlight || 0) +
+      (prewarmTotals.queued || 0) >
+    0;
+  return {
+    ts: Date.now(),
+    tabId,
+    reason,
+    totals: {
+      total: totals.total ?? 0,
+      done: totals.done ?? 0,
+      failed: totals.failed ?? 0,
+      inFlight: totals.inFlight ?? 0,
+      queued: totals.queued ?? 0
+    },
+    channels: {
+      page: {
+        totals: {
+          total: pageTotals.total ?? 0,
+          done: pageTotals.done ?? 0,
+          failed: pageTotals.failed ?? 0,
+          inFlight: pageTotals.inFlight ?? 0,
+          queued: pageTotals.queued ?? 0
+        },
+        lastError: page.lastError || null
+      },
+      prewarm: {
+        totals: {
+          total: prewarmTotals.total ?? 0,
+          done: prewarmTotals.done ?? 0,
+          failed: prewarmTotals.failed ?? 0,
+          inFlight: prewarmTotals.inFlight ?? 0,
+          queued: prewarmTotals.queued ?? 0
+        },
+        lastError: prewarm.lastError || null
+      }
+    },
+    busy,
+    stageCounts: stored.stageCounts || {},
+    lastError
+  };
+}
+
+async function publishProgress(tabId, reason, { force = false } = {}) {
+  if (!tabId) return;
+  const now = Date.now();
+  const lastPublish = lastProgressPublishedAt.get(tabId) || 0;
+  if (!force && now - lastPublish < 750) {
+    return;
+  }
+  lastProgressPublishedAt.set(tabId, now);
+  const snapshot = buildProgressSnapshot(tabId, reason);
+  ntProgressByTab[tabId] = snapshot;
+  await storageLocalSet({ ntProgressByTab });
+  sendRuntimeMessageSafe({ type: 'NT_PROGRESS_PUSH', tabId, snapshot });
+}
+
+function setLastError(tabId, { stage, reason, message, channel } = {}) {
+  if (!tabId) return;
+  const entry = ntProgressStateByTab[tabId] || {};
+  const channelKey = channel === 'prewarm' ? 'prewarm' : 'page';
+  entry.channels = entry.channels || {};
+  entry.channels[channelKey] = entry.channels[channelKey] || {};
+  const payload = {
+    ts: Date.now(),
+    stage: stage || 'unknown',
+    reason: reason || 'error',
+    message: message || ''
+  };
+  entry.channels[channelKey].lastError = payload;
+  entry.lastError = channelKey === 'page' ? payload : entry.lastError || payload;
+  ntProgressStateByTab[tabId] = entry;
+}
+
+function setTotals(tabId, totals, channel = 'page') {
+  if (!tabId) return;
+  const entry = ntProgressStateByTab[tabId] || {};
+  const channelKey = channel === 'prewarm' ? 'prewarm' : 'page';
+  entry.channels = entry.channels || {};
+  entry.channels[channelKey] = entry.channels[channelKey] || {};
+  const existingTotals = entry.channels[channelKey].totals || {};
+  entry.channels[channelKey].totals = {
+    total: Number.isFinite(totals?.total) ? totals.total : existingTotals.total || 0,
+    done: Number.isFinite(totals?.done) ? totals.done : existingTotals.done || 0,
+    failed: Number.isFinite(totals?.failed) ? totals.failed : existingTotals.failed || 0,
+    inFlight: Number.isFinite(totals?.inFlight) ? totals.inFlight : existingTotals.inFlight || 0,
+    queued: Number.isFinite(totals?.queued) ? totals.queued : existingTotals.queued || 0
+  };
+  if (channelKey === 'page') {
+    entry.totals = {
+      total: Number.isFinite(totals?.total) ? totals.total : existingTotals.total || 0,
+      done: Number.isFinite(totals?.done) ? totals.done : existingTotals.done || 0,
+      failed: Number.isFinite(totals?.failed) ? totals.failed : existingTotals.failed || 0,
+      inFlight: Number.isFinite(totals?.inFlight) ? totals.inFlight : existingTotals.inFlight || 0,
+      queued: Number.isFinite(totals?.queued) ? totals.queued : existingTotals.queued || 0
+    };
+  }
+  entry.stageCounts = totals?.stageCounts || entry.stageCounts || {};
+  ntProgressStateByTab[tabId] = entry;
+}
+
+async function handleSelfCheck(sendResponse, message = {}) {
+  try {
+    const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
+    const progressEntries = Object.values(translationStatusByTab);
+    const lastProgressAt = progressEntries.reduce((latest, entry) => {
+      const ts = Number(entry?.timestamp) || 0;
+      return ts > latest ? ts : latest;
+    }, 0);
+    const tabId = message?.tabId;
+    sendResponse({
+      ok: true,
+      version: chrome.runtime.getManifest().version,
+      stateCacheReady: Boolean(STATE_CACHE_READY),
+      hasStateCache: Boolean(STATE_CACHE),
+      schedulerTickRunning: Boolean(schedulerTickTimer),
+      progressTabs: progressEntries.length,
+      lastProgressAt: lastProgressAt || null,
+      preflight: tabId ? ntPreflightByTab[tabId] || null : null,
+      now: Date.now()
+    });
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      error: error?.message || String(error),
+      now: Date.now()
+    });
+  }
 }
 
 async function handleGetTranslationStatus(sendResponse, tabId) {

@@ -14,3 +14,24 @@ When loading an unpacked extension, Chrome/Edge rejects folders or files that st
 - Use the popup to cancel an in-progress translation on the current page.
 - Block or allow the active domain via the popup buttons.
 - Disable the translator globally with the toggle in the popup.
+
+## Reachability report (extension/)
+Generate a report of reachable/unused extension files:
+
+```bash
+node tools/reachability-report.js
+```
+
+Outputs:
+- `tools/reachability-report.json`
+- `tools/reachability-report.md`
+
+By default the script exits non-zero if unused candidates are detected. To allow unused files:
+
+```bash
+node tools/reachability-report.js --allow-unused
+```
+
+```bash
+node tools/smoke-check.js
+```

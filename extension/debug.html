@@ -769,6 +769,16 @@
       border-color: #fecaca;
       color: #991b1b;
     }
+    .self-check {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      background: #f8fafc;
+      color: #0f172a;
+      font-size: 14px;
+      white-space: pre-line;
+    }
     @media (max-width: 700px) {
       .summary-header {
         flex-direction: column;
@@ -791,11 +801,15 @@
     <button class="debug-button debug-button--danger" id="clear-debug" type="button">
       Очистить отладочные данные
     </button>
+    <button class="debug-button" id="run-self-check" type="button">
+      Self-check
+    </button>
     <label class="debug-checkbox" for="console-json-log">
       <input type="checkbox" id="console-json-log" />
       JSON лог в консоль (очень подробно)
     </label>
   </div>
+  <div class="self-check" id="self-check"></div>
   <div class="summary" id="summary"></div>
   <div class="health-panel" id="health"></div>
   <div id="events"></div>
