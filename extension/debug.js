@@ -2,7 +2,6 @@ const metaEl = document.getElementById('meta');
 const contextEl = document.getElementById('context');
 const summaryEl = document.getElementById('summary');
 const entriesEl = document.getElementById('entries');
-const eventsEl = document.getElementById('events');
 const clearDebugButton = document.getElementById('clear-debug');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
@@ -516,9 +515,6 @@ function renderEmpty(message) {
   debugDomState.entriesByKey.clear();
   debugDomState.entryPartsByKey.clear();
   debugDomState.payloadPartsByKey.clear();
-  if (eventsEl) {
-    eventsEl.innerHTML = '';
-  }
   renderSummary({
     items: [],
     contextStatus: 'pending',
@@ -548,7 +544,6 @@ function patchDebug(url, data) {
   const updatedAt = data.updatedAt ? new Date(data.updatedAt).toLocaleString('ru-RU') : '—';
   metaEl.textContent = `URL: ${url} • Обновлено: ${updatedAt}`;
   renderSummary(data, '');
-  renderEvents(data);
   patchContext(data);
 
   const items = Array.isArray(data.items) ? data.items : [];
@@ -710,34 +705,6 @@ function ensureDetailsElement(parent, debugKey, summaryText, className = '') {
   return { detailsEl: details, contentEl };
 }
 
-function renderEvents(data) {
-  if (!eventsEl) return;
-  const events = Array.isArray(data?.events) ? data.events : [];
-  if (!events.length) {
-    eventsEl.innerHTML = '';
-    return;
-  }
-  eventsEl.innerHTML = `
-    <div class="events">
-      <div class="events-title">Warnings</div>
-      ${events
-        .slice(-10)
-        .map((event) => {
-          const ts = event?.timestamp ? new Date(event.timestamp).toLocaleTimeString('ru-RU') : '—';
-          const tag = event?.tag || 'EVENT';
-          const message = event?.message || '';
-          return `
-            <div class="event-row">
-              <span class="event-time">${escapeHtml(ts)}</span>
-              <span class="event-tag">${escapeHtml(tag)}</span>
-              <span class="event-message">${escapeHtml(message)}</span>
-            </div>
-          `;
-        })
-        .join('')}
-    </div>
-  `;
-}
 
 function ensureContextSkeleton() {
   if (!contextEl || debugDomState.contextReady) return;
@@ -1083,8 +1050,7 @@ function normalizeDebugPayloads(payloads, fallbackRaw, phase, fallbackMeta = {})
         request: null,
         response: fallbackRaw,
         rawRefId: fallbackMeta?.rawRefId || '',
-        responseTruncated: fallbackMeta?.truncated || false,
-        parseIssues: []
+        responseTruncated: fallbackMeta?.truncated || false
       }
     ];
   }
@@ -1173,7 +1139,6 @@ function ensurePayloadElement(container, payloadKey) {
     const contextDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:context`, 'Context text sent');
     const requestDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:request`, 'Request (raw)');
     const responseDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:response`, 'Response (raw)');
-    const parseDetails = ensureDebugDetails(sectionsEl, `${payloadKey}:parse`, 'Parse/Validation');
     const modelSelectionDetails = ensureDebugDetails(
       sectionsEl,
       `${payloadKey}:model-selection`,
@@ -1192,7 +1157,6 @@ function ensurePayloadElement(container, payloadKey) {
       contextDetails,
       requestDetails,
       responseDetails,
-      parseDetails,
       modelSelectionDetails
     });
     container.appendChild(payloadEl);
@@ -1332,7 +1296,6 @@ function patchDebugPayload(payloadEl, payload, payloadKey) {
       allowLoad: allowRawLoad
     })
   );
-  setHtmlIfChanged(parts.parseDetails.contentEl, buildDebugParseContent(payload?.parseIssues));
   const hasModelSelectionDetails =
     payload &&
     (payload.candidateStrategy !== undefined ||
@@ -1384,13 +1347,6 @@ function buildDebugSectionContent(value, options = {}) {
       ${showPlaceholder ? '<div class="raw-loading">⏳ Загружаю полный текст…</div>' : renderRawResponse(value, emptyMessage)}
     </div>
   `;
-}
-
-function buildDebugParseContent(parseIssues) {
-  const issues = Array.isArray(parseIssues) ? parseIssues.filter(Boolean) : [];
-  return issues.length
-    ? `<pre class="raw-response">${escapeHtml(issues.join('\n'))}</pre>`
-    : `<div class="empty">Ошибок не обнаружено.</div>`;
 }
 
 function formatUsage(usage) {
