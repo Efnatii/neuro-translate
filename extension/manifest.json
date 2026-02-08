@@ -21,6 +21,7 @@
         "proofread-heuristics.js",
         "segment-dedup.js",
         "scheduler/page-preflight.js",
+        "settings.js",
         "content-script.js"
       ],
       "run_at": "document_idle"

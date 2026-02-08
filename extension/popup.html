@@ -174,6 +174,17 @@
       text-align: right;
       max-width: 45%;
     }
+    .status-details {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-align: right;
+    }
+    .status-error {
+      font-size: 11px;
+      color: #b91c1c;
+      text-align: right;
+      white-space: pre-wrap;
+    }
     .progress {
       position: relative;
       flex: 1;
@@ -358,10 +369,12 @@
         </div>
         <div class="status-text" id="status">Статус: перевод не выполняется.</div>
       </div>
+      <div class="status-details" id="statusDetails"></div>
+      <div class="status-error" id="statusError"></div>
     </div>
     <div class="section">
       <div class="row">
-        <button class="icon-button" id="translate" aria-label="Перевести страницу" title="Перевести страницу">
+        <button class="icon-button" id="btn-start" data-action="start" aria-label="Старт" title="Старт">
           <span class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24">
               <circle cx="12" cy="12" r="9"></circle>
@@ -370,9 +383,9 @@
               <path d="M12 3a15 15 0 0 0 0 18"></path>
             </svg>
           </span>
-          <span class="sr-only">Перевести страницу</span>
+          <span class="sr-only">Старт</span>
         </button>
-        <button class="icon-button" id="toggleTranslation" aria-pressed="false" aria-label="Показать перевод" title="Показать перевод">
+        <button class="icon-button" id="btn-reset" data-action="reset" aria-pressed="false" aria-label="Сброс" title="Сброс">
           <span class="icon icon-default" aria-hidden="true">
             <svg viewBox="0 0 24 24">
               <path d="M4 7h10"></path>
@@ -395,15 +408,15 @@
               <circle cx="7" cy="17" r="2"></circle>
             </svg>
           </span>
-          <span class="sr-only">Показать перевод</span>
+          <span class="sr-only">Сброс</span>
         </button>
-        <button class="icon-button" id="cancel" aria-label="Отменить перевод" title="Отменить перевод">
+        <button class="icon-button" id="btn-stop" data-action="stop" aria-label="Стоп" title="Стоп">
           <span class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24">
               <rect x="7" y="7" width="10" height="10" rx="1"></rect>
             </svg>
           </span>
-          <span class="sr-only">Отменить перевод</span>
+          <span class="sr-only">Стоп</span>
         </button>
       </div>
       <div class="row secondary-row">

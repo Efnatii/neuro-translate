@@ -1,0 +1,219 @@
+{
+  "reachableFiles": [
+    "ai-common.js",
+    "background.js",
+    "batch/batch-client.js",
+    "batch/batch-prewarm.js",
+    "content-script.js",
+    "context-service.js",
+    "debug.html",
+    "debug.js",
+    "guardrails.js",
+    "llm/Operation.js",
+    "llm/RequestRunner.js",
+    "manifest.json",
+    "messaging.js",
+    "model-router.js",
+    "popup.css",
+    "popup.html",
+    "popup.js",
+    "proofread-heuristics.js",
+    "proofread-service.js",
+    "resilience-policy.js",
+    "scheduler/page-preflight.js",
+    "scheduler/task-scheduler.js",
+    "segment-dedup.js",
+    "settings.js",
+    "throughput-controller.js",
+    "translation-service.js",
+    "ui-translation-memory.js"
+  ],
+  "edges": [
+    {
+      "from": "manifest",
+      "to": "manifest.json",
+      "reason": "manifest.root"
+    },
+    {
+      "from": "manifest",
+      "to": "background.js",
+      "reason": "manifest.background.service_worker"
+    },
+    {
+      "from": "manifest",
+      "to": "resilience-policy.js",
+      "reason": "manifest.content_scripts[0].js"
+    },
+    {
+      "from": "manifest",
+      "to": "ui-translation-memory.js",
+      "reason": "manifest.content_scripts[0].js"
+    },
+    {
+      "from": "manifest",
+      "to": "proofread-heuristics.js",
+      "reason": "manifest.content_scripts[0].js"
+    },
+    {
+      "from": "manifest",
+      "to": "segment-dedup.js",
+      "reason": "manifest.content_scripts[0].js"
+    },
+    {
+      "from": "manifest",
+      "to": "scheduler/page-preflight.js",
+      "reason": "manifest.content_scripts[0].js"
+    },
+    {
+      "from": "manifest",
+      "to": "settings.js",
+      "reason": "manifest.content_scripts[0].js"
+    },
+    {
+      "from": "manifest",
+      "to": "content-script.js",
+      "reason": "manifest.content_scripts[0].js"
+    },
+    {
+      "from": "manifest",
+      "to": "popup.html",
+      "reason": "manifest.action.default_popup"
+    },
+    {
+      "from": "background.js",
+      "to": "settings.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "ai-common.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "guardrails.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "resilience-policy.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "messaging.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "throughput-controller.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "model-router.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "llm/Operation.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "llm/RequestRunner.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "scheduler/task-scheduler.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "batch/batch-client.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "batch/batch-prewarm.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "translation-service.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "context-service.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "background.js",
+      "to": "proofread-service.js",
+      "reason": "importScripts"
+    },
+    {
+      "from": "popup.html",
+      "to": "ai-common.js",
+      "reason": "html.script"
+    },
+    {
+      "from": "popup.html",
+      "to": "messaging.js",
+      "reason": "html.script"
+    },
+    {
+      "from": "popup.html",
+      "to": "popup.js",
+      "reason": "html.script"
+    },
+    {
+      "from": "popup.html",
+      "to": "popup.css",
+      "reason": "html.link"
+    },
+    {
+      "from": "popup.js",
+      "to": "debug.html",
+      "reason": "runtime.getURL"
+    },
+    {
+      "from": "debug.html",
+      "to": "debug.js",
+      "reason": "html.script"
+    }
+  ],
+  "missingFiles": [],
+  "allFiles": [
+    "ai-common.js",
+    "background.js",
+    "batch/batch-client.js",
+    "batch/batch-prewarm.js",
+    "content-script.js",
+    "context-service.js",
+    "debug.html",
+    "debug.js",
+    "guardrails.js",
+    "llm/Operation.js",
+    "llm/RequestRunner.js",
+    "manifest.json",
+    "messaging.js",
+    "model-router.js",
+    "popup.css",
+    "popup.html",
+    "popup.js",
+    "proofread-heuristics.js",
+    "proofread-service.js",
+    "resilience-policy.js",
+    "scheduler/page-preflight.js",
+    "scheduler/task-scheduler.js",
+    "segment-dedup.js",
+    "settings.js",
+    "throughput-controller.js",
+    "translation-service.js",
+    "ui-translation-memory.js"
+  ],
+  "unusedCandidates": []
+}

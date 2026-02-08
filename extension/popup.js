@@ -15,8 +15,11 @@ const batchTurboModeSelect = document.getElementById('batchTurboMode');
 const statusLabel = document.getElementById('status');
 const statusProgressBar = document.getElementById('statusProgress');
 const statusProgressFill = document.getElementById('statusProgressFill');
-const cancelButton = document.getElementById('cancel');
-const translateButton = document.getElementById('translate');
+const statusDetails = document.getElementById('statusDetails');
+const statusError = document.getElementById('statusError');
+const startBtn = document.getElementById('btn-start') || document.querySelector('[data-action="start"]');
+const stopBtn = document.getElementById('btn-stop') || document.querySelector('[data-action="stop"]');
+const resetBtn = document.getElementById('btn-reset') || document.querySelector('[data-action="reset"]');
 const toggleTranslationButton = document.getElementById('toggleTranslation');
 const openDebugButton = document.getElementById('openDebug');
 const POPUP_PORT_NAME = 'popup';
@@ -38,6 +41,8 @@ let popupReconnectDelay = 500;
 let blockLengthUpdateTimeout = null;
 let pendingBlockLengthLimit = null;
 let lastBlockLengthLimit = null;
+let currentProgressSnapshot = null;
+let lastProgressTotals = null;
 
 const models = buildModelOptions();
 const defaultModelSpec = getDefaultModelSpec(models);
@@ -165,6 +170,7 @@ async function init() {
   chrome.storage.onChanged.addListener(handleStorageChange);
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
   connectPopupPort();
+  requestProgressSnapshot();
 
   apiKeyInput.addEventListener('input', handleApiKeyChange);
   openAiOrganizationInput.addEventListener('input', handleOpenAiOrganizationChange);
@@ -184,9 +190,21 @@ async function init() {
   }
   blockLengthLimitInput.addEventListener('input', handleBlockLengthLimitChange);
   blockLengthLimitInput.addEventListener('change', handleBlockLengthLimitCommit);
-  cancelButton.addEventListener('click', sendCancel);
-  translateButton.addEventListener('click', sendTranslateRequest);
-  toggleTranslationButton.addEventListener('click', handleToggleTranslationVisibility);
+  if (startBtn) {
+    startBtn.addEventListener('click', handleStartCommand);
+  } else {
+    console.warn('Start button not found in popup.');
+  }
+  if (stopBtn) {
+    stopBtn.addEventListener('click', handleStopCommand);
+  } else {
+    console.warn('Stop button not found in popup.');
+  }
+  if (resetBtn) {
+    resetBtn.addEventListener('click', handleResetCommand);
+  } else {
+    console.warn('Reset button not found in popup.');
+  }
   openDebugButton.addEventListener('click', handleOpenDebug);
 }
 
@@ -776,6 +794,72 @@ async function sendTranslateRequest() {
   setTemporaryStatus('Запускаем перевод страницы...');
 }
 
+async function handleStartCommand() {
+  if (isTranslationBusy()) {
+    setTemporaryStatus('Перевод уже выполняется.');
+    return;
+  }
+  const response = await sendTabCmd({ type: 'NT_CMD_START', mode: 'page' });
+  if (response?.ok) {
+    setTemporaryStatus('Запускаем перевод страницы...');
+    return;
+  }
+  if (response?.message === 'already_running') {
+    setTemporaryStatus('Перевод уже выполняется.');
+  }
+}
+
+async function handleStopCommand() {
+  const response = await sendTabCmd({ type: 'NT_CMD_STOP' });
+  if (response?.ok) {
+    setTemporaryStatus('Останавливаем перевод...');
+  }
+}
+
+async function handleResetCommand() {
+  if (isTranslationBusy()) {
+    await sendTabCmd({ type: 'NT_CMD_STOP' });
+  }
+  const response = await sendTabCmd({
+    type: 'NT_CMD_RESET',
+    resetContext: true,
+    resetMemory: true
+  });
+  if (response?.ok) {
+    setTemporaryStatus('Сбрасываем перевод...');
+  }
+}
+
+async function sendTabCmd(command) {
+  const tab = await getActiveTab();
+  if (!tab?.id) {
+    setTemporaryStatus('Нет активной вкладки.');
+    return { ok: false, message: 'no-active-tab' };
+  }
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tab.id, { ...command, tabId: tab.id }, (response) => {
+      if (chrome.runtime.lastError) {
+        const message = 'Контент-скрипт недоступен на этой странице.';
+        if (statusLabel) {
+          setTemporaryStatus(message);
+        } else {
+          alert(message);
+        }
+        resolve({ ok: false, message: chrome.runtime.lastError.message });
+        return;
+      }
+      if (!response?.ok) {
+        if (response?.message) {
+          setTemporaryStatus(response.message);
+        }
+        resolve(response || { ok: false, message: 'command-failed' });
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
 async function handleToggleTranslationVisibility() {
   const connection = await ensureActiveTabConnection();
   if (!connection.ok) {
@@ -818,6 +902,13 @@ function handleStorageChange(changes) {
     const nextVisibility = changes.translationVisibilityByTab.newValue || {};
     renderTranslationVisibility(activeTabId ? nextVisibility[activeTabId] : false);
   }
+  if (changes.ntProgressByTab) {
+    const nextProgress = changes.ntProgressByTab.newValue || {};
+    const snapshot = activeTabId ? nextProgress[activeTabId] : null;
+    if (snapshot) {
+      handleProgressSnapshot(snapshot);
+    }
+  }
   if (changes.batchTurboMode) {
     renderBatchTurboMode(changes.batchTurboMode.newValue);
   }
@@ -825,6 +916,12 @@ function handleStorageChange(changes) {
 
 async function handleRuntimeMessage(message, sender) {
   if (!message?.type) {
+    return;
+  }
+  if (message.type === 'NT_PROGRESS_PUSH') {
+    if (activeTabId && message.tabId === activeTabId) {
+      handleProgressSnapshot(message.snapshot);
+    }
     return;
   }
   if (message.type === 'TRANSLATION_CANCELLED') {
@@ -863,6 +960,31 @@ async function handleTranslationCancelled(tabId) {
   await chrome.tabs.reload(tabId);
 }
 
+function handleProgressSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return;
+  }
+  if (snapshot.totals && typeof snapshot.totals === 'object') {
+    currentProgressSnapshot = {
+      ...snapshot,
+      totals: normalizeProgressTotals(snapshot.totals)
+    };
+  } else {
+    currentProgressSnapshot = snapshot;
+  }
+  renderStatus();
+}
+
+function normalizeProgressTotals(totals) {
+  return {
+    total: Number(totals.total) || 0,
+    done: Number(totals.done) || 0,
+    failed: Number(totals.failed) || 0,
+    inFlight: Number(totals.inFlight) || 0,
+    queued: Number(totals.queued) || 0
+  };
+}
+
 function renderStatus() {
   if (!statusLabel) {
     return;
@@ -870,6 +992,8 @@ function renderStatus() {
   const baseMessage = getBaseStatusMessage();
   statusLabel.textContent = baseMessage;
   renderProgressBar();
+  renderProgressDetails();
+  renderCommandButtons();
 }
 
 function getBaseStatusMessage() {
@@ -914,7 +1038,102 @@ function renderProgressBar() {
   }
 }
 
+function getChannelTotals(channel) {
+  if (currentProgressSnapshot?.channels && currentProgressSnapshot.channels[channel]) {
+    return currentProgressSnapshot.channels[channel].totals || null;
+  }
+  if (channel === 'page') {
+    return currentProgressSnapshot?.totals || null;
+  }
+  return null;
+}
+
+function renderProgressDetails() {
+  if (!statusDetails || !statusError) {
+    return;
+  }
+  const pageTotals = getChannelTotals('page');
+  const prewarmTotals = getChannelTotals('prewarm');
+  if (!pageTotals || !Number.isFinite(pageTotals.total) || pageTotals.total <= 0) {
+    statusDetails.textContent = '';
+    if (prewarmTotals && (prewarmTotals.queued || 0) > 0) {
+      statusError.textContent = 'Активен Prewarm (UI). Он может не менять страницу.';
+    } else {
+      statusError.textContent = '';
+    }
+    lastProgressTotals = null;
+    return;
+  }
+  const doneDelta = lastProgressTotals ? pageTotals.done - lastProgressTotals.done : 0;
+  const doneLabel = doneDelta > 0 ? `${pageTotals.done} (+${doneDelta})` : `${pageTotals.done}`;
+  const details = [`Готово: ${doneLabel}`];
+  if (pageTotals.failed > 0) details.push(`Ошибки: ${pageTotals.failed}`);
+  if (pageTotals.inFlight > 0) details.push(`В работе: ${pageTotals.inFlight}`);
+  if (pageTotals.queued > 0) details.push(`Очередь: ${pageTotals.queued}`);
+  details.push(`Всего: ${pageTotals.total}`);
+  if (prewarmTotals && Number.isFinite(prewarmTotals.total) && prewarmTotals.total > 0) {
+    const prewarmDone = Number.isFinite(prewarmTotals.done) ? prewarmTotals.done : 0;
+    const prewarmQueued = Number.isFinite(prewarmTotals.queued) ? prewarmTotals.queued : 0;
+    details.push(`Prewarm UI: ${prewarmDone}/${prewarmQueued || prewarmTotals.total}`);
+  }
+  statusDetails.textContent = details.join(' • ');
+  lastProgressTotals = { ...pageTotals };
+
+  const lastError = currentProgressSnapshot?.lastError;
+  if (lastError?.message) {
+    const stage = lastError.stage || 'unknown';
+    const reason = lastError.reason || 'error';
+    if (stage === 'preflight' && reason === 'no_candidates') {
+      statusError.textContent = `Нет блоков для перевода: ${lastError.message}`;
+    } else {
+      statusError.textContent = `Последняя ошибка: ${stage}/${reason} — ${lastError.message}`;
+    }
+  } else {
+    statusError.textContent = '';
+  }
+}
+
+function isTranslationBusy() {
+  if (typeof currentProgressSnapshot?.busy === 'boolean') {
+    return currentProgressSnapshot.busy;
+  }
+  const pageTotals = getChannelTotals('page');
+  if (pageTotals) {
+    return (pageTotals.inFlight || 0) > 0 || (pageTotals.queued || 0) > 0;
+  }
+  const inProgress = currentTranslationStatus?.inProgressBlocks ?? currentTranslationStatus?.inProgressChunks ?? 0;
+  return inProgress > 0;
+}
+
+function renderCommandButtons() {
+  if (!startBtn || !stopBtn || !resetBtn) {
+    return;
+  }
+  const pageBusy = isTranslationBusy();
+  const prewarmTotals = getChannelTotals('prewarm');
+  const prewarmBusy = prewarmTotals
+    ? (prewarmTotals.inFlight || 0) > 0 || (prewarmTotals.queued || 0) > 0
+    : false;
+  startBtn.disabled = pageBusy;
+  stopBtn.disabled = !(pageBusy || prewarmBusy);
+  resetBtn.disabled = false;
+  if (pageBusy) {
+    startBtn.title = 'Уже выполняется';
+  } else {
+    startBtn.title = 'Старт';
+  }
+}
+
 function getProgressInfo(status) {
+  const totals = getChannelTotals('page');
+  if (totals && Number.isFinite(totals.total) && totals.total > 0) {
+    const current = Math.min(
+      totals.total,
+      (totals.done || 0) + (totals.failed || 0) + (totals.inFlight || 0)
+    );
+    const percent = Math.max(0, Math.min(100, Math.round((current / totals.total) * 100)));
+    return { percent, label: `Прогресс: ${percent}%` };
+  }
   if (!status) {
     return { percent: 0, label: 'Прогресс: 0%' };
   }
@@ -927,6 +1146,15 @@ function getProgressInfo(status) {
   const current = Math.min(totalBlocks, completedBlocks + inProgressBlocks);
   const percent = Math.max(0, Math.min(100, Math.round((current / totalBlocks) * 100)));
   return { percent, label: `Прогресс: ${percent}%` };
+}
+
+function requestProgressSnapshot() {
+  if (!activeTabId) return;
+  chrome.runtime.sendMessage({ type: 'NT_GET_PROGRESS', tabId: activeTabId }, (response) => {
+    if (response?.snapshot) {
+      handleProgressSnapshot(response.snapshot);
+    }
+  });
 }
 
 function setTemporaryStatus(message, durationMs = 2500) {
@@ -964,6 +1192,9 @@ async function getTranslationVisibilityFromPage(tab) {
 
 function updateTranslationVisibility(visible) {
   translationVisible = visible;
+  if (!toggleTranslationButton) {
+    return;
+  }
   const label = translationVisible ? 'Показать оригинал' : 'Показать перевод';
   const labelNode = toggleTranslationButton.querySelector('.sr-only');
   if (labelNode) {

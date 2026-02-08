@@ -83,9 +83,36 @@
 
   const buildPagePlan = (doc, targetLang, settings = {}) => {
     const helpers = globalThis.ntPagePreflightHelpers || {};
+    const stats = {
+      ts: Date.now(),
+      url: location.href,
+      scannedTextNodes: 0,
+      nonEmptyTextNodes: 0,
+      candidatesBeforeFilters: 0,
+      candidatesAfterFilters: 0,
+      filtered: {
+        empty: 0,
+        whitespaceOnly: 0,
+        tooShort: 0,
+        tooLong: 0,
+        duplicate: 0,
+        hidden: 0,
+        inScriptStyle: 0,
+        nonTranslatableTag: 0,
+        alreadyTranslated: 0,
+        other: 0
+      },
+      notes: []
+    };
+    const recordNote = (note) => {
+      if (!note) return;
+      if (stats.notes.length >= 10) return;
+      stats.notes.push(note);
+    };
     const collectTextNodes = helpers.collectTextNodes || ((root) => {
       const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
+          stats.scannedTextNodes += 1;
           if (!node.nodeValue?.trim()) return NodeFilter.FILTER_REJECT;
           return NodeFilter.FILTER_ACCEPT;
         }
@@ -106,7 +133,9 @@
     const computeTextHash = helpers.computeTextHash || ((text) => text.length);
     const getOriginalHash = helpers.getOriginalHash || ((original, originalHash) => originalHash || computeTextHash(original || ''));
 
-    const textNodes = collectTextNodes(doc.body);
+    const textNodes = collectTextNodes(doc.body, stats, recordNote);
+    stats.candidatesBeforeFilters = stats.nonEmptyTextNodes || textNodes.length;
+    stats.candidatesAfterFilters = textNodes.length;
     const nodesWithPath = textNodes.map((node) => ({
       node,
       path: getNodePath(node),
@@ -229,7 +258,8 @@
         estimatedOutputTokens
       },
       tasks,
-      hints
+      hints,
+      debug: stats
     };
   };
 

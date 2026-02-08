@@ -93,8 +93,11 @@
 let cancelRequested = false;
 let translationError = null;
 let translationProgress = { completedBlocks: 0, totalBlocks: 0 };
+let currentTabIdForProgress = null;
+let activeJobControl = null;
 let translationInProgress = false;
 let translationCallCount = 0;
+let inFlightBlockCount = 0;
 let activeTranslationEntries = [];
 let originalSnapshot = [];
 let translationVisible = false;
@@ -132,14 +135,7 @@ const HEALTH_TPM_WINDOW_MS = 60 * 1000;
 const HEALTH_BATCH_SAMPLE_LIMIT = 50;
 const HEALTH_EVENT_LIMIT = 300;
 let tpmLimiter = null;
-let tpmSettings = {
-  outputRatioByRole: {
-    translation: 0.6,
-    context: 0.4,
-    proofread: 0.5
-  },
-  safetyBufferTokens: 100
-};
+let tpmSettings = null;
 let pagePlan = null;
 let pagePlanHints = null;
 let schedulerModels = {
@@ -155,6 +151,10 @@ const RATE_LIMIT_RETRY_ATTEMPTS = 2;
 const SHORT_CONTEXT_MAX_CHARS = 800;
 const TRANSLATION_MAX_TOKENS_PER_REQUEST = 2600;
 const TRANSLATION_MICROBATCH_TARGET_TOKENS = 1200;
+let translationMicrobatchTargetTokens = TRANSLATION_MICROBATCH_TARGET_TOKENS;
+let translationMicrobatchMaxItems = 0;
+const IN_FLIGHT_WATCHDOG_INTERVAL_MS = 30000;
+const IN_FLIGHT_WATCHDOG_GRACE_MS = 60000;
 const PROOFREAD_SUSPICIOUS_RATIO = 0.35;
 const DEBUG_PREVIEW_MAX_CHARS = 2000;
 const DEBUG_RAW_MAX_CHARS = 50000;
@@ -172,21 +172,17 @@ const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
 const BLOCK_KEY_ATTR = 'data-nt-block-key';
 const TRANSLATED_ATTR = 'data-nt-translated';
 const PROOFREAD_ATTR = 'data-nt-proofread';
-const DEFAULT_TPM_LIMITS_BY_MODEL = {
-  default: 200000,
-  'gpt-4.1-mini': 200000,
-  'gpt-4.1': 300000,
-  'gpt-4o-mini': 200000,
-  'gpt-4o': 300000,
-  'o4-mini': 200000
-};
-const DEFAULT_OUTPUT_RATIO_BY_ROLE = {
+const NT_SETTINGS = globalThis.NT_SETTINGS || {};
+const DEFAULT_TPM_LIMITS_BY_MODEL = NT_SETTINGS.DEFAULT_TPM_LIMITS_BY_MODEL || { default: 200000 };
+const DEFAULT_OUTPUT_RATIO_BY_ROLE = NT_SETTINGS.DEFAULT_OUTPUT_RATIO_BY_ROLE || {
   translation: 0.6,
   context: 0.4,
   proofread: 0.5
 };
-const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = 100;
-const DEFAULT_STATE = {
+const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = Number.isFinite(NT_SETTINGS.DEFAULT_TPM_SAFETY_BUFFER_TOKENS)
+  ? NT_SETTINGS.DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+  : 100;
+const DEFAULT_STATE = NT_SETTINGS.DEFAULT_STATE || {
   apiKey: '',
   openAiOrganization: '',
   openAiProject: '',
@@ -207,6 +203,12 @@ const DEFAULT_STATE = {
   outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
   tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
 };
+if (!tpmSettings) {
+  tpmSettings = {
+    outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+    safetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+  };
+}
 const CALL_TAGS = {
   TRANSLATE_BASE_FULL: 'TRANSLATE_BASE_FULL',
   TRANSLATE_RETRY_FULL: 'TRANSLATE_RETRY_FULL',
@@ -563,10 +565,12 @@ function isRateLimitLikeError(error) {
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
 const RPC_HEARTBEAT_INTERVAL_MS = 20000;
-const RPC_PORT_ROTATE_MS = 240000;
+const RPC_PORT_ROTATE_MS = 1800000;
 let rpcHeartbeatTimer = null;
 let rpcPortCreatedAt = 0;
 const ntRpcPending = new Map();
+let translationStartInProgress = false;
+let lastPreflightDebug = null;
 const PUNCTUATION_TOKENS = new Map([
   ['«', '⟦PUNC_LGUILLEMET⟧'],
   ['»', '⟦PUNC_RGUILLEMET⟧'],
@@ -586,13 +590,74 @@ try {
 runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'NT_PING') {
     if (typeof sendResponse === 'function') {
-      sendResponse({ ok: true, type: 'NT_PONG', timestamp: Date.now() });
+      sendResponse({
+        ok: true,
+        type: 'NT_PONG',
+        timestamp: Date.now(),
+        url: location.href,
+        visible: translationVisible,
+        inFlightCount: inFlightBlockCount
+      });
     }
     return true;
   }
 
   if (message?.type === 'CANCEL_TRANSLATION') {
     cancelTranslation();
+  }
+
+  if (message?.type === 'NT_CMD_START') {
+    if (translationInProgress || translationStartInProgress) {
+      if (typeof sendResponse === 'function') {
+        sendResponse({ ok: false, message: 'already_running', code: 'already_running' });
+      }
+      return true;
+    }
+    translationStartInProgress = true;
+    const jobId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    if (typeof sendResponse === 'function') {
+      sendResponse({ ok: true, started: true, jobId, url: location.href });
+    }
+    void startTranslationFromPopup({
+      jobId,
+      mode: typeof message?.mode === 'string' ? message.mode : 'page'
+    });
+    return true;
+  }
+
+  if (message?.type === 'NT_CMD_STOP') {
+    Promise.resolve()
+      .then(() => stopTranslation('stop'))
+      .then(() => {
+        if (typeof sendResponse === 'function') {
+          sendResponse({ ok: true });
+        }
+      })
+      .catch((error) => {
+        if (typeof sendResponse === 'function') {
+          sendResponse({ ok: false, message: error?.message || String(error) });
+        }
+      });
+    return true;
+  }
+
+  if (message?.type === 'NT_CMD_RESET') {
+    Promise.resolve()
+      .then(() => resetTranslationState({
+        resetContext: Boolean(message?.resetContext),
+        resetMemory: Boolean(message?.resetMemory)
+      }))
+      .then(() => {
+        if (typeof sendResponse === 'function') {
+          sendResponse({ ok: true });
+        }
+      })
+      .catch((error) => {
+        if (typeof sendResponse === 'function') {
+          sendResponse({ ok: false, message: error?.message || String(error) });
+        }
+      });
+    return true;
   }
 
   if (message?.type === 'START_TRANSLATION') {
@@ -847,18 +912,9 @@ async function notifyDebugUpdate() {
 }
 
 async function readSettingsFromStorage() {
-  const stored = await storageLocalGet({ ...DEFAULT_STATE, model: null, chunkLengthLimit: null });
+  const stored = await storageLocalGet({ ...DEFAULT_STATE });
   const safeStored = stored && typeof stored === 'object' ? stored : {};
   const merged = { ...DEFAULT_STATE, ...safeStored };
-  if (!merged.blockLengthLimit && safeStored.chunkLengthLimit) {
-    merged.blockLengthLimit = safeStored.chunkLengthLimit;
-  }
-  if (!merged.translationModel && safeStored.model) {
-    merged.translationModel = safeStored.model;
-  }
-  if (!merged.contextModel && safeStored.model) {
-    merged.contextModel = safeStored.model;
-  }
   const previousModels = {
     translationModel: merged.translationModel,
     contextModel: merged.contextModel,
@@ -901,15 +957,15 @@ async function readSettingsFromStorage() {
   const fallbackContextModel = merged.contextModel || DEFAULT_STATE.contextModel;
   const fallbackProofreadModel = merged.proofreadModel || DEFAULT_STATE.proofreadModel;
   merged.translationModelList = normalizeModelList(
-    merged.translationModelList || merged.translationModel || safeStored.model,
+    merged.translationModelList || merged.translationModel,
     fallbackTranslationModel
   );
   merged.contextModelList = normalizeModelList(
-    merged.contextModelList || merged.contextModel || safeStored.model,
+    merged.contextModelList || merged.contextModel,
     fallbackContextModel
   );
   merged.proofreadModelList = normalizeModelList(
-    merged.proofreadModelList || merged.proofreadModel || safeStored.model,
+    merged.proofreadModelList || merged.proofreadModel,
     fallbackProofreadModel
   );
   merged.translationModel = parseModelSpec(merged.translationModelList[0]).id || fallbackTranslationModel;
@@ -1019,10 +1075,58 @@ function buildSettingsFromState(state) {
   };
 }
 
-async function startTranslation(triggerSource = 'manual') {
+function logStartEvent(kind, payload = {}) {
+  const entry = {
+    kind,
+    ts: Date.now(),
+    url: location.href,
+    ...payload
+  };
+  if (typeof globalThis.ntPageJsonLog === 'function') {
+    globalThis.ntPageJsonLog(entry, 'log');
+  } else {
+    console.info('[NT]', kind, entry);
+  }
+}
+
+async function startTranslationFromPopup({ mode = 'page', jobId } = {}) {
+  logStartEvent('start.cmd.received', { mode, jobId });
+  let tabId = null;
+  try {
+    tabId = await getActiveTabId();
+    currentTabIdForProgress = tabId || currentTabIdForProgress;
+    if (tabId) {
+      await sendBackgroundMessageSafe({
+        type: 'NT_PROGRESS_PULSE',
+        tabId,
+        channel: 'page',
+        reason: 'start_cmd'
+      });
+    }
+    const started = await startTranslation('popup', { logStart: true, startJobId: jobId, mode });
+    logStartEvent('start.pipeline.end', { ok: Boolean(started), jobId });
+  } catch (error) {
+    logStartEvent('start.pipeline.end', { ok: false, jobId, error: error?.message || String(error) });
+    reportLastError('start', 'start_failed', error);
+  } finally {
+    translationStartInProgress = false;
+    if (tabId) {
+      await sendBackgroundMessageSafe({
+        type: 'NT_PROGRESS_PULSE',
+        tabId,
+        channel: 'page',
+        reason: 'job_finished'
+      });
+    }
+  }
+}
+
+async function startTranslation(triggerSource = 'manual', options = {}) {
+  const logStart = Boolean(options?.logStart);
+  const startJobId = options?.startJobId || null;
   if (translationInProgress) {
     reportProgress('Перевод уже выполняется', translationProgress.completedBlocks, translationProgress.totalBlocks);
-    return;
+    return false;
   }
 
   let settings = await requestSettings();
@@ -1036,13 +1140,19 @@ async function startTranslation(triggerSource = 'manual') {
       translationProgress.completedBlocks,
       translationProgress.totalBlocks
     );
-    return;
+    return false;
   }
 
   if (!translationVisible) {
     await setTranslationVisibility(true);
   }
 
+  const tabIdForProgress = await getActiveTabId();
+  currentTabIdForProgress = tabIdForProgress || null;
+
+  if (logStart) {
+    logStartEvent('start.plan.begin', { jobId: startJobId });
+  }
   configureTpmLimiter(settings);
   schedulerModels = {
     translationModel: settings.translationModel || '',
@@ -1059,6 +1169,14 @@ async function startTranslation(triggerSource = 'manual') {
     if (plan) {
       pagePlan = { ...plan, planId };
       pagePlanHints = plan.hints || null;
+      lastPreflightDebug = plan.debug || null;
+      if (currentTabIdForProgress && lastPreflightDebug) {
+        void sendBackgroundMessageSafe({
+          type: 'NT_REPORT_PREFLIGHT',
+          tabId: currentTabIdForProgress,
+          debug: lastPreflightDebug
+        });
+      }
       globalThis.ntPageJsonLog?.({
         kind: 'preflight.summary',
         ts: Date.now(),
@@ -1066,6 +1184,62 @@ async function startTranslation(triggerSource = 'manual') {
         totals: plan.totals || {},
         hints: plan.hints || {}
       });
+      if (logStart) {
+        logStartEvent('start.plan.ready', {
+          jobId: startJobId,
+          totalBlocks: Number.isFinite(plan?.totals?.blocks) ? plan.totals.blocks : null
+        });
+      }
+      if (currentTabIdForProgress && Number.isFinite(plan?.totals?.blocks)) {
+        const totalBlocks = plan.totals.blocks;
+        void sendBackgroundMessageSafe({
+          type: 'NT_SET_TOTAL',
+          tabId: currentTabIdForProgress,
+          channel: 'page',
+          reason: totalBlocks > 0 ? 'plan_ready' : 'no_candidates',
+          totals: {
+            total: totalBlocks,
+            done: 0,
+            failed: 0,
+            inFlight: 0,
+            queued: totalBlocks
+          }
+        });
+        if (totalBlocks === 0) {
+          let topReason = 'none';
+          let topCount = 0;
+          if (lastPreflightDebug?.filtered && typeof lastPreflightDebug.filtered === 'object') {
+            const ranked = Object.entries(lastPreflightDebug.filtered).sort((a, b) => b[1] - a[1]);
+            if (ranked.length) {
+              [topReason, topCount] = ranked[0];
+            }
+          }
+          if (logStart) {
+            logStartEvent('start.no_candidates', {
+              jobId: startJobId,
+              reason: 'empty-plan',
+              topReason,
+              topCount
+            });
+          }
+          void sendBackgroundMessageSafe({
+            type: 'NT_REPORT_ERROR',
+            tabId: currentTabIdForProgress,
+            channel: 'page',
+            stage: 'preflight',
+            reason: 'no_candidates',
+            message: `top=${topReason}(${topCount}) scanned=${lastPreflightDebug?.scannedTextNodes ?? 0} nonEmpty=${lastPreflightDebug?.nonEmptyTextNodes ?? 0}`
+          });
+          void sendBackgroundMessageSafe({
+            type: 'NT_PROGRESS_PULSE',
+            tabId: currentTabIdForProgress,
+            channel: 'page',
+            reason: 'no_candidates',
+            queued: 0,
+            inFlight: 0
+          });
+        }
+      }
       const tabId = await getActiveTabId();
       if (tabId) {
         await sendRpcRequest(
@@ -1085,10 +1259,15 @@ async function startTranslation(triggerSource = 'manual') {
   translationInProgress = true;
   try {
     startRpcHeartbeat();
+    if (logStart) {
+      logStartEvent('start.pipeline.begin', { jobId: startJobId });
+    }
     await translatePage(settings, { triggerSource, planHints: pagePlanHints });
+    return true;
   } finally {
     translationInProgress = false;
     stopRpcHeartbeat();
+    activeJobControl = null;
   }
 }
 
@@ -1284,6 +1463,8 @@ async function translatePage(settings, options = {}) {
           Math.min(2, 0.5 + suggestedBatchSizeTranslate / 6)
       )
     : TRANSLATION_MICROBATCH_TARGET_TOKENS;
+  translationMicrobatchTargetTokens = translationBatchTargetTokens;
+  translationMicrobatchMaxItems = suggestedBatchSizeTranslate ? Math.max(1, suggestedBatchSizeTranslate) : 0;
   translationCallCount = 0;
   const textNodes = collectTextNodes(document.body);
   const existingDebugStore = await getTranslationDebugObject();
@@ -1919,9 +2100,31 @@ async function translatePage(settings, options = {}) {
         ts: Date.now(),
         fields: { reason: 'no_candidates' }
       });
+      if (currentTabIdForProgress) {
+        void sendBackgroundMessageSafe({
+          type: 'NT_PROGRESS_PULSE',
+          tabId: currentTabIdForProgress,
+          channel: 'prewarm',
+          reason: 'no_candidates',
+          queued: 0,
+          inFlight: 0,
+          total: 0
+        });
+      }
       return;
     }
     const limitedItems = items.slice(0, maxRequests);
+    if (currentTabIdForProgress) {
+      void sendBackgroundMessageSafe({
+        type: 'NT_PROGRESS_PULSE',
+        tabId: currentTabIdForProgress,
+        channel: 'prewarm',
+        reason: 'start_prewarm',
+        total: limitedItems.length,
+        queued: limitedItems.length,
+        inFlight: 0
+      });
+    }
     await sendRpcRequest(
       {
         type: 'START_BATCH_PREWARM',
@@ -1938,7 +2141,7 @@ async function translatePage(settings, options = {}) {
   void scheduleBatchPrewarm();
   cancelRequested = false;
   translationError = null;
-  reportProgress('Перевод запущен', 0, blocks.length, 0);
+  reportProgress('Перевод запущен', 0, blocks.length, 0, { reason: 'start' });
 
   const pageText = settings.contextGenerationEnabled ? buildPageText(nodesWithPath) : '';
 
@@ -2354,12 +2557,32 @@ async function translatePage(settings, options = {}) {
   const proofreadQueue = [];
   const queuedBlockElements = new WeakSet();
   const proofreadQueueKeys = new Set();
+  const inFlightBlocks = new Map();
+  const finalizedBlocks = new Set();
+  let inFlightWatchdogTimer = null;
   let proofreadConcurrency = singleBlockConcurrency
     ? 1
     : Math.max(1, Math.min(4, suggestedConcurrency || blocks.length));
   // Duplicate translate/proofread requests could be triggered for the same block; dedupe by jobKey.
   const jobInFlight = new Map();
   const jobCompleted = new Map();
+  const cancelActiveJob = async (reason = 'cancelled') => {
+    cancelRequested = true;
+    translationQueue.length = 0;
+    proofreadQueue.length = 0;
+    proofreadQueueKeys.clear();
+    translationQueueDone = true;
+    stopInFlightWatchdog();
+    const pending = Array.from(inFlightBlocks.values());
+    for (const entry of pending) {
+      await finalizeBlock({
+        item: entry.item,
+        stage: entry.stage,
+        status: 'failed',
+        reason
+      });
+    }
+  };
 
   const isBlockProcessed = (blockElement, stage) => {
     if (!blockElement?.getAttribute) return false;
@@ -2394,6 +2617,121 @@ async function translatePage(settings, options = {}) {
     jobInFlight.set(jobKey, promise);
     return promise;
   };
+
+  const getInFlightKey = (stage, key) => `${stage}:${key || 'unknown'}`;
+
+  const markBlockInFlight = (item, stage) => {
+    if (!item?.key) return;
+    const entryKey = getInFlightKey(stage, item.key);
+    inFlightBlocks.set(entryKey, {
+      key: item.key,
+      stage,
+      index: item.index,
+      blockElement: item.blockElement,
+      uiMode: item.uiMode,
+      startedAt: Date.now(),
+      item
+    });
+    inFlightBlockCount = inFlightBlocks.size;
+  };
+
+  const clearBlockInFlight = (item, stage) => {
+    if (!item?.key) return;
+    inFlightBlocks.delete(getInFlightKey(stage, item.key));
+    inFlightBlockCount = inFlightBlocks.size;
+  };
+
+  const isBlockFinalized = (stage, key) => finalizedBlocks.has(getInFlightKey(stage, key));
+
+  const finalizeBlock = async ({ item, stage, status, reason }) => {
+    if (!item?.key) return;
+    const entryKey = getInFlightKey(stage, item.key);
+    if (finalizedBlocks.has(entryKey)) return;
+    const entryIndex = item.index + 1;
+    const entry = debugEntries.find((debugItem) => debugItem.index === entryIndex);
+    if (stage === 'translate') {
+      const current = entry?.translationStatus;
+      if (current === 'done' || current === 'failed') {
+        finalizedBlocks.add(entryKey);
+        inFlightBlocks.delete(entryKey);
+        inFlightBlockCount = inFlightBlocks.size;
+        return;
+      }
+    }
+    if (stage === 'proofread') {
+      const current = entry?.proofreadStatus;
+      if (current === 'done' || current === 'failed') {
+        finalizedBlocks.add(entryKey);
+        inFlightBlocks.delete(entryKey);
+        inFlightBlockCount = inFlightBlocks.size;
+        return;
+      }
+    }
+    const now = Date.now();
+    const update = {};
+    if (stage === 'translate') {
+      update.translationStatus = status;
+      update.translationCompletedAt = now;
+      if (reason) update.translationLastError = reason;
+      if (status === 'failed' || status === 'skipped') {
+        update.proofreadStatus = 'disabled';
+      }
+      traceBlockLifecycle(item.index + 1, 'translate', `status -> ${status}`, {
+        blockKey: item.key,
+        reason
+      });
+    } else if (stage === 'proofread') {
+      update.proofreadStatus = status;
+      update.proofreadCompletedAt = now;
+      if (reason) update.proofreadLastError = reason;
+      traceBlockLifecycle(item.index + 1, 'proofread', `status -> ${status}`, {
+        blockKey: item.key,
+        reason
+      });
+    }
+    finalizedBlocks.add(entryKey);
+    inFlightBlocks.delete(entryKey);
+    inFlightBlockCount = inFlightBlocks.size;
+    await updateDebugEntry(entryIndex, update);
+    reportProgress('Перевод выполняется');
+  };
+
+  const startInFlightWatchdog = () => {
+    if (inFlightWatchdogTimer) return;
+    inFlightWatchdogTimer = setInterval(() => {
+      const now = Date.now();
+      for (const entry of inFlightBlocks.values()) {
+        const timeoutMs =
+          entry.stage === 'proofread'
+            ? getRpcTimeoutMs('PROOFREAD_TEXT')
+            : getRpcTimeoutMs('TRANSLATE_TEXT');
+        const thresholdMs = timeoutMs + IN_FLIGHT_WATCHDOG_GRACE_MS;
+        if (now - entry.startedAt <= thresholdMs) continue;
+        globalThis.ntPageJsonLog?.({
+          kind: 'block.watchdog.timeout',
+          ts: now,
+          stage: entry.stage,
+          blockKey: entry.key,
+          elapsedMs: now - entry.startedAt,
+          thresholdMs
+        });
+        void finalizeBlock({
+          item: entry.item,
+          stage: entry.stage,
+          status: 'failed',
+          reason: 'watchdog_timeout'
+        });
+      }
+    }, IN_FLIGHT_WATCHDOG_INTERVAL_MS);
+  };
+
+  const stopInFlightWatchdog = () => {
+    if (!inFlightWatchdogTimer) return;
+    clearInterval(inFlightWatchdogTimer);
+    inFlightWatchdogTimer = null;
+  };
+
+  activeJobControl = { cancel: cancelActiveJob };
 
   const finalizePrefilledBlock = async ({ block, index, blockElement, uiMode, uiLike }) => {
     const prefilled = prefilledTranslationsByBlock?.[index] || new Array(block.length).fill(null);
@@ -2516,6 +2854,11 @@ async function translatePage(settings, options = {}) {
     return message.includes('429') || message.includes('rate') || message.includes('too many');
   };
 
+  const isInvalidResponseShapeError = (err) => {
+    const message = String(err?.message || err || '').toLowerCase();
+    return message.includes('invalid response shape') || message.includes('length mismatch');
+  };
+
   const translationWorker = async () => {
     while (true) {
       if (cancelRequested) return;
@@ -2546,6 +2889,12 @@ async function translatePage(settings, options = {}) {
           prepareTextForTranslation(seedBlock[segmentIndex]?.original || '')
         );
         if (!seedPreparedTexts.length) {
+          await finalizeBlock({
+            item: seedItem,
+            stage: 'translate',
+            status: 'skipped',
+            reason: 'empty_texts'
+          });
           continue;
         }
         const { uniqueTexts: seedUniqueTexts, indexMap: seedIndexMap } = deduplicateTexts(seedPreparedTexts);
@@ -2582,6 +2931,7 @@ async function translatePage(settings, options = {}) {
             proofreadApplied: settings.proofreadEnabled && !item.uiMode,
             translationStartedAt: Date.now()
           });
+          markBlockInFlight(item, 'translate');
           traceBlockLifecycle(item.index + 1, 'translate', 'block start', { blockKey: item.key });
         }
         reportProgress('Перевод выполняется');
@@ -2669,6 +3019,14 @@ async function translatePage(settings, options = {}) {
             });
           });
           if (!combinedPreparedTexts.length) {
+            for (const item of batchItems) {
+              await finalizeBlock({
+                item,
+                stage: 'translate',
+                status: 'skipped',
+                reason: 'empty_texts'
+              });
+            }
             continue;
           }
           const { uniqueTexts, indexMap } = deduplicateTexts(combinedPreparedTexts);
@@ -2834,6 +3192,10 @@ async function translatePage(settings, options = {}) {
           });
           for (let itemIndex = 0; itemIndex < batchItems.length; itemIndex += 1) {
             const item = batchItems[itemIndex];
+            if (isBlockFinalized('translate', item.key)) {
+              clearBlockInFlight(item, 'translate');
+              continue;
+            }
             const block = item.block;
             const contextMeta = batchContexts[itemIndex];
             const blockTranslations = [];
@@ -2895,6 +3257,7 @@ async function translatePage(settings, options = {}) {
               });
               traceBlockLifecycle(item.index + 1, 'translate', 'status -> DONE');
               translationProgress.completedBlocks += 1;
+              clearBlockInFlight(item, 'translate');
               await maybeQueueProofread({
                 block,
                 index: item.index,
@@ -2924,6 +3287,10 @@ async function translatePage(settings, options = {}) {
 
         traceBlockLifecycle(seedIndex + 1, 'translate', 'parsed OK', { batchSize: 1 });
         try {
+          if (isBlockFinalized('translate', seedItem.key)) {
+            clearBlockInFlight(seedItem, 'translate');
+            continue;
+          }
           const pendingIndexBySegment = new Map();
           seedPendingIndices.forEach((segmentIndex, pendingIndex) => {
             pendingIndexBySegment.set(segmentIndex, pendingIndex);
@@ -2996,6 +3363,7 @@ async function translatePage(settings, options = {}) {
           });
           traceBlockLifecycle(seedIndex + 1, 'translate', 'status -> DONE');
           translationProgress.completedBlocks += 1;
+          clearBlockInFlight(seedItem, 'translate');
 
           await maybeQueueProofread({
             block: seedBlock,
@@ -3022,6 +3390,7 @@ async function translatePage(settings, options = {}) {
         }
       } catch (error) {
         console.error('Block translation failed', error);
+        reportLastError('translate', 'block', error);
         const policy = globalThis.ntResiliencePolicy;
         const errorType = classifyResilienceError(error);
         if (isFatalBlockError(error)) {
@@ -3035,13 +3404,25 @@ async function translatePage(settings, options = {}) {
                 errorMessage: error?.message || String(error)
               });
             }
-            await updateDebugEntry(item.index + 1, {
-              translationStatus: 'cancelled',
-              proofreadStatus: settings.proofreadEnabled ? 'cancelled' : 'disabled',
-              translationCompletedAt: Date.now()
+            await finalizeBlock({
+              item,
+              stage: 'translate',
+              status: 'failed',
+              reason: error?.message || String(error)
             });
           }
         } else {
+          if (isInvalidResponseShapeError(error)) {
+            for (const item of activeBatchItems) {
+              await finalizeBlock({
+                item,
+                stage: 'translate',
+                status: 'failed',
+                reason: 'invalid_response_shape'
+              });
+            }
+            continue;
+          }
           for (const item of activeBatchItems) {
             if (policy) {
               const resilienceKey = buildResilienceKey('translate', { blockKey: item.key });
@@ -3079,6 +3460,7 @@ async function translatePage(settings, options = {}) {
               translationRetryCount: item.retryCount,
               translationLastError: String(error?.message || error)
             });
+            clearBlockInFlight(item, 'translate');
             reportProgress(
               'Повтор перевода блока',
               translationProgress.completedBlocks,
@@ -3124,6 +3506,7 @@ async function translatePage(settings, options = {}) {
       activeProofreadWorkers += 1;
       try {
         await updateDebugEntry(task.index + 1, { proofreadStatus: 'in_progress', proofreadExecuted: true });
+        markBlockInFlight(task, 'proofread');
         traceBlockLifecycle(task.index + 1, 'proofread', 'block start', { blockKey: task.key });
         const debugEntry = debugEntries.find((item) => item.index === task.index + 1);
         const followupTag =
@@ -3264,6 +3647,10 @@ async function translatePage(settings, options = {}) {
         }
 
         traceBlockLifecycle(task.index + 1, 'proofread', 'parsed OK');
+        if (isBlockFinalized('proofread', task.key)) {
+          clearBlockInFlight(task, 'proofread');
+          continue;
+        }
         updatePageWithProofreading(task, finalTranslations);
         markBlockProcessed(task.blockElement, 'proofread');
         traceBlockLifecycle(task.index + 1, 'proofread', 'applied to DOM');
@@ -3309,9 +3696,11 @@ async function translatePage(settings, options = {}) {
           ...(baseProofreadCallId ? { proofreadBaseFullCallId: baseProofreadCallId } : {})
         });
         traceBlockLifecycle(task.index + 1, 'proofread', 'status -> DONE');
+        clearBlockInFlight(task, 'proofread');
         reportProgress('Вычитка выполняется');
       } catch (error) {
         console.warn('Proofreading failed, keeping original translations.', error);
+        reportLastError('proofread', 'block', error);
         const proofreadComparisons = buildProofreadComparisons({
           originalTexts: task.originalTexts,
           beforeTexts: task.translatedTexts,
@@ -3319,12 +3708,14 @@ async function translatePage(settings, options = {}) {
         }).filter((comparison) => comparison.changed);
         recordHealthProofreadDelta(proofreadComparisons.length, task.originalTexts.length);
         await updateDebugEntry(task.index + 1, {
-          proofreadStatus: 'cancelled',
+          proofreadStatus: 'failed',
           proofread: [],
           proofreadComparisons,
           proofreadExecuted: true,
-          proofreadCompletedAt: Date.now()
+          proofreadCompletedAt: Date.now(),
+          proofreadLastError: String(error?.message || error)
         });
+        clearBlockInFlight(task, 'proofread');
         reportProgress('Вычитка выполняется');
       } finally {
         activeProofreadWorkers = Math.max(0, activeProofreadWorkers - 1);
@@ -3445,23 +3836,26 @@ async function translatePage(settings, options = {}) {
   const totalBlocks = translationProgress.totalBlocks;
 
   if (totalBlocks !== blocks.length) {
-    reportProgress('Перевод запущен', translationProgress.completedBlocks, totalBlocks, 0);
+    reportProgress('Перевод запущен', translationProgress.completedBlocks, totalBlocks, 0, { reason: 'start' });
   }
 
   const workers = Array.from({ length: translationConcurrency }, () => translationWorker());
   const proofreadWorkers = settings.proofreadEnabled
     ? Array.from({ length: proofreadConcurrency }, () => proofreadWorker())
     : [];
+  startInFlightWatchdog();
   const translationCompletion = Promise.all(workers).then(() => {
     translationQueueDone = true;
   });
   await Promise.all([...proofreadWorkers, translationCompletion]);
+  stopInFlightWatchdog();
 
   if (translationError) {
     updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:error');
     logDedupSummary();
     reportProgress('Ошибка перевода', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
+    reportLastError('translate', 'page', translationError);
     return;
   }
 
@@ -3469,7 +3863,9 @@ async function translatePage(settings, options = {}) {
     updateDebugSessionEndTime();
     await flushPersistDebugState('translatePage:cancelled');
     logDedupSummary();
-    reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers);
+    reportProgress('Перевод отменён', translationProgress.completedBlocks, totalBlocks, activeTranslationWorkers, {
+      reason: 'cancelled'
+    });
     return;
   }
 
@@ -3596,23 +3992,48 @@ async function translate(
   const rawParts = [];
   const debugParts = [];
   const baseRequestMeta = requestMeta && typeof requestMeta === 'object' ? requestMeta : null;
+  const rootRequestId = baseRequestMeta?.requestId || (baseRequestMeta ? createRequestId() : null);
   const summaryOptions = debugOptions && typeof debugOptions === 'object' ? debugOptions : {};
   const entryIndex = Number.isFinite(summaryOptions.entryIndex) ? summaryOptions.entryIndex : debugEntryIndex;
   const shouldSummarize = !summaryOptions.skipSummaries;
   const onBatchApplied = typeof summaryOptions.onBatchApplied === 'function' ? summaryOptions.onBatchApplied : null;
   let batchCursor = 0;
 
-  for (let index = 0; index < resilientBatches.length; index += 1) {
-    const batch = resilientBatches[index];
-    const batchIndices = batch.map((_text, offset) => batchCursor + offset);
-    batchCursor += batch.length;
-    const batchContext = context;
+  const logSplitRetry = ({ batchLen, depth, reason, splitSide } = {}) => {
+    const payload = {
+      kind: 'translate.split_retry',
+      ts: Date.now(),
+      batchLen: Number.isFinite(batchLen) ? batchLen : null,
+      depth: Number.isFinite(depth) ? depth : null,
+      reason: reason || 'timeout',
+      splitSide: splitSide || null
+    };
+    if (typeof globalThis.ntPageJsonLog === 'function') {
+      globalThis.ntPageJsonLog(payload, 'log');
+    } else {
+      console.info('Translate split retry', payload);
+    }
+  };
+
+  const translateBatchWithSplit = async (batch, batchIndices, batchMeta, depth = 0) => {
+    const perBatchRequestId = baseRequestMeta ? createRequestId() : null;
     const batchRequestMeta = baseRequestMeta
       ? buildRequestMeta(baseRequestMeta, {
-          contextText: batchContext,
+          requestId: perBatchRequestId,
+          parentRequestId: rootRequestId,
+          contextText: context,
           contextMode: resilienceContextMeta.contextMode
         })
       : null;
+    if (batchRequestMeta) {
+      batchRequestMeta.batchIndex = batchMeta.batchIndex;
+      batchRequestMeta.batchCount = batchMeta.batchCount;
+      batchRequestMeta.batchOffset = batchIndices[0];
+      if (depth > 0) {
+        batchRequestMeta.splitDepth = depth;
+        batchRequestMeta.splitSide = batchMeta.splitSide || null;
+      }
+    }
     const requestBlockKeys = getRequestBlockKeys(baseRequestMeta);
     const fallbackEnabled = recordBlockAttempt(requestBlockKeys);
     const requestMetaForPayload =
@@ -3621,7 +4042,7 @@ async function translate(
         : batchRequestMeta;
     const estimatedTokens = estimateTokensForRole('translation', {
       texts: batch,
-      context: [batchContext, baseAnswer].filter(Boolean).join('\n')
+      context: [context, baseAnswer].filter(Boolean).join('\n')
     });
     await ensureTpmBudget('translation', estimatedTokens);
     recordHealthBatchSize('translate', batch.length);
@@ -3634,18 +4055,29 @@ async function translate(
       { batchSize: batch.length, contextMode: resilienceContextMeta.contextMode }
     );
     const requestStartedAt = Date.now();
-    let batchResult = null;
+    let schedulerOutcomeRecorded = false;
+    const recordSchedulerOutcomeOnce = async (status) => {
+      if (schedulerOutcomeRecorded) return;
+      schedulerOutcomeRecorded = true;
+      await recordSchedulerOutcome(
+        'translation',
+        status,
+        Date.now() - requestStartedAt,
+        requestMetaForPayload,
+        schedulerModel
+      );
+    };
     try {
-      batchResult = await withRateLimitRetry(
+      const response = await withRateLimitRetry(
         async () => {
           await incrementDebugAiRequestCount();
-          const response = await sendRuntimeMessage(
+          const rpcResponse = await sendRuntimeMessage(
             {
               type: 'TRANSLATE_TEXT',
               texts: batch,
               targetLanguage,
               context: {
-                text: batchContext,
+                text: context,
                 mode: resilienceContextMeta.contextMode,
                 fullText: resilienceContextMeta.contextFullText || resilienceContextMeta.contextText || '',
                 shortText: resilienceContextMeta.contextShortText || '',
@@ -3658,38 +4090,63 @@ async function translate(
             },
             'Не удалось выполнить перевод.'
           );
-          if (!response?.success) {
-            if (isTimeoutLikeResponse(response)) {
+          if (!rpcResponse?.success) {
+            if (isTimeoutLikeResponse(rpcResponse)) {
               recordBlockTimeout(requestBlockKeys);
             }
-            if (response?.contextOverflow) {
-              return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
+            if (rpcResponse?.contextOverflow) {
+              return { success: false, contextOverflow: true, error: rpcResponse.error || 'Контекст не помещается.' };
             }
-            if (response?.isRuntimeError) {
-              return { success: false, error: response.error || 'Не удалось выполнить перевод.' };
+            if (rpcResponse?.isRuntimeError) {
+              return { success: false, error: rpcResponse.error || 'Не удалось выполнить перевод.' };
             }
-            const error = new Error(response?.error || 'Не удалось выполнить перевод.');
-            error.status = response?.status;
+            const error = new Error(rpcResponse?.error || 'Не удалось выполнить перевод.');
+            error.status = rpcResponse?.status;
             error.healthRecorded = true;
             throw error;
           }
+          const translations = Array.isArray(rpcResponse.translations) ? rpcResponse.translations : null;
+          if (!translations || translations.length !== batch.length) {
+            logInvalidRpcResponse({
+              stage: 'translate',
+              reason: 'invalid_response_shape',
+              expectedCount: batch.length,
+              receivedCount: translations ? translations.length : null,
+              response: rpcResponse
+            });
+            const invalidError = new Error('Invalid response shape');
+            invalidError.isInvalidResponseShape = true;
+            throw invalidError;
+          }
           return {
             success: true,
-            translations: Array.isArray(response.translations) ? response.translations : [],
-            rawTranslation: response.rawTranslation || '',
-            debug: response.debug || []
+            translations,
+            rawTranslation: rpcResponse.rawTranslation || '',
+            debug: rpcResponse.debug || []
           };
         },
         'Translation'
       );
+      if (!response?.success) {
+        await recordSchedulerOutcomeOnce(response?.contextOverflow ? 413 : null);
+        return {
+          ok: false,
+          translations: new Array(batch.length).fill(null),
+          error: response?.error || '',
+          contextOverflow: Boolean(response?.contextOverflow),
+          requestMeta: batchRequestMeta
+        };
+      }
+      await recordSchedulerOutcomeOnce(200);
+      return {
+        ok: true,
+        translations: response.translations,
+        rawParts: response.rawTranslation ? [response.rawTranslation] : [],
+        debugParts: Array.isArray(response.debug) ? response.debug : [],
+        requestMeta: batchRequestMeta
+      };
     } catch (error) {
-      await recordSchedulerOutcome(
-        'translation',
-        Number.isFinite(error?.status) ? error.status : null,
-        Date.now() - requestStartedAt,
-        requestMetaForPayload,
-        schedulerModel
-      );
+      await recordSchedulerOutcomeOnce(Number.isFinite(error?.status) ? error.status : null);
       if (!error?.healthRecorded) {
         recordHealthError(classifyResilienceError(error));
       }
@@ -3706,50 +4163,92 @@ async function translate(
           policy.escalate(resilienceKey, errorType);
         }
       }
-      throw error;
+      if (!isTimeoutLikeError(error)) {
+        throw error;
+      }
+      if (batch.length > 1 && depth < 8) {
+        logSplitRetry({ batchLen: batch.length, depth, reason: error?.message || 'timeout' });
+        const midpoint = Math.ceil(batch.length / 2);
+        const leftBatch = batch.slice(0, midpoint);
+        const rightBatch = batch.slice(midpoint);
+        const leftIndices = batchIndices.slice(0, midpoint);
+        const rightIndices = batchIndices.slice(midpoint);
+        const leftResult = await translateBatchWithSplit(
+          leftBatch,
+          leftIndices,
+          { ...batchMeta, splitSide: 'L' },
+          depth + 1
+        );
+        const rightResult = await translateBatchWithSplit(
+          rightBatch,
+          rightIndices,
+          { ...batchMeta, splitSide: 'R' },
+          depth + 1
+        );
+        return {
+          ok: leftResult.ok && rightResult.ok,
+          translations: [...leftResult.translations, ...rightResult.translations],
+          rawParts: [...(leftResult.rawParts || []), ...(rightResult.rawParts || [])],
+          debugParts: [...(leftResult.debugParts || []), ...(rightResult.debugParts || [])],
+          requestMeta: batchRequestMeta
+        };
+      }
+      if (currentTabIdForProgress) {
+        reportLastError('translate', 'timeout_split_failed', error);
+      }
+      return {
+        ok: false,
+        translations: [null],
+        rawParts: [],
+        debugParts: [],
+        error,
+        requestMeta: batchRequestMeta
+      };
+    } finally {
+      if (!schedulerOutcomeRecorded) {
+        await recordSchedulerOutcomeOnce(null);
+      }
     }
-    if (!batchResult?.success) {
-      await recordSchedulerOutcome(
-        'translation',
-        batchResult?.contextOverflow ? 413 : null,
-        Date.now() - requestStartedAt,
-        requestMetaForPayload,
-        schedulerModel
-      );
+  };
+
+  for (let index = 0; index < resilientBatches.length; index += 1) {
+    const batch = resilientBatches[index];
+    const batchIndices = batch.map((_text, offset) => batchCursor + offset);
+    batchCursor += batch.length;
+    const batchResult = await translateBatchWithSplit(
+      batch,
+      batchIndices,
+      { batchIndex: index + 1, batchCount: resilientBatches.length }
+    );
+    if (batchResult?.contextOverflow) {
       return {
         success: false,
         error: batchResult?.error || 'Не удалось выполнить перевод.',
-        contextOverflow: Boolean(batchResult?.contextOverflow)
+        contextOverflow: true
       };
     }
-    await recordSchedulerOutcome(
-      'translation',
-      200,
-      Date.now() - requestStartedAt,
-      requestMetaForPayload,
-      schedulerModel
-    );
-    translations.push(...batchResult.translations);
+    translations.push(...(batchResult?.translations || []));
+    const batchContext = context;
     if (onBatchApplied) {
       await onBatchApplied({
-        batchTranslations: batchResult.translations,
+        batchTranslations: batchResult?.translations || [],
         batchIndices,
         batchIndex: index + 1,
         batchCount: batches.length
       });
     }
-    if (batchResult.rawTranslation) {
-      rawParts.push(batchResult.rawTranslation);
+    if (Array.isArray(batchResult?.rawParts) && batchResult.rawParts.length) {
+      rawParts.push(...batchResult.rawParts.filter(Boolean));
     }
-    if (Array.isArray(batchResult.debug)) {
-      const annotated = annotateContextUsage(batchResult.debug, {
+    if (Array.isArray(batchResult?.debugParts) && batchResult.debugParts.length) {
+      const annotated = annotateContextUsage(batchResult.debugParts, {
         contextMode: resilienceContextMeta.contextMode,
         baseAnswerIncluded: resilienceContextMeta.baseAnswerIncluded,
         baseAnswerPreview: resilienceContextMeta.baseAnswerPreview,
         contextTextSent: batchContext,
         tag: resilienceContextMeta.tag
       });
-      const withRequestMeta = annotateRequestMetadata(annotated, batchRequestMeta);
+      const withRequestMeta = annotateRequestMetadata(annotated, batchResult?.requestMeta || null);
       if (shouldSummarize) {
         const summarized = await summarizeDebugPayloads(withRequestMeta, {
           entryIndex,
@@ -3760,7 +4259,7 @@ async function translate(
         debugParts.push(...withRequestMeta);
       }
     }
-    recordAiResponseMetrics(batchResult?.debug || []);
+    recordAiResponseMetrics(batchResult?.debugParts || []);
   }
 
   if (policy && resilienceKey) {
@@ -3833,6 +4332,18 @@ async function requestProofreading(payload) {
     { batchSize: segments.length, contextMode: resilienceContextMeta.contextMode }
   );
   const requestStartedAt = Date.now();
+  let schedulerOutcomeRecorded = false;
+  const recordSchedulerOutcomeOnce = async (status) => {
+    if (schedulerOutcomeRecorded) return;
+    schedulerOutcomeRecorded = true;
+    await recordSchedulerOutcome(
+      'proofread',
+      status,
+      Date.now() - requestStartedAt,
+      resolvedRequestMeta,
+      schedulerModel
+    );
+  };
   try {
     const result = await withRateLimitRetry(
       async () => {
@@ -3883,34 +4394,35 @@ async function requestProofreading(payload) {
           entryIndex: payload?.debugEntryIndex,
           stage: 'proofreading'
         });
+        const translations = Array.isArray(response.translations) ? response.translations : null;
+        if (!translations || translations.length !== segments.length) {
+          logInvalidRpcResponse({
+            stage: 'proofread',
+            reason: 'invalid_response_shape',
+            expectedCount: segments.length,
+            receivedCount: translations ? translations.length : null,
+            response
+          });
+          const invalidError = new Error('Invalid response shape');
+          invalidError.isInvalidResponseShape = true;
+          throw invalidError;
+        }
         return {
           success: true,
-          translations: Array.isArray(response.translations) ? response.translations : [],
+          translations,
           rawProofread: response.rawProofread || '',
           debug: summarized
         };
       },
       'Proofreading'
     );
-    await recordSchedulerOutcome(
-      'proofread',
-      200,
-      Date.now() - requestStartedAt,
-      resolvedRequestMeta,
-      schedulerModel
-    );
+    await recordSchedulerOutcomeOnce(200);
     if (policy && resilienceKey) {
       policy.recordOutcome(resilienceKey, 'success');
     }
     return result;
   } catch (error) {
-    await recordSchedulerOutcome(
-      'proofread',
-      Number.isFinite(error?.status) ? error.status : null,
-      Date.now() - requestStartedAt,
-      resolvedRequestMeta,
-      schedulerModel
-    );
+    await recordSchedulerOutcomeOnce(Number.isFinite(error?.status) ? error.status : null);
     if (!error?.healthRecorded) {
       recordHealthError(classifyResilienceError(error));
     }
@@ -3925,6 +4437,10 @@ async function requestProofreading(payload) {
       }
     }
     throw error;
+  } finally {
+    if (!schedulerOutcomeRecorded) {
+      await recordSchedulerOutcomeOnce(null);
+    }
   }
 }
 
@@ -4003,7 +4519,9 @@ function ensureRpcPort() {
 function startRpcHeartbeat() {
   if (rpcHeartbeatTimer) return;
   rpcHeartbeatTimer = setInterval(() => {
-    sendRpcRequest({ type: 'RPC_HEARTBEAT' }, 'RPC heartbeat failed', 2000).then(() => {});
+    sendRpcRequest({ type: 'RPC_HEARTBEAT' }, 'RPC heartbeat failed', 2000, {
+      allowRotate: false
+    }).then(() => {});
   }, RPC_HEARTBEAT_INTERVAL_MS);
 }
 
@@ -4013,11 +4531,18 @@ function stopRpcHeartbeat() {
   rpcHeartbeatTimer = null;
 }
 
-function shouldRotateRpcPort() {
-  return rpcPortCreatedAt && Date.now() - rpcPortCreatedAt > RPC_PORT_ROTATE_MS;
+function shouldRotateRpcPort(allowRotate = true) {
+  return (
+    allowRotate &&
+    ntRpcPending.size === 0 &&
+    rpcPortCreatedAt &&
+    Date.now() - rpcPortCreatedAt > RPC_PORT_ROTATE_MS
+  );
 }
 
 function rotateRpcPort(reason = '') {
+  const ageMs = getRpcPortAgeMs();
+  const pendingCount = ntRpcPending.size;
   if (ntRpcPort) {
     try {
       ntRpcPort.disconnect();
@@ -4027,23 +4552,40 @@ function rotateRpcPort(reason = '') {
   }
   ntRpcPort = null;
   rpcPortCreatedAt = 0;
-  console.info('RPC port rotated', { reason });
-  globalThis.ntPageJsonLog?.({
-    kind: 'rpc.port.rotate',
-    pageUrl: window.location.href,
-    rpcPortCreatedAt,
-    reason,
-    ok: true
-  });
+  if (typeof globalThis.ntPageJsonLog === 'function') {
+    globalThis.ntPageJsonLog(
+      {
+        kind: 'rpc.port.rotate',
+        pageUrl: window.location.href,
+        reason,
+        ageMs,
+        pendingCount,
+        ok: true,
+        ts: Date.now()
+      },
+      'log'
+    );
+  } else {
+    console.info('RPC port rotated', { reason, ageMs, pendingCount });
+  }
 }
 
 function getRpcPortAgeMs() {
   return rpcPortCreatedAt ? Date.now() - rpcPortCreatedAt : 0;
 }
 
-function sendRpcRequest(payload, fallbackError, timeoutMs) {
+function logRpcTimeout(payload) {
+  const event = { kind: 'rpc.timeout', ...payload, ts: Date.now() };
+  if (typeof globalThis.ntPageJsonLog === 'function') {
+    globalThis.ntPageJsonLog(event, 'log');
+  } else {
+    console.info('RPC timeout', event);
+  }
+}
+
+function sendRpcRequest(payload, fallbackError, timeoutMs, options = {}) {
   let rotated = false;
-  if (shouldRotateRpcPort()) {
+  if (shouldRotateRpcPort(options.allowRotate !== false)) {
     rotateRpcPort('age');
     rotated = true;
   }
@@ -4071,12 +4613,12 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
   return new Promise((resolve) => {
     let timeoutId = setTimeout(() => {
       ntRpcPending.delete(rpcId);
-      globalThis.ntPageJsonLog?.({
-        kind: 'rpc.timeout',
+      logRpcTimeout({
         rpcId,
         type: payload?.type,
         timeoutMs,
-        ts: Date.now()
+        pendingCount: ntRpcPending.size,
+        rpcPortAgeMs: getRpcPortAgeMs()
       });
       resolve({
         success: false,
@@ -4118,12 +4660,12 @@ function sendRpcRequest(payload, fallbackError, timeoutMs) {
       });
       timeoutId = setTimeout(() => {
         ntRpcPending.delete(retryRpcId);
-        globalThis.ntPageJsonLog?.({
-          kind: 'rpc.timeout',
+        logRpcTimeout({
           rpcId: retryRpcId,
           type: payload?.type,
           timeoutMs,
-          ts: Date.now()
+          pendingCount: ntRpcPending.size,
+          rpcPortAgeMs: getRpcPortAgeMs()
         });
         resolve({
           success: false,
@@ -4214,9 +4756,9 @@ async function recordSchedulerOutcome(opType, status, latencyMs, requestMeta, mo
 }
 
 function getRpcTimeoutMs(type) {
-  if (type === 'TRANSLATE_TEXT') return 240000;
-  if (type === 'GENERATE_CONTEXT') return 120000;
-  if (type === 'PROOFREAD_TEXT') return 180000;
+  if (type === 'TRANSLATE_TEXT') return 480000;
+  if (type === 'GENERATE_CONTEXT') return 180000;
+  if (type === 'PROOFREAD_TEXT') return 360000;
   return 30000;
 }
 
@@ -4769,14 +5311,37 @@ function isUiBlock(blockElement, blockTexts = []) {
   return false;
 }
 
-function collectTextNodes(root) {
+function collectTextNodes(root, stats, recordNote) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      if (!node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      if (stats) {
+        stats.scannedTextNodes += 1;
+      }
+      const value = node.nodeValue ?? '';
+      if (!value.length) {
+        if (stats?.filtered) stats.filtered.empty += 1;
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (!value.trim()) {
+        if (stats?.filtered) stats.filtered.whitespaceOnly += 1;
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (stats) {
+        stats.nonEmptyTextNodes += 1;
+      }
       const parent = node.parentNode;
-      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (!parent) {
+        if (stats?.filtered) stats.filtered.other += 1;
+        if (typeof recordNote === 'function') recordNote('missing-parent');
+        return NodeFilter.FILTER_REJECT;
+      }
       const tag = parent.nodeName.toLowerCase();
-      if (['script', 'style', 'noscript', 'code', 'pre'].includes(tag)) {
+      if (['script', 'style', 'noscript'].includes(tag)) {
+        if (stats?.filtered) stats.filtered.inScriptStyle += 1;
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (['code', 'pre'].includes(tag)) {
+        if (stats?.filtered) stats.filtered.nonTranslatableTag += 1;
         return NodeFilter.FILTER_REJECT;
       }
       return NodeFilter.FILTER_ACCEPT;
@@ -4978,13 +5543,26 @@ function estimateTokensForRole(role, { texts = [], context = '', sourceTexts = [
 }
 
 function splitTextsByTokenEstimate(texts, context, maxTokens) {
-  const targetTokens = TRANSLATION_MICROBATCH_TARGET_TOKENS;
+  const targetTokens =
+    Number.isFinite(translationMicrobatchTargetTokens) && translationMicrobatchTargetTokens > 0
+      ? translationMicrobatchTargetTokens
+      : TRANSLATION_MICROBATCH_TARGET_TOKENS;
+  const maxItems =
+    Number.isFinite(translationMicrobatchMaxItems) && translationMicrobatchMaxItems > 0
+      ? translationMicrobatchMaxItems
+      : 0;
   const batches = [];
   let current = [];
   let currentTokensTotal = 0;
   let currentTokensNoContext = 0;
 
   texts.forEach((text, index) => {
+    if (current.length && maxItems && current.length >= maxItems) {
+      batches.push(current);
+      current = [];
+      currentTokensTotal = 0;
+      currentTokensNoContext = 0;
+    }
     const nextTotal = estimateTokensForRole('translation', {
       texts: [text],
       context: current.length ? '' : context
@@ -5003,6 +5581,13 @@ function splitTextsByTokenEstimate(texts, context, maxTokens) {
     currentTokensTotal += nextTotal;
     currentTokensNoContext += nextNoCtx;
     const isLast = index === texts.length - 1;
+    if (!isLast && maxItems && current.length >= maxItems) {
+      batches.push(current);
+      current = [];
+      currentTokensTotal = 0;
+      currentTokensNoContext = 0;
+      return;
+    }
     if (!isLast && targetTokens && currentTokensNoContext >= targetTokens) {
       batches.push(current);
       current = [];
@@ -5239,13 +5824,46 @@ function formatBlockText(texts) {
   return texts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
+function logInvalidRpcResponse({ stage, reason, expectedCount, receivedCount, response } = {}) {
+  const payload = {
+    kind: 'rpc.response.invalid',
+    ts: Date.now(),
+    stage: stage || 'unknown',
+    reason: reason || 'invalid_response_shape',
+    expectedCount: Number.isFinite(expectedCount) ? expectedCount : null,
+    receivedCount: Number.isFinite(receivedCount) ? receivedCount : null,
+    responseKeys:
+      response && typeof response === 'object' && !Array.isArray(response)
+        ? Object.keys(response)
+        : null
+  };
+  if (typeof globalThis.ntPageJsonLog === 'function') {
+    globalThis.ntPageJsonLog(payload, 'log');
+  } else {
+    console.info('RPC response invalid', payload);
+  }
+}
+
 function buildShortContextFallback(context = '') {
   if (!context) return '';
   const normalized = typeof context === 'string' ? context : String(context ?? '');
   return normalized.trimEnd();
 }
 
-function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0) {
+function reportLastError(stage, reason, error) {
+  if (!currentTabIdForProgress) return;
+  const message = error?.message || String(error || '');
+  void sendBackgroundMessageSafe({
+    type: 'NT_REPORT_ERROR',
+    tabId: currentTabIdForProgress,
+    channel: 'page',
+    stage,
+    reason,
+    message
+  });
+}
+
+function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks = 0, options = {}) {
   const snapshot = getProgressSnapshot();
   const resolvedCompleted = Number.isFinite(snapshot?.completedBlocks)
     ? snapshot.completedBlocks
@@ -5254,11 +5872,32 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
   const resolvedInProgress = Number.isFinite(snapshot?.inProgressBlocks)
     ? snapshot.inProgressBlocks
     : inProgressBlocks || 0;
+  const resolvedFailed = Number.isFinite(snapshot?.failedBlocks) ? snapshot.failedBlocks : 0;
+  const resolvedDone = Math.max(0, resolvedCompleted - resolvedFailed);
+  const resolvedQueued = Math.max(
+    0,
+    resolvedTotal - resolvedDone - resolvedFailed - resolvedInProgress
+  );
   translationProgress = {
     completedBlocks: resolvedCompleted,
     totalBlocks: resolvedTotal,
     inProgressBlocks: resolvedInProgress
   };
+  if (currentTabIdForProgress) {
+    void sendBackgroundMessageSafe({
+      type: 'NT_SET_TOTAL',
+      tabId: currentTabIdForProgress,
+      channel: 'page',
+      reason: options?.reason,
+      totals: {
+        total: resolvedTotal,
+        done: resolvedDone,
+        failed: resolvedFailed,
+        inFlight: resolvedInProgress,
+        queued: resolvedQueued
+      }
+    });
+  }
   void sendBackgroundMessageSafe({
     type: 'TRANSLATION_PROGRESS',
     message,
@@ -5409,6 +6048,7 @@ function computeTranslationProgress(entries) {
       inProgressBlocks += 1;
     } else if (status === 'failed') {
       failedBlocks += 1;
+      completedBlocks += 1;
     }
   });
 
@@ -5445,6 +6085,7 @@ function getOverallEntryStatus(entry) {
 }
 
 function normalizeEntryStatus(status, value, proofreadApplied = true) {
+  if (status === 'skipped') return 'done';
   if (status) return status;
   if (proofreadApplied === false) return 'disabled';
   if (Array.isArray(value)) {
@@ -6279,8 +6920,7 @@ function restoreOriginal(entries) {
 }
 
 async function cancelTranslation() {
-  cancelRequested = true;
-  stopRpcHeartbeat();
+  await stopTranslation('cancelled');
   updateDebugSessionEndTime();
   await flushPersistDebugState('cancelTranslation');
   const entriesToRestore = activeTranslationEntries.length ? activeTranslationEntries : originalSnapshot;
@@ -6292,12 +6932,79 @@ async function cancelTranslation() {
   activeTranslationEntries = [];
   originalSnapshot = [];
   debugState = null;
+  translationError = null;
+  cancelRequested = false;
   translationProgress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
   translationVisible = false;
   notifyVisibilityChange();
-  reportProgress('Перевод отменён', 0, 0, 0);
+  reportProgress('Перевод отменён', 0, 0, 0, { reason: 'cancelled' });
   const tabId = await getActiveTabId();
   void sendBackgroundMessageSafe({ type: 'TRANSLATION_CANCELLED', tabId });
+}
+
+async function stopTranslation(reason = 'stop') {
+  cancelRequested = true;
+  stopRpcHeartbeat();
+  if (activeJobControl?.cancel) {
+    await activeJobControl.cancel('cancelled');
+  }
+  reportProgress('Перевод остановлен', translationProgress.completedBlocks, translationProgress.totalBlocks, 0, {
+    reason
+  });
+  if (currentTabIdForProgress) {
+    void sendBackgroundMessageSafe({
+      type: 'NT_PROGRESS_PULSE',
+      tabId: currentTabIdForProgress,
+      channel: 'prewarm',
+      reason,
+      queued: 0,
+      inFlight: 0,
+      total: 0
+    });
+  }
+}
+
+function resetContextState() {
+  contextState.full.status = 'empty';
+  contextState.full.signature = '';
+  contextState.full.text = '';
+  contextState.full.promise = null;
+  contextState.short.status = 'empty';
+  contextState.short.signature = '';
+  contextState.short.text = '';
+  contextState.short.promise = null;
+  latestContextSummary = '';
+  latestShortContextSummary = '';
+  shortContextPromise = null;
+}
+
+async function resetContextCache() {
+  try {
+    await chrome.storage.local.remove([CONTEXT_CACHE_KEY]);
+  } catch (error) {
+    console.warn('Failed to reset context cache.', error);
+  }
+}
+
+async function resetTranslationState({ resetContext = true, resetMemory = true } = {}) {
+  await stopTranslation('reset');
+  if (resetContext) {
+    resetContextState();
+    await resetContextCache();
+  }
+  if (resetMemory) {
+    await clearStoredTranslations(location.href);
+  }
+  await resetTranslationDebugInfo(location.href);
+  activeTranslationEntries = [];
+  originalSnapshot = [];
+  debugState = null;
+  translationError = null;
+  cancelRequested = false;
+  translationProgress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
+  translationVisible = false;
+  notifyVisibilityChange();
+  reportProgress('Перевод сброшен', 0, 0, 0, { reason: 'reset' });
 }
 
 function getActiveTabId() {

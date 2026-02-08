@@ -6,6 +6,8 @@ const entriesEl = document.getElementById('entries');
 const eventsEl = document.getElementById('events');
 const clearDebugButton = document.getElementById('clear-debug');
 const consoleJsonLogCheckbox = document.getElementById('console-json-log');
+const selfCheckButton = document.getElementById('run-self-check');
+const selfCheckEl = document.getElementById('self-check');
 
 const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const CONTEXT_CACHE_KEY = 'contextCacheByPage';
@@ -58,6 +60,103 @@ const healthUiState = {
 
 init();
 
+function renderSelfCheck(status) {
+  if (!selfCheckEl) return;
+  if (!status) {
+    selfCheckEl.textContent = 'Self-check: нет данных.';
+    return;
+  }
+  const preflight = status.preflight || null;
+  const preflightLines = [];
+  if (preflight) {
+    preflightLines.push(
+      `Preflight scanned: ${preflight.scannedTextNodes ?? 0}`,
+      `Preflight non-empty: ${preflight.nonEmptyTextNodes ?? 0}`,
+      `Preflight candidates: ${preflight.candidatesAfterFilters ?? 0}`
+    );
+    if (preflight.filtered && typeof preflight.filtered === 'object') {
+      const topReasons = Object.entries(preflight.filtered)
+        .sort((a, b) => b[1] - a[1])
+        .filter(([, count]) => count > 0)
+        .slice(0, 3)
+        .map(([key, count]) => `${key}=${count}`);
+      if (topReasons.length) {
+        preflightLines.push(`Preflight top filtered: ${topReasons.join(', ')}`);
+      }
+    }
+  } else {
+    preflightLines.push('Preflight: нет данных');
+  }
+  const lines = [
+    `Self-check: ${status.ok ? 'ok' : 'error'}`,
+    `Version: ${status.version || '—'}`,
+    `State cache ready: ${status.stateCacheReady ? 'yes' : 'no'}`,
+    `Scheduler tick: ${status.schedulerTickRunning ? 'running' : 'stopped'}`,
+    `Progress tabs: ${status.progressTabs || 0}`,
+    `Last progress at: ${status.lastProgressAt ? new Date(status.lastProgressAt).toLocaleString() : '—'}`,
+    `Content script ping: ${status.pingOk ? 'ok' : status.pingError || 'failed'}`,
+    ...preflightLines
+  ];
+  selfCheckEl.textContent = lines.join('\n');
+}
+
+async function runSelfCheck() {
+  if (selfCheckEl) {
+    selfCheckEl.textContent = 'Self-check: выполняется...';
+  }
+  const status = {
+    ok: false,
+    pingOk: false,
+    pingError: null
+  };
+  const activeTabId = await new Promise((resolve) => {
+    if (!chrome.tabs?.query) {
+      resolve(null);
+      return;
+    }
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      resolve(tabs && tabs[0]?.id ? tabs[0].id : null);
+    });
+  });
+  const backgroundResult = await new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: 'NT_SELF_CHECK', tabId: activeTabId }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { ok: false });
+      });
+    } catch (error) {
+      resolve({ ok: false, error: error?.message || String(error) });
+    }
+  });
+  Object.assign(status, backgroundResult);
+
+  const pingResult = await new Promise((resolve) => {
+    if (!chrome.tabs?.query) {
+      resolve({ ok: false, error: 'tabs API unavailable' });
+      return;
+    }
+    if (!activeTabId) {
+      resolve({ ok: false, error: 'no active tab' });
+      return;
+    }
+    chrome.tabs.sendMessage(activeTabId, { type: 'NT_PING' }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve(response || { ok: false, error: 'no response' });
+    });
+  });
+
+  status.pingOk = Boolean(pingResult?.ok);
+  status.pingError = status.pingOk ? null : pingResult?.error || 'content-script not reachable';
+  status.ok = Boolean(backgroundResult?.ok) && status.pingOk;
+  renderSelfCheck(status);
+}
+
 async function init() {
   sourceUrl = getSourceUrlFromQuery();
   if (!sourceUrl) {
@@ -89,6 +188,13 @@ async function init() {
     addDebugListener(clearDebugButton, 'click', (event) => {
       event.preventDefault();
       clearDebugData();
+    });
+  }
+
+  if (selfCheckButton) {
+    addDebugListener(selfCheckButton, 'click', (event) => {
+      event.preventDefault();
+      runSelfCheck();
     });
   }
 
