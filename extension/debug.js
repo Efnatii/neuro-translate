@@ -15,6 +15,7 @@ const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
 const CONTEXT_CACHE_KEY = 'contextCacheByPage';
 const DEBUG_PORT_NAME = 'debug';
 const UI_HEARTBEAT_INTERVAL_MS = 18000;
+const UI_HEARTBEAT_TIMEOUT_MS = 5000;
 const DEBUG_DB_NAME = 'nt_debug';
 const DEBUG_DB_VERSION = 1;
 const DEBUG_RAW_STORE = 'raw';
@@ -34,9 +35,7 @@ let debugPort = null;
 let translationProgressStatus = null;
 let latestSummaryData = null;
 let latestSummaryFallbackMessage = '';
-let debugReconnectTimer = null;
-let debugReconnectDelay = 500;
-let debugHeartbeatTimer = null;
+let debugPortClient = null;
 const proofreadUiState = new Map();
 const debugUiState = {
   openKeys: new Set(),
@@ -61,6 +60,145 @@ const debugInstrumentation = {
 };
 
 init();
+
+class PortClient {
+  constructor({ name, onConnect, onDisconnect, onMessage }) {
+    this.name = name;
+    this.onConnect = onConnect;
+    this.onDisconnect = onDisconnect;
+    this.onMessage = onMessage;
+    this.port = null;
+    this.state = 'disconnected';
+    this.reconnectDelayMs = 250;
+    this.reconnectTimer = null;
+    this.messageQueue = [];
+    this.maxQueue = 100;
+    this.heartbeatTimer = null;
+    this.heartbeatTimeoutId = null;
+    this.lastHeartbeatAck = 0;
+  }
+
+  connect() {
+    if (this.state === 'connecting' || this.state === 'connected') return;
+    this.state = 'connecting';
+    try {
+      this.port = chrome.runtime.connect({ name: this.name });
+    } catch (error) {
+      this.state = 'disconnected';
+      this.scheduleReconnect();
+      return;
+    }
+    this.state = 'connected';
+    this.reconnectDelayMs = 250;
+    this.port.onMessage.addListener((message) => {
+      if (message?.type === 'UI_HEARTBEAT_ACK') {
+        this.lastHeartbeatAck = Date.now();
+        return;
+      }
+      if (typeof this.onMessage === 'function') {
+        this.onMessage(message);
+      }
+    });
+    this.port.onDisconnect.addListener(() => {
+      this.handleDisconnect();
+    });
+    if (typeof this.onConnect === 'function') {
+      this.onConnect(this.port);
+    }
+    this.flushQueue();
+    this.startHeartbeat();
+  }
+
+  handleDisconnect() {
+    if (this.state === 'disconnected') return;
+    this.state = 'disconnected';
+    this.port = null;
+    this.stopHeartbeat();
+    if (typeof this.onDisconnect === 'function') {
+      this.onDisconnect();
+    }
+    this.scheduleReconnect();
+  }
+
+  disconnect() {
+    if (this.port) {
+      try {
+        this.port.disconnect();
+      } catch (error) {
+        // ignore
+      }
+    }
+    this.handleDisconnect();
+  }
+
+  forceReconnect() {
+    this.disconnect();
+    this.connect();
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    const delay = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(10000, Math.max(250, this.reconnectDelayMs * 2));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  send(message) {
+    if (this.state !== 'connected' || !this.port) {
+      this.messageQueue.push(message);
+      if (this.messageQueue.length > this.maxQueue) {
+        this.messageQueue.shift();
+      }
+      return false;
+    }
+    try {
+      this.port.postMessage(message);
+      return true;
+    } catch (error) {
+      this.messageQueue.push(message);
+      if (this.messageQueue.length > this.maxQueue) {
+        this.messageQueue.shift();
+      }
+      this.handleDisconnect();
+      return false;
+    }
+  }
+
+  flushQueue() {
+    if (this.state !== 'connected' || !this.port || !this.messageQueue.length) return;
+    const queued = [...this.messageQueue];
+    this.messageQueue = [];
+    queued.forEach((message) => this.send(message));
+  }
+
+  startHeartbeat() {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.port) return;
+      this.send({ type: 'UI_HEARTBEAT', ts: Date.now() });
+      clearTimeout(this.heartbeatTimeoutId);
+      this.heartbeatTimeoutId = setTimeout(() => {
+        if (Date.now() - this.lastHeartbeatAck > UI_HEARTBEAT_TIMEOUT_MS) {
+          this.forceReconnect();
+        }
+      }, UI_HEARTBEAT_TIMEOUT_MS);
+    }, UI_HEARTBEAT_INTERVAL_MS);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.heartbeatTimeoutId) {
+      clearTimeout(this.heartbeatTimeoutId);
+      this.heartbeatTimeoutId = null;
+    }
+  }
+}
 
 async function init() {
   sourceUrl = getSourceUrlFromQuery();
@@ -353,56 +491,22 @@ function connectDebugPort() {
   if (typeof chrome === 'undefined' || !chrome.runtime?.connect) {
     return;
   }
-  if (debugPort) return;
-  try {
-    debugPort = chrome.runtime.connect({ name: DEBUG_PORT_NAME });
-  } catch (error) {
-    scheduleDebugReconnect();
-    return;
+  if (!debugPortClient) {
+    debugPortClient = new PortClient({
+      name: DEBUG_PORT_NAME,
+      onConnect: (port) => {
+        debugPort = port;
+        if (sourceUrl) {
+          debugPortClient.send({ type: 'DEBUG_GET_SNAPSHOT', sourceUrl });
+        }
+      },
+      onDisconnect: () => {
+        debugPort = null;
+      },
+      onMessage: handleDebugPortMessage
+    });
   }
-  debugReconnectDelay = 500;
-  debugPort.onMessage.addListener(handleDebugPortMessage);
-  startDebugHeartbeat();
-  debugPort.onDisconnect.addListener(() => {
-    debugPort = null;
-    stopDebugHeartbeat();
-    scheduleDebugReconnect();
-  });
-  if (sourceUrl) {
-    try {
-      debugPort.postMessage({ type: 'DEBUG_GET_SNAPSHOT', sourceUrl });
-    } catch (error) {
-      // ignore
-    }
-  }
-}
-
-function startDebugHeartbeat() {
-  if (!debugPort || debugHeartbeatTimer) return;
-  // WHY: ping the MV3 service worker occasionally so state snapshots recover after idle/BFCache.
-  debugHeartbeatTimer = setInterval(() => {
-    if (!debugPort) return;
-    try {
-      debugPort.postMessage({ type: 'UI_HEARTBEAT', ts: Date.now() });
-    } catch (error) {
-      // Ignore heartbeat failures; reconnect logic handles drops.
-    }
-  }, UI_HEARTBEAT_INTERVAL_MS);
-}
-
-function stopDebugHeartbeat() {
-  if (!debugHeartbeatTimer) return;
-  clearInterval(debugHeartbeatTimer);
-  debugHeartbeatTimer = null;
-}
-
-function scheduleDebugReconnect() {
-  if (debugReconnectTimer) return;
-  debugReconnectTimer = setTimeout(() => {
-    debugReconnectTimer = null;
-    connectDebugPort();
-    debugReconnectDelay = Math.min(10000, Math.max(500, debugReconnectDelay * 2));
-  }, debugReconnectDelay);
+  debugPortClient.connect();
 }
 
 function handleDebugPortMessage(message) {

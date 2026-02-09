@@ -19,6 +19,7 @@ const toggleTranslationButton = document.getElementById('toggleTranslation');
 const openDebugButton = document.getElementById('openDebug');
 const POPUP_PORT_NAME = 'popup';
 const UI_HEARTBEAT_INTERVAL_MS = 18000;
+const UI_HEARTBEAT_TIMEOUT_MS = 5000;
 
 let keySaveTimeout = null;
 let activeTabId = null;
@@ -30,10 +31,8 @@ let temporaryStatusTimeout = null;
 let pendingFailureToken = 0;
 let pendingFailureTimeoutId = null;
 let popupPort = null;
-let popupReconnectTimer = null;
-let popupReconnectDelay = 500;
 let popupPortConnected = false;
-let popupHeartbeatTimer = null;
+let popupPortClient = null;
 
 const models = buildModelOptions();
 const defaultModelSpec = getDefaultModelSpec(models);
@@ -79,6 +78,145 @@ function getDefaultModelSpec(modelOptions) {
 }
 
 init();
+
+class PortClient {
+  constructor({ name, onConnect, onDisconnect, onMessage }) {
+    this.name = name;
+    this.onConnect = onConnect;
+    this.onDisconnect = onDisconnect;
+    this.onMessage = onMessage;
+    this.port = null;
+    this.state = 'disconnected';
+    this.reconnectDelayMs = 250;
+    this.reconnectTimer = null;
+    this.messageQueue = [];
+    this.maxQueue = 100;
+    this.heartbeatTimer = null;
+    this.heartbeatTimeoutId = null;
+    this.lastHeartbeatAck = 0;
+  }
+
+  connect() {
+    if (this.state === 'connecting' || this.state === 'connected') return;
+    this.state = 'connecting';
+    try {
+      this.port = chrome.runtime.connect({ name: this.name });
+    } catch (error) {
+      this.state = 'disconnected';
+      this.scheduleReconnect();
+      return;
+    }
+    this.state = 'connected';
+    this.reconnectDelayMs = 250;
+    this.port.onMessage.addListener((message) => {
+      if (message?.type === 'UI_HEARTBEAT_ACK') {
+        this.lastHeartbeatAck = Date.now();
+        return;
+      }
+      if (typeof this.onMessage === 'function') {
+        this.onMessage(message);
+      }
+    });
+    this.port.onDisconnect.addListener(() => {
+      this.handleDisconnect();
+    });
+    if (typeof this.onConnect === 'function') {
+      this.onConnect(this.port);
+    }
+    this.flushQueue();
+    this.startHeartbeat();
+  }
+
+  handleDisconnect() {
+    if (this.state === 'disconnected') return;
+    this.state = 'disconnected';
+    this.port = null;
+    this.stopHeartbeat();
+    if (typeof this.onDisconnect === 'function') {
+      this.onDisconnect();
+    }
+    this.scheduleReconnect();
+  }
+
+  disconnect() {
+    if (this.port) {
+      try {
+        this.port.disconnect();
+      } catch (error) {
+        // ignore
+      }
+    }
+    this.handleDisconnect();
+  }
+
+  forceReconnect() {
+    this.disconnect();
+    this.connect();
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    const delay = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(10000, Math.max(250, this.reconnectDelayMs * 2));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  send(message) {
+    if (this.state !== 'connected' || !this.port) {
+      this.messageQueue.push(message);
+      if (this.messageQueue.length > this.maxQueue) {
+        this.messageQueue.shift();
+      }
+      return false;
+    }
+    try {
+      this.port.postMessage(message);
+      return true;
+    } catch (error) {
+      this.messageQueue.push(message);
+      if (this.messageQueue.length > this.maxQueue) {
+        this.messageQueue.shift();
+      }
+      this.handleDisconnect();
+      return false;
+    }
+  }
+
+  flushQueue() {
+    if (this.state !== 'connected' || !this.port || !this.messageQueue.length) return;
+    const queued = [...this.messageQueue];
+    this.messageQueue = [];
+    queued.forEach((message) => this.send(message));
+  }
+
+  startHeartbeat() {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.port) return;
+      this.send({ type: 'UI_HEARTBEAT', ts: Date.now() });
+      clearTimeout(this.heartbeatTimeoutId);
+      this.heartbeatTimeoutId = setTimeout(() => {
+        if (Date.now() - this.lastHeartbeatAck > UI_HEARTBEAT_TIMEOUT_MS) {
+          this.forceReconnect();
+        }
+      }, UI_HEARTBEAT_TIMEOUT_MS);
+    }, UI_HEARTBEAT_INTERVAL_MS);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.heartbeatTimeoutId) {
+      clearTimeout(this.heartbeatTimeoutId);
+      this.heartbeatTimeoutId = null;
+    }
+  }
+}
 
 async function init() {
   const tab = await getActiveTab();
@@ -164,57 +302,25 @@ async function init() {
 
 function connectPopupPort() {
   if (typeof chrome === 'undefined' || !chrome.runtime?.connect) return;
-  if (popupPort) return;
-  try {
-    popupPort = chrome.runtime.connect({ name: POPUP_PORT_NAME });
-  } catch (error) {
-    popupPortConnected = false;
-    renderConnectionStatus();
-    schedulePopupReconnect();
-    return;
+  if (!popupPortClient) {
+    popupPortClient = new PortClient({
+      name: POPUP_PORT_NAME,
+      onConnect: (port) => {
+        popupPort = port;
+        popupPortConnected = true;
+        renderConnectionStatus();
+      },
+      onDisconnect: () => {
+        popupPort = null;
+        popupPortConnected = false;
+        renderConnectionStatus();
+      },
+      onMessage: (message) => {
+        handleRuntimeMessage(message, {});
+      }
+    });
   }
-  popupReconnectDelay = 500;
-  popupPortConnected = true;
-  renderConnectionStatus();
-  startPopupHeartbeat();
-  popupPort.onMessage.addListener((message) => {
-    handleRuntimeMessage(message, {});
-  });
-  popupPort.onDisconnect.addListener(() => {
-    popupPort = null;
-    popupPortConnected = false;
-    stopPopupHeartbeat();
-    renderConnectionStatus();
-    schedulePopupReconnect();
-  });
-}
-
-function startPopupHeartbeat() {
-  if (!popupPort || popupHeartbeatTimer) return;
-  // WHY: send occasional port messages to revive MV3 service workers after idle/BFCache without keep-alive loops.
-  popupHeartbeatTimer = setInterval(() => {
-    if (!popupPort) return;
-    try {
-      popupPort.postMessage({ type: 'UI_HEARTBEAT', ts: Date.now() });
-    } catch (error) {
-      // Ignore heartbeat failures; reconnect logic handles drops.
-    }
-  }, UI_HEARTBEAT_INTERVAL_MS);
-}
-
-function stopPopupHeartbeat() {
-  if (!popupHeartbeatTimer) return;
-  clearInterval(popupHeartbeatTimer);
-  popupHeartbeatTimer = null;
-}
-
-function schedulePopupReconnect() {
-  if (popupReconnectTimer) return;
-  popupReconnectTimer = setTimeout(() => {
-    popupReconnectTimer = null;
-    connectPopupPort();
-    popupReconnectDelay = Math.min(10000, Math.max(500, popupReconnectDelay * 2));
-  }, popupReconnectDelay);
+  popupPortClient.connect();
 }
 
 function handleApiKeyChange() {
