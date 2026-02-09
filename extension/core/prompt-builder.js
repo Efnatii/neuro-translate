@@ -30,28 +30,36 @@
         rules.push(`Every segment must be fully in ${targetLanguage}.`);
       }
 
-      const outputContract = [
-        `Return JSON: {"translations": string[]} with exactly ${Array.isArray(segments) ? segments.length : 0} items.`,
-        'Keep the same order as input. No extra keys or commentary.'
+      const instructions = [
+        `Target language: ${targetLanguage}.`,
+        rules.join('\n'),
+        debugHints ? `Debug hints: ${globalThis.ntSafeText(debugHints)}` : '',
+        'Input is provided in SEGMENTS_JSON as items with fields {"i": number, "text": string}.'
+      ].filter(Boolean).join('\n');
+
+      const segmentsJson = JSON.stringify({
+        items: (Array.isArray(segments) ? segments : []).map((text, index) => ({
+          i: index,
+          text: globalThis.ntSafeText(text)
+        }))
+      });
+
+      const outputFormat = [
+        'Return ONLY JSON and nothing else.',
+        'Wrap the JSON in the OUTPUT_JSON section.',
+        `JSON schema: {"items":[{"i":0,"text":"..."}]}.`,
+        `Items count must be exactly ${Array.isArray(segments) ? segments.length : 0}.`,
+        'i must be an integer from 0..N-1, unique, and in any order.',
+        'Do NOT add markdown, comments, or extra keys.'
       ].join(' ');
 
-      const segmentLines = (Array.isArray(segments) ? segments : []).map(
-        (text, index) => `${index}: ${globalThis.ntSafeText(text)}`
-      );
-
-      const blocks = [
-        { tag: globalThis.NT_PROMPT_TAGS.TASK, content: 'Translate the SEGMENTS into the target language.' },
-        { tag: globalThis.NT_PROMPT_TAGS.TARGET_LANGUAGE, content: targetLanguage },
-        { tag: globalThis.NT_PROMPT_TAGS.RULES, content: rules.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.CONTEXT_MODE, content: contextText ? (contextMode || 'FULL') : 'NONE' },
-        { tag: globalThis.NT_PROMPT_TAGS.CONTEXT, content: contextText || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.SEGMENTS, content: segmentLines.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.OUTPUT_CONTRACT, content: outputContract }
+      const sections = [
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.INSTRUCTIONS, instructions) || instructions,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.CONTEXT, contextText || '') || '',
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.SEGMENTS_JSON, segmentsJson) || segmentsJson,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.OUTPUT_FORMAT, outputFormat) || outputFormat
       ];
-      if (debugHints) {
-        blocks.push({ tag: globalThis.NT_PROMPT_TAGS.DEBUG_HINTS, content: debugHints });
-      }
-      return globalThis.ntJoinTaggedBlocks(blocks);
+      return globalThis.joinPromptSections ? globalThis.joinPromptSections(sections) : sections.join('\n\n');
     }
 
     /**
@@ -68,20 +76,30 @@
         'Do not add or remove information.',
         'Self-check: if output equals source (case-insensitive), ensure it is allowlisted or already in target language; otherwise translate/transliterate.'
       ];
-      const outputContract = `Return JSON: {\"translations\": string[]} with exactly ${Array.isArray(items) ? items.length : 0} items in the same order.`;
-      const itemLines = (Array.isArray(items) ? items : []).map(
-        (item) =>
-          `${globalThis.ntSafeText(item?.id)} | source: ${globalThis.ntSafeText(item?.source)} | draft: ${globalThis.ntSafeText(item?.draft)}`
-      );
-      return globalThis.ntJoinTaggedBlocks([
-        { tag: globalThis.NT_PROMPT_TAGS.TASK, content: `Repair translations into ${targetLanguage}.` },
-        { tag: globalThis.NT_PROMPT_TAGS.TARGET_LANGUAGE, content: targetLanguage },
-        { tag: globalThis.NT_PROMPT_TAGS.RULES, content: rules.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.CONTEXT_MODE, content: contextText ? 'FULL' : 'NONE' },
-        { tag: globalThis.NT_PROMPT_TAGS.CONTEXT, content: contextText || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.SEGMENTS, content: itemLines.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.OUTPUT_CONTRACT, content: outputContract }
-      ]);
+      const instructions = [
+        `Repair translations into ${targetLanguage}.`,
+        rules.join('\n')
+      ].join('\n');
+      const segmentsJson = JSON.stringify({
+        items: (Array.isArray(items) ? items : []).map((item, index) => ({
+          i: index,
+          source: globalThis.ntSafeText(item?.source),
+          draft: globalThis.ntSafeText(item?.draft)
+        }))
+      });
+      const outputFormat = [
+        'Return ONLY JSON and nothing else.',
+        'Wrap the JSON in the OUTPUT_JSON section.',
+        `JSON schema: {"items":[{"i":0,"text":"..."}]}.`,
+        `Items count must be exactly ${Array.isArray(items) ? items.length : 0}.`
+      ].join(' ');
+      const sections = [
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.INSTRUCTIONS, instructions) || instructions,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.CONTEXT, contextText || '') || '',
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.SEGMENTS_JSON, segmentsJson) || segmentsJson,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.OUTPUT_FORMAT, outputFormat) || outputFormat
+      ];
+      return globalThis.joinPromptSections ? globalThis.joinPromptSections(sections) : sections.join('\n\n');
     }
 
     /**
@@ -101,17 +119,27 @@
       if (mode === 'SHORT') {
         rules.push('Keep it very short and high-signal (5-10 bullet points).');
       }
-      const outputContract = mode === 'SHORT'
-        ? 'Output plain text only; short bullet points allowed.'
-        : 'Return numbered sections 1-10 with brief bullet points only.';
-
-      return globalThis.ntJoinTaggedBlocks([
-        { tag: globalThis.NT_PROMPT_TAGS.TASK, content: 'Generate translation context for the SOURCE_BLOCK.' },
-        { tag: globalThis.NT_PROMPT_TAGS.TARGET_LANGUAGE, content: targetLanguage },
-        { tag: globalThis.NT_PROMPT_TAGS.RULES, content: rules.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.SOURCE_BLOCK, content: text || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.OUTPUT_CONTRACT, content: outputContract }
-      ]);
+      const instructions = [
+        'Generate translation context for the source text.',
+        `Target language: ${targetLanguage}.`,
+        rules.join('\n')
+      ].join('\n');
+      const segmentsJson = JSON.stringify({
+        items: [{ i: 0, text: globalThis.ntSafeText(text || '') }]
+      });
+      const outputFormat = [
+        'Return ONLY JSON and nothing else.',
+        'Wrap the JSON in the OUTPUT_JSON section.',
+        'JSON schema: {"items":[{"i":0,"text":"..."}]}.',
+        'The single item (i=0) must contain the context text.'
+      ].join(' ');
+      const sections = [
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.INSTRUCTIONS, instructions) || instructions,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.CONTEXT, '') || '',
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.SEGMENTS_JSON, segmentsJson) || segmentsJson,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.OUTPUT_FORMAT, outputFormat) || outputFormat
+      ];
+      return globalThis.joinPromptSections ? globalThis.joinPromptSections(sections) : sections.join('\n\n');
     }
 
     /**
@@ -153,30 +181,42 @@
         rules.push(globalThis.ntSafeText(extraReminder));
       }
 
-      const outputContract = [
-        `Return JSON: {"items": [{"id":"...","text":"..."}]} with exactly ${Array.isArray(items) ? items.length : 0} items.`,
-        'Keep ids unchanged and preserve order. No extra keys or commentary.'
+      const instructions = [
+        `Proofread mode: ${proofreadMode || 'READABILITY_REWRITE'}.`,
+        `Target language: ${language || ''}.`,
+        rules.join('\n'),
+        debugHints ? `Debug hints: ${globalThis.ntSafeText(debugHints)}` : ''
+      ].filter(Boolean).join('\n');
+
+      const contextPayload = [
+        contextText ? `Context:\n${contextText}` : '',
+        sourceBlock ? `Source block:\n${sourceBlock}` : '',
+        translatedBlock ? `Translated block:\n${translatedBlock}` : ''
+      ].filter(Boolean).join('\n\n');
+
+      const segmentsJson = JSON.stringify({
+        items: (Array.isArray(items) ? items : []).map((item, index) => ({
+          i: index,
+          text: globalThis.ntSafeText(item?.text)
+        }))
+      });
+
+      const outputFormat = [
+        'Return ONLY JSON and nothing else.',
+        'Wrap the JSON in the OUTPUT_JSON section.',
+        `JSON schema: {"items":[{"i":0,"text":"..."}]}.`,
+        `Items count must be exactly ${Array.isArray(items) ? items.length : 0}.`,
+        'i must be an integer from 0..N-1, unique.',
+        'Do NOT add markdown, comments, or extra keys.'
       ].join(' ');
 
-      const itemLines = (Array.isArray(items) ? items : []).map(
-        (item) => `${globalThis.ntSafeText(item?.id)}: ${globalThis.ntSafeText(item?.text)}`
-      );
-
-      const blocks = [
-        { tag: globalThis.NT_PROMPT_TAGS.TASK, content: `Proofread mode: ${proofreadMode || 'READABILITY_REWRITE'}.` },
-        { tag: globalThis.NT_PROMPT_TAGS.TARGET_LANGUAGE, content: language || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.RULES, content: rules.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.CONTEXT_MODE, content: contextText ? (contextMode || 'FULL') : 'NONE' },
-        { tag: globalThis.NT_PROMPT_TAGS.CONTEXT, content: contextText || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.SOURCE_BLOCK, content: sourceBlock || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.TRANSLATED_BLOCK, content: translatedBlock || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.SEGMENTS, content: itemLines.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.OUTPUT_CONTRACT, content: outputContract }
+      const sections = [
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.INSTRUCTIONS, instructions) || instructions,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.CONTEXT, contextPayload) || contextPayload,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.SEGMENTS_JSON, segmentsJson) || segmentsJson,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.OUTPUT_FORMAT, outputFormat) || outputFormat
       ];
-      if (debugHints) {
-        blocks.push({ tag: globalThis.NT_PROMPT_TAGS.DEBUG_HINTS, content: debugHints });
-      }
-      return globalThis.ntJoinTaggedBlocks(blocks);
+      return globalThis.joinPromptSections ? globalThis.joinPromptSections(sections) : sections.join('\n\n');
     }
 
     /**
@@ -191,13 +231,19 @@
         'Do not change meaning or wording.',
         'Return only JSON.'
       ];
-      const outputContract = `Return JSON: {"items": [{"id":"...","text":"..."}]} with exactly ${itemCount} items.`;
-      return globalThis.ntJoinTaggedBlocks([
-        { tag: globalThis.NT_PROMPT_TAGS.TASK, content: 'Repair the output format.' },
-        { tag: globalThis.NT_PROMPT_TAGS.RULES, content: rules.join('\n') },
-        { tag: globalThis.NT_PROMPT_TAGS.DEBUG_HINTS, content: rawResponse || '' },
-        { tag: globalThis.NT_PROMPT_TAGS.OUTPUT_CONTRACT, content: outputContract }
-      ]);
+      const instructions = ['Repair the output format.', rules.join('\n')].join('\n');
+      const outputFormat = [
+        'Return ONLY JSON and nothing else.',
+        'Wrap the JSON in the OUTPUT_JSON section.',
+        `JSON schema: {"items":[{"i":0,"text":"..."}]}.`,
+        `Items count must be exactly ${itemCount}.`
+      ].join(' ');
+      const sections = [
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.INSTRUCTIONS, instructions) || instructions,
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.CONTEXT, rawResponse || '') || '',
+        globalThis.buildPromptSection?.(globalThis.PROMPT_SECTION_TAGS.OUTPUT_FORMAT, outputFormat) || outputFormat
+      ];
+      return globalThis.joinPromptSections ? globalThis.joinPromptSections(sections) : sections.join('\n\n');
     }
 
     /**

@@ -57,19 +57,75 @@ const CONTEXT_SYSTEM_PROMPT = [
   '- recurring templates/placeholders (if any)',
   '',
   'Output only the sections with brief bullet points.',
-  'If a section is empty, write "not specified".'
+  'If a section is empty, write "not specified".',
+  'Follow any user-provided output formatting instructions.'
 ].join('\n');
 const SHORT_CONTEXT_SYSTEM_PROMPT = [
   'You are a translation context summarizer.',
   'Generate a short, high-signal translation context from the provided text.',
   'Keep it concise and factual; no fluff, no repetition.',
   'Preserve key terminology, ambiguity notes, and style guidance.',
-  'Output plain text only (no JSON, no code).',
+  'Follow any user-provided output formatting instructions.',
   'Use short bullet points where helpful.',
   'Target length: 5-10 bullet points maximum.'
 ].join('\n');
 const CONTEXT_PROMPT_BUILDER = new PromptBuilder({ systemRulesBase: CONTEXT_SYSTEM_PROMPT });
 const SHORT_CONTEXT_PROMPT_BUILDER = new PromptBuilder({ systemRulesBase: SHORT_CONTEXT_SYSTEM_PROMPT });
+
+function parseJsonObjectFlexible(content = '', label = 'response') {
+  const normalizeString = (value = '') =>
+    value.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
+
+  const normalizedContent = normalizeString(String(content ?? '')).trim();
+  if (!normalizedContent) {
+    throw new Error(`${label} response is empty.`);
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(normalizedContent);
+  } catch (error) {
+    const startIndex = normalizedContent.indexOf('{');
+    const endIndex = normalizedContent.lastIndexOf('}');
+    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+      throw new Error(`${label} response does not contain a JSON object.`);
+    }
+
+    const slice = normalizedContent.slice(startIndex, endIndex + 1);
+    try {
+      parsed = JSON.parse(slice);
+    } catch (innerError) {
+      throw new Error(`${label} response JSON parsing failed.`);
+    }
+  }
+
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new Error(`${label} response is not a JSON object.`);
+  }
+
+  return parsed;
+}
+
+function extractOutputJsonSection(content = '') {
+  if (typeof globalThis.extractPromptSection !== 'function' || !globalThis.PROMPT_SECTION_TAGS) {
+    return '';
+  }
+  return globalThis.extractPromptSection(content, globalThis.PROMPT_SECTION_TAGS.OUTPUT_JSON);
+}
+
+function parseIndexedItemsResponse(content, label = 'response') {
+  const sectionContent = extractOutputJsonSection(content) || content;
+  const parsed = parseJsonObjectFlexible(sectionContent, label);
+  const items = parsed?.items;
+  if (!Array.isArray(items)) {
+    throw new Error('bad_shape: missing items array');
+  }
+  const entry = items.find((item) => Number(item?.i) === 0);
+  if (!entry) {
+    throw new Error('bad_shape: missing i=0');
+  }
+  return typeof entry?.text === 'string' ? entry.text : String(entry?.text ?? '');
+}
 
 function resolveContextModelSpec(requestMeta, fallbackModelSpec) {
   const triggerSource =
@@ -188,6 +244,7 @@ function attachContextRequestMeta(payload, requestMeta) {
         : Array.isArray(payload.candidateOrderedList)
           ? payload.candidateOrderedList
           : [],
+    timeoutMs: payload.timeoutMs ?? requestMeta.timeoutMs ?? null,
     attemptIndex:
       Number.isFinite(payload.attemptIndex) || payload.attemptIndex === 0
         ? payload.attemptIndex
@@ -217,6 +274,8 @@ async function generateTranslationContext(
   if (!text?.trim()) return { context: '', debug: [] };
   const controller = new AbortController();
   let removeAbortListener = () => {};
+  let timeoutId = null;
+  let timeoutTriggered = false;
   if (requestSignal) {
     if (requestSignal.aborted) {
       controller.abort(requestSignal.reason || 'cancelled');
@@ -241,6 +300,22 @@ async function generateTranslationContext(
     requestMeta.selectedModelSpec = selectedModelSpec;
     requestMeta.candidateStrategy = selection.candidateStrategyUsed || requestMeta.candidateStrategy || '';
   }
+  const timeoutMs = getLlmTimeoutMs({
+    role: 'context_full',
+    tier: selectedTier,
+    model: selectedModelId,
+    textsCount: 1,
+    totalChars: text.length,
+    attemptIndex: requestMeta?.attemptIndex
+  });
+  // timeoutMs is computed via the shared LLM timeout policy for context generation.
+  if (requestMeta && typeof requestMeta === 'object') {
+    requestMeta.timeoutMs = timeoutMs;
+  }
+  timeoutId = setTimeout(() => {
+    timeoutTriggered = true;
+    controller.abort(new Error('timeout'));
+  }, timeoutMs);
   const effectiveRequestOptions =
     requestOptions && typeof requestOptions === 'object'
       ? {
@@ -340,7 +415,12 @@ async function generateTranslationContext(
 
   const latencyMs = Date.now() - startedAt;
   const usage = normalizeUsage(data?.usage);
-  const trimmed = typeof content === 'string' ? content.trim() : '';
+  let trimmed = typeof content === 'string' ? content.trim() : '';
+  try {
+    trimmed = parseIndexedItemsResponse(content, 'context');
+  } catch (error) {
+    console.warn('Context parsing failed; using raw content.', error);
+  }
   const debugPayload = attachContextRequestMeta(
     {
       phase: 'CONTEXT',
@@ -356,7 +436,15 @@ async function generateTranslationContext(
   );
 
   return { context: trimmed, debug: [debugPayload] };
+  } catch (error) {
+    if (timeoutTriggered && error && typeof error === 'object') {
+      error.isTimeout = true;
+    }
+    throw error;
   } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
     removeAbortListener();
   }
 }
@@ -374,6 +462,8 @@ async function generateShortTranslationContext(
   if (!text?.trim()) return { context: '', debug: [] };
   const controller = new AbortController();
   let removeAbortListener = () => {};
+  let timeoutId = null;
+  let timeoutTriggered = false;
   if (requestSignal) {
     if (requestSignal.aborted) {
       controller.abort(requestSignal.reason || 'cancelled');
@@ -398,6 +488,22 @@ async function generateShortTranslationContext(
     requestMeta.selectedModelSpec = selectedModelSpec;
     requestMeta.candidateStrategy = selection.candidateStrategyUsed || requestMeta.candidateStrategy || '';
   }
+  const timeoutMs = getLlmTimeoutMs({
+    role: 'context_short',
+    tier: selectedTier,
+    model: selectedModelId,
+    textsCount: 1,
+    totalChars: text.length,
+    attemptIndex: requestMeta?.attemptIndex
+  });
+  // timeoutMs is computed via the shared LLM timeout policy for short context generation.
+  if (requestMeta && typeof requestMeta === 'object') {
+    requestMeta.timeoutMs = timeoutMs;
+  }
+  timeoutId = setTimeout(() => {
+    timeoutTriggered = true;
+    controller.abort(new Error('timeout'));
+  }, timeoutMs);
   const effectiveRequestOptions =
     requestOptions && typeof requestOptions === 'object'
       ? {
@@ -513,7 +619,15 @@ async function generateShortTranslationContext(
   );
 
   return { context: trimmed, debug: [debugPayload] };
+  } catch (error) {
+    if (timeoutTriggered && error && typeof error === 'object') {
+      error.isTimeout = true;
+    }
+    throw error;
   } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
     removeAbortListener();
   }
 }

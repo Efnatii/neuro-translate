@@ -139,7 +139,7 @@ class PortClient {
   scheduleReconnect() {
     if (this.reconnectTimer) return;
     const delay = this.reconnectDelayMs;
-    this.reconnectDelayMs = Math.min(10000, Math.max(250, this.reconnectDelayMs * 2));
+    this.reconnectDelayMs = Math.min(2000, Math.max(250, this.reconnectDelayMs * 2));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
@@ -499,6 +499,16 @@ function connectDebugPort() {
         if (sourceUrl) {
           debugPortClient.send({ type: 'DEBUG_GET_SNAPSHOT', sourceUrl });
         }
+        resolveTabIdForSourceUrl()
+          .then((tabId) => {
+            debugPortClient.send({
+              type: 'SUBSCRIBE_STATUS',
+              tabId: Number.isFinite(tabId) ? tabId : null
+            });
+          })
+          .catch(() => {
+            debugPortClient.send({ type: 'SUBSCRIBE_STATUS', tabId: null });
+          });
       },
       onDisconnect: () => {
         debugPort = null;
@@ -509,6 +519,20 @@ function connectDebugPort() {
   debugPortClient.connect();
 }
 
+async function resolveTabIdForSourceUrl() {
+  if (!sourceUrl || !chrome?.tabs?.query) return null;
+  return new Promise((resolve) => {
+    try {
+      chrome.tabs.query({ url: sourceUrl }, (tabs) => {
+        const tabId = Array.isArray(tabs) && tabs[0]?.id ? tabs[0].id : null;
+        resolve(tabId);
+      });
+    } catch (error) {
+      resolve(null);
+    }
+  });
+}
+
 function handleDebugPortMessage(message) {
   if (!message || typeof message !== 'object') return;
   if (message.type === 'TRANSLATION_STATUS') {
@@ -516,6 +540,26 @@ function handleDebugPortMessage(message) {
     const status = payload?.status && typeof payload.status === 'object' ? payload.status : payload;
     if (status && typeof status === 'object') {
       translationProgressStatus = status;
+      if (latestSummaryData) {
+        renderSummary(latestSummaryData, latestSummaryFallbackMessage);
+      }
+    }
+    return;
+  }
+  if (message.type === 'STATUS_UPDATE' || message.type === 'SNAPSHOT') {
+    const snapshot = message.payload?.snapshot || message.payload || null;
+    if (snapshot && typeof snapshot === 'object') {
+      if (sourceUrl && snapshot.url && snapshot.url !== sourceUrl) {
+        return;
+      }
+      translationProgressStatus = {
+        tabId: snapshot.tabId,
+        url: snapshot.url || '',
+        stage: snapshot.stage || 'idle',
+        progress: snapshot.progress || {},
+        error: snapshot.lastError || null,
+        lastUpdateTs: snapshot.updatedAt || Date.now()
+      };
       if (latestSummaryData) {
         renderSummary(latestSummaryData, latestSummaryFallbackMessage);
       }

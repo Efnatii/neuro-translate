@@ -157,7 +157,7 @@ class PortClient {
   scheduleReconnect() {
     if (this.reconnectTimer) return;
     const delay = this.reconnectDelayMs;
-    this.reconnectDelayMs = Math.min(10000, Math.max(250, this.reconnectDelayMs * 2));
+    this.reconnectDelayMs = Math.min(2000, Math.max(250, this.reconnectDelayMs * 2));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
@@ -309,6 +309,10 @@ function connectPopupPort() {
         popupPort = port;
         popupPortConnected = true;
         renderConnectionStatus();
+        popupPortClient.send({
+          type: 'SUBSCRIBE_STATUS',
+          tabId: Number.isFinite(activeTabId) ? activeTabId : null
+        });
       },
       onDisconnect: () => {
         popupPort = null;
@@ -838,6 +842,27 @@ async function handleRuntimeMessage(message, sender) {
       return;
     }
     currentTranslationStatus = status;
+    updateCanShowTranslation(currentTranslationStatus);
+    renderStatus();
+    return;
+  }
+  if (message.type === 'STATUS_UPDATE' || message.type === 'SNAPSHOT') {
+    const snapshot = message.payload?.snapshot || message.payload || null;
+    const statusTabId = snapshot?.tabId;
+    if (typeof statusTabId === 'number' && activeTabId && statusTabId !== activeTabId) {
+      return;
+    }
+    if (!snapshot || typeof snapshot !== 'object') return;
+    cancelScheduledFailure();
+    currentTranslationStatus = {
+      ...(currentTranslationStatus || {}),
+      tabId: snapshot.tabId,
+      url: snapshot.url || '',
+      stage: snapshot.stage || 'idle',
+      progress: snapshot.progress || {},
+      error: snapshot.lastError || null,
+      lastUpdateTs: snapshot.updatedAt || Date.now()
+    };
     updateCanShowTranslation(currentTranslationStatus);
     renderStatus();
     return;

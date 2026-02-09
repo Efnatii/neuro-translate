@@ -1065,6 +1065,30 @@ async function translatePage(settings, options = {}) {
     });
   };
 
+  const SHORT_CONTEXT_FALLBACK_MAX_CHARS = 800;
+  const SHORT_CONTEXT_ERROR_MAX_CHARS = 160;
+
+  const buildShortContextFallback = (fullContext) => {
+    const normalized = typeof fullContext === 'string' ? fullContext.trim() : '';
+    if (!normalized) return '';
+    const lines = normalized.split('\n');
+    let summary = '';
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+      const next = summary ? `${summary}\n${trimmedLine}` : trimmedLine;
+      if (next.length > SHORT_CONTEXT_FALLBACK_MAX_CHARS) break;
+      summary = next;
+    }
+    if (!summary) {
+      summary = truncateText(normalized, SHORT_CONTEXT_FALLBACK_MAX_CHARS).text;
+    }
+    return summary;
+  };
+
+  const formatShortContextError = (error) =>
+    truncateText(String(error?.message || error || 'short-context-failed'), SHORT_CONTEXT_ERROR_MAX_CHARS).text;
+
   const buildContextBundle = async () => {
     if (!settings.contextGenerationEnabled) return;
     if (!pageText) {
@@ -1092,7 +1116,7 @@ async function translatePage(settings, options = {}) {
       if (shortResult.promise) {
         session.context.shortPromise = shortResult.promise
           .then(async (shortContext) => {
-            session.context.latestShort = shortContext;
+            session.context.latestShort = typeof shortContext === 'string' ? shortContext.trim() : '';
             if (session.context.latestShort && contextCacheKey) {
               const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
               await setContextCacheEntry(contextCacheKey, {
@@ -1103,11 +1127,26 @@ async function translatePage(settings, options = {}) {
                 updatedAt: Date.now()
               });
             }
+            if (!session.context.latestShort) {
+              // Short context is optional; fallback to a trimmed full context instead of failing the workflow.
+              session.context.latestShort = buildShortContextFallback(
+                session.context.latestFull || existingContextFullText
+              );
+              updateDebugContextShortError('empty-short-context');
+              await updateDebugContextShort(session.context.latestShort, 'done_with_fallback');
+              return;
+            }
+            updateDebugContextShortError('');
             await updateDebugContextShort(session.context.latestShort, 'done');
           })
           .catch(async (error) => {
             console.warn('Short context generation failed, continuing without it.', error);
-            await updateDebugContextShort(session.context.latestShort, 'failed');
+            // Short context is optional; continue with a truncated full context on errors.
+            session.context.latestShort = buildShortContextFallback(
+              session.context.latestFull || existingContextFullText
+            );
+            updateDebugContextShortError(formatShortContextError(error));
+            await updateDebugContextShort(session.context.latestShort, 'done_with_fallback');
           });
       }
     }
@@ -1192,7 +1231,7 @@ async function translatePage(settings, options = {}) {
     if (!shortResult.promise) return;
     session.context.shortPromise = shortResult.promise
       .then(async (shortContext) => {
-        session.context.latestShort = shortContext;
+        session.context.latestShort = typeof shortContext === 'string' ? shortContext.trim() : '';
         if (session.context.latestShort && contextCacheKey) {
           const currentEntry = (await getContextCacheEntry(contextCacheKey)) || {};
           await setContextCacheEntry(contextCacheKey, {
@@ -1203,12 +1242,27 @@ async function translatePage(settings, options = {}) {
             updatedAt: Date.now()
           });
         }
+        if (!session.context.latestShort) {
+          // Short context is optional; fallback to full context for retry/validate flows.
+          session.context.latestShort = buildShortContextFallback(
+            session.context.latestFull || existingContextFullText
+          );
+          updateDebugContextShortError('empty-short-context');
+          await updateDebugContextShort(session.context.latestShort, 'done_with_fallback');
+          return session.context.latestShort;
+        }
+        updateDebugContextShortError('');
         await updateDebugContextShort(session.context.latestShort, 'done');
         return session.context.latestShort;
       })
       .catch(async (error) => {
         console.warn('Short context generation failed, continuing without it.', error);
-        await updateDebugContextShort(session.context.latestShort, 'failed');
+        // Short context is optional; fallback to full context for retry/validate flows.
+        session.context.latestShort = buildShortContextFallback(
+          session.context.latestFull || existingContextFullText
+        );
+        updateDebugContextShortError(formatShortContextError(error));
+        await updateDebugContextShort(session.context.latestShort, 'done_with_fallback');
         return session.context.latestShort;
       });
     await session.context.shortPromise;
@@ -1244,7 +1298,16 @@ async function translatePage(settings, options = {}) {
     if (contextMode === 'SHORT' && session.context.shortPromise) {
       await session.context.shortPromise;
     }
-    const contextText = contextMode === 'SHORT' ? session.context.latestShort : session.context.latestFull;
+    let contextText = contextMode === 'SHORT' ? session.context.latestShort : session.context.latestFull;
+    if (contextMode === 'SHORT' && !contextText) {
+      // Short context is optional; fall back to full context if available.
+      contextMode = 'FULL';
+      contextText = session.context.latestFull || '';
+    }
+    if (contextMode === 'FULL' && !contextText) {
+      contextMode = 'NONE';
+      contextText = '';
+    }
     const baseAnswerIncluded = contextMode === 'SHORT' && Boolean(baseAnswer) && (!options.forceShort || fullSuccess);
     const baseAnswerPreview = baseAnswerIncluded ? buildBaseAnswerPreview(baseAnswer) : '';
     updateDebugEntry(entry.index, {
@@ -1267,6 +1330,10 @@ async function translatePage(settings, options = {}) {
   let totalBlockRetries = 0;
   let activeTranslationWorkers = 0;
   let activeProofreadWorkers = 0;
+  // Fixed chunk size for timeout fallback mode (batch -> chunked).
+  const CHUNKED_TRANSLATION_SIZE = 16;
+  // Retry count for a single chunk before falling back to per-segment mode.
+  const MAX_CHUNK_TIMEOUT_RETRIES = 2;
   let translationQueueDone = false;
   const translationQueue = new BlockQueue({
     leaseTimeoutMs: BLOCK_LEASE_TIMEOUT_MS,
@@ -1361,7 +1428,7 @@ async function translatePage(settings, options = {}) {
       retryCount: 0,
       leaseTimeoutCount: 0,
       availableAt: 0,
-      fallbackMode: 'normal'
+      fallbackMode: 'batch'
     });
     return true;
   };
@@ -1397,6 +1464,23 @@ async function translatePage(settings, options = {}) {
     if (status === 429 || status === 503) return true;
     const message = String(err?.message || err || '').toLowerCase();
     return message.includes('429') || message.includes('rate') || message.includes('too many');
+  };
+
+  const isTimeoutError = (err) => {
+    if (err?.isTimeout) return true;
+    const message = String(err?.message || err || '').toLowerCase();
+    return message.includes('timeout') || message.includes('aborterror');
+  };
+
+  const getErrorKind = (err) => {
+    if (isTimeoutError(err)) return 'timeout';
+    if (isRateLimitOrOverload(err)) return 'rate_limit';
+    if (err?.isLeaseTimeout) return 'lease_timeout';
+    const message = String(err?.message || err || '').toLowerCase();
+    if (message.includes('network') || message.includes('failed to fetch')) {
+      return 'network';
+    }
+    return 'unknown';
   };
 
   const registerActiveTranslations = (block, finalTranslations) => {
@@ -1484,7 +1568,8 @@ async function translatePage(settings, options = {}) {
         await updateDebugEntry(currentIndex + 1, {
           translationStatus: 'in_progress',
           proofreadStatus: settings.proofreadEnabled ? 'pending' : 'disabled',
-          translationStartedAt: Date.now()
+          translationStartedAt: Date.now(),
+          fallbackMode: queuedItem.fallbackMode || 'batch'
         });
         reportProgress('Перевод выполняется', undefined, undefined, undefined, 'translation');
         const preparedTexts = block.map(({ original }) =>
@@ -1511,8 +1596,83 @@ async function translatePage(settings, options = {}) {
         traceRequestInitiator(mainRequestMeta);
         const translateJobKey = `${queuedItem.key}:translate`;
         let result = null;
+        const fallbackMode = queuedItem.fallbackMode || 'batch';
 
-        if (queuedItem.fallbackMode === 'single') {
+        const translateChunked = async () => {
+          const translations = new Array(uniqueTexts.length);
+          const rawParts = [];
+          const debugParts = [];
+          for (let startIndex = 0; startIndex < uniqueTexts.length; startIndex += CHUNKED_TRANSLATION_SIZE) {
+            const chunk = uniqueTexts.slice(startIndex, startIndex + CHUNKED_TRANSLATION_SIZE);
+            let chunkAttempt = 0;
+            while (true) {
+              const chunkRequestMeta = buildRequestMeta(baseRequestMeta, {
+                requestId: createRequestId(),
+                parentRequestId: mainRequestMeta.requestId,
+                purpose: 'chunk',
+                attempt: primaryContext.attemptIndex,
+                triggerSource: 'retry',
+                contextText: primaryContext.contextText,
+                contextMode: primaryContext.contextMode
+              });
+              traceRequestInitiator(chunkRequestMeta);
+              try {
+                await ensureShortContextReadyForTrigger(chunkRequestMeta);
+                const chunkResult = await withLeaseTimeout(
+                  translate(
+                    chunk,
+                    settings.targetLanguage || 'ru',
+                    {
+                      contextText: primaryContext.contextText,
+                      contextMode: primaryContext.contextMode,
+                      baseAnswer: primaryContext.baseAnswer,
+                      baseAnswerIncluded: primaryContext.baseAnswerIncluded,
+                      baseAnswerPreview: primaryContext.baseAnswerPreview
+                    },
+                    keepPunctuationTokens,
+                    currentIndex + 1,
+                    chunkRequestMeta
+                  ),
+                  BLOCK_LEASE_TIMEOUT_MS,
+                  'translation'
+                );
+                if (!chunkResult?.success || chunkResult.translations.length !== chunk.length) {
+                  throw new Error(chunkResult?.error || 'Не удалось выполнить перевод пачки.');
+                }
+                chunkResult.translations.forEach((text, offset) => {
+                  translations[startIndex + offset] = text;
+                });
+                if (chunkResult.rawTranslation) {
+                  rawParts.push(chunkResult.rawTranslation);
+                }
+                if (Array.isArray(chunkResult.debug)) {
+                  debugParts.push(...chunkResult.debug);
+                }
+                break;
+              } catch (error) {
+                if (isTimeoutError(error)) {
+                  chunkAttempt += 1;
+                  if (chunkAttempt <= MAX_CHUNK_TIMEOUT_RETRIES) {
+                    continue;
+                  }
+                  queuedItem.fallbackMode = 'single';
+                  const timeoutError = new Error('Chunk translation timed out');
+                  timeoutError.isTimeout = true;
+                  throw timeoutError;
+                }
+                throw error;
+              }
+            }
+          }
+          return {
+            success: true,
+            translations,
+            rawTranslation: rawParts.filter(Boolean).join('\n\n---\n\n'),
+            debug: debugParts
+          };
+        };
+
+        if (fallbackMode === 'single') {
           const fallbackContext = await selectContextForBlock(debugEntry, 'translation', { forceShort: true });
           const perTextTranslations = [];
           for (let textIndex = 0; textIndex < uniqueTexts.length; textIndex += 1) {
@@ -1556,6 +1716,8 @@ async function translatePage(settings, options = {}) {
             perTextTranslations.push(translatedText);
           }
           result = { success: true, translations: perTextTranslations, rawTranslation: '', debug: [] };
+        } else if (fallbackMode === 'chunked') {
+          result = await translateChunked();
         } else {
           result = await runJobOnce(
             translateJobKey,
@@ -1680,6 +1842,7 @@ async function translatePage(settings, options = {}) {
           translationRawRefId: translationRawField.refId,
           translationRawTruncated: translationRawField.truncated || translationRawField.rawTruncated,
           translationDebug: result.debug || [],
+          fallbackMode: queuedItem.fallbackMode || 'batch',
           ...(baseTranslationAnswer
             ? { translationBaseFullAnswer: baseTranslationAnswer, translationFullSuccess: true }
             : {}),
@@ -1719,11 +1882,15 @@ async function translatePage(settings, options = {}) {
         }
       } catch (error) {
         console.error('Block translation failed', error);
+        const errorKind = getErrorKind(error);
+        const isTimeoutFailure = errorKind === 'timeout';
         if (error?.isCancelled || session.state.cancelRequested) {
           await updateDebugEntry(currentIndex + 1, {
             translationStatus: 'cancelled',
             proofreadStatus: settings.proofreadEnabled ? 'cancelled' : 'disabled',
-            translationCompletedAt: Date.now()
+            translationCompletedAt: Date.now(),
+            lastErrorKind: errorKind,
+            fallbackMode: queuedItem.fallbackMode || 'batch'
           });
           translationQueue.markCancelled(queuedItem.key);
           markTranslationApplySkipped(currentIndex);
@@ -1741,7 +1908,9 @@ async function translatePage(settings, options = {}) {
             queuedItem.availableAt = Date.now() + 2000;
             await updateDebugEntry(currentIndex + 1, {
               translationStatus: 'retrying',
-              translationLastError: 'Lease timeout'
+              translationLastError: 'Lease timeout',
+              lastErrorKind: errorKind,
+              fallbackMode: queuedItem.fallbackMode || 'batch'
             });
             recordDebugEvent('RETRY', {
               stage: 'translation',
@@ -1763,7 +1932,9 @@ async function translatePage(settings, options = {}) {
           await updateDebugEntry(currentIndex + 1, {
             translationStatus: 'timeout',
             translationLastError: 'Lease timeout',
-            translationCompletedAt: Date.now()
+            translationCompletedAt: Date.now(),
+            lastErrorKind: errorKind,
+            fallbackMode: queuedItem.fallbackMode || 'batch'
           });
           translationQueue.markError(queuedItem.key);
           markTranslationApplySkipped(currentIndex);
@@ -1775,13 +1946,47 @@ async function translatePage(settings, options = {}) {
           );
           continue;
         }
+        if (isTimeoutFailure && queuedItem.fallbackMode !== 'single') {
+          if (queuedItem.fallbackMode === 'batch') {
+            queuedItem.fallbackMode = 'chunked';
+          } else if (queuedItem.fallbackMode === 'chunked') {
+            queuedItem.fallbackMode = 'single';
+          }
+          queuedItem.retryCount = 0;
+          queuedItem.availableAt = Date.now() + 1000;
+          await updateDebugEntry(currentIndex + 1, {
+            translationStatus: 'retrying',
+            translationLastError: String(error?.message || error),
+            lastErrorKind: errorKind,
+            fallbackMode: queuedItem.fallbackMode || 'batch'
+          });
+          recordDebugEvent('RETRY', {
+            stage: 'translation',
+            summary: `Timeout fallback to ${queuedItem.fallbackMode} for block ${currentIndex + 1}`,
+            details: {
+              blockIndex: currentIndex + 1,
+              fallbackMode: queuedItem.fallbackMode,
+              error: String(error?.message || error)
+            }
+          });
+          reportProgress(
+            'Повтор перевода блока',
+            session.state.progress.completedBlocks,
+            totalBlocks,
+            activeTranslationWorkers
+          );
+          translationQueue.enqueue(queuedItem);
+          continue;
+        }
         if (isFatalBlockError(error)) {
           session.state.error = error;
           session.state.cancelRequested = true;
           await updateDebugEntry(currentIndex + 1, {
             translationStatus: 'failed',
             proofreadStatus: settings.proofreadEnabled ? 'failed' : 'disabled',
-            translationCompletedAt: Date.now()
+            translationCompletedAt: Date.now(),
+            lastErrorKind: errorKind,
+            fallbackMode: queuedItem.fallbackMode || 'batch'
           });
           translationQueue.markError(queuedItem.key);
           markTranslationApplySkipped(currentIndex);
@@ -1804,7 +2009,9 @@ async function translatePage(settings, options = {}) {
           await updateDebugEntry(currentIndex + 1, {
             translationStatus: 'retrying',
             translationRetryCount: queuedItem.retryCount,
-            translationLastError: String(error?.message || error)
+            translationLastError: String(error?.message || error),
+            lastErrorKind: errorKind,
+            fallbackMode: queuedItem.fallbackMode || 'batch'
           });
           recordDebugEvent('RETRY', {
             stage: 'translation',
@@ -2278,6 +2485,11 @@ async function translate(
         if (!response?.success) {
           if (response?.isCancelled) {
             throw createCancelledError(response?.error || 'Перевод отменён.');
+          }
+          if (response?.isTimeout) {
+            const timeoutError = new Error(response?.error || 'Translation timed out.');
+            timeoutError.isTimeout = true;
+            throw timeoutError;
           }
           if (response?.contextOverflow) {
             return { success: false, contextOverflow: true, error: response.error || 'Контекст не помещается.' };
@@ -4163,6 +4375,7 @@ async function resetTranslationDebugInfo(url) {
         ? entry.context
         : '';
   const contextShort = typeof entry.contextShort === 'string' ? entry.contextShort : '';
+  const contextShortError = typeof entry.contextShortError === 'string' ? entry.contextShortError : '';
   const contextFullStatus = entry.contextFullStatus || entry.contextStatus || (contextFull ? 'done' : 'pending');
   const contextShortStatus = entry.contextShortStatus || (contextShort ? 'done' : 'pending');
   existing[url] = {
@@ -4172,6 +4385,7 @@ async function resetTranslationDebugInfo(url) {
     contextFullStatus,
     contextShort,
     contextShortStatus,
+    contextShortError,
     contextFullRefId: entry.contextFullRefId || '',
     contextShortRefId: entry.contextShortRefId || '',
     contextFullTruncated: entry.contextFullTruncated || false,
@@ -4198,6 +4412,8 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
   const blockKeys = Array.isArray(options?.blockKeys) ? options.blockKeys : [];
   const initialContextFull = typeof initial.initialContextFull === 'string' ? initial.initialContextFull : '';
   const initialContextShort = typeof initial.initialContextShort === 'string' ? initial.initialContextShort : '';
+  const initialContextShortError =
+    typeof initial.initialContextShortError === 'string' ? initial.initialContextShortError : '';
   const initialContextFullStatus =
     initial.initialContextFullStatus ||
     (settings.contextGenerationEnabled ? 'pending' : 'disabled');
@@ -4266,6 +4482,7 @@ async function initializeDebugState(blocks, settings = {}, initial = {}, options
     contextFullStatus: initialContextFullStatus,
     contextShort: contextShortPreview.text || '',
     contextShortStatus: initialContextShortStatus,
+    contextShortError: initialContextShortError,
     contextFullRefId,
     contextShortRefId,
     contextFullTruncated: contextFullPreview.truncated,
@@ -4372,6 +4589,12 @@ function updateDebugContextShort(context, status) {
     session.debugStore.state.contextShortStatus = status;
   }
   schedulePersistDebugState('updateDebugContextShort');
+}
+
+function updateDebugContextShortError(error) {
+  if (!session.debugStore.state) return;
+  session.debugStore.state.contextShortError = typeof error === 'string' ? error : '';
+  schedulePersistDebugState('updateDebugContextShortError');
 }
 
 function updateDebugContextFullStatus(status) {
