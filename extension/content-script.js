@@ -25,7 +25,7 @@
     constructor() {
       this.translationVisible = false;
       this.inProgress = false;
-      this.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
+      this.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0, appliedBlocks: 0 };
       this.error = null;
       this.activeEntries = [];
       this.originalSnapshot = [];
@@ -52,7 +52,7 @@
     reset() {
       this.inProgress = false;
       this.error = null;
-      this.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
+      this.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0, appliedBlocks: 0 };
       this.activeEntries = [];
       this.originalSnapshot = [];
       this.translationVisible = false;
@@ -334,6 +334,7 @@ function formatModelSpec(id, tier) {
 const pendingSettingsRequests = new Map();
 let ntRpcPort = null;
 let ntRpcClient = null;
+let rpcPortClient = null;
 const RPC_HEARTBEAT_INTERVAL_MS = 20000;
 const RPC_PORT_ROTATE_MS = 240000;
 let rpcHeartbeatTimer = null;
@@ -1015,7 +1016,7 @@ async function translatePage(settings, options = {}) {
     return blockKey;
   };
   const blockKeys = blocks.map((block) => getBlockKey(block));
-  session.state.progress = { completedBlocks: 0, totalBlocks: blocks.length };
+  session.state.progress = { completedBlocks: 0, totalBlocks: blocks.length, appliedBlocks: 0 };
   const initialContextFullStatus = settings.contextGenerationEnabled
     ? session.context.latestFull
       ? 'done'
@@ -1278,6 +1279,10 @@ async function translatePage(settings, options = {}) {
   // Duplicate translate/proofread requests could be triggered for the same block; dedupe by jobKey.
   const jobInFlight = new Map();
   const jobCompleted = new Map();
+  const applyInOrder = true;
+  const pendingTranslationApplies = new Map();
+  const skippedTranslationApplies = new Set();
+  let nextApplyIndex = 0;
 
   const isBlockProcessed = (blockElement, stage) => {
     if (!blockElement?.getAttribute) return false;
@@ -1394,6 +1399,68 @@ async function translatePage(settings, options = {}) {
     return message.includes('429') || message.includes('rate') || message.includes('too many');
   };
 
+  const registerActiveTranslations = (block, finalTranslations) => {
+    block.forEach(({ path, original, originalHash }, index) => {
+      const withOriginalFormatting = finalTranslations[index] || '';
+      updateActiveEntry(path, original, withOriginalFormatting, originalHash);
+    });
+  };
+
+  const applyTranslationToDom = ({ block, finalTranslations }) => {
+    let applied = 0;
+    block.forEach(({ node, path, original, originalHash }, index) => {
+      if (!shouldApplyTranslation(node, original, originalHash)) {
+        return;
+      }
+      const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
+      if (session.state.translationVisible) {
+        node.nodeValue = withOriginalFormatting;
+      }
+      updateActiveEntry(path, original, withOriginalFormatting, originalHash);
+      applied += 1;
+    });
+    if (applied > 0) {
+      session.state.progress.appliedBlocks = (session.state.progress.appliedBlocks || 0) + 1;
+    }
+  };
+
+  const flushTranslationApplies = () => {
+    if (!applyInOrder) return;
+    let appliedAny = false;
+    while (true) {
+      if (session.state.cancelRequested) {
+        pendingTranslationApplies.clear();
+        skippedTranslationApplies.clear();
+        return;
+      }
+      if (skippedTranslationApplies.has(nextApplyIndex)) {
+        skippedTranslationApplies.delete(nextApplyIndex);
+        nextApplyIndex += 1;
+        continue;
+      }
+      const pending = pendingTranslationApplies.get(nextApplyIndex);
+      if (!pending) break;
+      pendingTranslationApplies.delete(nextApplyIndex);
+      applyTranslationToDom(pending);
+      nextApplyIndex += 1;
+      appliedAny = true;
+    }
+    if (appliedAny) {
+      reportProgress(
+        'Перевод выполняется',
+        session.state.progress.completedBlocks,
+        session.state.progress.totalBlocks,
+        activeTranslationWorkers
+      );
+    }
+  };
+
+  const markTranslationApplySkipped = (index) => {
+    if (!applyInOrder) return;
+    skippedTranslationApplies.add(index);
+    flushTranslationApplies();
+  };
+
   const translationWorker = async () => {
     while (true) {
       if (session.state.cancelRequested) return;
@@ -1424,8 +1491,6 @@ async function translatePage(settings, options = {}) {
           prepareTextForTranslation(original)
         );
         const { uniqueTexts, indexMap } = deduplicateTexts(preparedTexts);
-        const blockTranslations = [];
-
         const keepPunctuationTokens = Boolean(settings.proofreadEnabled);
         const debugEntry = session.debugStore.entries.find((item) => item.index === currentIndex + 1);
         const primaryContext = await selectContextForBlock(debugEntry, 'translation');
@@ -1594,18 +1659,7 @@ async function translatePage(settings, options = {}) {
           finalTranslations = finalTranslations.map((text) => restorePunctuationTokens(text));
         }
 
-        block.forEach(({ node, path, original, originalHash }, index) => {
-          if (!shouldApplyTranslation(node, original, originalHash)) {
-            blockTranslations.push(node.nodeValue);
-            return;
-          }
-          const withOriginalFormatting = finalTranslations[index] || node.nodeValue;
-          if (session.state.translationVisible) {
-            node.nodeValue = withOriginalFormatting;
-          }
-          blockTranslations.push(withOriginalFormatting);
-          updateActiveEntry(path, original, withOriginalFormatting, originalHash);
-        });
+        registerActiveTranslations(block, finalTranslations);
         markBlockProcessed(queuedItem.blockElement, 'translate');
         translationQueue.markDone(queuedItem.key);
         const baseTranslationAnswer =
@@ -1618,7 +1672,7 @@ async function translatePage(settings, options = {}) {
             : null;
         const translationRawField = await prepareRawTextField(result.rawTranslation || '', 'translation_raw');
         await updateDebugEntry(currentIndex + 1, {
-          translated: formatBlockText(blockTranslations),
+          translated: formatBlockText(finalTranslations),
           translatedSegments: translatedTexts,
           translationStatus: 'done',
           translationCompletedAt: Date.now(),
@@ -1632,6 +1686,12 @@ async function translatePage(settings, options = {}) {
           ...(baseTranslationCallId ? { translationBaseFullCallId: baseTranslationCallId } : {})
         });
         session.state.progress.completedBlocks += 1;
+        if (applyInOrder) {
+          pendingTranslationApplies.set(currentIndex, { block, finalTranslations });
+          flushTranslationApplies();
+        } else {
+          applyTranslationToDom({ block, finalTranslations });
+        }
 
         if (settings.proofreadEnabled) {
           const proofreadSegments = translatedTexts.map((text, index) => ({ id: String(index), text }));
@@ -1666,6 +1726,7 @@ async function translatePage(settings, options = {}) {
             translationCompletedAt: Date.now()
           });
           translationQueue.markCancelled(queuedItem.key);
+          markTranslationApplySkipped(currentIndex);
           reportProgress(
             'Перевод отменён',
             session.state.progress.completedBlocks,
@@ -1705,6 +1766,7 @@ async function translatePage(settings, options = {}) {
             translationCompletedAt: Date.now()
           });
           translationQueue.markError(queuedItem.key);
+          markTranslationApplySkipped(currentIndex);
           reportProgress(
             'Таймаут перевода блока',
             session.state.progress.completedBlocks,
@@ -1722,6 +1784,7 @@ async function translatePage(settings, options = {}) {
             translationCompletedAt: Date.now()
           });
           translationQueue.markError(queuedItem.key);
+          markTranslationApplySkipped(currentIndex);
         } else {
           queuedItem.retryCount += 1;
           totalBlockRetries += 1;
@@ -2385,26 +2448,124 @@ async function requestProofreading(payload) {
   );
 }
 
-function ensureRpcPort() {
-  if (ntRpcPort) return ntRpcPort;
-  try {
-    ntRpcPort = chrome.runtime.connect({ name: NT_RPC_PORT_NAME });
-    rpcPortCreatedAt = Date.now();
-    ntRpcClient = new NtRpcClient({ port: ntRpcPort, defaultTimeoutMs: 30000 });
-  } catch (error) {
-    console.warn('Failed to connect RPC port', error);
-    ntRpcPort = null;
-    ntRpcClient = null;
-    return null;
+class PortClient {
+  constructor({ name, onConnect, onDisconnect }) {
+    this.name = name;
+    this.onConnect = onConnect;
+    this.onDisconnect = onDisconnect;
+    this.port = null;
+    this.state = 'disconnected';
+    this.reconnectDelayMs = 250;
+    this.reconnectTimer = null;
+    this.messageQueue = [];
+    this.maxQueue = 100;
   }
-  ntRpcPort.onDisconnect.addListener(() => {
-    const err = chrome.runtime.lastError;
-    console.warn('RPC port disconnected', err?.message || '');
-    ntRpcPort = null;
-    ntRpcClient = null;
-    rpcPortCreatedAt = 0;
-  });
 
+  connect() {
+    if (this.state === 'connecting' || this.state === 'connected') return;
+    this.state = 'connecting';
+    try {
+      this.port = chrome.runtime.connect({ name: this.name });
+    } catch (error) {
+      this.state = 'disconnected';
+      this.scheduleReconnect();
+      return;
+    }
+    this.state = 'connected';
+    this.reconnectDelayMs = 250;
+    this.port.onDisconnect.addListener(() => {
+      this.handleDisconnect();
+    });
+    if (typeof this.onConnect === 'function') {
+      this.onConnect(this.port);
+    }
+    this.flushQueue();
+  }
+
+  handleDisconnect() {
+    if (this.state === 'disconnected') return;
+    this.state = 'disconnected';
+    this.port = null;
+    if (typeof this.onDisconnect === 'function') {
+      this.onDisconnect();
+    }
+    this.scheduleReconnect();
+  }
+
+  disconnect() {
+    if (this.port) {
+      try {
+        this.port.disconnect();
+      } catch (error) {
+        // ignore
+      }
+    }
+    this.handleDisconnect();
+  }
+
+  forceReconnect() {
+    this.disconnect();
+    this.connect();
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    const delay = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(10000, Math.max(250, this.reconnectDelayMs * 2));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  send(message) {
+    if (this.state !== 'connected' || !this.port) {
+      this.messageQueue.push(message);
+      if (this.messageQueue.length > this.maxQueue) {
+        this.messageQueue.shift();
+      }
+      return false;
+    }
+    try {
+      this.port.postMessage(message);
+      return true;
+    } catch (error) {
+      this.messageQueue.push(message);
+      if (this.messageQueue.length > this.maxQueue) {
+        this.messageQueue.shift();
+      }
+      this.handleDisconnect();
+      return false;
+    }
+  }
+
+  flushQueue() {
+    if (this.state !== 'connected' || !this.port || !this.messageQueue.length) return;
+    const queued = [...this.messageQueue];
+    this.messageQueue = [];
+    queued.forEach((message) => this.send(message));
+  }
+}
+
+function ensureRpcPort() {
+  if (!rpcPortClient) {
+    rpcPortClient = new PortClient({
+      name: NT_RPC_PORT_NAME,
+      onConnect: (port) => {
+        ntRpcPort = port;
+        rpcPortCreatedAt = Date.now();
+        ntRpcClient = new NtRpcClient({ port, defaultTimeoutMs: 30000 });
+      },
+      onDisconnect: () => {
+        const err = chrome.runtime.lastError;
+        console.warn('RPC port disconnected', err?.message || '');
+        ntRpcPort = null;
+        ntRpcClient = null;
+        rpcPortCreatedAt = 0;
+      }
+    });
+  }
+  rpcPortClient.connect();
   return ntRpcPort;
 }
 
@@ -2416,7 +2577,11 @@ function startRpcHeartbeat() {
       'RPC heartbeat failed',
       2000,
       { stage: 'heartbeat' }
-    ).then(() => {});
+    ).then((response) => {
+      if (!response?.success || response?.rpcUnavailable) {
+        rpcPortClient?.forceReconnect();
+      }
+    });
   }, RPC_HEARTBEAT_INTERVAL_MS);
 }
 
@@ -2431,16 +2596,7 @@ function shouldRotateRpcPort() {
 }
 
 function rotateRpcPort(reason = '') {
-  if (ntRpcPort) {
-    try {
-      ntRpcPort.disconnect();
-    } catch (error) {
-      // ignore
-    }
-  }
-  ntRpcPort = null;
-  ntRpcClient = null;
-  rpcPortCreatedAt = 0;
+  rpcPortClient?.forceReconnect();
   console.info('RPC port rotated', { reason });
 }
 
@@ -3399,10 +3555,14 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
   const resolvedInProgress = Number.isFinite(snapshot?.inProgressBlocks)
     ? snapshot.inProgressBlocks
     : inProgressBlocks || 0;
+  const resolvedApplied = Number.isFinite(session.state.progress?.appliedBlocks)
+    ? session.state.progress.appliedBlocks
+    : 0;
   session.state.progress = {
     completedBlocks: resolvedCompleted,
     totalBlocks: resolvedTotal,
-    inProgressBlocks: resolvedInProgress
+    inProgressBlocks: resolvedInProgress,
+    appliedBlocks: resolvedApplied
   };
   const resolvedStage = stage || session.status?.stage || 'idle';
   emitTranslationStatus(
@@ -3410,7 +3570,8 @@ function reportProgress(message, completedBlocks, totalBlocks, inProgressBlocks 
     {
       completed: resolvedCompleted,
       total: resolvedTotal,
-      inFlight: resolvedInProgress
+      inFlight: resolvedInProgress,
+      applied: resolvedApplied
     },
     resolvedStage === 'error' ? session.state.error : null
   );
@@ -4438,7 +4599,7 @@ async function cancelTranslation() {
   session.state.activeEntries = [];
   session.state.originalSnapshot = [];
   session.debugStore.state = null;
-  session.state.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0 };
+  session.state.progress = { completedBlocks: 0, totalBlocks: 0, inProgressBlocks: 0, appliedBlocks: 0 };
   session.state.translationVisible = false;
   notifyVisibilityChange();
   reportProgress('Перевод отменён', 0, 0, 0, 'cancelled');

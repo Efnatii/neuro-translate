@@ -6,6 +6,7 @@ importScripts('core/state-store.js');
 importScripts('core/rpc.js');
 importScripts('core/openai-client.js');
 importScripts('core/llm-service-base.js');
+importScripts('core/job-manager.js');
 importScripts('core/user-notifier.js');
 importScripts('core/prompt-tags.js');
 importScripts('core/prompt-builder.js');
@@ -100,35 +101,7 @@ const NT_TRANSLATION_SERVICE = new TranslationService({ client: globalThis.ntOpe
 const NT_CONTEXT_SERVICE = new ContextService({ client: globalThis.ntOpenAiClient });
 const NT_PROOFREAD_SERVICE = new ProofreadService({ client: globalThis.ntOpenAiClient });
 const NT_RPC_SERVER = new NtRpcServer({ portHub: globalThis.ntPortHub, notifications: globalThis.ntNotifications });
-const ACTIVE_JOBS = new Map();
-
-function createJobController(jobId, meta = {}) {
-  if (!jobId) return null;
-  const existing = ACTIVE_JOBS.get(jobId);
-  if (existing?.abortController) {
-    try {
-      existing.abortController.abort('replaced');
-    } catch (error) {
-      // ignore
-    }
-  }
-  const abortController = new AbortController();
-  const entry = {
-    tabId: meta.tabId ?? null,
-    startedAt: Date.now(),
-    abortController,
-    stage: meta.stage || ''
-  };
-  ACTIVE_JOBS.set(jobId, entry);
-  return entry;
-}
-
-function releaseJobController(jobId, abortController) {
-  const existing = ACTIVE_JOBS.get(jobId);
-  if (existing?.abortController === abortController) {
-    ACTIVE_JOBS.delete(jobId);
-  }
-}
+const JOBS = new NtJobManager({ defaultTtlMs: 10 * 60 * 1000 });
 
 function isCancelledError(error) {
   return Boolean(error?.isCancelled || error?.name === 'AbortError');
@@ -139,18 +112,37 @@ async function runJobHandler(stage, payload, meta, handler, timeoutMs) {
   if (!jobId) {
     return { success: false, error: 'Missing jobId.', isRuntimeError: true };
   }
-  const jobEntry = createJobController(jobId, { tabId: meta?.tabId, stage });
-  if (!jobEntry) {
+  const job = JOBS.acquire(jobId, { tabId: meta?.tabId, stage });
+  if (!job) {
     return { success: false, error: 'Failed to register job.', isRuntimeError: true };
   }
   try {
+    const abortSignal = job.entry.abortController.signal;
     const message = {
       ...(payload && typeof payload === 'object' ? payload : {}),
-      abortSignal: jobEntry.abortController.signal
+      // Share a single AbortSignal per jobId while tracking parallel RPCs via refCount.
+      abortSignal
     };
-    return await invokeHandlerAsPromise(handler, mergeRpcMeta(message, meta), timeoutMs);
+    const response = await invokeHandlerAsPromise(handler, mergeRpcMeta(message, meta), timeoutMs);
+    if (abortSignal.aborted) {
+      const reason = abortSignal.reason;
+      const abortError = buildRpcError(
+        'JOB_ABORTED',
+        typeof reason === 'string' && reason.trim() ? `Request aborted: ${reason}` : 'Request aborted',
+        { reason, stage, jobId }
+      );
+      return {
+        success: false,
+        error: abortError.message,
+        errorCode: abortError.code,
+        errorDetails: abortError.details,
+        isRuntimeError: true,
+        isCancelled: true
+      };
+    }
+    return response;
   } finally {
-    releaseJobController(jobId, jobEntry.abortController);
+    job.release();
   }
 }
 
@@ -187,16 +179,11 @@ function registerRpcHandlers() {
       if (!jobId) {
         return { success: false, error: 'Missing jobId.', isRuntimeError: true };
       }
-      const entry = ACTIVE_JOBS.get(jobId);
+      const entry = JOBS.get(jobId);
       if (!entry) {
         return { success: false, error: 'Job not found.', isRuntimeError: true };
       }
-      try {
-        entry.abortController.abort('cancelled');
-      } catch (error) {
-        // ignore
-      }
-      ACTIVE_JOBS.delete(jobId);
+      JOBS.cancel(jobId, 'cancelled-by-user');
       if (globalThis.ntPortHub && globalThis.ntCreateMessage) {
         const envelope = globalThis.ntCreateMessage(
           'JOB_CANCELLED',
@@ -424,17 +411,37 @@ function invokeHandlerAsPromise(handler, message, timeoutMs = 240000) {
       });
       if (maybePromise && typeof maybePromise.then === 'function') {
         maybePromise.catch((error) => {
+          const normalized = typeof globalThis.ntNormalizeError === 'function'
+            ? globalThis.ntNormalizeError(error, 'Unknown error')
+            : {
+                code: error?.code || 'rpc_error',
+                message: error?.message || String(error || 'Unknown error'),
+                details: error?.details
+              };
           safeResolve({
             success: false,
-            error: error?.message || String(error),
+            error: normalized.message,
+            errorCode: normalized.code,
+            errorDetails: normalized.details,
+            isCancelled: normalized.code === 'JOB_ABORTED' || normalized.code === 'REQUEST_ABORTED',
             isRuntimeError: true
           });
         });
       }
     } catch (error) {
+      const normalized = typeof globalThis.ntNormalizeError === 'function'
+        ? globalThis.ntNormalizeError(error, 'Unknown error')
+        : {
+            code: error?.code || 'rpc_error',
+            message: error?.message || String(error || 'Unknown error'),
+            details: error?.details
+          };
       safeResolve({
         success: false,
-        error: error?.message || String(error),
+        error: normalized.message,
+        errorCode: normalized.code,
+        errorDetails: normalized.details,
+        isCancelled: normalized.code === 'JOB_ABORTED' || normalized.code === 'REQUEST_ABORTED',
         isRuntimeError: true
       });
     }
@@ -534,6 +541,66 @@ function storageLocalSet(items, timeoutMs = 3000) {
     }, timeoutMs);
     try {
       chrome.storage.local.set(items, () => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        resolve();
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function storageSessionGet(keysOrDefaults, timeoutMs = 2000) {
+  if (!chrome.storage?.session) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('storageSessionGet timeout'));
+    }, timeoutMs);
+    try {
+      chrome.storage.session.get(keysOrDefaults, (items) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        if (!items || typeof items !== 'object') {
+          resolve({});
+          return;
+        }
+        resolve(items);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function storageSessionSet(items, timeoutMs = 2000) {
+  if (!chrome.storage?.session) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('storageSessionSet timeout'));
+    }, timeoutMs);
+    try {
+      chrome.storage.session.set(items, () => {
         if (hasCompleted) return;
         hasCompleted = true;
         clearTimeout(timeoutId);
@@ -1832,7 +1899,8 @@ function normalizeTranslationStatus(rawStatus, fallback = {}) {
     inFlight: coerceProgressValue(
       progressSource.inFlight ?? progressSource.inProgressBlocks ?? progressSource.inProgressChunks,
       0
-    )
+    ),
+    applied: coerceProgressValue(progressSource.applied ?? progressSource.appliedBlocks, 0)
   };
   const tabId =
     typeof status.tabId === 'number'
@@ -1866,8 +1934,13 @@ function getTranslationStageLabel(stage) {
 }
 
 async function persistTranslationStatus(status, { tabId, source } = {}) {
+  // MV3 service workers can restart at any time, so persist volatile status in session storage too.
   const resolvedTabId = typeof tabId === 'number' ? tabId : status?.tabId;
   if (!resolvedTabId) return;
+  const sessionState = await storageSessionGet({ translationStatusByTab: {} }).catch(() => ({}));
+  const sessionStatusByTab = sessionState?.translationStatusByTab || {};
+  sessionStatusByTab[resolvedTabId] = status;
+  await storageSessionSet({ translationStatusByTab: sessionStatusByTab }).catch(() => {});
   const currentState = globalThis.ntStateStore
     ? await ensureStateStoreLoaded()
     : await storageLocalGet({ translationStatusByTab: {} });
@@ -1937,6 +2010,12 @@ async function handleTranslationProgress(message, sender) {
 }
 
 async function handleGetTranslationStatus(sendResponse, tabId) {
+  const sessionState = await storageSessionGet({ translationStatusByTab: {} }).catch(() => ({}));
+  const sessionStatus = sessionState?.translationStatusByTab?.[tabId] || null;
+  if (sessionStatus) {
+    sendResponse(sessionStatus);
+    return;
+  }
   const currentState = globalThis.ntStateStore
     ? await ensureStateStoreLoaded()
     : await storageLocalGet({ translationStatusByTab: {} });
@@ -1947,6 +2026,10 @@ async function handleGetTranslationStatus(sendResponse, tabId) {
 async function handleTranslationVisibility(message, sender) {
   const tabId = sender?.tab?.id;
   if (!tabId) return;
+  const sessionState = await storageSessionGet({ translationVisibilityByTab: {} }).catch(() => ({}));
+  const sessionVisibilityByTab = sessionState?.translationVisibilityByTab || {};
+  sessionVisibilityByTab[tabId] = Boolean(message.visible);
+  await storageSessionSet({ translationVisibilityByTab: sessionVisibilityByTab }).catch(() => {});
   const currentState = globalThis.ntStateStore
     ? await ensureStateStoreLoaded()
     : await storageLocalGet({ translationVisibilityByTab: {} });
@@ -1966,6 +2049,12 @@ async function handleTranslationCancelled(message, sender) {
   const tabId = message?.tabId ?? sender?.tab?.id;
   if (!tabId) return;
   const jobId = message?.jobId || '';
+  const sessionState = await storageSessionGet({ translationStatusByTab: {}, translationVisibilityByTab: {} }).catch(() => ({}));
+  const sessionStatusByTab = sessionState?.translationStatusByTab || {};
+  const sessionVisibilityByTab = sessionState?.translationVisibilityByTab || {};
+  delete sessionStatusByTab[tabId];
+  sessionVisibilityByTab[tabId] = false;
+  await storageSessionSet({ translationStatusByTab: sessionStatusByTab, translationVisibilityByTab: sessionVisibilityByTab }).catch(() => {});
   const currentState = globalThis.ntStateStore
     ? await ensureStateStoreLoaded()
     : await storageLocalGet({ translationStatusByTab: {}, translationVisibilityByTab: {} });

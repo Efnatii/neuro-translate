@@ -21,8 +21,49 @@ function isJsonSafe(value, seen = new Set()) {
   return Object.values(value).every((item) => isJsonSafe(item, seen));
 }
 
+function normalizeError(err, fallbackMessage = 'Unknown error') {
+  let code = err?.code || '';
+  let details = err?.details;
+  let message = '';
+
+  if (typeof err === 'string') {
+    message = err;
+  } else if (err && typeof err === 'object') {
+    message = err.message || '';
+  }
+
+  const abortReason = err?.reason;
+  const isAbort =
+    err?.name === 'AbortError' ||
+    err?.code === 'ERR_ABORTED' ||
+    err?.isCancelled === true ||
+    err?.aborted === true ||
+    abortReason != null;
+
+  if (isAbort) {
+    code = code || 'JOB_ABORTED';
+    if (typeof abortReason === 'string' && abortReason.trim()) {
+      message = `Request aborted: ${abortReason}`;
+    } else if (!message) {
+      message = 'Request aborted';
+    }
+  }
+
+  if (!message || typeof message !== 'string') {
+    message = fallbackMessage;
+  }
+
+  return {
+    code: code || 'rpc_error',
+    message,
+    details
+  };
+}
+
 function buildRpcError(code, message, details) {
-  const error = { code: code || 'rpc_error', message: message || 'RPC error' };
+  const normalizedMessage =
+    typeof message === 'string' && message.trim() ? message : 'RPC error';
+  const error = { code: code || 'rpc_error', message: normalizedMessage };
   if (details !== undefined) {
     error.details = details;
   }
@@ -84,7 +125,8 @@ class NtRpcServer {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutId);
-        this._postError(port, id, error?.code || 'handler_error', error?.message || String(error), error?.details);
+        const normalized = normalizeError(error, 'RPC handler failed.');
+        this._postError(port, id, normalized.code || 'handler_error', normalized.message, normalized.details);
       };
       const timeoutId = setTimeout(() => {
         rejectOnce(buildRpcError('timeout', 'RPC handler timed out.'));
@@ -201,3 +243,4 @@ class NtRpcClient {
 globalThis.NtRpcServer = NtRpcServer;
 globalThis.NtRpcClient = NtRpcClient;
 globalThis.ntRpcCreateId = createRpcId;
+globalThis.ntNormalizeError = normalizeError;
