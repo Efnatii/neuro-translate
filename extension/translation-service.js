@@ -155,6 +155,7 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
     selectedTier: merged.selectedTier || '',
     selectedModelSpec: merged.selectedModelSpec || '',
     attemptIndex: Number.isFinite(merged.attemptIndex) ? merged.attemptIndex : 0,
+    timeoutMs: Number.isFinite(merged.timeoutMs) ? merged.timeoutMs : null,
     fallbackReason: merged.fallbackReason || ''
   };
 }
@@ -524,6 +525,7 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     contextLength: payload.contextLength ?? (effectiveContext?.length ?? 0),
     contextTextSent: payload.contextTextSent ?? effectiveContext?.text,
     contextMissing: payload.contextMissing ?? effectiveContext?.contextMissing,
+    timeoutMs: payload.timeoutMs ?? requestMeta?.timeoutMs ?? null,
     baseAnswerIncluded: payload.baseAnswerIncluded ?? effectiveContext?.baseAnswerIncluded,
     manualArtifactsUsed:
       payload.manualArtifactsUsed ??
@@ -598,7 +600,8 @@ async function translateTexts(
   let lastRetryDelayMs = null;
   let lastRawTranslation = '';
   const debugPayloads = [];
-  const timeoutMs = DEFAULT_TRANSLATION_TIMEOUT_MS;
+  const textsCount = texts.length;
+  const totalChars = texts.reduce((sum, text) => sum + (typeof text === 'string' ? text.length : 0), 0);
 
   const createExternalAbortHandler = (controller) => {
     if (!requestSignal) return () => {};
@@ -612,21 +615,36 @@ async function translateTexts(
   };
 
   while (true) {
+    const attemptMeta =
+      timeoutAttempts > 0 || retryableRetries > 0
+        ? createChildRequestMeta(baseRequestMeta, {
+            stage: 'translation',
+            purpose: 'retry',
+            attempt: baseRequestMeta.attempt + timeoutAttempts + retryableRetries,
+            triggerSource: 'retry',
+            forceFullContextOnRetry: true
+          })
+        : baseRequestMeta;
+    const timeoutModelSelection = resolveModelSpecForMeta(attemptMeta);
+    const timeoutMs = getLlmTimeoutMs({
+      role: 'translate',
+      tier: timeoutModelSelection?.tier || attemptMeta.selectedTier || requestOptions?.tier || 'standard',
+      model: timeoutModelSelection?.modelId || attemptMeta.selectedModel || model || '',
+      textsCount,
+      totalChars,
+      attemptIndex: attemptMeta.attemptIndex
+    });
+    // timeoutMs is derived from the LLM timeout policy to avoid premature aborts on large batches.
+    attemptMeta.timeoutMs = timeoutMs;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let timeoutTriggered = false;
+    const timeout = setTimeout(() => {
+      timeoutTriggered = true;
+      controller.abort(new Error('timeout'));
+    }, timeoutMs);
     const removeAbortListener = createExternalAbortHandler(controller);
 
     try {
-      const attemptMeta =
-        timeoutAttempts > 0 || retryableRetries > 0
-          ? createChildRequestMeta(baseRequestMeta, {
-              stage: 'translation',
-              purpose: 'retry',
-              attempt: baseRequestMeta.attempt + timeoutAttempts + retryableRetries,
-              triggerSource: 'retry',
-              forceFullContextOnRetry: true
-            })
-          : baseRequestMeta;
       const result = await performTranslationRequest(
         texts,
         apiKey,
@@ -657,7 +675,23 @@ async function translateTexts(
         cancelError.isCancelled = true;
         throw cancelError;
       }
-      lastError = error?.name === 'AbortError' ? new Error('Translation request timed out') : error;
+      const abortReason = controller.signal?.reason;
+      const isTimeout =
+        timeoutTriggered ||
+        abortReason === 'timeout' ||
+        abortReason?.message === 'timeout' ||
+        error?.message?.toLowerCase?.().includes('timed out') ||
+        error?.message?.toLowerCase?.().includes('timeout');
+      if (isTimeout && error && typeof error === 'object') {
+        error.isTimeout = true;
+      }
+      if (isTimeout) {
+        const timeoutError = new Error('Translation request timed out');
+        timeoutError.isTimeout = true;
+        lastError = timeoutError;
+      } else {
+        lastError = error;
+      }
       if (error?.rawTranslation) {
         lastRawTranslation = error.rawTranslation;
       }
@@ -665,7 +699,6 @@ async function translateTexts(
         debugPayloads.push(error.debugPayload);
       }
 
-      const isTimeout = error?.name === 'AbortError' || error?.message?.toLowerCase?.().includes('timed out');
       if (isTimeout && timeoutAttempts < maxTimeoutAttempts - 1) {
         timeoutAttempts += 1;
         console.warn('Translation attempt timed out, retrying...');
@@ -1183,14 +1216,22 @@ async function performTranslationRequest(
         schema: {
           type: 'object',
           properties: {
-            translations: {
+            items: {
               type: 'array',
               minItems: tokenizedTexts.length,
               maxItems: tokenizedTexts.length,
-              items: { type: 'string' }
+              items: {
+                type: 'object',
+                properties: {
+                  i: { type: 'integer' },
+                  text: { type: 'string' }
+                },
+                required: ['i', 'text'],
+                additionalProperties: false
+              }
             }
           },
-          required: ['translations'],
+          required: ['items'],
           additionalProperties: false
         }
       }
@@ -2040,14 +2081,22 @@ async function performTranslationRepairRequest(
         schema: {
           type: 'object',
           properties: {
-            translations: {
+            items: {
               type: 'array',
               minItems: normalizedItems.length,
               maxItems: normalizedItems.length,
-              items: { type: 'string' }
+              items: {
+                type: 'object',
+                properties: {
+                  i: { type: 'integer' },
+                  text: { type: 'string' }
+                },
+                required: ['i', 'text'],
+                additionalProperties: false
+              }
             }
           },
-          required: ['translations'],
+          required: ['items'],
           additionalProperties: false
         }
       }
@@ -2379,20 +2428,58 @@ function parseJsonObjectFlexible(content = '', label = 'response') {
   return parsed;
 }
 
+function extractOutputJsonSection(content = '') {
+  if (typeof globalThis.extractPromptSection !== 'function' || !globalThis.PROMPT_SECTION_TAGS) {
+    return '';
+  }
+  return globalThis.extractPromptSection(content, globalThis.PROMPT_SECTION_TAGS.OUTPUT_JSON);
+}
+
+function normalizeItemsPayload(items = []) {
+  const normalized = [];
+  const seen = new Set();
+  for (const item of items) {
+    const index = Number(item?.i);
+    if (!Number.isInteger(index)) {
+      throw new Error('bad_shape: item index is not an integer');
+    }
+    if (seen.has(index)) {
+      throw new Error('bad_shape: duplicate item index');
+    }
+    seen.add(index);
+    const text = typeof item?.text === 'string' ? item.text : String(item?.text ?? '');
+    normalized.push({ i: index, text });
+  }
+  return normalized;
+}
+
+function parseItemsResponse(content, expectedLength, label = 'response') {
+  const sectionContent = extractOutputJsonSection(content) || content;
+  const parsed = parseJsonObjectFlexible(sectionContent, label);
+  const items = parsed?.items;
+  if (!Array.isArray(items)) {
+    throw new Error('bad_shape: missing items array');
+  }
+  const normalized = normalizeItemsPayload(items);
+  if (expectedLength && normalized.length !== expectedLength) {
+    throw new Error(`bad_shape: length mismatch expected ${expectedLength}, got ${normalized.length}`);
+  }
+  if (expectedLength) {
+    for (let i = 0; i < expectedLength; i += 1) {
+      if (!normalized.find((entry) => entry.i === i)) {
+        throw new Error('bad_shape: missing item index');
+      }
+    }
+  }
+  const ordered = expectedLength
+    ? normalized.sort((a, b) => a.i - b.i)
+    : normalized.sort((a, b) => a.i - b.i);
+  return ordered.map((entry) => entry.text);
+}
+
 function parseTranslationsResponse(content, expectedLength) {
   try {
-    const parsed = parseJsonObjectFlexible(content, 'translation');
-    const translations = parsed?.translations;
-    if (!Array.isArray(translations)) {
-      throw new Error('translation response is missing translations array.');
-    }
-    const normalizedArray = translations.map((item) => (typeof item === 'string' ? item : String(item ?? '')));
-    if (expectedLength && normalizedArray.length !== expectedLength) {
-      throw new Error(
-        `translation response length mismatch: expected ${expectedLength}, got ${normalizedArray.length}`
-      );
-    }
-    return normalizedArray;
+    return parseItemsResponse(content, expectedLength, 'translation');
   } catch (error) {
     console.warn('Translation response object parsing failed; falling back to array parsing.', error);
   }

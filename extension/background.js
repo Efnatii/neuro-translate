@@ -11,6 +11,9 @@ importScripts('core/user-notifier.js');
 importScripts('core/prompt-tags.js');
 importScripts('core/prompt-builder.js');
 importScripts('ai-common.js');
+importScripts('llm-timeout-policy.js');
+importScripts('prompt-sections.js');
+importScripts('notification-center.js');
 importScripts('messaging.js');
 importScripts('translation-service.js');
 importScripts('context-service.js');
@@ -66,6 +69,17 @@ const DEBUG_DB_VERSION = 1;
 const DEBUG_RAW_STORE = 'raw';
 const DEBUG_RAW_MAX_RECORDS = 1500;
 const DEBUG_RAW_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const STATUS_SNAPSHOT_TOPIC = 'SNAPSHOT';
+const STATUS_UPDATE_TOPIC = 'STATUS_UPDATE';
+const OFFSCREEN_URL = 'offscreen.html';
+const OFFSCREEN_REQUEST_TYPE = 'OFFSCREEN_LLM_REQUEST';
+const OFFSCREEN_RESPONSE_TYPE = 'OFFSCREEN_LLM_RESPONSE';
+const OFFSCREEN_LLM_ACTIONS = {
+  translate_text: 'translate_text',
+  generate_context: 'generate_context',
+  generate_short_context: 'generate_short_context',
+  proofread_text: 'proofread_text'
+};
 // Obsolete storage keys from removed settings (OpenAI org/project, single-block concurrency).
 const OBSOLETE_STORAGE_KEYS = [
   'openAi' + 'Organization',
@@ -97,14 +111,93 @@ const DEBUG_PORTS = new Set();
 const POPUP_PORTS = new Set();
 let debugDbPromise = null;
 let STATE_STORE_READY = false;
+const STATUS_CENTER = globalThis.ntStatusCenter || null;
+const OFFSCREEN_PENDING = new Map();
 const NT_TRANSLATION_SERVICE = new TranslationService({ client: globalThis.ntOpenAiClient });
 const NT_CONTEXT_SERVICE = new ContextService({ client: globalThis.ntOpenAiClient });
 const NT_PROOFREAD_SERVICE = new ProofreadService({ client: globalThis.ntOpenAiClient });
 const NT_RPC_SERVER = new NtRpcServer({ portHub: globalThis.ntPortHub, notifications: globalThis.ntNotifications });
 const JOBS = new NtJobManager({ defaultTtlMs: 10 * 60 * 1000 });
 
+function isTimeoutError(error) {
+  return Boolean(error?.isTimeout);
+}
+
 function isCancelledError(error) {
-  return Boolean(error?.isCancelled || error?.name === 'AbortError');
+  return Boolean(error?.isCancelled || (error?.name === 'AbortError' && !isTimeoutError(error)));
+}
+
+function createCorrelationId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+async function ensureOffscreenDocument() {
+  if (!chrome?.offscreen) return;
+  const hasDocument = await chrome.offscreen.hasDocument();
+  if (hasDocument) return;
+  // Offscreen keeps long-running fetches alive even when MV3 service workers suspend.
+  await chrome.offscreen.createDocument({
+    url: OFFSCREEN_URL,
+    reasons: [chrome.offscreen.Reason.NETWORK],
+    justification: 'LLM fetches should run outside the MV3 service worker lifecycle.'
+  });
+}
+
+function reviveOffscreenError(errorPayload) {
+  if (!errorPayload) return null;
+  const err = new Error(errorPayload.message || 'Offscreen request failed');
+  err.name = errorPayload.name || 'Error';
+  if (errorPayload.stack) err.stack = errorPayload.stack;
+  if (errorPayload.status != null) err.status = errorPayload.status;
+  if (errorPayload.retryAfterMs != null) err.retryAfterMs = errorPayload.retryAfterMs;
+  if (errorPayload.isTimeout) err.isTimeout = true;
+  if (errorPayload.isCancelled) err.isCancelled = true;
+  if (errorPayload.isRateLimit) err.isRateLimit = true;
+  if (errorPayload.isContextOverflow) err.isContextOverflow = true;
+  return err;
+}
+
+async function sendOffscreenRequest(action, payload, abortSignal = null) {
+  await ensureOffscreenDocument();
+  const correlationId = createCorrelationId();
+  return new Promise((resolve, reject) => {
+    const handleAbort = () => {
+      OFFSCREEN_PENDING.delete(correlationId);
+      const abortError = new Error('Request aborted');
+      abortError.isCancelled = true;
+      reject(abortError);
+    };
+    if (abortSignal?.aborted) {
+      handleAbort();
+      return;
+    }
+    if (abortSignal) {
+      abortSignal.addEventListener('abort', handleAbort, { once: true });
+    }
+    OFFSCREEN_PENDING.set(correlationId, {
+      resolve: (result) => {
+        if (abortSignal) abortSignal.removeEventListener('abort', handleAbort);
+        resolve(result);
+      },
+      reject: (error) => {
+        if (abortSignal) abortSignal.removeEventListener('abort', handleAbort);
+        reject(error);
+      }
+    });
+    chrome.runtime.sendMessage(
+      { type: OFFSCREEN_REQUEST_TYPE, correlationId, action, payload },
+      () => {
+        if (chrome.runtime.lastError) {
+          OFFSCREEN_PENDING.delete(correlationId);
+          if (abortSignal) abortSignal.removeEventListener('abort', handleAbort);
+          reject(chrome.runtime.lastError);
+        }
+      }
+    );
+  });
 }
 
 async function runJobHandler(stage, payload, meta, handler, timeoutMs) {
@@ -296,6 +389,22 @@ async function getDebugRaw(id) {
   return withRawStore('readonly', (store) => wrapIdbRequest(store.get(id)));
 }
 
+async function sendStatusSnapshotsToPort(port, tabId = null) {
+  if (!STATUS_CENTER || !port) return;
+  if (Number.isFinite(tabId)) {
+    const snapshot = await STATUS_CENTER.getSnapshot(tabId);
+    if (snapshot) {
+      port.postMessage({ type: STATUS_SNAPSHOT_TOPIC, payload: snapshot });
+    }
+    return;
+  }
+  const snapshots = await STATUS_CENTER.getAllSnapshots();
+  snapshots.forEach((snapshot) => {
+    if (!snapshot) return;
+    port.postMessage({ type: STATUS_SNAPSHOT_TOPIC, payload: snapshot });
+  });
+}
+
 function registerUiPort(port, kind) {
   port.onMessage.addListener((message) => {
     if (!message || typeof message !== 'object') return;
@@ -308,6 +417,21 @@ function registerUiPort(port, kind) {
       } catch (error) {
         // Ignore heartbeat post failures to avoid log spam.
       }
+      return;
+    }
+    if (message.type === 'SUBSCRIBE_STATUS') {
+      if (STATUS_CENTER) {
+        const topics = Array.isArray(message.topics) && message.topics.length
+          ? message.topics
+          : [STATUS_UPDATE_TOPIC, STATUS_SNAPSHOT_TOPIC];
+        STATUS_CENTER.subscribe(port, topics);
+        const requestedTabId = Number.isFinite(message.tabId) ? message.tabId : null;
+        void sendStatusSnapshotsToPort(port, requestedTabId);
+      }
+      return;
+    }
+    if (message.type === 'UNSUBSCRIBE_STATUS') {
+      STATUS_CENTER?.unsubscribe(port);
       return;
     }
     if (kind !== UI_PORT_NAMES.debug) return;
@@ -1180,6 +1304,10 @@ chrome.runtime.onConnect.addListener((port) => {
   }
   if (port.name === UI_PORT_NAMES.debug || port.name === UI_PORT_NAMES.popup) {
     registerUiPort(port, port.name);
+    if (STATUS_CENTER) {
+      STATUS_CENTER.subscribe(port, [STATUS_UPDATE_TOPIC, STATUS_SNAPSHOT_TOPIC]);
+      void sendStatusSnapshotsToPort(port);
+    }
     return;
   }
   if (port.name !== NT_RPC_PORT_NAME) return;
@@ -1187,6 +1315,19 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === OFFSCREEN_RESPONSE_TYPE) {
+    const entry = OFFSCREEN_PENDING.get(message.correlationId);
+    if (entry) {
+      OFFSCREEN_PENDING.delete(message.correlationId);
+      if (message.error) {
+        entry.reject(reviveOffscreenError(message.error));
+      } else {
+        entry.resolve(message.result);
+      }
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
   if (message?.type === 'DEBUG_STORE_RAW') {
     Promise.resolve()
       .then(() => storeDebugRaw(message?.record || {}))
@@ -1700,18 +1841,22 @@ async function handleTranslateText(message, sendResponse) {
 
     const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('translate', state, message, async ({ modelId, requestOptions, requestMeta }) => {
-      return NT_TRANSLATION_SERVICE.translateSegments({
-        segments: message.texts,
-        targetLanguage: message.targetLanguage,
-        contextPayload: message.context,
-        modelSpec: modelId,
-        apiKey,
-        apiBaseUrl,
-        keepPunctuationTokens: message.keepPunctuationTokens,
-        requestMeta,
-        requestOptions,
+      return sendOffscreenRequest(
+        OFFSCREEN_LLM_ACTIONS.translate_text,
+        {
+          segments: message.texts,
+          targetLanguage: message.targetLanguage,
+          contextPayload: message.context,
+          modelSpec: modelId,
+          apiKey,
+          apiBaseUrl,
+          keepPunctuationTokens: message.keepPunctuationTokens,
+          requestMeta,
+          requestOptions,
+          requestSignal: null
+        },
         requestSignal
-      });
+      );
     });
     sendResponse({ success: true, translations: result.translations, rawTranslation: result.rawTranslation, debug: result.debug });
   } catch (error) {
@@ -1720,7 +1865,8 @@ async function handleTranslateText(message, sendResponse) {
       success: false,
       error: error?.message || 'Unknown error',
       contextOverflow: Boolean(error?.isContextOverflow),
-      isCancelled: isCancelledError(error)
+      isCancelled: isCancelledError(error),
+      isTimeout: isTimeoutError(error)
     });
   }
 }
@@ -1756,16 +1902,20 @@ async function handleGenerateContext(message, sendResponse) {
     };
     const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
-      return NT_CONTEXT_SERVICE.buildContext({
-        text: message.text,
-        targetLanguage: message.targetLanguage,
-        modelSpec: modelId,
-        apiKey,
-        apiBaseUrl,
-        requestMeta,
-        requestOptions,
+      return sendOffscreenRequest(
+        OFFSCREEN_LLM_ACTIONS.generate_context,
+        {
+          text: message.text,
+          targetLanguage: message.targetLanguage,
+          modelSpec: modelId,
+          apiKey,
+          apiBaseUrl,
+          requestMeta,
+          requestOptions,
+          requestSignal: null
+        },
         requestSignal
-      });
+      );
     });
     sendResponse({ success: true, context: result.context, debug: result.debug });
   } catch (error) {
@@ -1773,7 +1923,8 @@ async function handleGenerateContext(message, sendResponse) {
     sendResponse({
       success: false,
       error: error?.message || 'Unknown error',
-      isCancelled: isCancelledError(error)
+      isCancelled: isCancelledError(error),
+      isTimeout: isTimeoutError(error)
     });
   }
 }
@@ -1809,16 +1960,20 @@ async function handleGenerateShortContext(message, sendResponse) {
     };
     const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
-      return NT_CONTEXT_SERVICE.buildShortContext({
-        text: message.text,
-        targetLanguage: message.targetLanguage,
-        modelSpec: modelId,
-        apiKey,
-        apiBaseUrl,
-        requestMeta,
-        requestOptions,
+      return sendOffscreenRequest(
+        OFFSCREEN_LLM_ACTIONS.generate_short_context,
+        {
+          text: message.text,
+          targetLanguage: message.targetLanguage,
+          modelSpec: modelId,
+          apiKey,
+          apiBaseUrl,
+          requestMeta,
+          requestOptions,
+          requestSignal: null
+        },
         requestSignal
-      });
+      );
     });
     sendResponse({ success: true, context: result.context, debug: result.debug });
   } catch (error) {
@@ -1826,7 +1981,8 @@ async function handleGenerateShortContext(message, sendResponse) {
     sendResponse({
       success: false,
       error: error?.message || 'Unknown error',
-      isCancelled: isCancelledError(error)
+      isCancelled: isCancelledError(error),
+      isTimeout: isTimeoutError(error)
     });
   }
 }
@@ -1847,20 +2003,24 @@ async function handleProofreadText(message, sendResponse) {
 
     const requestSignal = message?.abortSignal;
     const result = await executeModelFallback('proofread', state, message, async ({ modelId, requestOptions, requestMeta }) => {
-      return NT_PROOFREAD_SERVICE.proofreadSegments({
-        segments: message.segments,
-        sourceBlock: message.sourceBlock,
-        translatedBlock: message.translatedBlock,
-        contextPayload: message.context,
-        mode: message.proofreadMode,
-        language: message.language,
-        modelSpec: modelId,
-        apiKey,
-        apiBaseUrl,
-        requestMeta,
-        requestOptions,
+      return sendOffscreenRequest(
+        OFFSCREEN_LLM_ACTIONS.proofread_text,
+        {
+          segments: message.segments,
+          sourceBlock: message.sourceBlock,
+          translatedBlock: message.translatedBlock,
+          contextPayload: message.context,
+          mode: message.proofreadMode,
+          language: message.language,
+          modelSpec: modelId,
+          apiKey,
+          apiBaseUrl,
+          requestMeta,
+          requestOptions,
+          requestSignal: null
+        },
         requestSignal
-      });
+      );
     });
     sendResponse({
       success: true,
@@ -1874,7 +2034,8 @@ async function handleProofreadText(message, sendResponse) {
       success: false,
       error: error?.message || 'Unknown error',
       contextOverflow: Boolean(error?.isContextOverflow),
-      isCancelled: isCancelledError(error)
+      isCancelled: isCancelledError(error),
+      isTimeout: isTimeoutError(error)
     });
   }
 }
@@ -1933,6 +2094,33 @@ function getTranslationStageLabel(stage) {
   return stageLabels[stage] || '';
 }
 
+function buildStatusSnapshot(status, tabId) {
+  const safeStatus = status && typeof status === 'object' ? status : {};
+  const safeProgress = safeStatus.progress && typeof safeStatus.progress === 'object'
+    ? safeStatus.progress
+    : {};
+  return {
+    tabId,
+    url: safeStatus.url || '',
+    stage: safeStatus.stage || 'idle',
+    progress: {
+      completed: Number.isFinite(safeProgress.completed) ? safeProgress.completed : 0,
+      total: Number.isFinite(safeProgress.total) ? safeProgress.total : 0,
+      inFlight: Number.isFinite(safeProgress.inFlight) ? safeProgress.inFlight : 0,
+      applied: Number.isFinite(safeProgress.applied) ? safeProgress.applied : 0
+    },
+    lastError: safeStatus.error ?? null,
+    updatedAt: Number.isFinite(safeStatus.lastUpdateTs) ? safeStatus.lastUpdateTs : Date.now()
+  };
+}
+
+async function publishStatusSnapshot(status, tabId) {
+  if (!STATUS_CENTER || !Number.isFinite(tabId)) return;
+  const snapshot = buildStatusSnapshot(status, tabId);
+  await STATUS_CENTER.setSnapshot(tabId, snapshot);
+  STATUS_CENTER.publish(STATUS_UPDATE_TOPIC, snapshot);
+}
+
 async function persistTranslationStatus(status, { tabId, source } = {}) {
   // MV3 service workers can restart at any time, so persist volatile status in session storage too.
   const resolvedTabId = typeof tabId === 'number' ? tabId : status?.tabId;
@@ -1956,6 +2144,7 @@ async function persistTranslationStatus(status, { tabId, source } = {}) {
     globalThis.ntPortHub.broadcastUi(envelope);
     sendRuntimeMessageSafe(envelope);
   }
+  await publishStatusSnapshot(status, resolvedTabId);
   if (areNotificationsEnabled() && globalThis.ntUserNotifier) {
     const totalBlocks = status?.progress?.total || 0;
     const completedBlocks = status?.progress?.completed || 0;
@@ -2082,6 +2271,7 @@ async function handleTranslationCancelled(message, sender) {
     globalThis.ntPortHub.broadcastUi(envelope);
     sendRuntimeMessageSafe(envelope);
   }
+  await publishStatusSnapshot(cancelledStatus, tabId);
   const payload = { type: 'TRANSLATION_CANCELLED', tabId, jobId };
   broadcastToPorts(POPUP_PORTS, payload);
   sendRuntimeMessageSafe(payload);

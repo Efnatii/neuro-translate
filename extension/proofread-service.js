@@ -112,6 +112,7 @@ function normalizeRequestMeta(meta = {}, overrides = {}) {
     selectedTier: merged.selectedTier || '',
     selectedModelSpec: merged.selectedModelSpec || '',
     attemptIndex: Number.isFinite(merged.attemptIndex) ? merged.attemptIndex : 0,
+    timeoutMs: Number.isFinite(merged.timeoutMs) ? merged.timeoutMs : null,
     fallbackReason: merged.fallbackReason || ''
   };
 }
@@ -484,6 +485,7 @@ function attachRequestMeta(payload, requestMeta, effectiveContext) {
     contextLength: payload.contextLength ?? (effectiveContext?.length ?? 0),
     contextTextSent: payload.contextTextSent ?? effectiveContext?.text,
     contextMissing: payload.contextMissing ?? effectiveContext?.contextMissing,
+    timeoutMs: payload.timeoutMs ?? requestMeta?.timeoutMs ?? null,
     baseAnswerIncluded: payload.baseAnswerIncluded ?? effectiveContext?.baseAnswerIncluded,
     manualArtifactsUsed:
       payload.manualArtifactsUsed ??
@@ -833,6 +835,53 @@ function parseJsonObjectFlexible(content = '', label = 'response') {
   return parsed;
 }
 
+function extractOutputJsonSection(content = '') {
+  if (typeof globalThis.extractPromptSection !== 'function' || !globalThis.PROMPT_SECTION_TAGS) {
+    return '';
+  }
+  return globalThis.extractPromptSection(content, globalThis.PROMPT_SECTION_TAGS.OUTPUT_JSON);
+}
+
+function normalizeIndexedItems(items = []) {
+  const normalized = [];
+  const seen = new Set();
+  items.forEach((item) => {
+    const index = Number(item?.i);
+    if (!Number.isInteger(index)) {
+      throw new Error('bad_shape: item index is not an integer');
+    }
+    if (seen.has(index)) {
+      throw new Error('bad_shape: duplicate item index');
+    }
+    seen.add(index);
+    const text = typeof item?.text === 'string' ? item.text : String(item?.text ?? '');
+    normalized.push({ i: index, text });
+  });
+  return normalized;
+}
+
+function parseIndexedItemsResponse(content, expectedLength, label = 'response') {
+  const sectionContent = extractOutputJsonSection(content) || content;
+  const parsed = parseJsonObjectFlexible(sectionContent, label);
+  const items = parsed?.items;
+  if (!Array.isArray(items)) {
+    throw new Error('bad_shape: missing items array');
+  }
+  const normalized = normalizeIndexedItems(items);
+  if (expectedLength && normalized.length !== expectedLength) {
+    throw new Error(`bad_shape: length mismatch expected ${expectedLength}, got ${normalized.length}`);
+  }
+  if (expectedLength) {
+    for (let i = 0; i < expectedLength; i += 1) {
+      if (!normalized.find((entry) => entry.i === i)) {
+        throw new Error('bad_shape: missing item index');
+      }
+    }
+  }
+  const ordered = normalized.sort((a, b) => a.i - b.i);
+  return ordered.map((entry) => entry.text);
+}
+
 function chunkProofreadItems(items) {
   const chunks = [];
   let current = [];
@@ -859,18 +908,6 @@ function chunkProofreadItems(items) {
   }
 
   return chunks;
-}
-
-function normalizeProofreadItems(items) {
-  if (!Array.isArray(items)) return [];
-  return items
-    .map((item) => {
-      const id = item?.id;
-      if (id === null || id === undefined) return null;
-      const text = typeof item?.text === 'string' ? item.text : String(item?.text ?? '');
-      return { id: String(id), text };
-    })
-    .filter(Boolean);
 }
 
 function normalizeProofreadSegments(segments) {
@@ -1146,6 +1183,32 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           Math.max(512, Math.ceil(baseMaxTokens * maxTokensOverride))
         );
   const maxTokens = adjustedMaxTokens;
+  const timeoutMs = getLlmTimeoutMs({
+    role: 'proofread',
+    tier: requestMeta.selectedTier || resolvedTier,
+    model: requestMeta.selectedModel || model,
+    textsCount: items.length,
+    totalChars: inputChars,
+    attemptIndex: requestMeta.attemptIndex
+  });
+  // timeoutMs is derived from the shared LLM timeout policy for proofread requests.
+  requestMeta.timeoutMs = timeoutMs;
+  const controller = new AbortController();
+  let removeAbortListener = () => {};
+  let timeoutTriggered = false;
+  if (requestSignal) {
+    if (requestSignal.aborted) {
+      controller.abort(requestSignal.reason || 'cancelled');
+    } else {
+      const onAbort = () => controller.abort(requestSignal.reason || 'cancelled');
+      requestSignal.addEventListener('abort', onAbort, { once: true });
+      removeAbortListener = () => requestSignal.removeEventListener('abort', onAbort);
+    }
+  }
+  const timeoutId = setTimeout(() => {
+    timeoutTriggered = true;
+    controller.abort(new Error('timeout'));
+  }, timeoutMs);
 
   const requestPayload = {
     model,
@@ -1165,10 +1228,10 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
               items: {
                 type: 'object',
                 properties: {
-                  id: { type: 'string' },
+                  i: { type: 'integer' },
                   text: { type: 'string' }
                 },
-                required: ['id', 'text'],
+                required: ['i', 'text'],
                 additionalProperties: false
               }
             }
@@ -1182,6 +1245,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   applyPromptCacheParams(requestPayload, apiBaseUrl, model, 'neuro-translate:proofread:v1');
   applyModelRequestParams(requestPayload, model, requestOptions);
   const startedAt = Date.now();
+  try {
   let response = await fetch(apiBaseUrl, {
     method: 'POST',
     headers: {
@@ -1189,7 +1253,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
       Authorization: `Bearer ${apiKey}`
     },
     body: JSON.stringify(requestPayload),
-    signal: requestSignal
+    signal: controller.signal
   });
 
   if (!response.ok) {
@@ -1237,7 +1301,7 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
           Authorization: `Bearer ${apiKey}`
         },
         body: JSON.stringify(requestPayload),
-        signal: requestSignal
+        signal: controller.signal
       });
       if (!response.ok) {
         errorText = await response.text();
@@ -1339,10 +1403,10 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
   );
   const debugPayloads = [debugPayload];
 
-  let parsed = null;
+  let parsedItems = null;
   let parseError = null;
   try {
-    parsed = parseJsonObjectFlexible(content, 'proofread');
+    parsedItems = parseIndexedItemsResponse(content, items.length, 'proofread');
   } catch (error) {
     parseError = error?.message || 'parse-error';
   }
@@ -1382,25 +1446,28 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     if (Array.isArray(repaired.debug)) {
       debugPayloads.push(...repaired.debug);
     }
-    if (repaired.parsed) {
-      parsed = repaired.parsed;
+    if (repaired.parsedItems) {
+      parsedItems = repaired.parsedItems;
       parseError = repaired.parseError || null;
     }
   }
 
-  const normalizedItems = normalizeProofreadItems(parsed?.items);
   const itemsById = new Map();
-  normalizedItems.forEach((item) => {
-    itemsById.set(item.id, item.text);
-  });
+  if (Array.isArray(parsedItems)) {
+    parsedItems.forEach((text, index) => {
+      const id = String(items[index]?.id);
+      const normalizedText = typeof text === 'string' ? text : String(text ?? '');
+      itemsById.set(id, normalizedText);
+    });
+  }
 
   const expectedIds = items.map((item) => String(item.id));
   const receivedIds = Array.from(itemsById.keys());
   const missingIds = expectedIds.filter((id) => !itemsById.has(id));
   const extraIds = receivedIds.filter((id) => !expectedIds.includes(id));
   const validationErrors = [];
-  if (normalizedItems.length !== items.length) {
-    validationErrors.push(`proofread items length mismatch: expected ${items.length}, got ${normalizedItems.length}`);
+  if ((parsedItems || []).length !== items.length) {
+    validationErrors.push(`proofread items length mismatch: expected ${items.length}, got ${(parsedItems || []).length}`);
   }
   if (missingIds.length) {
     validationErrors.push(`missing ids: ${missingIds.join(', ')}`);
@@ -1418,7 +1485,16 @@ async function requestProofreadChunk(items, metadata, apiKey, model, apiBaseUrl,
     };
   }
 
-  return { itemsById, rawProofread, parseError, debug: debugPayloads };
+    return { itemsById, rawProofread, parseError, debug: debugPayloads };
+  } catch (error) {
+    if (timeoutTriggered && error && typeof error === 'object') {
+      error.isTimeout = true;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    removeAbortListener();
+  }
 }
 
 async function requestProofreadFormatRepair(
@@ -1493,10 +1569,10 @@ async function requestProofreadFormatRepair(
               items: {
                 type: 'object',
                 properties: {
-                  id: { type: 'string' },
+                  i: { type: 'integer' },
                   text: { type: 'string' }
                 },
-                required: ['id', 'text'],
+                required: ['i', 'text'],
                 additionalProperties: false
               }
             }
@@ -1602,16 +1678,16 @@ async function requestProofreadFormatRepair(
     effectiveContext
   );
 
-  let parsed = null;
+  let parsedItems = null;
   let parseError = null;
   try {
-    parsed = parseJsonObjectFlexible(content, 'proofread-format-repair');
+    parsedItems = parseIndexedItemsResponse(content, items.length, 'proofread-format-repair');
   } catch (error) {
     parseError = error?.message || 'parse-error';
   }
 
   return {
-    parsed,
+    parsedItems,
     rawProofread: [rawResponse, content].filter(Boolean).join('\n\n---\n\n'),
     parseError,
     debug: [debugPayload]
@@ -1709,10 +1785,10 @@ async function repairProofreadSegments(
               items: {
                 type: 'object',
                 properties: {
-                  id: { type: 'string' },
+                  i: { type: 'integer' },
                   text: { type: 'string' }
                 },
-                required: ['id', 'text'],
+                required: ['i', 'text'],
                 additionalProperties: false
               }
             }
@@ -1817,11 +1893,12 @@ async function repairProofreadSegments(
     if (Array.isArray(debugPayloads)) {
       debugPayloads.push(debugPayload);
     }
-    const parsed = parseJsonObjectFlexible(content, 'proofread-repair');
-    const normalizedItems = normalizeProofreadItems(parsed?.items);
+    const parsedItems = parseIndexedItemsResponse(content, repairItems.length, 'proofread-repair');
     const itemsById = new Map();
-    normalizedItems.forEach((item) => {
-      itemsById.set(item.id, item.text);
+    parsedItems.forEach((text, index) => {
+      const id = String(repairItems[index]?.id);
+      const normalizedText = typeof text === 'string' ? text : String(text ?? '');
+      itemsById.set(id, normalizedText);
     });
     repairIndices.forEach((index) => {
       const id = String(items[index]?.id);
